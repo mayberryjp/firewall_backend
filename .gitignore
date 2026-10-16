@@ -1,0 +1,9 @@
+/netcontrold
+/netcontrold.exe
+/state.json
+/state.json.lock
+/auth.json
+/keys/
+/coverage.out
+/coverage.html
+*.test
