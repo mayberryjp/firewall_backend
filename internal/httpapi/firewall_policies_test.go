@@ -100,7 +100,7 @@ func TestHostPolicyExampleAndInterfaceRead(t *testing.T) {
 
 func TestInterfacePolicyRequiresFirewallPermissionNotInterfaceMutationPermission(t *testing.T) {
 	before := control.EmptyConfig()
-	before.Interfaces = []control.Interface{{Name: "lan", Kind: "dummy", MTU: 1500}}
+	before.Interfaces = []control.Interface{{Name: "lan", Kind: "dummy", Role: "lan", MTU: 1500}}
 	after := control.Clone(before)
 	after.Firewall.Policies = &control.FirewallPolicies{Interfaces: []control.InterfacePolicy{{Interface: "lan", Rules: []control.HostPolicyRule{{Action: "drop"}}}}}
 	if err := authorize(Credential{Permissions: []string{"firewall.write"}}, before, after); err != nil {

@@ -132,7 +132,7 @@ func TestStatisticsAreReadOnlyAndSimulated(t *testing.T) {
 	store := testStore(t)
 	journal := &failingJournal{Journal: store}
 	c := EmptyConfig()
-	c.Interfaces = []Interface{{Name: "z.last", Kind: "dummy", MTU: 1500}, {Name: "a.first", Kind: "dummy", MTU: 1400, Up: true}}
+	c.Interfaces = []Interface{{Name: "z.last", Kind: "dummy", Role: "wan", MTU: 1500}, {Name: "a.first", Kind: "dummy", Role: "lan", MTU: 1400, Up: true}}
 	e := testEngine(t, journal, NewSimulator(EmptyConfig()))
 	tx := submit(t, e, 0, c)
 	before := e.Snapshot()

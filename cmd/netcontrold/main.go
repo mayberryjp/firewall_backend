@@ -39,6 +39,10 @@ func run(logger *slog.Logger) error {
 	flowRuntime := flag.String("softflowd-runtime-dir", "/run/netcontrol-softflowd", "dedicated root-owned mode-0711 process runtime directory")
 	flowUID := flag.Int("softflowd-uid", -1, "non-root numeric UID for managed softflowd children")
 	flowGID := flag.Int("softflowd-gid", -1, "non-root numeric GID for managed softflowd children")
+	relayBinary := flag.String("dhcp-relay-binary", "", "absolute path to operator-installed dnsmasq (relay integration disabled when empty)")
+	relayRuntime := flag.String("dhcp-relay-runtime-dir", "/run/netcontrol-dhcp-relay", "dedicated root-owned mode-0711 DHCP relay runtime directory")
+	relayUID := flag.Int("dhcp-relay-uid", -1, "non-root numeric UID of an existing account for the DHCP relay child")
+	relayGID := flag.Int("dhcp-relay-gid", -1, "non-root numeric GID of an existing group for the DHCP relay child")
 	hostTunables := flag.Bool("allow-host-tunables", false, "explicitly allow allowlisted host-global network sysctls; takes an exclusive host tuning lock")
 	authFile := flag.String("auth-file", "", "JSON credential file containing token hashes and permissions")
 	credentialDB := flag.String("credential-db", "", "device credential database (default: <state>.credentials.db); mutually exclusive with -auth-file")
@@ -136,6 +140,8 @@ func run(logger *slog.Logger) error {
 			ParentInterfaces: parentNames, SoftflowdBinary: *flowBinary, RuntimeDirectory: *flowRuntime,
 			SoftflowdUID: *flowUID, SoftflowdGID: *flowGID, Logger: logger,
 			AllowHostTunables: *hostTunables,
+			DHCPRelayBinary:   *relayBinary, DHCPRelayRuntimeDirectory: *relayRuntime,
+			DHCPRelayUID: *relayUID, DHCPRelayGID: *relayGID,
 		})
 		if err != nil {
 			return err

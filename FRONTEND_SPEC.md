@@ -40,6 +40,8 @@ Support:
 - IPv4/IPv6 masquerading.
 - WireGuard key references, peers, endpoints, allowed networks, and keepalive.
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
+- Per-interface DHCPv4 relay server lists and enable flags, managed dnsmasq relay,
+  runtime inspection, and explicit service repair.
 - Complete-package transactions, confirmation, rollback, and recovery.
 - Committed configuration history, comparison, export, and historical restore.
 - Read-only namespace interface counters and IP/TCP/UDP/ICMP protocol statistics,
@@ -48,7 +50,8 @@ Support:
 Do not present as supported:
 
 - Physical-device provisioning, parent adoption, namespace creation or selection
-  through the API, bridges, DHCP, DNS management, or forwarding sysctl management.
+  through the API, bridges, DHCP server management, DHCPv6 relay, DNS management,
+  or forwarding sysctl management.
 - SNAT, DNAT, port forwarding, arbitrary protocol matches/port ranges, sets, conntrack
   controls, traffic control, device tuning, or hardware offload.
 - Private-key upload/generation, key-file listing, package installation, arbitrary
@@ -241,7 +244,7 @@ Configuration changes additionally require permissions for every changed area:
 
 | Change | Additional permission |
 | --- | --- |
-| Interface/address/VLAN fields | `interfaces.write` |
+| Interface/address/VLAN fields, roles, DHCP relay settings | `interfaces.write` |
 | WireGuard settings and removal of a WireGuard interface | `wireguard.write` |
 | Routes | `routes.write` |
 | Source-policy rules | `policy.write` |
@@ -253,7 +256,11 @@ Creating/removing a WireGuard interface typically needs both interface and
 WireGuard permissions. Confirm/rollback requires the permissions for the original
 transaction's full previous-to-candidate difference, even for another submitter.
 Restore also requires `state.read`. Service reconciliation requires `state.read`
-and `softflowd.write` in addition to `transactions.write`.
+and `transactions.write`, plus `softflowd.write` for the softflowd repair endpoint
+or `interfaces.write` for DHCP relay repair. Both actions repair all enabled
+services: also require `softflowd.write` when any softflowd instance is enabled,
+and `interfaces.write` when any DHCP relay is enabled. Authorization uses the
+current committed/pending configuration under the engine lock, not the draft.
 
 There is no current-user or permissions endpoint. Do not probe authorization by
 issuing writes. Deployment-supplied UI permission hints may disable controls, but
@@ -402,15 +409,33 @@ host-global softnet/sockstat, WireGuard peer, or streaming API is implied.
 
 ### 6.2 Managed interfaces and VLANs
 
-Table columns: name, kind, administrative up/down, MTU, addresses, VLAN parent/ID
+Table columns: name, kind, WAN/LAN role, administrative up/down, MTU, addresses, VLAN parent/ID
 when applicable, staged-change indicator, and actions. Filters: text, kind, and
-administrative state. Detail views include desired/observed comparison.
+administrative state, and role. Detail views include desired/observed comparison.
 
 Editor fields:
 
-- Name, kind (`dummy`, `wireguard`, `vlan`), MTU, administrative up, address list.
+- Name, kind (`dummy`, `wireguard`, `vlan`), required role (`wan` or `lan`),
+  MTU, administrative up, address list.
 - VLAN: parent selector and VLAN ID.
 - WireGuard: embedded settings/peers or link to the same shared WireGuard editor.
+
+Show role choices as WAN/LAN but serialize lowercase `wan`/`lan`. Require an
+explicit selection for every managed interface; do not infer from names, routes,
+or VLAN parents, or silently assign a default. Omitted, null, empty, uppercase,
+and unknown values are invalid (422); non-string JSON values are malformed (400).
+Apply validation to all managed kinds and include role edits in review diffs.
+Multiple interfaces may share a role; no WAN/LAN count requirement exists.
+
+Roles are descriptive metadata, not automatic firewall zones or NAT/routing
+configuration. Preserve them in client types, full-package payloads, shared
+drafts, reads, and revision workflows. Role edits require `interfaces.write`
+and `transactions.write`, not `firewall.write`. Linux observed roles come from
+the expected configuration, not a kernel-derived observation; do not claim
+independent verification of network-facing identity.
+Adopted read-only parents remain unchanged and do not have editable roles.
+This is a greenfield contract: saved configurations/snapshots without required
+roles are invalid; do not add a compatibility fallback or migration.
 
 Parent selector combines eligible managed dummy/VLAN interfaces in the draft
 with available adopted parents. Identify adopted parents as read-only. Do not
@@ -425,6 +450,56 @@ Deleting an interface opens a dependency review showing child VLANs, routes,
 masquerade rules, and capture instances. Do not silently cascade. Require explicit
 staging of removals/references and block apply until the full package is valid.
 Renames must similarly surface dependencies. Up does not imply carrier/readiness.
+
+### 6.2.1 Per-interface DHCPv4 relay
+
+Include an **Enable DHCP relay** boolean and an editable server-address list in
+each managed interface editor. Wire field:
+`dhcp_relay: { enabled: boolean, servers: string[] }`. Default is disabled with
+an empty list; normalized reads include the object. Retain valid server entries
+when toggled off. Lists are normalized and every configured server receives
+requests; this is not ordered failover.
+
+Servers must be distinct canonical unicast IPv4 literals: no hostnames, ports,
+prefixes, IPv6, loopback, link-local, multicast, broadcast, or unspecified IPs.
+Validate entries even when disabled. Enabling requires at least one server,
+an administratively up dummy/VLAN interface, and a configured unicast IPv4
+address. WireGuard cannot be enabled for relay. WAN/LAN role does not restrict
+relay or select upstream interfaces.
+
+The first IPv4 address in lexicographically sorted canonical interface prefixes
+is the relay address (`giaddr`). Show it in the editor/review when more than one
+IPv4 address is present; do not infer a different subnet. Enabled interfaces must
+use distinct relay addresses. IPv6 DHCP is not implemented.
+
+Linux uses operator-installed dnsmasq in relay-only mode with DNS disabled.
+Simulator status is `simulated`, never actual packet forwarding. Missing daemon
+integration rejects enabled configurations during preflight. Operators supply
+the trusted binary, dedicated runtime directory, service UID/GID, capabilities,
+namespace/procfs access, routes, server return paths, and UDP 67/68 firewall
+permissions. Do not imply automatic routing/NAT/firewall changes.
+
+Use interface write permissions and full-package transaction workflows;
+confirmation, rollback, restart, and revision restoration preserve settings.
+One process serves all enabled interfaces, so edits to any enabled interface's
+servers/selected relay address can briefly interrupt others. Show this warning
+in review. Disabled server lists still persist.
+
+Read `GET /api/v1/services/dhcp-relay/status` as
+`{ interfaces: DHCPRelayStatus[], error: string }`, or use runtime's `dhcp_relay`
+array. Join rows by interface name. Show disabled, simulated, unavailable,
+not_running, running, unhealthy, and exited distinctly; preserve errors and
+unknown values. Enabled rows share one PID. Running verifies supervised process
+identity/namespace and owned UDP 67 socket, not server reachability or lease
+delivery. Missing runtime data is Unknown, not Disabled.
+
+If the daemon fails, observed `dhcp_relay.enabled` becomes false and creates
+drift; do not replace the desired enabled setting with that observed value.
+Runtime remains accessible even when full observation fails.
+Offer explicit bodyless `POST /api/v1/services/dhcp-relay/reconcile` using stored
+committed/pending settings, not drafts. It repairs all managed services, creates
+no revision, does not replay networking, and requires permissions described in
+the authorization section. Do not automatically retry it.
 
 ### 6.3 Adopted parents
 
@@ -454,6 +529,29 @@ only priorities must be unique.
 
 ### 6.6 Firewall forwarding
 
+Provide a global **Allow all IPv4 ICMP (protocol 1)** toggle bound to
+`config.firewall.allow_all_icmp`, with `firewall.write` and `transactions.write`
+required to change it. It defaults to `true` when omitted or `null`; normalized
+reads return a boolean. Preserve explicit `false` in full-package submissions,
+revision restore, and draft editing; do not use a truthy fallback.
+
+When enabled, an implicit accept exception runs before all owned forward rules
+in both policy modes, including host/interface drops and the global default.
+It also accepts protocol 1 in owned input/output chains. It applies to every
+interface in the managed namespace, including loopback, adopted parents, and
+future interfaces, without generating editable per-interface policy entries.
+It covers all IPv4 ICMP types/codes, not just echo, and does not cover ICMPv6
+(protocol 58). Other nftables tables may still drop traffic.
+
+Disabling removes the exception and owned input/output chains, not a blanket
+ICMP block. Other local traffic remains unchanged because those chains use
+accept defaults. Forwarding rules/defaults still apply when disabled.
+Show this exception prominently in both policy modes and in the review diff.
+Warn that an older client omitting the field re-enables it. Older durable
+configurations and historical snapshots without the setting default to enabled;
+startup applies the exception even over previous ICMP drops. Explicit `false`
+survives upgrades. Unrelated owned-firewall drift fails migration/startup.
+
 The primary policy view pivots around **hosts**, not interfaces. Host inventory:
 stable ID, unique display name, one or more explicit IPv4/IPv6 addresses, outbound
 default Accept/Drop, and ordered rules. Show hosts as independently editable
@@ -470,6 +568,7 @@ A separate **Interface overrides** view configures ordered rules for an ingress
 interface (managed draft link or adopted parent). There is no interface default.
 Display the effective precedence prominently:
 
+0. If Allow all IPv4 ICMP is enabled, IPv4 protocol 1 is accepted.
 1. Established/related traffic is accepted, including existing connections.
 2. First matching ingress-interface rule wins, overriding host policy.
 3. Otherwise evaluate the source host's ordered rules, then its default.
@@ -479,11 +578,13 @@ The destination host's own outbound policy is not evaluated. Interface allows
 override host drops as well as interface drops overriding host allows. Warn about
 interface catch-alls that shadow all host policies. Existing connections can
 survive a newly applied block until conntrack expires; no connection-flush action
-exists. This applies only to forwarded traffic, not management input or local
-device output. NAT remains separate.
+exists. Host/interface rules apply only to forwarded traffic, not management
+input or local device output; the global ICMP exception also covers input/output.
+NAT remains separate.
 
 Include explicit **Legacy ordered rules** mode for existing configurations:
-source/destination prefixes or Any, Accept/Drop, and global default; stateless.
+source/destination prefixes or Any, Accept/Drop, and global default; stateless
+after the optional global ICMP exception.
 It is selected by absent/null `firewall.policies`. New host/interface mode sends
 `policies` and an empty legacy `rules` list; never mix the models. Switching models
 must show the full difference and require acknowledgement, not silently translate
@@ -546,6 +647,7 @@ Display runtime states:
 | `not_running` | Not running |
 | `unhealthy` | Unhealthy |
 | `exited` | Exited |
+| `unavailable` | Integration unavailable |
 | Unknown future value | Unknown status, retaining raw value |
 
 Missing runtime data means Unknown, not Disabled. Keep top-level runtime error
@@ -557,6 +659,10 @@ Explain that it affects managed services collectively, may lose flow caches, doe
 not replay networking, and creates no revision. Do not suggest per-instance restart
 or automatically retry it. Block it during applying/rolling-back/recovery-failed
 states; it is allowed by the backend during pending confirmation.
+
+This includes the shared DHCP relay process. Require permissions for all enabled
+services and warn that repair may briefly interrupt DHCP relay on every enabled
+interface, not just softflowd.
 
 ### 6.10 Changes/review
 
@@ -849,6 +955,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/firewall/nat` | Observed `{ "masquerade": [...] }` |
 | GET | `/services/softflowd` | Observed `SoftflowdConfig[]` |
 | GET | `/services/softflowd/status` | `{ "instances": SoftflowdStatus[], "error": string }` |
+| GET | `/services/dhcp-relay/status` | `{ "interfaces": DHCPRelayStatus[], "error": string }` |
 | GET | `/transactions` | `Record<string, Transaction>` |
 | GET | `/transactions/{id}` | `Transaction` |
 | GET | `/revisions?limit=50&before_revision=N` | `RevisionPage` |
@@ -858,6 +965,7 @@ Paths below are relative to `/api/v1`.
 | POST | `/transactions/{id}/rollback` | No body -> `Transaction` |
 | POST | `/revisions/{revision}/restore` | Restore request -> `Transaction` |
 | POST | `/services/softflowd/reconcile` | No body -> `RuntimeState` |
+| POST | `/services/dhcp-relay/reconcile` | No body -> `RuntimeState`; repairs all managed services |
 
 For revision lists, `limit` defaults to 50, accepts 1..100, and
 `before_revision` is an exclusive uint64 cursor. Unknown, duplicated, empty, or
@@ -930,9 +1038,11 @@ interface Config {
 interface ManagedInterface {
   name: string;
   kind: "dummy" | "wireguard" | "vlan";
+  role: "wan" | "lan";
   mtu: number;
   up: boolean;
   addresses: string[];
+  dhcp_relay: { enabled: boolean; servers: string[] };
   vlan?: { parent: string; id: number };
   wireguard?: {
     key_ref: string;
@@ -963,6 +1073,7 @@ interface PolicyRule {
 }
 
 interface Firewall {
+  allow_all_icmp: boolean; // Omitted/null input defaults to true; normalized output is explicit.
   policy: "accept" | "drop";
   rules: Array<{ source?: string; destination?: string; action: "accept" | "drop" }>;
   nat: { masquerade: MasqueradeRule[] };
@@ -1063,6 +1174,15 @@ interface SoftflowdStatus {
 interface RuntimeState {
   parent_interfaces: ParentInterface[];
   softflowd: SoftflowdStatus[];
+  dhcp_relay: DHCPRelayStatus[];
+  error?: string;
+}
+
+interface DHCPRelayStatus {
+  interface: string;
+  state: string;
+  pid?: number;
+  started_at?: Timestamp;
   error?: string;
 }
 

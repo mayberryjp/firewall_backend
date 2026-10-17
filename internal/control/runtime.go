@@ -28,7 +28,7 @@ func (e *Engine) Runtime(ctx context.Context) (RuntimeState, error) {
 	return Clone(state), err
 }
 
-func (e *Engine) ReconcileServices(ctx context.Context, actor string) (RuntimeState, error) {
+func (e *Engine) ReconcileServices(ctx context.Context, actor string, authorize func(Config) error) (RuntimeState, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.state.Active != "" && e.state.Transactions[e.state.Active].Status != "pending_confirmation" {
@@ -37,13 +37,19 @@ func (e *Engine) ReconcileServices(ctx context.Context, actor string) (RuntimeSt
 	if err := ctx.Err(); err != nil {
 		return RuntimeState{}, err
 	}
+	expected := e.runtimeConfig()
+	if authorize != nil {
+		if err := authorize(Clone(expected)); err != nil {
+			return RuntimeState{}, err
+		}
+	}
 	adapter, ok := e.adapter.(RuntimeAdapter)
 	if !ok {
 		return RuntimeState{}, fmt.Errorf("adapter does not support service reconciliation")
 	}
 	opctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := adapter.Resume(opctx, e.runtimeConfig()); err != nil {
+	if err := adapter.Resume(opctx, expected); err != nil {
 		e.runtimeError = err.Error()
 		e.log.Error("service runtime reconciliation failed", "actor", actor, "error", err)
 		return RuntimeState{}, err

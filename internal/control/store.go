@@ -40,7 +40,7 @@ func (s *Store) Close() error { return s.lock.Unlock() }
 func (s *Store) Load() (State, error) {
 	b, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
-		return State{Desired: EmptyConfig(), Transactions: map[string]*Transaction{}}, nil
+		return State{Desired: EmptyConfig(), Transactions: map[string]*Transaction{}, ICMPDefaultMigration: true}, nil
 	}
 	if err != nil {
 		return State{}, err
@@ -52,6 +52,9 @@ func (s *Store) Load() (State, error) {
 	if state.Transactions == nil {
 		return State{}, fmt.Errorf("invalid durable state: missing transactions")
 	}
+	if state.Desired.Firewall.AllowAllICMP == nil {
+		state.ICMPDefaultMigration = true
+	}
 	state.Desired.Normalize()
 	state.KernelBaseline.Normalize()
 	if err := state.Desired.Validate(); err != nil {
@@ -60,6 +63,9 @@ func (s *Store) Load() (State, error) {
 	for id, t := range state.Transactions {
 		if t == nil || t.ID != id {
 			return State{}, fmt.Errorf("invalid transaction journal entry %q", id)
+		}
+		if state.Active == id && t.Candidate.Firewall.AllowAllICMP == nil {
+			state.ICMPDefaultMigration = true
 		}
 		t.Candidate.Normalize()
 		t.Previous.Normalize()

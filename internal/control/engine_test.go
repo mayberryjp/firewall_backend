@@ -38,7 +38,7 @@ func testEngine(t *testing.T, store Journal, adapter Adapter) *Engine {
 
 func candidate() Config {
 	c := EmptyConfig()
-	c.Interfaces = []Interface{{Name: "wan", Kind: "dummy", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
+	c.Interfaces = []Interface{{Name: "wan", Kind: "dummy", Role: "wan", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
 	c.Routes = []Route{{Destination: "0.0.0.0/0", Gateway: "192.0.2.1", Interface: "wan", Table: 10000, Metric: 100}}
 	c.Rules = []Rule{{Priority: 10000, Source: "192.0.2.0/24", Table: 10000}}
 	c.Firewall = Firewall{Policy: "drop", Rules: []FirewallRule{{Source: "192.0.2.0/24", Action: "accept"}},

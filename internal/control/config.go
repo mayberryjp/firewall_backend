@@ -19,13 +19,15 @@ type Config struct {
 }
 
 type Interface struct {
-	Name      string     `json:"name"`
-	Kind      string     `json:"kind"`
-	MTU       int        `json:"mtu"`
-	Up        bool       `json:"up"`
-	Addresses []string   `json:"addresses"`
-	WireGuard *WireGuard `json:"wireguard,omitempty"`
-	VLAN      *VLAN      `json:"vlan,omitempty"`
+	Name      string          `json:"name"`
+	Kind      string          `json:"kind"`
+	Role      string          `json:"role"`
+	MTU       int             `json:"mtu"`
+	Up        bool            `json:"up"`
+	Addresses []string        `json:"addresses"`
+	DHCPRelay DHCPRelayConfig `json:"dhcp_relay"`
+	WireGuard *WireGuard      `json:"wireguard,omitempty"`
+	VLAN      *VLAN           `json:"vlan,omitempty"`
 }
 
 type WireGuard struct {
@@ -57,10 +59,15 @@ type Rule struct {
 
 // Firewall owns only the inet/netcontrol table.
 type Firewall struct {
-	Policy   string            `json:"policy"`
-	Rules    []FirewallRule    `json:"rules"`
-	NAT      NAT               `json:"nat"`
-	Policies *FirewallPolicies `json:"policies,omitempty"`
+	AllowAllICMP *bool             `json:"allow_all_icmp"`
+	Policy       string            `json:"policy"`
+	Rules        []FirewallRule    `json:"rules"`
+	NAT          NAT               `json:"nat"`
+	Policies     *FirewallPolicies `json:"policies,omitempty"`
+}
+
+func (f Firewall) allowsAllICMP() bool {
+	return f.AllowAllICMP == nil || *f.AllowAllICMP
 }
 
 type NAT struct {
@@ -102,6 +109,10 @@ func Clone[T any](v T) T {
 
 func (c *Config) Normalize() {
 	c.Kernel.Normalize()
+	if c.Firewall.AllowAllICMP == nil {
+		enabled := true
+		c.Firewall.AllowAllICMP = &enabled
+	}
 	if c.Interfaces == nil {
 		c.Interfaces = []Interface{}
 	}
@@ -135,6 +146,10 @@ func (c *Config) Normalize() {
 			link.Addresses = []string{}
 		}
 		slices.Sort(link.Addresses)
+		if link.DHCPRelay.Servers == nil {
+			link.DHCPRelay.Servers = []string{}
+		}
+		slices.Sort(link.DHCPRelay.Servers)
 		if link.WireGuard != nil {
 			if link.WireGuard.Peers == nil {
 				link.WireGuard.Peers = []Peer{}
@@ -183,6 +198,9 @@ func (c Config) Validate() error {
 			return fmt.Errorf("invalid or duplicate interface name %q", link.Name)
 		}
 		names[link.Name] = true
+		if link.Role != "wan" && link.Role != "lan" {
+			return fmt.Errorf("interface %s: role must be wan or lan", link.Name)
+		}
 		if link.Kind != "dummy" && link.Kind != "wireguard" && link.Kind != "vlan" {
 			return fmt.Errorf("interface %s: supported kinds are dummy, wireguard, and vlan", link.Name)
 		}
@@ -251,6 +269,9 @@ func (c Config) Validate() error {
 		}
 	}
 	if _, err := orderedInterfaces(c.Interfaces); err != nil {
+		return err
+	}
+	if _, err := dhcpRelayBindings(c.Interfaces); err != nil {
 		return err
 	}
 	if err := validateSoftflowd(c.Softflowd); err != nil {

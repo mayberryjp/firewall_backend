@@ -105,7 +105,7 @@ func TestLinuxVLANProtectedParents(t *testing.T) {
 		t.Fatalf("%+v %v", initial, err)
 	}
 	invalid := EmptyConfig()
-	invalid.Interfaces = []Interface{{Name: "uplink", Kind: "dummy", MTU: 1400}}
+	invalid.Interfaces = []Interface{{Name: "uplink", Kind: "dummy", Role: "wan", MTU: 1400}}
 	if _, err := e.Submit(context.Background(), "test", Request{Config: invalid, ConfirmSeconds: 30}); !errors.Is(err, ErrValidation) {
 		t.Fatalf("protected parent mutation: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestLinuxSoftflowdLifecycle(t *testing.T) {
 	store := testStore(t)
 	e := testEngine(t, store, adapter)
 	c := EmptyConfig()
-	c.Interfaces = []Interface{{Name: "capture", Kind: "dummy", MTU: 1500, Up: true}}
+	c.Interfaces = []Interface{{Name: "capture", Kind: "dummy", Role: "lan", MTU: 1500, Up: true}}
 	c.Softflowd = []SoftflowdConfig{flowConfig()}
 	c.Softflowd[0].Interface = "capture"
 	c.Softflowd[0].Collector = "127.0.0.1:2055"
@@ -261,7 +261,7 @@ func TestLinuxSoftflowdLifecycle(t *testing.T) {
 	if err != nil || !view.Drift {
 		t.Fatalf("process loss did not cause drift: %+v %v", view, err)
 	}
-	state, err = e.ReconcileServices(context.Background(), "test")
+	state, err = e.ReconcileServices(context.Background(), "test", nil)
 	if err != nil || state.Softflowd[0].State != "running" || state.Softflowd[0].PID == child.cmd.Process.Pid {
 		t.Fatalf("%+v %v", state, err)
 	}

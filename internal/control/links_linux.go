@@ -137,7 +137,7 @@ func deletionOrder(links []netlink.Link) []netlink.Link {
 }
 
 func (a *linuxAdapter) Runtime(ctx context.Context, hints Config) (RuntimeState, error) {
-	result := RuntimeState{Parents: []ParentInterface{}, Softflowd: []SoftflowdStatus{}}
+	result := RuntimeState{Parents: []ParentInterface{}, Softflowd: []SoftflowdStatus{}, DHCPRelay: []DHCPRelayStatus{}}
 	err := a.inNamespace(ctx, func() error {
 		h, err := netlink.NewHandle()
 		if err != nil {
@@ -168,6 +168,10 @@ func (a *linuxAdapter) Runtime(ctx context.Context, hints Config) (RuntimeState,
 				result.Softflowd = append(result.Softflowd, status)
 			}
 		}
+		result.DHCPRelay = dhcpRelayStatuses(hints.Interfaces, "unavailable", "DHCP relay integration is not configured")
+		if a.relay != nil {
+			result.DHCPRelay = a.relay.Status(hints.Interfaces)
+		}
 		return ctx.Err()
 	})
 	slices.SortFunc(result.Parents, func(a, b ParentInterface) int { return strings.Compare(a.Name, b.Name) })
@@ -181,7 +185,6 @@ func (a *linuxAdapter) Resume(ctx context.Context, c Config) error {
 				return fmt.Errorf("softflowd integration is not configured")
 			}
 		}
-		return nil
 	}
 	return a.inNamespace(ctx, func() error {
 		h, err := netlink.NewHandle()
@@ -192,11 +195,44 @@ func (a *linuxAdapter) Resume(ctx context.Context, c Config) error {
 		if err := a.preflightLinks(h, c); err != nil {
 			return err
 		}
-		if err := a.flows.Preflight(ctx, c.Softflowd); err != nil {
+		if err := a.preflightDHCPRelay(ctx, c.Interfaces); err != nil {
 			return err
 		}
-		return a.flows.Reconcile(ctx, c.Softflowd)
+		if a.flows != nil {
+			if err := a.flows.Preflight(ctx, c.Softflowd); err != nil {
+				return err
+			}
+			if err := a.flows.Reconcile(ctx, c.Softflowd); err != nil {
+				return err
+			}
+		}
+		if a.relay != nil {
+			return a.relay.Reconcile(ctx, c.Interfaces)
+		}
+		return ctx.Err()
 	})
+}
+
+func (a *linuxAdapter) preflightDHCPRelay(ctx context.Context, interfaces []Interface) error {
+	if a.relay != nil {
+		return a.relay.Preflight(ctx, interfaces)
+	}
+	for _, link := range interfaces {
+		if link.DHCPRelay.Enabled {
+			return fmt.Errorf("%w: DHCP relay integration is not configured", ErrValidation)
+		}
+	}
+	return ctx.Err()
+}
+
+func (a *linuxAdapter) observeDHCPRelay(interfaces []Interface) {
+	if a.relay != nil {
+		a.relay.Observe(interfaces)
+		return
+	}
+	for i := range interfaces {
+		interfaces[i].DHCPRelay.Enabled = false
+	}
 }
 
 func (a *linuxAdapter) observeServices(ctx context.Context, hints []SoftflowdConfig) []SoftflowdConfig {

@@ -44,7 +44,7 @@ func TestRuntimeRemainsReadableWhenConfigurationObservationFails(t *testing.T) {
 	if w := request(t, h, "GET", "/api/v1/state", "runtime-reader-test-token", nil); w.Code != 503 {
 		t.Fatalf("observation error hidden: %d %s", w.Code, w.Body.String())
 	}
-	for _, path := range []string{"/api/v1/runtime", "/api/v1/parent-interfaces", "/api/v1/services/softflowd/status", "/api/v1/kernel/tunables", "/api/v1/kernel/tunables/catalog", "/api/v1/statistics", "/api/v1/statistics/interfaces", "/api/v1/statistics/protocols"} {
+	for _, path := range []string{"/api/v1/runtime", "/api/v1/parent-interfaces", "/api/v1/services/softflowd/status", "/api/v1/services/dhcp-relay/status", "/api/v1/kernel/tunables", "/api/v1/kernel/tunables/catalog", "/api/v1/statistics", "/api/v1/statistics/interfaces", "/api/v1/statistics/protocols"} {
 		if w := request(t, h, "GET", path, "runtime-reader-test-token", nil); w.Code != 200 {
 			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
 		}
@@ -130,7 +130,7 @@ func TestServiceAPIAndSeparateAuthorization(t *testing.T) {
 func TestVLANAndRuntimeResources(t *testing.T) {
 	h, _ := fixture(t)
 	c := control.EmptyConfig()
-	c.Interfaces = []control.Interface{{Name: "uplink.100", Kind: "vlan", MTU: 1500, Up: true, VLAN: &control.VLAN{Parent: "uplink", ID: 100}}}
+	c.Interfaces = []control.Interface{{Name: "uplink.100", Kind: "vlan", Role: "lan", MTU: 1500, Up: true, VLAN: &control.VLAN{Parent: "uplink", ID: 100}}}
 	body := control.Request{Config: c, ConfirmSeconds: 30}
 	if w := request(t, h, "POST", "/api/v1/transactions", "softflowd-test-token", body); w.Code != 403 {
 		t.Fatalf("service permission configured a VLAN: %d", w.Code)

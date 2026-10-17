@@ -111,6 +111,23 @@ func reconcileFirewall(f Firewall) error {
 	}
 	chain := conn.AddChain(&nftables.Chain{Name: "forward", Table: table, Type: nftables.ChainTypeFilter,
 		Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityFilter, Policy: &policy})
+	if f.allowsAllICMP() {
+		rule := allowAllICMPRule()
+		rule.Table, rule.Chain = table, chain
+		conn.AddRule(rule)
+		accept := nftables.ChainPolicyAccept
+		for _, local := range []*nftables.Chain{
+			{Name: "input", Hooknum: nftables.ChainHookInput},
+			{Name: "output", Hooknum: nftables.ChainHookOutput},
+		} {
+			local.Table, local.Type = table, nftables.ChainTypeFilter
+			local.Priority, local.Policy = nftables.ChainPriorityFilter, &accept
+			local = conn.AddChain(local)
+			rule := allowAllICMPRule()
+			rule.Table, rule.Chain = table, local
+			conn.AddRule(rule)
+		}
+	}
 	if f.Policies != nil {
 		metadataChain := conn.AddChain(&nftables.Chain{Name: firewallMetadataChain, Table: table})
 		for _, rule := range metadataRules {
@@ -159,7 +176,7 @@ func observeFirewall() (Firewall, error) {
 	if err != nil {
 		return f, err
 	}
-	var chain, postrouting, metadataChain *nftables.Chain
+	var chain, postrouting, metadataChain, inputChain, outputChain *nftables.Chain
 	for _, c := range chains {
 		if c.Table.Name != firewallTable {
 			continue
@@ -175,6 +192,26 @@ func observeFirewall() (Firewall, error) {
 			return f, fmt.Errorf("owned nftables table contains unsupported chains")
 		}
 		switch c.Name {
+		case "input", "output":
+			hook := nftables.ChainHookInput
+			if c.Name == "output" {
+				hook = nftables.ChainHookOutput
+			}
+			if c.Type != nftables.ChainTypeFilter || *c.Hooknum != *hook ||
+				*c.Priority != *nftables.ChainPriorityFilter || *c.Policy != nftables.ChainPolicyAccept {
+				return f, fmt.Errorf("owned ICMP %s chain has unsupported settings", c.Name)
+			}
+			if c.Name == "input" {
+				if inputChain != nil {
+					return f, fmt.Errorf("duplicate owned input chain")
+				}
+				inputChain = c
+			} else {
+				if outputChain != nil {
+					return f, fmt.Errorf("duplicate owned output chain")
+				}
+				outputChain = c
+			}
 		case "forward":
 			if chain != nil || c.Type != nftables.ChainTypeFilter ||
 				*c.Hooknum != *nftables.ChainHookForward || *c.Priority != *nftables.ChainPriorityFilter {
@@ -210,6 +247,27 @@ func observeFirewall() (Firewall, error) {
 	if err != nil {
 		return f, err
 	}
+	var inputRules, outputRules []*nftables.Rule
+	for _, local := range []struct {
+		chain *nftables.Chain
+		rules *[]*nftables.Rule
+	}{{inputChain, &inputRules}, {outputChain, &outputRules}} {
+		if local.chain == nil {
+			continue
+		}
+		*local.rules, err = conn.GetRules(table, local.chain)
+		if err != nil {
+			return f, err
+		}
+		if len(*local.rules) != 1 {
+			return f, fmt.Errorf("owned ICMP %s chain must contain exactly one rule", local.chain.Name)
+		}
+	}
+	enabled, rules, err := observeICMPFirewall(rules, inputRules, outputRules)
+	if err != nil {
+		return f, err
+	}
+	f.AllowAllICMP = &enabled
 	if metadataChain != nil {
 		metadata, err := conn.GetRules(table, metadataChain)
 		if err != nil {

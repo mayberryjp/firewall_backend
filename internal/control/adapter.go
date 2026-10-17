@@ -114,6 +114,13 @@ func (s *Simulator) Resume(ctx context.Context, config Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.Softflowd = Clone(config.Softflowd)
+	relays := make(map[string]DHCPRelayConfig, len(config.Interfaces))
+	for _, link := range config.Interfaces {
+		relays[link.Name] = link.DHCPRelay
+	}
+	for i := range s.state.Interfaces {
+		s.state.Interfaces[i].DHCPRelay = Clone(relays[s.state.Interfaces[i].Name])
+	}
 	return nil
 }
 
@@ -121,6 +128,7 @@ func (s *Simulator) Runtime(ctx context.Context, _ Config) (RuntimeState, error)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state := RuntimeState{Parents: []ParentInterface{}, Softflowd: []SoftflowdStatus{}}
+	state.DHCPRelay = dhcpRelayStatuses(s.state.Interfaces, "simulated", "")
 	for _, config := range s.state.Softflowd {
 		status := SoftflowdStatus{Name: config.Name, State: "disabled"}
 		if config.Enabled {

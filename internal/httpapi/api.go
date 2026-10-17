@@ -152,7 +152,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.encode(w, view)
 			return
 		}
-		if r.URL.Path == "/api/v1/runtime" || r.URL.Path == "/api/v1/parent-interfaces" || r.URL.Path == "/api/v1/services/softflowd/status" {
+		if r.URL.Path == "/api/v1/runtime" || r.URL.Path == "/api/v1/parent-interfaces" ||
+			r.URL.Path == "/api/v1/services/softflowd/status" || r.URL.Path == "/api/v1/services/dhcp-relay/status" {
 			runtime, err := a.engine.Runtime(r.Context())
 			if err != nil {
 				fail(http.StatusServiceUnavailable, err, nil)
@@ -163,6 +164,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				a.encode(w, runtime.Parents)
 			case "/api/v1/services/softflowd/status":
 				a.encode(w, map[string]any{"instances": runtime.Softflowd, "error": runtime.Error})
+			case "/api/v1/services/dhcp-relay/status":
+				a.encode(w, map[string]any{"interfaces": runtime.DHCPRelay, "error": runtime.Error})
 			default:
 				a.encode(w, runtime)
 			}
@@ -295,14 +298,26 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusForbidden, fmt.Errorf("transactions.write permission required"), nil)
 		return
 	}
-	if r.URL.Path == "/api/v1/services/softflowd/reconcile" {
-		if !has("state.read") || !has("softflowd.write") {
-			fail(http.StatusForbidden, fmt.Errorf("state.read and softflowd.write permissions required"), nil)
+	if r.URL.Path == "/api/v1/services/softflowd/reconcile" || r.URL.Path == "/api/v1/services/dhcp-relay/reconcile" {
+		permission := "softflowd.write"
+		if r.URL.Path == "/api/v1/services/dhcp-relay/reconcile" {
+			permission = "interfaces.write"
+		}
+		if !has("state.read") || !has(permission) {
+			fail(http.StatusForbidden, fmt.Errorf("state.read and %s permissions required", permission), nil)
 			return
 		}
-		runtime, err := a.engine.ReconcileServices(r.Context(), actor)
+		var denied error
+		runtime, err := a.engine.ReconcileServices(r.Context(), actor, func(expected control.Config) error {
+			denied = authorizeServiceReconcile(*credential, expected)
+			return denied
+		})
 		if err != nil {
-			fail(errorStatus(err), err, nil)
+			status := errorStatus(err)
+			if denied != nil {
+				status = http.StatusForbidden
+			}
+			fail(status, err, nil)
 			return
 		}
 		a.encode(w, runtime)
@@ -470,6 +485,20 @@ func authorizeAtRevision(c Credential, state control.State, base uint64, target 
 		return control.ErrConflict
 	}
 	return authorize(c, state.Desired, target)
+}
+
+func authorizeServiceReconcile(c Credential, expected control.Config) error {
+	for _, service := range expected.Softflowd {
+		if service.Enabled && !slices.Contains(c.Permissions, "softflowd.write") {
+			return fmt.Errorf("softflowd.write permission required to reconcile enabled services")
+		}
+	}
+	for _, link := range expected.Interfaces {
+		if link.DHCPRelay.Enabled && !slices.Contains(c.Permissions, "interfaces.write") {
+			return fmt.Errorf("interfaces.write permission required to reconcile enabled DHCP relays")
+		}
+	}
+	return nil
 }
 
 func decode(w http.ResponseWriter, r *http.Request, target any) error {

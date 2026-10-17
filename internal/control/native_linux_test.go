@@ -81,7 +81,7 @@ func TestLinuxIsolatedTransaction(t *testing.T) {
 	e := testEngine(t, testStore(t), adapter)
 	c := candidate()
 	c.Interfaces[0].Addresses = append(c.Interfaces[0].Addresses, "192.0.2.11/24")
-	c.Interfaces = append(c.Interfaces, Interface{Name: "wg0", Kind: "wireguard", MTU: 1420, Up: true, Addresses: []string{"2001:db8::1/64"}, WireGuard: &WireGuard{KeyRef: "wg0", ListenPort: 51820}})
+	c.Interfaces = append(c.Interfaces, Interface{Name: "wg0", Kind: "wireguard", Role: "lan", MTU: 1420, Up: true, Addresses: []string{"2001:db8::1/64"}, WireGuard: &WireGuard{KeyRef: "wg0", ListenPort: 51820}})
 	c.Routes = append(c.Routes, Route{Destination: "2001:db8:1::/64", Interface: "wg0", Table: 10001, Metric: 100})
 	c.Rules = append(c.Rules, Rule{Priority: 10001, Source: "::/0", Table: 10001})
 	c.Firewall.Rules = append(c.Firewall.Rules, FirewallRule{Source: "2001:db8::/32", Destination: "2001:db8:1::/64", Action: "accept"})

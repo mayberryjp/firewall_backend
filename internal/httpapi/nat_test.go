@@ -18,7 +18,7 @@ func TestNATReadReturnsStableEmptyArray(t *testing.T) {
 func TestNATTransactionAuthorizationAndRollback(t *testing.T) {
 	h, e := fixture(t)
 	base := control.EmptyConfig()
-	base.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
+	base.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", Role: "wan", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
 	w := request(t, h, "POST", "/api/v1/transactions", "admin-test-token", control.Request{Config: base, ConfirmSeconds: 30})
 	if w.Code != 202 {
 		t.Fatalf("base: %d %s", w.Code, w.Body.String())
@@ -99,7 +99,7 @@ func TestNATPermissionDoesNotGrantFilteringOrInterfaces(t *testing.T) {
 		t.Fatal("NAT permission granted filter writes")
 	}
 	after = control.Clone(before)
-	after.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", MTU: 1500}}
+	after.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", Role: "wan", MTU: 1500}}
 	if err := authorize(c, before, after); err == nil {
 		t.Fatal("NAT permission granted interface writes")
 	}

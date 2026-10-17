@@ -4,6 +4,153 @@ A Go REST control plane for packaged Linux networking migrations. This is an
 initial implementation for **isolated labs**, not a production host-networking
 manager. The default backend simulates changes without touching the OS.
 
+## Development policy
+
+This is a **greenfield project**: backward compatibility is not a requirement.
+Implement the current contract directly; do not add legacy fallbacks, compatibility
+layers, or upgrade migrations unless specifically requested. Breaking API,
+configuration, and saved-state changes are acceptable. Keep tests, examples, and
+the frontend specification synchronized, and reject invalid inputs explicitly.
+This does not relax authorization, transaction recovery, or rollback guarantees
+for valid current configurations, and does not authorize deleting existing data.
+See the [repository instructions](.github/copilot-instructions.md).
+
+## Interface roles
+
+Every managed interface must explicitly declare `"role": "wan"` or
+`"role": "lan"` in its configuration, independent of its name and kind:
+
+```json
+{
+  "name": "edge0",
+  "kind": "dummy",
+  "role": "wan",
+  "mtu": 1500,
+  "up": true,
+  "addresses": ["192.0.2.2/24"]
+}
+```
+
+This is one entry in `config.interfaces`, not a full transaction. Both values are
+lowercase; omission, null, empty values, and other labels are invalid. There is no
+default, name-based inference, migration, or inherited role for VLAN children.
+Any supported managed kind (dummy, VLAN, WireGuard) can have either role; there
+is no requirement to have exactly one WAN or at least one interface of each role.
+
+Roles are descriptive configuration metadata only. They do not automatically
+change routes, firewall rules, NAT, or interface operational settings. They are
+preserved in desired/observed API reads, full-package transactions, durable state,
+and revision snapshots, including confirmation, rollback, restart, and restore.
+Linux observation copies roles from the corresponding expected configuration;
+the role is not a kernel-derived property or an independent operational check.
+Adopted read-only parents are not managed interfaces and do not acquire this field.
+
+Use the normal full-package transaction workflow; role edits require
+`interfaces.write` and `transactions.write`. Invalid role values return HTTP 422;
+non-string JSON types return HTTP 400. Saved configurations and historical
+transaction snapshots must also satisfy the current role requirement or loading
+fails explicitly. No older-format fallback is provided.
+
+## Per-interface DHCPv4 relay
+
+Each managed interface has a `dhcp_relay` configuration:
+
+```json
+{
+  "enabled": true,
+  "servers": ["198.51.100.10", "198.51.100.20"]
+}
+```
+
+This object belongs inside an interface entry, alongside `name`, `role`, and
+`addresses`. It defaults to disabled with an empty server list. Disabled
+configurations may retain their server list. All entries must be distinct,
+canonical numeric unicast IPv4 addresses, even when disabled: no hostnames,
+ports, prefixes, IPv6, loopback, link-local, multicast, or broadcast addresses.
+Server order is normalized; requests go to every configured server, not an
+ordered failover list.
+
+Enabling requires at least one server and an administratively up dummy or VLAN
+interface with a unicast IPv4 address. WireGuard is not supported as a DHCP relay
+client-facing interface. Either WAN/LAN role is allowed; roles do not choose
+upstream links. The first IPv4 address in lexicographically sorted canonical
+interface prefixes is used as the local relay address (`giaddr`); if a link has
+multiple IPv4 addresses, ensure that subnet choice is intended. Enabled relay
+interfaces must have distinct relay addresses.
+
+The simulator preserves settings and reports `simulated`; it sends no DHCP
+packets. The Linux backend manages one **operator-installed dnsmasq** process
+for the enabled interfaces in the target network namespace. DNS is disabled
+(`--port=0`), no DHCP address ranges are configured, and system dnsmasq config,
+hosts, and resolver files are not loaded. This is relay-only, not a DHCP server.
+See the complete [DHCP relay example](examples/dhcp-relay.json) and the upstream
+[dnsmasq relay documentation](https://dnsmasq.org/docs/dnsmasq-man.html).
+
+### Relay operator setup
+
+Install a dnsmasq build supporting DHCPv4 relay and supply:
+
+```text
+-dhcp-relay-binary /usr/sbin/dnsmasq
+-dhcp-relay-runtime-dir /run/netcontrol-dhcp-relay
+-dhcp-relay-uid <existing non-root service UID>
+-dhcp-relay-gid <existing non-root service GID>
+```
+
+These flags supplement the normal `-backend linux`, `-namespace`, and any
+`-adopt-parents` options. The example uses an operator-adopted `uplink` trunk,
+with client VLAN 100 and server VLAN 200. Provision the trunk outside Netcontrol
+and adopt it read-only. Servers must have a return route to the client subnet;
+the example's connected upstream subnet supplies the outbound path.
+
+The binary must be an absolute, root-owned executable, not group/world-writable,
+with no set-ID bits or file capabilities. The runtime root must be dedicated,
+root-owned, non-symlink, traversable and not group/world-writable (0711 is
+recommended), including traversable ancestors. Use a separate directory from
+softflowd. Service UID/GID must identify existing local user/group accounts.
+Children start as that non-root identity with only the required ambient
+`CAP_NET_BIND_SERVICE`, `CAP_NET_ADMIN`, and `CAP_NET_RAW` capabilities.
+The parent needs the documented namespace privileges and permission to inspect
+its child's namespace and `/proc/<pid>/fd` socket ownership (which can require
+`CAP_SYS_PTRACE` under restricted procfs/ptrace policies).
+
+Do not run another DHCP service on UDP 67 in the same namespace. Configure
+upstream reachability, server return routes, and any other firewall's UDP 67/68
+permissions explicitly; this feature does not create routes/NAT/firewall
+exceptions. DHCPv6 and custom server ports are not implemented.
+If integration is absent, enabling is rejected before transaction intent is
+written. Invalid daemon configuration, bind/privilege errors, and startup
+failures are explicit errors, not successful disabled fallbacks.
+
+### Relay lifecycle and runtime
+
+Settings use normal full-package transactions, `interfaces.write` plus
+`transactions.write`, and preserve server lists across confirmation, rollback,
+restart, revision reads/restores, and interface deletion/recreation. A changed
+server list, selected address, or enabled interface set restarts the shared
+relay; changing one interface can briefly interrupt relay service on the others.
+Changed/removed instances stop before networking edits and start after routes
+and firewall reconciliation. Startup and explicit repair resume the stored
+committed/pending configuration, not a client draft.
+
+`GET /api/v1/services/dhcp-relay/status` requires `state.read` and returns
+`{"interfaces": [...], "error": ""}`. `/api/v1/runtime` also includes a
+`dhcp_relay` array. Each status has `interface`, `state`, optional `pid`,
+`started_at`, and `error`. States include disabled, simulated, unavailable,
+not_running, running, unhealthy, and exited. Enabled interfaces share one PID.
+Running means the supervised process owns its UDP 67 socket in the correct
+namespace with the expected PID file, not that an upstream server or client
+has successfully exchanged a lease. Process failures also produce configuration
+drift; status remains accessible without successful full observation.
+
+`POST /api/v1/services/dhcp-relay/reconcile` takes no body and requires
+`state.read`, `transactions.write`, and `interfaces.write`. It repairs all managed
+services, so `softflowd.write` is also required if any softflowd instance is
+enabled. Conversely, softflowd's repair endpoint requires `interfaces.write`
+when a DHCP relay is enabled. These checks use the current committed/pending
+configuration under the engine lock. Repair creates no revision and does not
+reapply links/routes/firewall. Do not automatically retry a repair.
+
 ## Frontend developer handoff
 
 See the [frontend specification](FRONTEND_SPEC.md) for screens, shared-draft and
@@ -34,8 +181,9 @@ atomic native batch.
    order, configure addresses and WireGuard, reconcile routes and policy
    rules, atomically replace the owned nftables table, then remove obsolete
    links in child-first order. Start/reconfigure softflowd and check its private
-   control socket. Networking uses native kernel interfaces; only the optional
-   softflowd integration launches an operator-installed executable. No shell
+   control socket and resume DHCP relay after network reconciliation. Networking
+   uses native kernel interfaces; optional softflowd and DHCP relay integrations
+   launch operator-installed executables. No shell
    commands are executed by the service.
 5. Read back the modeled state. Return `202 pending_confirmation` only if it
    matches the candidate. The committed desired revision is unchanged.
@@ -80,7 +228,7 @@ not cancel apply/recovery.
 
 | Subsystem | Initial contract |
 | --- | --- |
-| Interfaces | Create/delete `dummy`, kernel `wireguard`, and 802.1Q `vlan` links; name, MTU, up/down |
+| Interfaces | Create/delete `dummy`, kernel `wireguard`, and 802.1Q `vlan` links; name, required WAN/LAN role, MTU, up/down |
 | VLAN parents | Operator-adopted physical Ethernet/veth/dummy parents, protected from API deletion and direct reconfiguration; managed dummy/VLAN parents also supported |
 | Addresses | Exact global-unicast IPv4/IPv6 prefixes on managed links; host bits retained |
 | Routes | Unicast destination/gateway/device/positive metric, tables 10000..19999, protocol 242 |
@@ -89,6 +237,7 @@ not cancel apply/recovery.
 | NAT | IPv4/IPv6 masquerading in the same table's `postrouting` NAT chain, with explicit family, optional source network, and required managed egress interface |
 | WireGuard | Private-key references, stable listen ports, peers, numeric endpoints, allowed IPs and keepalive |
 | softflowd | Typed foreground instances: enable/disable, capture interface/filter, numeric collector, NetFlow/IPFIX version, sampling, max flows, snaplen, promiscuity, and timeouts |
+| DHCPv4 relay | Per-interface enable/server list; supervised relay-only dnsmasq on up dummy/VLAN links; runtime inspection and repair |
 | Kernel TCP/IP tuning | Allowlisted, validated namespace tunables, plus separately opted-in host-global network tunables; original-value capture, drift checks and transaction recovery |
 
 The Linux backend requires an **explicit, pre-created, initially empty network
@@ -453,7 +602,8 @@ POST /api/v1/services/softflowd/reconcile
 ```
 
 This bodyless action requires `state.read`, `transactions.write`, and
-`softflowd.write`. It uses the server's current committed/pending configuration,
+`softflowd.write`, plus `interfaces.write` when a DHCP relay is enabled because
+it repairs all managed services. It uses the server's current committed/pending configuration,
 repairs only managed service processes, never replays networking or accepts new
 configuration, and does not create a configuration revision. Unresolved
 transaction recovery blocks it. `/api/v1/runtime` and the status endpoint expose
@@ -766,6 +916,8 @@ Every request requires `Authorization: Bearer <token>`.
 | POST | `/api/v1/transactions/{id}/rollback` | Roll back or retry failed recovery; idempotent after rollback |
 | POST | `/api/v1/revisions/{revision}/restore` | Apply a historical configuration as a new provisional transaction |
 | POST | `/api/v1/services/softflowd/reconcile` | Retry service runtime reconciliation using stored configuration; no body |
+| GET | `/api/v1/services/dhcp-relay/status` | Per-interface relay runtime states, shared PID, and errors |
+| POST | `/api/v1/services/dhcp-relay/reconcile` | Retry all managed services using stored configuration; no body |
 
 There are deliberately no independent write endpoints for individual subsystems:
 all configuration edits travel through the package transaction boundary. The
@@ -858,6 +1010,53 @@ remain unchanged. The old transaction `/rollback` action is still for the active
 provisional transaction, not for historical restoration. History and dates persist
 in the same JSON journal; retain and back up that journal to retain the archive.
 
+### Allow all IPv4 ICMP
+
+Set `config.firewall.allow_all_icmp` in the configuration JSON:
+
+```json
+{
+  "allow_all_icmp": true,
+  "policy": "drop",
+  "rules": [],
+  "nat": {"masquerade": []}
+}
+```
+
+This is the `firewall` object inside a complete configuration package, not a
+standalone transaction. The setting defaults to `true` when omitted or `null`.
+Normalized configurations and firewall reads return an explicit boolean.
+
+When enabled, the backend installs an IPv4 protocol **1** accept exception before
+all other owned forwarding rules, in both legacy and host/interface modes. It also
+creates owned input and output filter chains containing that exception, with
+accept defaults so other local traffic is unchanged. The exception has no
+interface/address/type/code restrictions: it covers every interface in the
+managed network namespace, including loopback, adopted parents, and interfaces
+created later. No per-interface policy entries need to be added.
+
+Setting the flag to `false` removes the forwarding exception and the owned input
+and output chains; it does **not** add an ICMP drop rule. Existing forwarding
+rules/defaults then decide ICMP behavior. IPv6 ICMP (protocol 58) is unaffected.
+Rules in other nftables tables can still drop traffic; this setting does not
+override them, configure forwarding sysctls, or change routing/NAT.
+
+**Upgrade behavior:** new namespaces receive the default rules during backend
+initialization. Existing durable configurations without this field, including
+transaction/rollback snapshots, default to enabled. Startup atomically reconciles
+the owned firewall to the expected configuration, enabling the exception even
+if earlier forwarding defaults or rules blocked ICMP. Unrelated firewall drift
+or invalid owned rules fail startup rather than being overwritten. A pending
+transaction's candidate determines the live policy during migration. Explicit
+`false` values are preserved; migration completion is persisted and retried on
+failure. Historical snapshots that never specified the flag now restore the
+enabled default.
+
+Changing this setting requires `firewall.write` plus `transactions.write` and
+uses the normal full-package submit/confirm/rollback workflow. Read it through
+`GET /api/v1/firewall/rules` or `/api/v1/state`. The hosts/interface-policy reads
+continue returning only user-authored entries, not the implicit exception.
+
 ### Host-centric and interface firewall policies
 
 Host policies attach to named devices, **not interfaces**. A host has a stable
@@ -907,6 +1106,7 @@ Host-only, interface-only, and combined policies are supported.
 
 Evaluation order for forwarded traffic:
 
+0. If `allow_all_icmp` is enabled (the default), accept IPv4 protocol 1.
 1. Accept **established/related** conntrack traffic, including replies.
 2. Evaluate the matching **ingress-interface** rule list in order. The first
    matching rule accepts or drops, overriding any host policy.
@@ -931,8 +1131,9 @@ is valid. Catch-all rules may intentionally shadow subsequent rules.
 **Existing connections survive policy changes and rollback.** The API does not
 flush conntrack, and the established/related rule runs before interface blocks.
 New blocks govern new connections, not guaranteed termination of active sessions.
-This is a forwarding policy, not the device's input/output firewall or protection
-of its management listener. NAT remains separate and still uses an egress
+Host/interface policies govern forwarding, not the device's input/output
+firewall or protection of its management listener. The global ICMP exception
+described above also covers input/output. NAT remains separate and still uses an egress
 interface. Firewall policy edits, host address/name edits, and interface overrides
 require `firewall.write` plus `transactions.write`; NAT and link edits retain
 their own permissions.
@@ -940,13 +1141,14 @@ their own permissions.
 Limits: 128 hosts, 16 addresses per host, 32 interface policies, 64 ordered rules
 per host/interface, 32 unique destination ports per rule, 64 KiB of serialized
 policy metadata, and at most 4096 expanded forwarding rules (including the
-stateful rule and per-address defaults). Host IDs use
+stateful rule and per-address defaults, excluding the separate global ICMP
+exception). Host IDs use
 `^[a-zA-Z0-9_-]{1,64}$`; names are unique, nonblank, at most 80 bytes, and have
 no outer whitespace or control characters. Hosts require canonical unicast IPs,
 not loopback, link-local, multicast, IPv4-mapped IPv6, or zone-qualified addresses.
 
-Omitting `policies` (or setting it to `null`) retains the existing **stateless
-legacy** `rules` behavior and JSON shape. A nonempty legacy list cannot be mixed
+Omitting `policies` (or setting it to `null`) selects **stateless legacy** `rules`,
+after the optional global ICMP exception. A nonempty legacy list cannot be mixed
 with `policies`; switching models is an explicit full-package transaction.
 History, restoration, confirmation, drift detection, and rollback include the
 abstract inventory. On Linux the inventory is chunked into bounded userdata in an
@@ -1080,6 +1282,23 @@ sudo env NETCONTROL_INTEGRATION=1 \
   NETCONTROL_SOFTFLOWD_GID="$(id -g netcontrol-flow)" \
   go test ./internal/control -run '^TestLinuxSoftflowdLifecycle$' -count=1 -v
 ```
+
+DHCP relay lifecycle and packet tests require an installed dnsmasq plus the
+non-root account/group described in [Relay operator setup](#relay-operator-setup):
+
+```sh
+sudo env NETCONTROL_INTEGRATION=1 \
+  NETCONTROL_DHCP_RELAY_BINARY=/usr/sbin/dnsmasq \
+  NETCONTROL_DHCP_RELAY_UID="$(id -u netcontrol-relay)" \
+  NETCONTROL_DHCP_RELAY_GID="$(id -g netcontrol-relay)" \
+  go test ./internal/control -run '^TestLinuxDHCPRelay' -count=1 -v
+```
+
+These tests cover process readiness, pending-candidate restart, crash repair,
+enable/disable, server changes, interface removal, and rollback. The packet test
+creates isolated router/client/server namespaces and VLAN/veth links, checks that
+a request reaches both configured servers with the selected relay address, and
+verifies an offer returns to the client. They never target the host network.
 
 The ordinary suite skips these integration tests unless explicitly enabled. Cross-compilation alone
 does not validate native kernel behavior.

@@ -38,13 +38,14 @@ type Transaction struct {
 }
 
 type State struct {
-	Scope          string                  `json:"scope"`
-	Revision       uint64                  `json:"revision"`
-	Desired        Config                  `json:"desired"`
-	Active         string                  `json:"active_transaction,omitempty"`
-	Transactions   map[string]*Transaction `json:"transactions"`
-	InitializedAt  *time.Time              `json:"initialized_at"`
-	KernelBaseline KernelConfig            `json:"kernel_baseline"`
+	Scope                string                  `json:"scope"`
+	Revision             uint64                  `json:"revision"`
+	Desired              Config                  `json:"desired"`
+	Active               string                  `json:"active_transaction,omitempty"`
+	Transactions         map[string]*Transaction `json:"transactions"`
+	InitializedAt        *time.Time              `json:"initialized_at"`
+	KernelBaseline       KernelConfig            `json:"kernel_baseline"`
+	ICMPDefaultMigration bool                    `json:"icmp_default_migration,omitempty"`
 }
 
 type Request struct {
@@ -87,8 +88,10 @@ func NewEngine(store Journal, adapter Adapter, logger *slog.Logger) (*Engine, er
 			now := time.Now().UTC()
 			state.InitializedAt = &now
 		}
-		if err := store.Save(state); err != nil {
-			return nil, fmt.Errorf("bind state to adapter scope: %w", err)
+		if !state.ICMPDefaultMigration {
+			if err := store.Save(state); err != nil {
+				return nil, fmt.Errorf("bind state to adapter scope: %w", err)
+			}
 		}
 	} else if state.Scope != adapter.Scope() {
 		return nil, fmt.Errorf("state belongs to scope %q, not %q", state.Scope, adapter.Scope())
@@ -126,6 +129,30 @@ func NewEngine(store Journal, adapter Adapter, logger *slog.Logger) (*Engine, er
 			}
 		default:
 			return nil, fmt.Errorf("invalid active transaction status %q", t.Status)
+		}
+	}
+	if e.state.ICMPDefaultMigration {
+		expected := e.state.Desired
+		if e.state.Active != "" {
+			active := e.state.Transactions[e.state.Active]
+			if active.Status != "pending_confirmation" {
+				return nil, fmt.Errorf("ICMP default migration blocked by incomplete transaction recovery")
+			}
+			expected = active.Candidate
+		}
+		if migrator, ok := adapter.(interface {
+			migrateICMPDefault(context.Context, Firewall) error
+		}); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := migrator.migrateICMPDefault(ctx, expected.Firewall)
+			cancel()
+			if err != nil {
+				return nil, fmt.Errorf("migrate default ICMP policy: %w", err)
+			}
+		}
+		e.state.ICMPDefaultMigration = false
+		if err := store.Save(e.state); err != nil {
+			return nil, fmt.Errorf("save ICMP default migration: %w", err)
 		}
 	}
 	if runtimeAdapter, ok := adapter.(RuntimeAdapter); ok {

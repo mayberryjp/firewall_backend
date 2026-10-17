@@ -1,6 +1,46 @@
 package control
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestAllowAllICMPDefaultAndRoundTrip(t *testing.T) {
+	for _, value := range []string{"", `,"allow_all_icmp":null`, `,"allow_all_icmp":true`, `,"allow_all_icmp":false`} {
+		t.Run(value, func(t *testing.T) {
+			var c Config
+			if err := json.Unmarshal([]byte(`{"firewall":{"policy":"drop"`+value+`}}`), &c); err != nil {
+				t.Fatal(err)
+			}
+			want := value != `,"allow_all_icmp":false`
+			if c.Firewall.allowsAllICMP() != want {
+				t.Fatal("incorrect default before normalization")
+			}
+			c.Normalize()
+			if err := c.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			copy := Clone(c)
+			if copy.Firewall.AllowAllICMP == nil || *copy.Firewall.AllowAllICMP != want || !Equal(c, copy) {
+				t.Fatal("ICMP setting lost during normalization or cloning")
+			}
+			other := !want
+			copy.Firewall.AllowAllICMP = &other
+			if Equal(c, copy) {
+				t.Fatal("ICMP setting ignored by configuration equality")
+			}
+		})
+	}
+	for _, value := range []string{`"true"`, `1`, `{}`} {
+		var c Config
+		if err := json.Unmarshal([]byte(`{"firewall":{"allow_all_icmp":`+value+`}}`), &c); err == nil {
+			t.Fatalf("invalid ICMP setting %s accepted", value)
+		}
+	}
+	if !EmptyConfig().Firewall.allowsAllICMP() {
+		t.Fatal("empty configuration must allow ICMP by default")
+	}
+}
 
 func TestValidationRejectsUnsupportedAndAmbiguousConfigurations(t *testing.T) {
 	cases := map[string]func(*Config){

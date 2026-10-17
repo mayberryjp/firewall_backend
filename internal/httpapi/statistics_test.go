@@ -20,7 +20,7 @@ import (
 func TestStatisticsRoutesPermissionsAndShapes(t *testing.T) {
 	h, e := fixture(t)
 	c := control.EmptyConfig()
-	c.Interfaces = []control.Interface{{Name: "wan.100", Kind: "dummy", MTU: 1500, Up: true}}
+	c.Interfaces = []control.Interface{{Name: "wan.100", Kind: "dummy", Role: "wan", MTU: 1500, Up: true}}
 	tx, err := e.Submit(context.Background(), "test", control.Request{Config: c, ConfirmSeconds: 30})
 	if err != nil {
 		t.Fatal(err)

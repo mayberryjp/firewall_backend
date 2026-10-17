@@ -26,7 +26,7 @@ func commitHistoryConfig(t *testing.T, e *control.Engine, config control.Config)
 
 func historyConfig() control.Config {
 	c := control.EmptyConfig()
-	c.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
+	c.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", Role: "wan", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
 	c.Firewall.NAT.Masquerade = []control.MasqueradeRule{{Family: "ipv4", Source: "10.8.0.0/24", OutInterface: "wan"}}
 	return c
 }

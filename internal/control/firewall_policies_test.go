@@ -10,7 +10,7 @@ import (
 
 func hostPolicyConfig() Config {
 	c := EmptyConfig()
-	c.Interfaces = []Interface{{Name: "lan", Kind: "dummy", MTU: 1500, Up: true}}
+	c.Interfaces = []Interface{{Name: "lan", Kind: "dummy", Role: "lan", MTU: 1500, Up: true}}
 	c.Firewall.Policy = "drop"
 	c.Firewall.Policies = &FirewallPolicies{
 		Hosts: []FirewallHost{

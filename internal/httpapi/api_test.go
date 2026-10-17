@@ -85,7 +85,7 @@ func request(t *testing.T, h http.Handler, method, path, token string, body any)
 func TestHTTPTransactionRoundTrip(t *testing.T) {
 	h, e := fixture(t)
 	c := control.EmptyConfig()
-	c.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
+	c.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", Role: "wan", MTU: 1500, Up: true, Addresses: []string{"192.0.2.10/24"}}}
 	w := request(t, h, "POST", "/api/v1/transactions", "admin-test-token", control.Request{BaseRevision: 0, ConfirmSeconds: 30, Config: c})
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
@@ -148,7 +148,7 @@ func TestHTTPRejectsUnauthorizedAndInvalidRequests(t *testing.T) {
 func TestSubsystemAuthorizationAlsoAppliesToConfirmationAndRollback(t *testing.T) {
 	h, e := fixture(t)
 	c := control.EmptyConfig()
-	c.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", MTU: 1500, Up: true}}
+	c.Interfaces = []control.Interface{{Name: "wan", Kind: "dummy", Role: "wan", MTU: 1500, Up: true}}
 	w := request(t, h, "POST", "/api/v1/transactions", "firewall-test-token", control.Request{Config: c, ConfirmSeconds: 30})
 	if w.Code != 403 {
 		t.Fatalf("firewall operator modified interface: %d", w.Code)
@@ -177,7 +177,7 @@ func TestSubsystemAuthorizationAlsoAppliesToConfirmationAndRollback(t *testing.T
 
 func TestWireGuardRemovalRequiresWireGuardPermission(t *testing.T) {
 	before := control.EmptyConfig()
-	before.Interfaces = []control.Interface{{Name: "wg0", Kind: "wireguard", MTU: 1420, WireGuard: &control.WireGuard{KeyRef: "wg0", ListenPort: 51820}}}
+	before.Interfaces = []control.Interface{{Name: "wg0", Kind: "wireguard", Role: "lan", MTU: 1420, WireGuard: &control.WireGuard{KeyRef: "wg0", ListenPort: 51820}}}
 	limited := Credential{Permissions: []string{"interfaces.write"}}
 	if err := authorize(limited, before, control.EmptyConfig()); err == nil {
 		t.Fatal("WireGuard removal bypassed subsystem permission")

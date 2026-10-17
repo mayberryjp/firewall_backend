@@ -7,6 +7,7 @@
       {
         "name": "wan",
         "kind": "dummy",
+        "role": "wan",
         "mtu": 1500,
         "up": true,
         "addresses": ["192.0.2.10/24"]
@@ -14,6 +15,7 @@
       {
         "name": "wg0",
         "kind": "wireguard",
+        "role": "lan",
         "mtu": 1420,
         "up": true,
         "addresses": ["10.8.0.1/24"],
@@ -52,6 +54,7 @@
       }
     ],
     "firewall": {
+      "allow_all_icmp": true,
       "policy": "drop",
       "rules": [
         {"source": "192.0.2.0/24", "action": "accept"},

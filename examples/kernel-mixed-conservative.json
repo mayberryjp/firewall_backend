@@ -6,7 +6,7 @@
     "interfaces": [],
     "routes": [],
     "policy_rules": [],
-    "firewall": {"policy": "accept", "rules": [], "nat": {"masquerade": []}},
+    "firewall": {"allow_all_icmp": true, "policy": "accept", "rules": [], "nat": {"masquerade": []}},
     "softflowd": [],
     "kernel": {
       "namespace": {

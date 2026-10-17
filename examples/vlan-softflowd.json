@@ -7,6 +7,7 @@
       {
         "name": "uplink.100",
         "kind": "vlan",
+        "role": "lan",
         "mtu": 1500,
         "up": true,
         "addresses": ["192.0.2.10/24"],
@@ -19,7 +20,7 @@
     "policy_rules": [
       {"priority": 10000, "source": "0.0.0.0/0", "table": 10000}
     ],
-    "firewall": {"policy": "accept", "rules": [], "nat": {"masquerade": []}},
+    "firewall": {"allow_all_icmp": true, "policy": "accept", "rules": [], "nat": {"masquerade": []}},
     "softflowd": [
       {
         "name": "office",

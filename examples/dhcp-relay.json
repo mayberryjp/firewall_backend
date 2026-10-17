@@ -1,0 +1,42 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 120,
+  "description": "Relay office VLAN DHCP to two IPv4 servers on the upstream VLAN",
+  "config": {
+    "interfaces": [
+      {
+        "name": "lan.100",
+        "kind": "vlan",
+        "role": "lan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": ["192.0.2.1/24"],
+        "vlan": {"parent": "uplink", "id": 100},
+        "dhcp_relay": {
+          "enabled": true,
+          "servers": ["198.51.100.10", "198.51.100.20"]
+        }
+      },
+      {
+        "name": "wan.200",
+        "kind": "vlan",
+        "role": "wan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": ["198.51.100.1/24"],
+        "vlan": {"parent": "uplink", "id": 200},
+        "dhcp_relay": {"enabled": false, "servers": []}
+      }
+    ],
+    "routes": [],
+    "policy_rules": [],
+    "firewall": {
+      "allow_all_icmp": true,
+      "policy": "drop",
+      "rules": [],
+      "nat": {"masquerade": []}
+    },
+    "softflowd": [],
+    "kernel": {"namespace": {}, "host": {}}
+  }
+}

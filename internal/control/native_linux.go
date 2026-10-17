@@ -30,6 +30,7 @@ type linuxAdapter struct {
 	keys             string
 	parents          map[string]ParentInterface
 	flows            *softflowdManager
+	relay            *dhcpRelayManager
 	hostNamespace    netns.NsHandle
 	hostTunablesLock *flock.Flock
 }
@@ -74,6 +75,12 @@ func NewLinuxAdapter(namespace, keyDirectory string, options ...LinuxOptions) (A
 		if err != nil {
 			return nil, errors.Join(err, a.Close())
 		}
+		if option.DHCPRelayBinary != "" {
+			a.relay, err = newDHCPRelayManager(a, option)
+			if err != nil {
+				return nil, errors.Join(err, a.Close())
+			}
+		}
 	}
 	return a, nil
 }
@@ -83,6 +90,9 @@ func (a *linuxAdapter) Close() error {
 	var err error
 	if a.flows != nil {
 		err = a.flows.Close()
+	}
+	if a.relay != nil {
+		err = errors.Join(err, a.relay.Close())
 	}
 	if a.hostTunablesLock != nil {
 		err = errors.Join(err, a.hostNamespace.Close(), a.hostTunablesLock.Unlock())
@@ -198,6 +208,9 @@ func (a *linuxAdapter) Preflight(ctx context.Context, c Config) error {
 		if err := a.preflightLinks(h, c); err != nil {
 			return err
 		}
+		if err := a.preflightDHCPRelay(ctx, c.Interfaces); err != nil {
+			return err
+		}
 		if a.flows != nil {
 			return a.flows.Preflight(ctx, c.Softflowd)
 		}
@@ -216,6 +229,11 @@ func (a *linuxAdapter) Preflight(ctx context.Context, c Config) error {
 
 func (a *linuxAdapter) Observe(ctx context.Context, hints Config) (Config, error) {
 	var observed Config
+	// Roles are configuration metadata, not kernel link attributes.
+	metadata := make(map[string]Interface, len(hints.Interfaces))
+	for _, link := range hints.Interfaces {
+		metadata[link.Name] = link
+	}
 	err := a.inNamespace(ctx, func() error {
 		h, err := netlink.NewHandle()
 		if err != nil {
@@ -237,7 +255,9 @@ func (a *linuxAdapter) Observe(ctx context.Context, hints Config) (Config, error
 			if _, adopted := a.parents[l.Attrs().Name]; l.Attrs().Name == "lo" || adopted {
 				continue
 			}
-			link := Interface{Name: l.Attrs().Name, Kind: l.Type(), MTU: l.Attrs().MTU, Up: l.Attrs().Flags&net.FlagUp != 0}
+			hint := metadata[l.Attrs().Name]
+			link := Interface{Name: l.Attrs().Name, Kind: l.Type(), Role: hint.Role, DHCPRelay: Clone(hint.DHCPRelay),
+				MTU: l.Attrs().MTU, Up: l.Attrs().Flags&net.FlagUp != 0}
 			if vlan, ok := l.(*netlink.Vlan); ok {
 				if vlan.VlanProtocol != netlink.VLAN_PROTOCOL_8021Q || byIndex[vlan.ParentIndex] == "" {
 					return fmt.Errorf("unsupported VLAN protocol or missing parent on %s", link.Name)
@@ -266,6 +286,7 @@ func (a *linuxAdapter) Observe(ctx context.Context, hints Config) (Config, error
 			}
 			observed.Interfaces = append(observed.Interfaces, link)
 		}
+		a.observeDHCPRelay(observed.Interfaces)
 		routes, err := ownedRoutes(h)
 		if err != nil {
 			return err
@@ -472,6 +493,14 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 		if err := a.preflightLinks(h, target); err != nil {
 			return err
 		}
+		if err := a.preflightDHCPRelay(ctx, target.Interfaces); err != nil {
+			return err
+		}
+		if a.relay != nil {
+			if err := a.relay.StopChanged(ctx, target.Interfaces); err != nil {
+				return err
+			}
+		}
 		if a.flows != nil {
 			if err := a.flows.StopChanged(ctx, target.Softflowd); err != nil {
 				return err
@@ -590,11 +619,16 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 			}
 		}
 		if a.flows != nil {
-			return a.flows.Reconcile(ctx, target.Softflowd)
+			if err := a.flows.Reconcile(ctx, target.Softflowd); err != nil {
+				return err
+			}
 		}
 		for _, service := range target.Softflowd {
-			if service.Enabled {
+			if service.Enabled && a.flows == nil {
 				return fmt.Errorf("softflowd integration is unavailable")
+			}
+			if a.relay != nil {
+				return a.relay.Reconcile(ctx, target.Interfaces)
 			}
 		}
 		return ctx.Err()

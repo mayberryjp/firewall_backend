@@ -15,8 +15,8 @@ import (
 func vlanConfig() Config {
 	c := EmptyConfig()
 	c.Interfaces = []Interface{
-		{Name: "a.inner", Kind: "vlan", MTU: 1400, Up: true, VLAN: &VLAN{Parent: "z.outer", ID: 200}},
-		{Name: "z.outer", Kind: "vlan", MTU: 1500, Up: true, VLAN: &VLAN{Parent: "uplink", ID: 100}},
+		{Name: "a.inner", Kind: "vlan", Role: "lan", MTU: 1400, Up: true, VLAN: &VLAN{Parent: "z.outer", ID: 200}},
+		{Name: "z.outer", Kind: "vlan", Role: "wan", MTU: 1500, Up: true, VLAN: &VLAN{Parent: "uplink", ID: 100}},
 	}
 	c.Normalize()
 	return c
@@ -52,7 +52,7 @@ func TestVLANValidationAndDependencyOrdering(t *testing.T) {
 		"cycle":            func(c *Config) { c.Interfaces[1].VLAN.Parent = c.Interfaces[0].Name },
 		"oversized-mtu":    func(c *Config) { c.Interfaces[0].MTU = 1600 },
 		"duplicate-id": func(c *Config) {
-			c.Interfaces = append(c.Interfaces, Interface{Name: "duplicate", Kind: "vlan", MTU: 1400, VLAN: &VLAN{Parent: "uplink", ID: 100}})
+			c.Interfaces = append(c.Interfaces, Interface{Name: "duplicate", Kind: "vlan", Role: "lan", MTU: 1400, VLAN: &VLAN{Parent: "uplink", ID: 100}})
 		},
 		"settings-on-dummy": func(c *Config) { c.Interfaces[0].Kind = "dummy" },
 		"wireguard-parent": func(c *Config) {
@@ -262,11 +262,11 @@ func TestServiceStartupAndExplicitRecovery(t *testing.T) {
 	if err != nil || !strings.Contains(runtime.Error, "unavailable binary") {
 		t.Fatalf("%+v %v", runtime, err)
 	}
-	if _, err := e.ReconcileServices(context.Background(), "admin"); err == nil {
+	if _, err := e.ReconcileServices(context.Background(), "admin", nil); err == nil {
 		t.Fatal("runtime failure hidden")
 	}
 	a.resumeErr = nil
-	runtime, err = e.ReconcileServices(context.Background(), "admin")
+	runtime, err = e.ReconcileServices(context.Background(), "admin", nil)
 	if err != nil || runtime.Error != "" || runtime.Softflowd[0].State != "simulated" {
 		t.Fatalf("%+v %v", runtime, err)
 	}
@@ -280,7 +280,7 @@ func TestServiceStartupAndExplicitRecovery(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	count := len(a.resumed)
-	if _, err := e.ReconcileServices(ctx, "admin"); !errors.Is(err, context.Canceled) || len(a.resumed) != count {
+	if _, err := e.ReconcileServices(ctx, "admin", nil); !errors.Is(err, context.Canceled) || len(a.resumed) != count {
 		t.Fatalf("canceled retry mutated runtime: %v", err)
 	}
 }
@@ -316,7 +316,7 @@ func TestServicePendingRestartAndRecoveryFailureGating(t *testing.T) {
 		if len(a.resumed) != 0 {
 			t.Fatal("services restarted despite failed recovery")
 		}
-		if _, err := e.ReconcileServices(context.Background(), "admin"); !errors.Is(err, ErrConflict) {
+		if _, err := e.ReconcileServices(context.Background(), "admin", nil); !errors.Is(err, ErrConflict) {
 			t.Fatalf("failed recovery bypassed: %v", err)
 		}
 	})

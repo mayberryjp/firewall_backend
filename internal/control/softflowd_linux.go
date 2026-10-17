@@ -54,6 +54,7 @@ type flowOutput struct {
 	truncated bool
 	logger    *slog.Logger
 	name      string
+	service   string
 }
 
 func (o *flowOutput) Write(p []byte) (int, error) {
@@ -69,7 +70,11 @@ func (o *flowOutput) Write(p []byte) (int, error) {
 		o.truncated = true
 	}
 	if o.logger != nil {
-		o.logger.Info("softflowd output", "instance", o.name, "message", string(p[:min(len(p), 4096)]), "truncated", len(p) > 4096)
+		service := o.service
+		if service == "" {
+			service = "softflowd"
+		}
+		o.logger.Info(service+" output", "instance", o.name, "message", string(p[:min(len(p), 4096)]), "truncated", len(p) > 4096)
 	}
 	return len(p), nil
 }
@@ -91,24 +96,9 @@ func newSoftflowdManager(a *linuxAdapter, option LinuxOptions) (*softflowdManage
 		option.SoftflowdUID <= 0 || option.SoftflowdGID <= 0 || uint64(option.SoftflowdUID) > uint64(^uint32(0)-1) || uint64(option.SoftflowdGID) > uint64(^uint32(0)-1) {
 		return nil, fmt.Errorf("softflowd requires absolute operator-supplied binary/runtime paths and non-root UID/GID")
 	}
-	binary, err := filepath.EvalSymlinks(option.SoftflowdBinary)
+	binary, err := validateDaemonBinary(option.SoftflowdBinary, "softflowd")
 	if err != nil {
 		return nil, err
-	}
-	info, err := os.Stat(binary)
-	if err != nil {
-		return nil, err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 || info.Mode().Perm()&0022 != 0 || stat.Uid != 0 || info.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
-		return nil, fmt.Errorf("softflowd binary must be a root-owned executable without set-ID bits and not writable by group/others")
-	}
-	capabilityBytes, err := unix.Getxattr(binary, "security.capability", nil)
-	if err != nil && !errors.Is(err, unix.ENODATA) && !errors.Is(err, unix.ENOTSUP) {
-		return nil, fmt.Errorf("inspect softflowd file capabilities: %w", err)
-	}
-	if capabilityBytes > 0 {
-		return nil, fmt.Errorf("softflowd binary must not carry file capabilities; capture capabilities are supplied to the child")
 	}
 	if err := os.MkdirAll(option.RuntimeDirectory, 0711); err != nil {
 		return nil, err

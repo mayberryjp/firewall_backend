@@ -51,6 +51,7 @@ type SoftflowdStatus struct {
 }
 
 type RuntimeState struct {
+	DHCPRelay []DHCPRelayStatus `json:"dhcp_relay"`
 	Parents   []ParentInterface `json:"parent_interfaces"`
 	Softflowd []SoftflowdStatus `json:"softflowd"`
 	Error     string            `json:"error,omitempty"`
@@ -62,13 +63,17 @@ type RuntimeAdapter interface {
 }
 
 type LinuxOptions struct {
-	AllowHostTunables bool
-	ParentInterfaces  []string
-	SoftflowdBinary   string
-	RuntimeDirectory  string
-	SoftflowdUID      int
-	SoftflowdGID      int
-	Logger            *slog.Logger
+	DHCPRelayBinary           string
+	DHCPRelayRuntimeDirectory string
+	DHCPRelayUID              int
+	DHCPRelayGID              int
+	AllowHostTunables         bool
+	ParentInterfaces          []string
+	SoftflowdBinary           string
+	RuntimeDirectory          string
+	SoftflowdUID              int
+	SoftflowdGID              int
+	Logger                    *slog.Logger
 }
 
 var serviceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}$`)
