@@ -42,16 +42,19 @@
     <p>Only the last four characters are retained for display. Lost a key? Remove it and generate a replacement. Removing a key immediately blocks new API requests using it.</p>
     <div class="table-wrap"><table><caption class="sr-only">API keys</caption><thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Action</th></tr></thead><tbody id="key-list"></tbody></table></div>
     <p id="no-keys" hidden>No API keys yet.</p>
-    <div id="finish-panel" hidden>
-      <h3>Finish setup</h3>
-      <p>API access stays disabled until setup is finished. If a key was lost after a refresh, remove it and generate another before continuing.</p>
-      <form id="finish-form"><label class="check"><input id="saved" type="checkbox" required> I have saved at least one API key securely.</label><button type="submit">Finish setup</button></form>
-    </div>
+    <button id="review-setup" type="button" hidden>Continue to finish</button>
     <div id="ready-panel" hidden>
       <h3>Your device is ready</h3><p>Call the networking API with <code>Authorization: Bearer YOUR_API_KEY</code>. The device password is only for this management website.</p>
       <p><code id="api-url"></code></p>
     </div>
     <button id="logout" class="secondary" type="button">Sign out</button>
+  </section>
+  <section id="finish-panel" hidden>
+    <h2>Finish setup</h2>
+    <p>Your account and named API keys have been created. API access stays disabled until setup is finished.</p>
+    <p>If a key was lost after a refresh, go back, remove it, and generate another before continuing.</p>
+    <form id="finish-form"><label class="check"><input id="saved" type="checkbox" required> I have saved at least one API key securely.</label><button type="submit">Finish setup</button></form>
+    <button id="back-to-keys" class="secondary" type="button">Back to API keys</button>
   </section>
   <footer>Credentials are stored separately from network configuration. Full API keys are never stored.</footer>
 </main>

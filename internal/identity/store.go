@@ -21,10 +21,10 @@ import (
 
 var (
 	ErrConflict = errors.New("device account already exists")
-	ErrInvalid = errors.New("invalid username, password, or key name")
-	ErrDenied = errors.New("invalid credentials or expired session")
+	ErrInvalid  = errors.New("invalid username, password, or key name")
+	ErrDenied   = errors.New("invalid credentials or expired session")
 	ErrNotFound = errors.New("API key not found")
-	ErrNoKey = errors.New("create and save an API key before finishing setup")
+	ErrNoKey    = errors.New("create and save an API key before finishing setup")
 )
 
 var bucket = []byte("identity-v1")
@@ -36,13 +36,13 @@ type Store struct{ db *bolt.DB }
 type account struct {
 	Username string `json:"username"`
 	Password []byte `json:"password_hash"`
-	Complete bool `json:"complete"`
+	Complete bool   `json:"complete"`
 }
 
 type Key struct {
-	ID string `json:"id"`
-	Name string `json:"name"`
-	Masked string `json:"masked"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Masked    string    `json:"masked"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -57,8 +57,8 @@ type session struct {
 
 type Status struct {
 	AccountExists bool
-	Complete bool
-	Username string
+	Complete      bool
+	Username      string
 }
 
 func Open(path string) (*Store, error) {
@@ -69,6 +69,9 @@ func Open(path string) (*Store, error) {
 	if err == nil {
 		if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0) {
 			return nil, fmt.Errorf("credential database must be a regular owner-only file")
+		}
+		if info.Size() == 0 {
+			return nil, fmt.Errorf("existing credential database is empty; refusing to reset device identity")
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err

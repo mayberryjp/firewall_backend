@@ -10,7 +10,7 @@ require (
 	github.com/vishvananda/netns v0.0.5
 	go.etcd.io/bbolt v1.4.0
 	golang.org/x/crypto v0.31.0
-	golang.org/x/sys v0.28.0
+	golang.org/x/sys v0.29.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 )
 

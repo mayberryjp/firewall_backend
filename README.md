@@ -137,9 +137,76 @@ go build ./cmd/netcontrold
 
 ### Authentication
 
-Authentication is mandatory, including in the simulator. Generate a strong random
-bearer token locally, retain the plaintext only on the client, and place its
-lowercase SHA-256 hash in a private `auth.json`:
+Authentication is mandatory for the networking API, including in the simulator.
+There are two mutually exclusive startup modes.
+
+#### Device website (default)
+
+Start without `-auth-file`, then open the management listener in a browser:
+
+```text
+netcontrold -backend simulator -state state.json
+```
+
+Visit `http://127.0.0.1:8080/` for local development. The embedded website needs no
+separate frontend build and provides:
+
+1. **Device account:** choose a username and a unique 12..72-byte password.
+2. **API keys:** enter a name and generate one or more cryptographically random
+   256-bit keys. Save the full key from the one-time dialog. After dismissal or
+   refresh, only its name, creation time, and last four characters are displayed.
+3. **Finish:** acknowledge saving a key and finish setup. Networking API access is
+   disabled until this step completes. Use `Authorization: Bearer <key>` thereafter.
+
+Account creation is atomic: only one visitor can claim the device. **There is no
+bootstrap code: anyone who can reach an unclaimed device can claim it.** Restrict
+network access until setup completes. If interrupted after account creation, sign
+in with that account to resume; an existing account is never overwritten.
+Setup does not configure interfaces, routes, or firewall policy.
+
+Subsequent visits offer password sign-in and named key creation/removal. Each key
+has full networking API permissions; scoped keys remain available through legacy
+mode below. A device-account session cannot call networking endpoints, and API keys
+cannot manage credentials. Removing a key blocks subsequent authenticated requests;
+it does not cancel work already authorized or pending transactions. The last key
+may be removed: the device account can always generate a replacement.
+
+Credentials are held in a separate embedded bbolt database, by default
+`<state>.credentials.db`, configurable with `-credential-db`. It is not part of the
+network JSON journal, revision history, or configuration exports. Only bcrypt
+password hashes (cost 12), SHA-256 hashes of random API keys/session tokens, key
+metadata, and session expiry are stored; full API keys cannot be recovered. This is
+hash-based secret protection, **not database encryption**. The database uses an
+exclusive process lock, synchronous transactions, and owner-only file permissions
+on Unix; place it in a trusted private local directory and protect backups.
+Windows is a development target: restrict the directory with Windows ACLs; Unix
+mode bits do not enforce Windows access control. Never delete/replace a configured
+database to work around sign-in problems: an absent database creates an unclaimed
+device. There is no remote password reset or account recovery in this version.
+
+Website sessions expire after 30 minutes and sign-out revokes them. They use
+HttpOnly, SameSite=Strict cookies (Secure over HTTPS), restricted to `/auth/`.
+Mutations require JSON and an exact same-origin `Origin` header. Sign-in and setup
+share a device-wide limit of 10 attempts/minute (a busy/untrusted client can
+temporarily exhaust it); at most 32 sessions and 100 unique-named keys are allowed.
+API keys do not expire automatically. Keys are not saved in browser storage.
+If a key-creation response is lost, sign in, remove that named key and create a
+replacement; the plaintext cannot be fetched again.
+
+Use the daemon's native TLS listener for remote website access. A proxy must
+preserve the external Host and scheme as seen by the daemon (TLS re-encryption for
+HTTPS); forwarded headers are not trusted. Do not proxy an HTTPS website to this
+plaintext backend: exact-origin checks and Secure-cookie detection require
+end-to-end TLS. The website only manages onboarding and keys, not the broader
+networking dashboard described in the frontend handoff.
+
+#### Pre-provisioned auth-file mode (legacy, optional)
+
+Supplying `-auth-file auth.json` explicitly selects the existing static-token
+behavior and disables the device website/session endpoints. It cannot be combined
+with `-credential-db`; no automatic migration of existing tokens is performed.
+Generate a strong random bearer token locally, retain the plaintext only on the
+client, and place its lowercase SHA-256 hash in a private `auth.json`:
 
 ```json
 [
@@ -207,8 +274,9 @@ unauthenticated remote traffic to the loopback listener.
 
 Structured HTTP audit and transaction lifecycle events go to stderr; authorization
 failures are logged, and bearer tokens/private keys are not. Deployments must
-collect and protect these logs; this is not a tamper-evident audit store. Credential
-reload, expiry, and rate limiting are not implemented.
+collect and protect these logs; this is not a tamper-evident audit store. In legacy
+mode credential reload, expiry, and rate limiting are not implemented. Managed
+keys are checked against the database on each networking request.
 
 ### Simulator (Windows or Linux)
 

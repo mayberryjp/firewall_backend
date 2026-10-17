@@ -22,11 +22,11 @@ var deviceFiles embed.FS
 const sessionCookie = "netcontrol_session"
 
 type device struct {
-	store *identity.Store
-	api *API
-	logger *slog.Logger
-	mu sync.Mutex
-	window time.Time
+	store    *identity.Store
+	api      *API
+	logger   *slog.Logger
+	mu       sync.Mutex
+	window   time.Time
 	attempts int
 }
 
@@ -184,7 +184,9 @@ func (d *device) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/auth/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 		d.write(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/auth/complete" && r.Method == http.MethodPost:
-		var input struct { Saved bool `json:"saved"` }
+		var input struct {
+			Saved bool `json:"saved"`
+		}
 		if err := decode(w, r, &input); err != nil || !input.Saved {
 			d.fail(w, 400, fmt.Errorf("confirm that you saved your API key"))
 			return
@@ -203,7 +205,9 @@ func (d *device) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		d.write(w, 200, map[string]any{"keys": list})
 	case r.URL.Path == "/auth/keys" && r.Method == http.MethodPost:
-		var input struct { Name string `json:"name"` }
+		var input struct {
+			Name string `json:"name"`
+		}
 		if err := decode(w, r, &input); err != nil {
 			d.fail(w, 400, err)
 			return

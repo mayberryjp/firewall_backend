@@ -13,7 +13,11 @@ async function api(path, method = "GET", body) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(data.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -25,6 +29,17 @@ async function perform(action) {
   try {
     await action();
   } catch (error) {
+    if (error.status === 401) {
+      $("new-key").value = "";
+      $("reveal").close();
+      $("key-list").replaceChildren();
+      $("keys").hidden = true;
+      $("finish-panel").hidden = true;
+      $("account").hidden = true;
+      $("steps").hidden = true;
+      $("login").hidden = false;
+      $("subtitle").textContent = "Sign in to continue.";
+    }
     $("error").textContent = error.message;
     $("error").hidden = false;
   } finally {
@@ -37,6 +52,7 @@ async function loadKeys() {
   const data = await api("/auth/keys");
   $("key-list").replaceChildren();
   $("no-keys").hidden = data.keys.length !== 0;
+  $("review-setup").hidden = stage !== "keys" || data.keys.length === 0;
   for (const key of data.keys) {
     const row = document.createElement("tr");
     for (const value of [key.name, key.masked, new Date(key.created_at).toLocaleString()]) {
@@ -77,7 +93,8 @@ async function refresh() {
   $("subtitle").textContent = status.authenticated
     ? `Signed in as ${status.username}. Sessions expire after 30 minutes.`
     : "A secure starting point for your network.";
-  $("finish-panel").hidden = stage !== "keys";
+  $("finish-panel").hidden = true;
+  $("step-review").setAttribute("aria-current", "false");
   $("ready-panel").hidden = stage !== "ready";
   $("keys-title").textContent = stage === "ready" ? "Manage API keys" : "Create your first API key";
   $("api-url").textContent = `${window.location.origin}/api/v1/state`;
@@ -140,6 +157,20 @@ $("copy").addEventListener("click", async () => {
 $("dismiss").addEventListener("click", () => {
   $("new-key").value = "";
   $("reveal").close();
+});
+
+$("review-setup").addEventListener("click", () => {
+  $("keys").hidden = true;
+  $("finish-panel").hidden = false;
+  $("step-keys").setAttribute("aria-current", "false");
+  $("step-review").setAttribute("aria-current", "step");
+  $("saved").focus();
+});
+$("back-to-keys").addEventListener("click", () => {
+  $("finish-panel").hidden = true;
+  $("keys").hidden = false;
+  $("step-keys").setAttribute("aria-current", "step");
+  $("step-review").setAttribute("aria-current", "false");
 });
 
 $("finish-form").addEventListener("submit", (event) => {

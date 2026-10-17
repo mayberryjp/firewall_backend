@@ -147,9 +147,13 @@ write outcome, pending confirmation, unavailable/stale state, modeled drift.
 ### 4.1 Deployment contract
 
 **Operator prerequisite:** Serve the frontend and API through one trusted HTTPS
-origin, with `/api/v1` forwarded to Netcontrol. The daemon does not serve frontend
-assets and does not implement CORS handling. A Vite/development proxy may provide
-the same-origin path for local development.
+origin, with `/api/v1` forwarded to Netcontrol. In default device mode the daemon
+serves a small embedded onboarding/key-management website at `/`; the broader
+networking dashboard specified here still needs a separate frontend. Legacy
+`-auth-file` mode serves only the networking API. Neither mode implements CORS.
+A Vite/development proxy may provide same-origin networking API paths locally.
+Remote device website access should use native TLS; `/auth/` origin and Secure
+cookie checks do not trust forwarded headers.
 
 The frontend API base is deployment configuration, not arbitrary user input in
 the initial release. Do not send an operator's token to a URL supplied by a query
@@ -162,6 +166,52 @@ mode, namespace, version, or feature capabilities. Never infer Linux operation
 from an empty service list or fabricate a namespace label.
 
 ### 4.2 Credential flow
+
+#### Device onboarding and key management (implemented)
+
+Without `-auth-file`, `/` hosts a three-step setup wizard: username/password,
+named automatically generated API key(s), then saved-key acknowledgement and
+completion. Anyone reaching an unclaimed device can claim it; restrict management
+network access until setup completes. Networking API keys do not work before
+completion. An interrupted account setup resumes through password sign-in.
+
+Credentials live in an owner-restricted bbolt database, separate from network JSON,
+using bcrypt password hashes and SHA-256 hashes of random 256-bit keys. API-key
+plaintext is returned only by creation, shown in a one-time dialog, cleared when
+hidden, and never persisted in browser storage. Lists show name, creation time,
+and a masked suffix (last four characters). Lost-response recovery is removal and
+replacement, never fetching plaintext. New keys have all networking permissions.
+
+The device account manages keys using an HttpOnly, SameSite=Strict session cookie
+scoped to `/auth/`, Secure with native HTTPS, expiring after 30 minutes. Mutations
+require `Content-Type: application/json` and a matching `Origin` header. Sign-out
+invalidates the session. Networking API endpoints remain bearer-only; sessions do
+not authorize them, and bearer keys cannot manage device credentials.
+
+| Endpoint | Request/response |
+| --- | --- |
+| `GET /auth/status` | `{stage: "account" \| "login" \| "keys" \| "ready", authenticated: boolean, configured: boolean, username: string}`; username empty unless signed in |
+| `POST /auth/setup` | `{username, password}`; claims once and sets session cookie |
+| `POST /auth/login` | `{username, password}`; sets session cookie |
+| `POST /auth/logout` | `{}`; revokes session and clears cookie |
+| `GET /auth/keys` | `{keys: [{id, name, masked, created_at}]}`; signed-in only |
+| `POST /auth/keys` | `{name}` -> `201 {key: {id, name, masked, created_at}, token}`; sole plaintext response |
+| `DELETE /auth/keys/{id}` | Immediately revokes future requests; already authorized operations continue |
+| `POST /auth/complete` | `{saved: true}`; requires session and at least one key |
+
+Auth responses are `no-store`; errors are `{error: string}`. Common failures:
+`400` invalid fields, `401` bad/expired session or credentials, `403` origin,
+`404` missing key, `409` already claimed/missing initial key, `415` content type,
+`429` sign-in/setup rate limit (10 attempts/minute device-wide, `Retry-After: 60`),
+`500` credential-store failure. Usernames are 1..64 bytes, passwords 12..72 UTF-8
+bytes, key names 1..80 bytes and unique. Names cannot have outer whitespace or
+control characters. At most 100 keys and 32 active sessions are allowed.
+
+The account can remove even the last key and generate replacements; no password
+reset, remote recovery, API-key expiration, or managed-key permission editor is
+provided. `-auth-file` is an explicit alternative, not an automatic migration.
+
+#### Connecting the broader networking dashboard
 
 1. Show a masked bearer-token input and **Connect**.
 2. Keep the token in memory only. No token in local/session storage, URLs, logs,
@@ -177,8 +227,9 @@ from an empty service list or fabricate a namespace label.
    warning. If a transaction is pending, explain that disconnecting does not
    confirm, cancel, or reliably trigger immediate rollback.
 
-No login/session/token-refresh endpoint exists. A reload requires token re-entry.
-Do not suggest that deleting a browser token revokes the server credential.
+The device-account session above does not authenticate this networking client.
+A dashboard reload requires API-token re-entry. Clearing a browser token does not
+revoke it; use device key management (or operator edits/restart in legacy mode).
 
 ### 4.3 Authorization
 
@@ -727,7 +778,7 @@ identified as frontend presets and never applied silently to existing records.
 
 ### 9.1 Common behavior
 
-- All requests: `Authorization: Bearer <token>`.
+- All networking `/api/v1` requests: `Authorization: Bearer <token>`.
 - JSON-body POST requests: `Content-Type: application/json`.
 - Responses are JSON with `Cache-Control: no-store`.
 - JSON-body requests have a 1 MiB limit; unknown fields/trailing JSON values fail.
@@ -1123,8 +1174,8 @@ the initial frontend release.
 
 | Gap/prerequisite | Initial frontend treatment |
 | --- | --- |
-| No frontend hosting/CORS | Same-origin reverse proxy/development proxy |
-| No identity/permission discovery | Token entry, advisory deployment hints, handle `403` |
+| No broader dashboard hosting/CORS | Embedded onboarding at `/`; separate same-origin dashboard deployment |
+| No networking-key permission discovery | Token entry, advisory deployment hints, handle `403`; `/auth/status` only identifies device-account sessions |
 | No backend/namespace/capability endpoint | Deployment labels or Unknown; no guessed capabilities |
 | No key inventory/private-key API | Manual validated key reference; operator provisions files |
 | No dry-run/diff/validation endpoint | Local validation/diff; server preflight happens during submit |

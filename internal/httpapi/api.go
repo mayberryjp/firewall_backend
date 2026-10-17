@@ -28,9 +28,9 @@ type Credential struct {
 var permissions = []string{"state.read", "transactions.write", "interfaces.write", "routes.write", "policy.write", "firewall.write", "nat.write", "wireguard.write", "softflowd.write", "kernel.namespace.write", "kernel.host.write"}
 
 type API struct {
-	engine      *control.Engine
-	credentials []Credential
-	logger      *slog.Logger
+	engine       *control.Engine
+	credentials  []Credential
+	logger       *slog.Logger
 	authenticate func(string) (Credential, bool, error)
 }
 
