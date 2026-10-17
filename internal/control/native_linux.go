@@ -75,11 +75,11 @@ func NewLinuxAdapter(namespace, keyDirectory string, options ...LinuxOptions) (A
 		if err != nil {
 			return nil, errors.Join(err, a.Close())
 		}
-		if option.DHCPRelayBinary != "" {
-			a.relay, err = newDHCPRelayManager(a, option)
-			if err != nil {
-				return nil, errors.Join(err, a.Close())
-			}
+	}
+	if option.DHCPRelayBinary != "" {
+		a.relay, err = newDHCPRelayManager(a, option)
+		if err != nil {
+			return nil, errors.Join(err, a.Close())
 		}
 	}
 	return a, nil

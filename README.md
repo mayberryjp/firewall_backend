@@ -278,6 +278,10 @@ Transaction history is retained in the journal without automatic pruning.
 
 ## Build and run
 
+For Alpine APK installation, OpenRC configuration, local package builds, and
+automatic GitHub Actions artifacts, see the
+[build and installation specification](docs/BUILD_AND_INSTALL.md).
+
 Requires Go 1.24 or later:
 
 ```text

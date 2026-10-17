@@ -103,6 +103,9 @@ func TestLinuxDHCPRelayLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if adapter.(*linuxAdapter).relay == nil || adapter.(*linuxAdapter).flows != nil {
+		t.Fatal("DHCP relay must initialize independently of softflowd")
+	}
 	t.Cleanup(func() {
 		if adapter != nil {
 			if err := adapter.Close(); err != nil {

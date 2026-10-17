@@ -152,6 +152,12 @@ write outcome, pending confirmation, unavailable/stale state, modeled drift.
 
 ### 4.1 Deployment contract
 
+Alpine APK/OpenRC installation and automatic build artifacts are documented in
+the [build and installation specification](docs/BUILD_AND_INSTALL.md).
+Packages default to simulator mode with a loopback-only listener; package
+installation must not be presented as proof of native networking readiness.
+The embedded website requires no separate frontend build.
+
 **Operator prerequisite:** Serve the frontend and API through one trusted HTTPS
 origin, with `/api/v1` forwarded to Netcontrol. In default device mode the daemon
 serves a small embedded onboarding/key-management website at `/`; the broader

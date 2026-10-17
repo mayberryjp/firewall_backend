@@ -4,6 +4,9 @@
 
 ### Added
 
+- Automatic GitHub Actions checks and Alpine 3.23 APK builds for x86_64/aarch64,
+  with OpenRC integration, install smoke checks, development-build provenance,
+  ephemeral signing keys, checksums, and a build/installation specification.
 - Per-interface DHCPv4 relay settings (`dhcp_relay.enabled` and `servers`),
   managed relay-only dnsmasq lifecycle on Linux, operator CLI settings, runtime
   status/repair APIs, simulation, and transaction/revision persistence.
@@ -31,6 +34,11 @@
   to enabled. Startup migrates owned firewall rules atomically while rejecting
   unrelated firewall drift. This can override previous forwarding ICMP drops;
   explicit `false` retains rule/default-controlled behavior.
+
+### Fixed
+
+- DHCP relay initialization no longer depends on configuring softflowd; the
+  native lifecycle test explicitly checks independent relay integration.
 
 Release recommendation: **major**, because default behavior broadens accepted
 traffic for existing configurations. No release baseline or version is assigned.

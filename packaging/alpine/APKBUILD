@@ -1,0 +1,36 @@
+pkgname=netcontrol
+pkgver=${NETCONTROL_PKGVER:?Use packaging/alpine/build.sh to prepare the source}
+pkgrel=0
+pkgdesc="Isolated-namespace networking control plane"
+url="https://github.com/mayberryjp/firewall_backend"
+arch="x86_64 aarch64"
+license="LicenseRef-Unspecified"
+depends="openrc"
+makedepends="go"
+source="
+	netcontrol-$pkgver.tar.gz
+	netcontrold.initd
+	netcontrold.confd
+	"
+builddir="$srcdir/netcontrol-$pkgver"
+
+build() {
+	export CGO_ENABLED=0 GOTOOLCHAIN=local
+	go build -mod=readonly -buildvcs=false -trimpath \
+		-ldflags="-s -w -buildid=" -o netcontrold ./cmd/netcontrold
+}
+
+check() {
+	export CGO_ENABLED=0 GOTOOLCHAIN=local
+	go test -mod=readonly ./...
+	go vet -mod=readonly ./...
+}
+
+package() {
+	install -Dm755 netcontrold "$pkgdir/usr/sbin/netcontrold"
+	install -Dm755 "$srcdir/netcontrold.initd" "$pkgdir/etc/init.d/netcontrold"
+	install -Dm644 "$srcdir/netcontrold.confd" "$pkgdir/etc/conf.d/netcontrold"
+	install -d -m700 "$pkgdir/var/lib/netcontrol" "$pkgdir/etc/netcontrol/keys"
+}
+
+sha512sums=""

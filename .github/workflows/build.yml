@@ -1,0 +1,127 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Go checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l cmd internal)"
+          if [ -n "$files" ]; then
+            printf 'Unformatted Go files:\n%s\n' "$files" >&2
+            exit 1
+          fi
+      - run: go mod verify
+      - name: Check packaging shell syntax
+        if: runner.os == 'Linux'
+        run: |
+          for script in packaging/alpine/*.sh packaging/alpine/*.initd packaging/alpine/*.confd packaging/alpine/APKBUILD; do
+            sh -n "$script"
+          done
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go build ./cmd/netcontrold
+      - name: Race detection
+        if: runner.os == 'Linux'
+        run: go test -race ./internal/...
+
+  native:
+    name: Isolated Linux integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Prepare native test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y dnsmasq-base softflowd
+          for module in dummy 8021q wireguard nf_tables nf_conntrack nf_nat; do
+            sudo modprobe "$module"
+          done
+      - name: Test kernel networking and managed daemons
+        run: |
+          sudo env "PATH=$PATH" \
+            NETCONTROL_INTEGRATION=1 \
+            NETCONTROL_DHCP_RELAY_BINARY=/usr/sbin/dnsmasq \
+            NETCONTROL_DHCP_RELAY_UID="$(id -u nobody)" \
+            NETCONTROL_DHCP_RELAY_GID="$(id -g nobody)" \
+            NETCONTROL_SOFTFLOWD_BINARY=/usr/sbin/softflowd \
+            NETCONTROL_SOFTFLOWD_UID="$(id -u nobody)" \
+            NETCONTROL_SOFTFLOWD_GID="$(id -g nobody)" \
+            go test ./internal/control -count=1 -v
+
+  apk:
+    name: Alpine 3.23 APK (${{ matrix.arch }})
+    needs: [checks, native]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build and install-test APK in Alpine
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/dist,dst=/out" \
+            alpine:3.23 sh -euc '
+              apk add --no-cache alpine-sdk go openrc curl
+              adduser -D builder
+              addgroup builder abuild
+              cp -a /source /work
+              chown -R builder:abuild /work /out
+              su builder -c "cd /work && OUTDIR=/out sh packaging/alpine/build.sh"
+              cp /out/*.rsa.pub /etc/apk/keys/
+              apk add /out/*.apk
+              mkdir -p /run/openrc
+              touch /run/openrc/softlevel
+              NETCONTROL_PACKAGE_SMOKE=1 sh /work/packaging/alpine/smoke-test.sh
+            '
+      - name: Upload APK, public key, provenance and checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: netcontrol-alpine3.23-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

@@ -6,4 +6,5 @@
 /keys/
 /coverage.out
 /coverage.html
+/dist/
 *.test
