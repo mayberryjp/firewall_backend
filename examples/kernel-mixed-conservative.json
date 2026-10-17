@@ -1,0 +1,27 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 120,
+  "description": "Mixed-workload conservative starting point v1; benchmark before deployment",
+  "config": {
+    "interfaces": [],
+    "routes": [],
+    "policy_rules": [],
+    "firewall": {"policy": "accept", "rules": [], "nat": {"masquerade": []}},
+    "softflowd": [],
+    "kernel": {
+      "namespace": {
+        "net.core.somaxconn": "4096",
+        "net.ipv4.tcp_syncookies": "1",
+        "net.ipv4.tcp_sack": "1",
+        "net.ipv4.tcp_window_scaling": "1",
+        "net.ipv4.tcp_timestamps": "1",
+        "net.ipv4.tcp_moderate_rcvbuf": "1",
+        "net.ipv4.tcp_mtu_probing": "1",
+        "net.ipv4.tcp_slow_start_after_idle": "1",
+        "net.ipv4.tcp_autocorking": "1",
+        "net.ipv4.tcp_no_metrics_save": "0"
+      },
+      "host": {}
+    }
+  }
+}

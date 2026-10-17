@@ -6,39 +6,52 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"strings"
 	"sync"
 	"time"
 )
 
 var (
-	ErrConflict   = errors.New("configuration conflict")
-	ErrNotFound   = errors.New("transaction not found")
-	ErrValidation = errors.New("invalid request")
+	ErrConflict         = errors.New("configuration conflict")
+	ErrNotFound         = errors.New("transaction not found")
+	ErrRevisionNotFound = errors.New("revision not found")
+	ErrValidation       = errors.New("invalid request")
 )
 
 type Transaction struct {
-	ID           string    `json:"id"`
-	Actor        string    `json:"actor"`
-	Status       string    `json:"status"`
-	BaseRevision uint64    `json:"base_revision"`
-	Candidate    Config    `json:"candidate"`
-	Previous     Config    `json:"previous"`
-	Deadline     time.Time `json:"confirmation_deadline"`
-	Error        string    `json:"error,omitempty"`
+	ID           string        `json:"id"`
+	Actor        string        `json:"actor"`
+	Status       string        `json:"status"`
+	BaseRevision uint64        `json:"base_revision"`
+	Candidate    Config        `json:"candidate"`
+	Previous     Config        `json:"previous"`
+	Deadline     time.Time     `json:"confirmation_deadline"`
+	Error        string        `json:"error,omitempty"`
+	Description  string        `json:"description,omitempty"`
+	SubmittedAt  *time.Time    `json:"submitted_at"`
+	CommittedAt  *time.Time    `json:"committed_at"`
+	CommittedBy  string        `json:"committed_by,omitempty"`
+	RestoredFrom *uint64       `json:"restored_from_revision,omitempty"`
+	KernelBefore *KernelConfig `json:"kernel_before,omitempty"`
+	KernelAfter  *KernelConfig `json:"kernel_after,omitempty"`
 }
 
 type State struct {
-	Scope        string                  `json:"scope"`
-	Revision     uint64                  `json:"revision"`
-	Desired      Config                  `json:"desired"`
-	Active       string                  `json:"active_transaction,omitempty"`
-	Transactions map[string]*Transaction `json:"transactions"`
+	Scope          string                  `json:"scope"`
+	Revision       uint64                  `json:"revision"`
+	Desired        Config                  `json:"desired"`
+	Active         string                  `json:"active_transaction,omitempty"`
+	Transactions   map[string]*Transaction `json:"transactions"`
+	InitializedAt  *time.Time              `json:"initialized_at"`
+	KernelBaseline KernelConfig            `json:"kernel_baseline"`
 }
 
 type Request struct {
 	BaseRevision   uint64 `json:"base_revision"`
 	ConfirmSeconds int    `json:"confirm_timeout_seconds"`
 	Config         Config `json:"config"`
+	Description    string `json:"description,omitempty"`
 }
 
 type View struct {
@@ -50,12 +63,13 @@ type View struct {
 }
 
 type Engine struct {
-	mu      sync.Mutex
-	state   State
-	store   Journal
-	adapter Adapter
-	now     func() time.Time
-	log     *slog.Logger
+	mu           sync.Mutex
+	state        State
+	store        Journal
+	adapter      Adapter
+	now          func() time.Time
+	log          *slog.Logger
+	runtimeError string
 }
 
 func NewEngine(store Journal, adapter Adapter, logger *slog.Logger) (*Engine, error) {
@@ -63,13 +77,35 @@ func NewEngine(store Journal, adapter Adapter, logger *slog.Logger) (*Engine, er
 	if err != nil {
 		return nil, err
 	}
+	state.KernelBaseline.Normalize()
+	if err := validateKernelJournal(state); err != nil {
+		return nil, err
+	}
 	if state.Scope == "" {
 		state.Scope = adapter.Scope()
+		if state.Revision == 0 && len(state.Transactions) == 0 {
+			now := time.Now().UTC()
+			state.InitializedAt = &now
+		}
 		if err := store.Save(state); err != nil {
 			return nil, fmt.Errorf("bind state to adapter scope: %w", err)
 		}
 	} else if state.Scope != adapter.Scope() {
 		return nil, fmt.Errorf("state belongs to scope %q, not %q", state.Scope, adapter.Scope())
+	}
+	if owner, ok := adapter.(kernelOwnershipAdapter); ok {
+		keys := state.Desired.Kernel
+		if state.Active != "" {
+			if active := state.Transactions[state.Active]; active != nil {
+				keys = kernelUnion(keys, active.Candidate.Kernel)
+				if active.KernelBefore != nil {
+					keys = kernelUnion(keys, *active.KernelBefore)
+				}
+			}
+		}
+		if err := owner.checkKernelOwnership(keys); err != nil {
+			return nil, err
+		}
 	}
 	e := &Engine{store: store, adapter: adapter, state: state, now: time.Now, log: logger}
 	if state.Active != "" {
@@ -90,6 +126,32 @@ func NewEngine(store Journal, adapter Adapter, logger *slog.Logger) (*Engine, er
 			}
 		default:
 			return nil, fmt.Errorf("invalid active transaction status %q", t.Status)
+		}
+	}
+	if runtimeAdapter, ok := adapter.(RuntimeAdapter); ok {
+		expected := e.state.Desired
+		canResume := true
+		if e.state.Active != "" {
+			active := e.state.Transactions[e.state.Active]
+			if active.Status == "pending_confirmation" {
+				expected = active.Candidate
+			} else {
+				canResume = false
+			}
+		}
+		if canResume {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := runtimeAdapter.Resume(ctx, expected)
+			cancel()
+			if err != nil {
+				e.runtimeError = err.Error()
+				logger.Error("service startup reconciliation failed; inspect runtime status", "error", err)
+				if e.state.Active != "" {
+					if rollbackErr := e.rollback(e.state.Transactions[e.state.Active], "service startup reconciliation failed: "+err.Error()); rollbackErr != nil {
+						logger.Error("startup service rollback failed", "error", rollbackErr)
+					}
+				}
+			}
 		}
 	}
 	return e, nil
@@ -116,12 +178,29 @@ func (e *Engine) View(ctx context.Context) (View, error) {
 	if err != nil {
 		return View{}, err
 	}
-	return Clone(View{Revision: e.state.Revision, Desired: e.state.Desired, Observed: observed, Drift: !Equal(expected, observed), Active: active}), nil
+	drift := !Equal(expected, observed)
+	if active != nil && active.Status == "pending_confirmation" {
+		if err := e.verifyKernel(ctx, active.KernelAfter); err != nil {
+			if !errors.Is(err, ErrConflict) {
+				return View{}, err
+			}
+			drift = true
+		}
+	}
+	return Clone(View{Revision: e.state.Revision, Desired: e.state.Desired, Observed: observed, Drift: drift, Active: active}), nil
 }
 
 func (e *Engine) Submit(ctx context.Context, actor string, r Request) (Transaction, error) {
+	return e.submit(ctx, actor, r, nil)
+}
+
+func (e *Engine) submit(ctx context.Context, actor string, r Request, restoredFrom *uint64) (Transaction, error) {
 	r.Config = Clone(r.Config)
 	r.Config.Normalize()
+	r.Description = strings.TrimSpace(r.Description)
+	if len(r.Description) > 1024 {
+		return Transaction{}, fmt.Errorf("%w: description must not exceed 1024 bytes", ErrValidation)
+	}
 	if err := r.Config.Validate(); err != nil {
 		return Transaction{}, fmt.Errorf("%w: %v", ErrValidation, err)
 	}
@@ -130,7 +209,7 @@ func (e *Engine) Submit(ctx context.Context, actor string, r Request) (Transacti
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.state.Active != "" || r.BaseRevision != e.state.Revision {
+	if e.state.Active != "" || r.BaseRevision != e.state.Revision || e.state.Revision == math.MaxUint64 {
 		return Transaction{}, ErrConflict
 	}
 	observed, err := e.adapter.Observe(ctx, e.state.Desired)
@@ -155,31 +234,54 @@ func (e *Engine) Submit(ctx context.Context, actor string, r Request) (Transacti
 			if before.Name == after.Name && before.Kind != after.Kind {
 				return Transaction{}, fmt.Errorf("%w: interface kind changes require separate confirmed transactions", ErrValidation)
 			}
+			if before.Name == after.Name && before.VLAN != nil && after.VLAN != nil && *before.VLAN != *after.VLAN {
+				return Transaction{}, fmt.Errorf("%w: VLAN parent/ID changes require a new interface name or separate confirmed deletion and creation", ErrValidation)
+			}
 		}
 	}
 	id := make([]byte, 16)
 	if _, err := rand.Read(id); err != nil {
 		return Transaction{}, err
 	}
+	kernelBefore, kernelAfter, err := e.captureKernel(ctx, r.Config)
+	if err != nil {
+		return Transaction{}, fmt.Errorf("capture kernel rollback values: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Transaction{}, err
+	}
+	submittedAt := e.now().UTC()
+	priorBaseline := Clone(e.state.KernelBaseline)
+	if kernelBefore != nil {
+		e.state.KernelBaseline = kernelUnion(*kernelBefore, e.state.KernelBaseline)
+	}
 	t := &Transaction{ID: fmt.Sprintf("%x", id), Actor: actor, Status: "applying", BaseRevision: e.state.Revision,
-		Candidate: r.Config, Previous: Clone(e.state.Desired), Deadline: e.now().Add(time.Duration(r.ConfirmSeconds) * time.Second)}
+		Candidate: r.Config, Previous: Clone(e.state.Desired), Deadline: submittedAt.Add(time.Duration(r.ConfirmSeconds) * time.Second),
+		Description: r.Description, SubmittedAt: &submittedAt, RestoredFrom: restoredFrom, KernelBefore: kernelBefore, KernelAfter: kernelAfter}
 	e.state.Transactions[t.ID], e.state.Active = t, t.ID
 	if err := e.store.Save(e.state); err != nil {
 		delete(e.state.Transactions, t.ID)
 		e.state.Active = ""
+		e.state.KernelBaseline = priorBaseline
 		return Transaction{}, fmt.Errorf("persist intent: %w", err)
 	}
 	e.log.Info("transaction applying", "transaction", t.ID, "actor", actor, "base_revision", r.BaseRevision)
 	// Once intent is durable, disconnecting a client must not interrupt recovery.
 	opctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err = e.adapter.Reconcile(opctx, t.Candidate)
+	err = e.writeKernel(opctx, t.KernelAfter)
+	if err == nil {
+		err = e.adapter.Reconcile(opctx, t.Candidate)
+	}
 	if err == nil {
 		var actual Config
 		actual, err = e.adapter.Observe(opctx, t.Candidate)
 		if err == nil && !Equal(actual, t.Candidate) {
 			err = fmt.Errorf("post-apply verification mismatch")
 		}
+	}
+	if err == nil {
+		err = e.verifyKernel(opctx, t.KernelAfter)
 	}
 	if err == nil && !e.now().Before(t.Deadline) {
 		err = fmt.Errorf("confirmation deadline elapsed while applying")
@@ -210,6 +312,9 @@ func (e *Engine) Confirm(ctx context.Context, id, actor string) (Transaction, er
 	if e.state.Active != id || t.Status != "pending_confirmation" {
 		return Clone(*t), ErrConflict
 	}
+	if e.state.Revision == math.MaxUint64 {
+		return Clone(*t), fmt.Errorf("%w: revision counter exhausted", ErrConflict)
+	}
 	if !e.now().Before(t.Deadline) {
 		err := e.rollback(t, "confirmation expired")
 		return Clone(*t), errors.Join(ErrConflict, err)
@@ -221,6 +326,9 @@ func (e *Engine) Confirm(ctx context.Context, id, actor string) (Transaction, er
 	if !Equal(actual, t.Candidate) {
 		return Clone(*t), fmt.Errorf("%w: candidate drifted before confirmation", ErrConflict)
 	}
+	if err := e.verifyKernel(ctx, t.KernelAfter); err != nil {
+		return Clone(*t), err
+	}
 	if !e.now().Before(t.Deadline) {
 		err := e.rollback(t, "confirmation expired during verification")
 		return Clone(*t), errors.Join(ErrConflict, err)
@@ -229,13 +337,15 @@ func (e *Engine) Confirm(ctx context.Context, id, actor string) (Transaction, er
 		return Clone(*t), err
 	}
 	before := Clone(e.state)
+	committedAt := e.now().UTC()
+	t.CommittedAt, t.CommittedBy = &committedAt, actor
 	e.state.Revision++
 	e.state.Desired, e.state.Active, t.Status = Clone(t.Candidate), "", "committed"
 	if err := e.store.Save(e.state); err != nil {
 		e.state = before
 		return Transaction{}, fmt.Errorf("persist confirmation: %w", err)
 	}
-	e.log.Info("transaction committed", "transaction", id, "actor", actor, "revision", e.state.Revision)
+	e.log.Info("transaction committed", "transaction", id, "actor", actor, "revision", e.state.Revision, "restored_from_revision", t.RestoredFrom)
 	return Clone(*t), nil
 }
 
@@ -265,13 +375,16 @@ func (e *Engine) rollback(t *Transaction, reason string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	err := e.adapter.Reconcile(ctx, t.Previous)
+	err := errors.Join(e.writeKernel(ctx, t.KernelBefore), e.adapter.Reconcile(ctx, t.Previous))
 	if err == nil {
 		var observed Config
 		observed, err = e.adapter.Observe(ctx, t.Previous)
 		if err == nil && !Equal(observed, t.Previous) {
 			err = fmt.Errorf("rollback verification mismatch")
 		}
+	}
+	if err == nil {
+		err = e.verifyKernel(ctx, t.KernelBefore)
 	}
 	if err != nil {
 		t.Status, t.Error = "recovery_failed", reason+"; rollback: "+err.Error()

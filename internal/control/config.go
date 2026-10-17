@@ -10,10 +10,12 @@ import (
 )
 
 type Config struct {
-	Interfaces []Interface `json:"interfaces"`
-	Routes     []Route     `json:"routes"`
-	Rules      []Rule      `json:"policy_rules"`
-	Firewall   Firewall    `json:"firewall"`
+	Interfaces []Interface       `json:"interfaces"`
+	Routes     []Route           `json:"routes"`
+	Rules      []Rule            `json:"policy_rules"`
+	Firewall   Firewall          `json:"firewall"`
+	Softflowd  []SoftflowdConfig `json:"softflowd"`
+	Kernel     KernelConfig      `json:"kernel"`
 }
 
 type Interface struct {
@@ -23,6 +25,7 @@ type Interface struct {
 	Up        bool       `json:"up"`
 	Addresses []string   `json:"addresses"`
 	WireGuard *WireGuard `json:"wireguard,omitempty"`
+	VLAN      *VLAN      `json:"vlan,omitempty"`
 }
 
 type WireGuard struct {
@@ -75,7 +78,7 @@ type FirewallRule struct {
 	Action      string `json:"action"`
 }
 
-var namePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
+var namePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,15}$`)
 var keyPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 func EmptyConfig() Config {
@@ -97,6 +100,7 @@ func Clone[T any](v T) T {
 }
 
 func (c *Config) Normalize() {
+	c.Kernel.Normalize()
 	if c.Interfaces == nil {
 		c.Interfaces = []Interface{}
 	}
@@ -106,6 +110,15 @@ func (c *Config) Normalize() {
 	if c.Rules == nil {
 		c.Rules = []Rule{}
 	}
+	if c.Softflowd == nil {
+		c.Softflowd = []SoftflowdConfig{}
+	}
+	for i := range c.Softflowd {
+		if c.Softflowd[i].Timeouts == nil {
+			c.Softflowd[i].Timeouts = map[string]int{}
+		}
+	}
+	slices.SortFunc(c.Softflowd, func(a, b SoftflowdConfig) int { return strings.Compare(a.Name, b.Name) })
 	if c.Firewall.Rules == nil {
 		c.Firewall.Rules = []FirewallRule{}
 	}
@@ -157,14 +170,17 @@ func canonicalPrefix(s string, network bool) (netip.Prefix, error) {
 }
 
 func (c Config) Validate() error {
+	if err := c.Kernel.Validate(); err != nil {
+		return err
+	}
 	names := map[string]bool{}
 	for _, link := range c.Interfaces {
-		if !namePattern.MatchString(link.Name) || link.Name == "lo" || names[link.Name] {
+		if !validInterfaceName(link.Name) || names[link.Name] {
 			return fmt.Errorf("invalid or duplicate interface name %q", link.Name)
 		}
 		names[link.Name] = true
-		if link.Kind != "dummy" && link.Kind != "wireguard" {
-			return fmt.Errorf("interface %s: supported kinds are dummy and wireguard", link.Name)
+		if link.Kind != "dummy" && link.Kind != "wireguard" && link.Kind != "vlan" {
+			return fmt.Errorf("interface %s: supported kinds are dummy, wireguard, and vlan", link.Name)
 		}
 		if link.MTU < 1280 || link.MTU > 65535 {
 			return fmt.Errorf("interface %s: MTU must be 1280..65535", link.Name)
@@ -222,6 +238,19 @@ func (c Config) Validate() error {
 		} else if link.WireGuard != nil {
 			return fmt.Errorf("%s: WireGuard settings require wireguard kind", link.Name)
 		}
+		if link.Kind == "vlan" {
+			if link.VLAN == nil || !validInterfaceName(link.VLAN.Parent) || link.VLAN.ID < 1 || link.VLAN.ID > 4094 {
+				return fmt.Errorf("%s: VLAN requires a valid parent and ID 1..4094", link.Name)
+			}
+		} else if link.VLAN != nil {
+			return fmt.Errorf("%s: VLAN settings require vlan kind", link.Name)
+		}
+	}
+	if _, err := orderedInterfaces(c.Interfaces); err != nil {
+		return err
+	}
+	if err := validateSoftflowd(c.Softflowd); err != nil {
+		return err
 	}
 	routeKeys := map[string]bool{}
 	for _, r := range c.Routes {
@@ -302,7 +331,7 @@ func (r MasqueradeRule) validate(interfaces map[string]bool) error {
 	if r.Family != "ipv4" && r.Family != "ipv6" {
 		return fmt.Errorf("masquerade family must be ipv4 or ipv6")
 	}
-	if !namePattern.MatchString(r.OutInterface) || r.OutInterface == "lo" ||
+	if !validInterfaceName(r.OutInterface) ||
 		(interfaces != nil && !interfaces[r.OutInterface]) {
 		return fmt.Errorf("masquerade requires a managed egress interface")
 	}

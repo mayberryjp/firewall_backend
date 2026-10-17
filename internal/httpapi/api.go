@@ -10,7 +10,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,12 +25,13 @@ type Credential struct {
 	Permissions []string `json:"permissions"`
 }
 
-var permissions = []string{"state.read", "transactions.write", "interfaces.write", "routes.write", "policy.write", "firewall.write", "nat.write", "wireguard.write"}
+var permissions = []string{"state.read", "transactions.write", "interfaces.write", "routes.write", "policy.write", "firewall.write", "nat.write", "wireguard.write", "softflowd.write", "kernel.namespace.write", "kernel.host.write"}
 
 type API struct {
 	engine      *control.Engine
 	credentials []Credential
 	logger      *slog.Logger
+	authenticate func(string) (Credential, bool, error)
 }
 
 func New(engine *control.Engine, credentials []Credential, logger *slog.Logger) (http.Handler, error) {
@@ -68,11 +71,24 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var credential *Credential
 	header := r.Header.Get("Authorization")
 	if strings.HasPrefix(header, "Bearer ") {
-		hash := sha256.Sum256([]byte(strings.TrimPrefix(header, "Bearer ")))
-		for i := range a.credentials {
-			expected, _ := hex.DecodeString(a.credentials[i].TokenSHA256)
-			if subtle.ConstantTimeCompare(hash[:], expected) == 1 {
-				credential = &a.credentials[i]
+		token := strings.TrimPrefix(header, "Bearer ")
+		if a.authenticate != nil {
+			value, ok, err := a.authenticate(token)
+			if err != nil {
+				a.logger.Error("credential lookup failed", "error", err)
+				fail(http.StatusServiceUnavailable, fmt.Errorf("credential store unavailable"), nil)
+				return
+			}
+			if ok {
+				credential = &value
+			}
+		} else {
+			hash := sha256.Sum256([]byte(token))
+			for i := range a.credentials {
+				expected, _ := hex.DecodeString(a.credentials[i].TokenSHA256)
+				if subtle.ConstantTimeCompare(hash[:], expected) == 1 {
+					credential = &a.credentials[i]
+				}
 			}
 		}
 	}
@@ -86,6 +102,103 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		if !has("state.read") {
 			fail(http.StatusForbidden, fmt.Errorf("state.read permission required"), nil)
+			return
+		}
+		if isStatisticsPath(r.URL.Path) {
+			query, err := statisticsQuery(r)
+			if err != nil {
+				code := http.StatusBadRequest
+				if errors.Is(err, errStatisticsEndpointNotFound) {
+					code = http.StatusNotFound
+				}
+				fail(code, err, nil)
+				return
+			}
+			snapshot, err := a.engine.Statistics(r.Context(), query)
+			if err != nil {
+				code := http.StatusServiceUnavailable
+				if errors.Is(err, control.ErrStatisticsInterfaceNotFound) {
+					code = http.StatusNotFound
+				}
+				fail(code, err, nil)
+				return
+			}
+			switch {
+			case query.Interface != "":
+				if len(snapshot.Interfaces) != 1 || snapshot.Interfaces[0].Name != query.Interface {
+					fail(http.StatusServiceUnavailable, fmt.Errorf("adapter returned an inconsistent interface sample"), nil)
+					return
+				}
+				a.encode(w, map[string]any{"sample": snapshot.Sample, "interface": snapshot.Interfaces[0]})
+			case query.Section == control.StatisticsInterfaces:
+				a.encode(w, map[string]any{"sample": snapshot.Sample, "interfaces": snapshot.Interfaces})
+			case query.Section == control.StatisticsProtocols:
+				a.encode(w, map[string]any{"sample": snapshot.Sample, "protocols": snapshot.Protocols})
+			default:
+				a.encode(w, snapshot)
+			}
+			return
+		}
+		if r.URL.Path == "/api/v1/kernel/tunables/catalog" {
+			a.encode(w, control.KernelCatalog())
+			return
+		}
+		if r.URL.Path == "/api/v1/kernel/tunables" {
+			view, err := a.engine.KernelView(r.Context())
+			if err != nil {
+				fail(http.StatusServiceUnavailable, err, nil)
+				return
+			}
+			a.encode(w, view)
+			return
+		}
+		if r.URL.Path == "/api/v1/runtime" || r.URL.Path == "/api/v1/parent-interfaces" || r.URL.Path == "/api/v1/services/softflowd/status" {
+			runtime, err := a.engine.Runtime(r.Context())
+			if err != nil {
+				fail(http.StatusServiceUnavailable, err, nil)
+				return
+			}
+			switch r.URL.Path {
+			case "/api/v1/parent-interfaces":
+				a.encode(w, runtime.Parents)
+			case "/api/v1/services/softflowd/status":
+				a.encode(w, map[string]any{"instances": runtime.Softflowd, "error": runtime.Error})
+			default:
+				a.encode(w, runtime)
+			}
+			return
+		}
+		if r.URL.Path == "/api/v1/revisions" {
+			limit, before, err := revisionListOptions(r)
+			if err != nil {
+				fail(http.StatusBadRequest, err, nil)
+				return
+			}
+			page, err := a.engine.ListRevisions(limit, before)
+			if err != nil {
+				fail(errorStatus(err), err, nil)
+				return
+			}
+			a.encode(w, page)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/revisions/") {
+			value := strings.TrimPrefix(r.URL.Path, "/api/v1/revisions/")
+			if strings.Contains(value, "/") {
+				fail(http.StatusNotFound, fmt.Errorf("endpoint not found"), nil)
+				return
+			}
+			number, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				fail(http.StatusBadRequest, fmt.Errorf("revision must be an unsigned 64-bit integer"), nil)
+				return
+			}
+			revision, err := a.engine.GetRevision(number)
+			if err != nil {
+				fail(errorStatus(err), err, nil)
+				return
+			}
+			a.encode(w, revision)
 			return
 		}
 		if r.URL.Path == "/api/v1/transactions" {
@@ -102,7 +215,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.encode(w, t)
 			return
 		}
-		known := []string{"/api/v1/state", "/api/v1/interfaces", "/api/v1/routes", "/api/v1/policy-rules", "/api/v1/firewall/rules", "/api/v1/firewall/nat", "/api/v1/wireguard"}
+		known := []string{"/api/v1/state", "/api/v1/interfaces", "/api/v1/vlans", "/api/v1/services/softflowd", "/api/v1/routes", "/api/v1/policy-rules", "/api/v1/firewall/rules", "/api/v1/firewall/nat", "/api/v1/wireguard"}
 		isInterface := strings.HasPrefix(r.URL.Path, "/api/v1/interfaces/")
 		if !slices.Contains(known, r.URL.Path) && !isInterface {
 			fail(http.StatusNotFound, fmt.Errorf("endpoint not found"), nil)
@@ -118,6 +231,16 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.encode(w, view)
 		case "/api/v1/interfaces":
 			a.encode(w, view.Observed.Interfaces)
+		case "/api/v1/vlans":
+			links := []control.Interface{}
+			for _, link := range view.Observed.Interfaces {
+				if link.VLAN != nil {
+					links = append(links, link)
+				}
+			}
+			a.encode(w, links)
+		case "/api/v1/services/softflowd":
+			a.encode(w, view.Observed.Softflowd)
 		case "/api/v1/routes":
 			a.encode(w, view.Observed.Routes)
 		case "/api/v1/policy-rules":
@@ -146,6 +269,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if isStatisticsPath(r.URL.Path) {
+		w.Header().Set("Allow", "GET")
+		fail(http.StatusMethodNotAllowed, fmt.Errorf("statistics endpoints are read-only"), nil)
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "GET, POST")
 		fail(http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"), nil)
@@ -153,6 +281,19 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !has("transactions.write") {
 		fail(http.StatusForbidden, fmt.Errorf("transactions.write permission required"), nil)
+		return
+	}
+	if r.URL.Path == "/api/v1/services/softflowd/reconcile" {
+		if !has("state.read") || !has("softflowd.write") {
+			fail(http.StatusForbidden, fmt.Errorf("state.read and softflowd.write permissions required"), nil)
+			return
+		}
+		runtime, err := a.engine.ReconcileServices(r.Context(), actor)
+		if err != nil {
+			fail(errorStatus(err), err, nil)
+			return
+		}
+		a.encode(w, runtime)
 		return
 	}
 	if r.URL.Path == "/api/v1/transactions" {
@@ -165,11 +306,63 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fail(http.StatusBadRequest, err, nil)
 			return
 		}
-		if err := authorize(*credential, a.engine.Snapshot().Desired, request.Config); err != nil {
-			fail(http.StatusForbidden, err, nil)
+		if err := authorizeAtRevision(*credential, a.engine.Snapshot(), request.BaseRevision, request.Config); err != nil {
+			code := http.StatusForbidden
+			if errors.Is(err, control.ErrConflict) {
+				code = http.StatusConflict
+			}
+			fail(code, err, nil)
 			return
 		}
 		t, err := a.engine.Submit(r.Context(), actor, request)
+		if err != nil {
+			fail(errorStatus(err), err, transactionPointer(t))
+			return
+		}
+		status = http.StatusAccepted
+		w.Header().Set("Location", "/api/v1/transactions/"+t.ID)
+		w.WriteHeader(status)
+		a.encode(w, t)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/v1/revisions/") {
+		path := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/revisions/"), "/")
+		if len(path) != 2 || path[1] != "restore" {
+			fail(http.StatusNotFound, fmt.Errorf("endpoint not found"), nil)
+			return
+		}
+		if !has("state.read") {
+			fail(http.StatusForbidden, fmt.Errorf("state.read permission required for historical restore"), nil)
+			return
+		}
+		number, err := strconv.ParseUint(path[0], 10, 64)
+		if err != nil {
+			fail(http.StatusBadRequest, fmt.Errorf("revision must be an unsigned 64-bit integer"), nil)
+			return
+		}
+		if strings.Split(r.Header.Get("Content-Type"), ";")[0] != "application/json" {
+			fail(http.StatusUnsupportedMediaType, fmt.Errorf("application/json required"), nil)
+			return
+		}
+		var request control.RestoreRequest
+		if err := decode(w, r, &request); err != nil {
+			fail(http.StatusBadRequest, err, nil)
+			return
+		}
+		revision, err := a.engine.GetRevision(number)
+		if err != nil {
+			fail(errorStatus(err), err, nil)
+			return
+		}
+		if err := authorizeAtRevision(*credential, a.engine.Snapshot(), request.BaseRevision, revision.Config); err != nil {
+			code := http.StatusForbidden
+			if errors.Is(err, control.ErrConflict) {
+				code = http.StatusConflict
+			}
+			fail(code, err, nil)
+			return
+		}
+		t, err := a.engine.Restore(r.Context(), actor, number, request)
 		if err != nil {
 			fail(errorStatus(err), err, transactionPointer(t))
 			return
@@ -222,11 +415,49 @@ func errorStatus(err error) int {
 		return http.StatusUnprocessableEntity
 	case errors.Is(err, control.ErrConflict):
 		return http.StatusConflict
-	case errors.Is(err, control.ErrNotFound):
+	case errors.Is(err, control.ErrNotFound), errors.Is(err, control.ErrRevisionNotFound):
 		return http.StatusNotFound
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+func revisionListOptions(r *http.Request) (int, *uint64, error) {
+	limit := 50
+	var before *uint64
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return 0, nil, fmt.Errorf("invalid revision list query: %w", err)
+	}
+	for name, values := range query {
+		if len(values) != 1 || values[0] == "" {
+			return 0, nil, fmt.Errorf("revision list parameters must have exactly one nonempty value")
+		}
+		switch name {
+		case "limit":
+			n, err := strconv.Atoi(values[0])
+			if err != nil || n < 1 || n > 100 {
+				return 0, nil, fmt.Errorf("limit must be 1..100")
+			}
+			limit = n
+		case "before_revision":
+			n, err := strconv.ParseUint(values[0], 10, 64)
+			if err != nil {
+				return 0, nil, fmt.Errorf("before_revision must be an unsigned 64-bit integer")
+			}
+			before = &n
+		default:
+			return 0, nil, fmt.Errorf("unknown revision list parameter %q", name)
+		}
+	}
+	return limit, before, nil
+}
+
+func authorizeAtRevision(c Credential, state control.State, base uint64, target control.Config) error {
+	if state.Revision != base {
+		return control.ErrConflict
+	}
+	return authorize(c, state.Desired, target)
 }
 
 func decode(w http.ResponseWriter, r *http.Request, target any) error {
@@ -267,6 +498,15 @@ func authorize(c Credential, before, after control.Config) error {
 		return err
 	}
 	if err := need("policy.write", !equal(before.Rules, after.Rules)); err != nil {
+		return err
+	}
+	if err := need("softflowd.write", !equal(before.Softflowd, after.Softflowd)); err != nil {
+		return err
+	}
+	if err := need("kernel.namespace.write", !equal(before.Kernel.Namespace, after.Kernel.Namespace)); err != nil {
+		return err
+	}
+	if err := need("kernel.host.write", !equal(before.Kernel.Host, after.Kernel.Host)); err != nil {
 		return err
 	}
 	if err := need("nat.write", !equal(before.Firewall.NAT, after.Firewall.NAT)); err != nil {

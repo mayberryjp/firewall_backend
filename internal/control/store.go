@@ -53,6 +53,7 @@ func (s *Store) Load() (State, error) {
 		return State{}, fmt.Errorf("invalid durable state: missing transactions")
 	}
 	state.Desired.Normalize()
+	state.KernelBaseline.Normalize()
 	if err := state.Desired.Validate(); err != nil {
 		return State{}, fmt.Errorf("invalid durable desired state: %w", err)
 	}
@@ -77,6 +78,12 @@ func (s *Store) Load() (State, error) {
 		default:
 			return State{}, fmt.Errorf("unknown transaction status in %q", id)
 		}
+	}
+	if err := validateKernelJournal(state); err != nil {
+		return State{}, fmt.Errorf("invalid kernel journal: %w", err)
+	}
+	if _, err := revisionRecords(state); err != nil {
+		return State{}, fmt.Errorf("invalid revision history: %w", err)
 	}
 	return state, nil
 }

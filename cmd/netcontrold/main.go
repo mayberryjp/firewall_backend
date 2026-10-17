@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"netcontrol/internal/control"
 	"netcontrol/internal/httpapi"
+	"netcontrol/internal/identity"
 )
 
 func main() {
@@ -31,13 +34,20 @@ func run(logger *slog.Logger) error {
 	namespace := flag.String("namespace", "", "exclusive pre-created Linux network namespace")
 	stateFile := flag.String("state", "state.json", "durable journal path (local filesystem)")
 	keyDir := flag.String("keys", "", "directory of pre-provisioned private WireGuard key files")
+	parents := flag.String("adopt-parents", "", "comma-separated pre-provisioned read-only VLAN/capture parent links")
+	flowBinary := flag.String("softflowd-binary", "", "absolute path to operator-installed softflowd (integration disabled when empty)")
+	flowRuntime := flag.String("softflowd-runtime-dir", "/run/netcontrol-softflowd", "dedicated root-owned mode-0711 process runtime directory")
+	flowUID := flag.Int("softflowd-uid", -1, "non-root numeric UID for managed softflowd children")
+	flowGID := flag.Int("softflowd-gid", -1, "non-root numeric GID for managed softflowd children")
+	hostTunables := flag.Bool("allow-host-tunables", false, "explicitly allow allowlisted host-global network sysctls; takes an exclusive host tuning lock")
 	authFile := flag.String("auth-file", "", "JSON credential file containing token hashes and permissions")
+	credentialDB := flag.String("credential-db", "", "device credential database (default: <state>.credentials.db); mutually exclusive with -auth-file")
 	listen := flag.String("listen", "127.0.0.1:8080", "management listener outside the target namespace")
 	cert := flag.String("tls-cert", "", "TLS certificate; required for non-loopback listeners")
 	key := flag.String("tls-key", "", "TLS private key")
 	flag.Parse()
-	if *authFile == "" {
-		return fmt.Errorf("-auth-file is required; anonymous administration is disabled")
+	if *authFile != "" && *credentialDB != "" {
+		return fmt.Errorf("-auth-file and -credential-db are mutually exclusive")
 	}
 	host, _, err := net.SplitHostPort(*listen)
 	if err != nil {
@@ -50,13 +60,47 @@ func run(logger *slog.Logger) error {
 	if *cert == "" && (ip == nil || !ip.IsLoopback()) {
 		return fmt.Errorf("non-loopback listeners require TLS")
 	}
-	data, err := os.ReadFile(*authFile)
-	if err != nil {
-		return err
-	}
 	var credentials []httpapi.Credential
-	if err := json.Unmarshal(data, &credentials); err != nil {
-		return fmt.Errorf("parse credentials: %w", err)
+	var identities *identity.Store
+	if *authFile != "" {
+		data, err := os.ReadFile(*authFile)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &credentials); err != nil {
+			return fmt.Errorf("parse credentials: %w", err)
+		}
+	} else {
+		if *credentialDB == "" {
+			*credentialDB = *stateFile + ".credentials.db"
+		}
+		dbPath, err := filepath.Abs(*credentialDB)
+		if err != nil {
+			return err
+		}
+		statePath, err := filepath.Abs(*stateFile)
+		if err != nil {
+			return err
+		}
+		if strings.EqualFold(dbPath, statePath) {
+			return fmt.Errorf("credential database must be separate from the network state journal")
+		}
+		identities, err = identity.Open(*credentialDB)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := identities.Close(); err != nil {
+				logger.Error("credential database close failed", "error", err)
+			}
+		}()
+		status, err := identities.Status()
+		if err != nil {
+			return err
+		}
+		if !status.AccountExists {
+			logger.Warn("device is unclaimed; first visitor can create the device account; restrict management network access until configured")
+		}
 	}
 	store, err := control.OpenStore(*stateFile)
 	if err != nil {
@@ -84,7 +128,15 @@ func run(logger *slog.Logger) error {
 		}
 		adapter = control.NewSimulator(initial)
 	case "linux":
-		adapter, err = control.NewLinuxAdapter(*namespace, *keyDir)
+		var parentNames []string
+		if *parents != "" {
+			parentNames = strings.Split(*parents, ",")
+		}
+		adapter, err = control.NewLinuxAdapter(*namespace, *keyDir, control.LinuxOptions{
+			ParentInterfaces: parentNames, SoftflowdBinary: *flowBinary, RuntimeDirectory: *flowRuntime,
+			SoftflowdUID: *flowUID, SoftflowdGID: *flowGID, Logger: logger,
+			AllowHostTunables: *hostTunables,
+		})
 		if err != nil {
 			return err
 		}
@@ -100,9 +152,14 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	handler, err := httpapi.New(engine, credentials, logger)
-	if err != nil {
-		return err
+	var handler http.Handler
+	if identities != nil {
+		handler = httpapi.NewDevice(engine, identities, logger)
+	} else {
+		handler, err = httpapi.New(engine, credentials, logger)
+		if err != nil {
+			return err
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	watchDone := make(chan struct{})

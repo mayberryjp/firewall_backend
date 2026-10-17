@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
 	rtnetlink "github.com/mdlayher/netlink"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
@@ -24,12 +25,23 @@ import (
 const ownedProtocol = 242
 
 type linuxAdapter struct {
-	namespace netns.NsHandle
-	scope     string
-	keys      string
+	namespace        netns.NsHandle
+	scope            string
+	keys             string
+	parents          map[string]ParentInterface
+	flows            *softflowdManager
+	hostNamespace    netns.NsHandle
+	hostTunablesLock *flock.Flock
 }
 
-func NewLinuxAdapter(namespace, keyDirectory string) (Adapter, error) {
+func NewLinuxAdapter(namespace, keyDirectory string, options ...LinuxOptions) (Adapter, error) {
+	if len(options) > 1 {
+		return nil, fmt.Errorf("at most one Linux options object is supported")
+	}
+	var option LinuxOptions
+	if len(options) == 1 {
+		option = options[0]
+	}
 	if !keyPattern.MatchString(namespace) {
 		return nil, fmt.Errorf("an explicit named network namespace is required")
 	}
@@ -47,20 +59,45 @@ func NewLinuxAdapter(namespace, keyDirectory string) (Adapter, error) {
 		handle.Close()
 		return nil, err
 	}
-	a := &linuxAdapter{namespace: handle, keys: keyDirectory, scope: fmt.Sprintf("linux:%s:%d:%d", strings.TrimSpace(string(boot)), stat.Dev, stat.Ino)}
-	if err := a.inNamespace(context.Background(), func() error { return nil }); err != nil {
+	a := &linuxAdapter{namespace: handle, keys: keyDirectory, parents: map[string]ParentInterface{}, scope: fmt.Sprintf("linux:%s:%d:%d", strings.TrimSpace(string(boot)), stat.Dev, stat.Ino)}
+	if err := a.initializeParents(option.ParentInterfaces); err != nil {
 		handle.Close()
 		return nil, err
+	}
+	if option.AllowHostTunables {
+		if err := a.initializeHostTunables(); err != nil {
+			return nil, errors.Join(err, a.Close())
+		}
+	}
+	if option.SoftflowdBinary != "" {
+		a.flows, err = newSoftflowdManager(a, option)
+		if err != nil {
+			return nil, errors.Join(err, a.Close())
+		}
 	}
 	return a, nil
 }
 
 func (a *linuxAdapter) Scope() string { return a.scope }
-func (a *linuxAdapter) Close() error  { return a.namespace.Close() }
+func (a *linuxAdapter) Close() error {
+	var err error
+	if a.flows != nil {
+		err = a.flows.Close()
+	}
+	if a.hostTunablesLock != nil {
+		err = errors.Join(err, a.hostNamespace.Close(), a.hostTunablesLock.Unlock())
+		a.hostTunablesLock = nil
+	}
+	return errors.Join(err, a.namespace.Close())
+}
 
 // Each operation uses a pinned thread. The HTTP listener remains outside the
 // managed namespace, so a migration cannot remove its own management interface.
 func (a *linuxAdapter) inNamespace(ctx context.Context, fn func() error) error {
+	return a.runInNamespace(ctx, a.namespace, true, fn)
+}
+
+func (a *linuxAdapter) runInNamespace(ctx context.Context, target netns.NsHandle, forbidHost bool, fn func() error) error {
 	result := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
@@ -71,7 +108,6 @@ func (a *linuxAdapter) inNamespace(ctx context.Context, fn func() error) error {
 			return
 		}
 		defer original.Close()
-		target := a.namespace
 		initNS, err := netns.GetFromPid(1)
 		if err != nil {
 			runtime.UnlockOSThread()
@@ -80,7 +116,7 @@ func (a *linuxAdapter) inNamespace(ctx context.Context, fn func() error) error {
 		}
 		isHost := target.Equal(original) || target.Equal(initNS)
 		initNS.Close()
-		if isHost {
+		if forbidHost && isHost {
 			runtime.UnlockOSThread()
 			result <- fmt.Errorf("refusing current or PID 1 network namespace")
 			return
@@ -146,15 +182,29 @@ func (a *linuxAdapter) Preflight(ctx context.Context, c Config) error {
 			}
 		}
 	}
-	return a.inNamespace(ctx, func() error {
+	err := a.inNamespace(ctx, func() error {
 		h, err := netlink.NewHandle()
 		if err != nil {
 			return err
 		}
 		defer h.Close()
-		_, err = h.LinkList()
-		return err
+		if err := a.preflightLinks(h, c); err != nil {
+			return err
+		}
+		if a.flows != nil {
+			return a.flows.Preflight(ctx, c.Softflowd)
+		}
+		for _, service := range c.Softflowd {
+			if service.Enabled {
+				return fmt.Errorf("%w: softflowd integration is not configured by the operator", ErrValidation)
+			}
+		}
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return a.preflightKernel(ctx, c.Kernel)
 }
 
 func (a *linuxAdapter) Observe(ctx context.Context, hints Config) (Config, error) {
@@ -172,10 +222,21 @@ func (a *linuxAdapter) Observe(ctx context.Context, hints Config) (Config, error
 		byIndex := map[int]string{}
 		for _, l := range links {
 			byIndex[l.Attrs().Index] = l.Attrs().Name
-			if l.Attrs().Name == "lo" {
+		}
+		if err := a.checkParents(h); err != nil {
+			return err
+		}
+		for _, l := range links {
+			if _, adopted := a.parents[l.Attrs().Name]; l.Attrs().Name == "lo" || adopted {
 				continue
 			}
 			link := Interface{Name: l.Attrs().Name, Kind: l.Type(), MTU: l.Attrs().MTU, Up: l.Attrs().Flags&net.FlagUp != 0}
+			if vlan, ok := l.(*netlink.Vlan); ok {
+				if vlan.VlanProtocol != netlink.VLAN_PROTOCOL_8021Q || byIndex[vlan.ParentIndex] == "" {
+					return fmt.Errorf("unsupported VLAN protocol or missing parent on %s", link.Name)
+				}
+				link.VLAN = &VLAN{Parent: byIndex[vlan.ParentIndex], ID: vlan.VlanId}
+			}
 			addrs, err := h.AddrList(l, netlink.FAMILY_ALL)
 			if err != nil {
 				return err
@@ -224,8 +285,15 @@ func (a *linuxAdapter) Observe(ctx context.Context, hints Config) (Config, error
 			observed.Rules = append(observed.Rules, Rule{Source: ruleSource(r), Table: r.Table, Priority: r.Priority})
 		}
 		observed.Firewall, err = observeFirewall()
+		if err == nil {
+			observed.Softflowd = a.observeServices(ctx, hints.Softflowd)
+			err = ctx.Err()
+		}
 		return err
 	})
+	if err == nil {
+		observed.Kernel, err = a.ReadKernel(ctx, hints.Kernel)
+	}
 	observed.Normalize()
 	return observed, err
 }
@@ -385,12 +453,23 @@ func decodeOwnedRule(data []byte) (netlink.Rule, bool, error) {
 }
 
 func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
+	if err := a.WriteKernel(ctx, target.Kernel); err != nil {
+		return err
+	}
 	return a.inNamespace(ctx, func() error {
 		h, err := netlink.NewHandle()
 		if err != nil {
 			return err
 		}
 		defer h.Close()
+		if err := a.preflightLinks(h, target); err != nil {
+			return err
+		}
+		if a.flows != nil {
+			if err := a.flows.StopChanged(ctx, target.Softflowd); err != nil {
+				return err
+			}
+		}
 		links, err := h.LinkList()
 		if err != nil {
 			return err
@@ -400,7 +479,14 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 			existing[link.Attrs().Name] = link
 		}
 		wanted := map[string]bool{"lo": true}
-		for _, link := range target.Interfaces {
+		for name := range a.parents {
+			wanted[name] = true
+		}
+		ordered, err := orderedInterfaces(target.Interfaces)
+		if err != nil {
+			return err
+		}
+		for _, link := range ordered {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -408,6 +494,16 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 			l, found := existing[link.Name]
 			if found && l.Type() != link.Kind {
 				return fmt.Errorf("%s has conflicting interface kind", link.Name)
+			}
+			if found && link.VLAN != nil {
+				vlan, ok := l.(*netlink.Vlan)
+				parent, parentErr := h.LinkByName(link.VLAN.Parent)
+				if parentErr != nil {
+					return parentErr
+				}
+				if !ok || vlan.VlanId != link.VLAN.ID || vlan.ParentIndex != parent.Attrs().Index || vlan.VlanProtocol != netlink.VLAN_PROTOCOL_8021Q {
+					return fmt.Errorf("existing VLAN %s has conflicting identity", link.Name)
+				}
 			}
 			if !found {
 				attrs := netlink.NewLinkAttrs()
@@ -417,6 +513,13 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 					l = &netlink.Dummy{LinkAttrs: attrs}
 				case "wireguard":
 					l = &netlink.GenericLink{LinkAttrs: attrs, LinkType: "wireguard"}
+				case "vlan":
+					parent, err := h.LinkByName(link.VLAN.Parent)
+					if err != nil {
+						return err
+					}
+					attrs.ParentIndex = parent.Attrs().Index
+					l = &netlink.Vlan{LinkAttrs: attrs, VlanId: link.VLAN.ID, VlanProtocol: netlink.VLAN_PROTOCOL_8021Q}
 				default:
 					return fmt.Errorf("unsupported link kind %s", link.Kind)
 				}
@@ -469,14 +572,22 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 		if err := reconcileFirewall(target.Firewall); err != nil {
 			return err
 		}
-		for name, link := range existing {
-			if !wanted[name] {
+		for _, link := range deletionOrder(links) {
+			if !wanted[link.Attrs().Name] {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
 				if err := h.LinkDel(link); err != nil {
-					return fmt.Errorf("delete %s: %w", name, err)
+					return fmt.Errorf("delete %s: %w", link.Attrs().Name, err)
 				}
+			}
+		}
+		if a.flows != nil {
+			return a.flows.Reconcile(ctx, target.Softflowd)
+		}
+		for _, service := range target.Softflowd {
+			if service.Enabled {
+				return fmt.Errorf("softflowd integration is unavailable")
 			}
 		}
 		return ctx.Err()

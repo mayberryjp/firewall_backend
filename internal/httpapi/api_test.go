@@ -38,8 +38,13 @@ func fixture(t *testing.T) (http.Handler, *control.Engine) {
 	handler, err := New(e, []Credential{
 		{Name: "admin", TokenSHA256: hash("admin-test-token"), Permissions: permissions},
 		{Name: "reader", TokenSHA256: hash("reader-test-token"), Permissions: []string{"state.read"}},
+		{Name: "writeonly", TokenSHA256: hash("writer-test-token"), Permissions: []string{"transactions.write"}},
 		{Name: "firewall", TokenSHA256: hash("firewall-test-token"), Permissions: []string{"state.read", "transactions.write", "firewall.write"}},
 		{Name: "nat", TokenSHA256: hash("nat-test-token"), Permissions: []string{"state.read", "transactions.write", "nat.write"}},
+		{Name: "softflowd", TokenSHA256: hash("softflowd-test-token"), Permissions: []string{"state.read", "transactions.write", "softflowd.write"}},
+		{Name: "interfaces", TokenSHA256: hash("interfaces-test-token"), Permissions: []string{"state.read", "transactions.write", "interfaces.write"}},
+		{Name: "kernel-namespace", TokenSHA256: hash("kernel-namespace-test-token"), Permissions: []string{"state.read", "transactions.write", "kernel.namespace.write"}},
+		{Name: "kernel-host", TokenSHA256: hash("kernel-host-test-token"), Permissions: []string{"state.read", "transactions.write", "kernel.host.write"}},
 	}, log)
 	if err != nil {
 		t.Fatal(err)
