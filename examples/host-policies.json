@@ -1,0 +1,56 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 60,
+  "description": "Host-centric outbound policies with ingress-interface overrides",
+  "config": {
+    "interfaces": [
+      {"name": "lan", "kind": "dummy", "mtu": 1500, "up": true, "addresses": ["192.0.2.1/24"]},
+      {"name": "wan", "kind": "dummy", "mtu": 1500, "up": true, "addresses": ["198.51.100.2/24"]}
+    ],
+    "routes": [
+      {"destination": "0.0.0.0/0", "gateway": "198.51.100.1", "interface": "wan", "table": 10000, "metric": 100}
+    ],
+    "policy_rules": [
+      {"priority": 10000, "source": "192.0.2.0/24", "table": 10000}
+    ],
+    "firewall": {
+      "policy": "drop",
+      "rules": [],
+      "policies": {
+        "hosts": [
+          {
+            "id": "laptop",
+            "name": "Laptop",
+            "addresses": ["192.0.2.10", "2001:db8::10"],
+            "policy": "drop",
+            "rules": [
+              {"protocol": "tcp", "destination_ports": [22, 443], "action": "accept"},
+              {"destination_host": "nas", "protocol": "tcp", "destination_ports": [8443], "action": "accept"}
+            ]
+          },
+          {
+            "id": "nas",
+            "name": "NAS",
+            "addresses": ["192.0.2.20", "2001:db8::20"],
+            "policy": "drop",
+            "rules": []
+          }
+        ],
+        "interfaces": [
+          {
+            "interface": "lan",
+            "rules": [
+              {"protocol": "tcp", "destination_ports": [22], "action": "drop"},
+              {"protocol": "udp", "destination_ports": [53], "action": "accept"}
+            ]
+          }
+        ]
+      },
+      "nat": {
+        "masquerade": [
+          {"family": "ipv4", "source": "192.0.2.0/24", "out_interface": "wan"}
+        ]
+      }
+    }
+  }
+}

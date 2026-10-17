@@ -81,6 +81,21 @@ func ownedFirewallTable(conn *nftables.Conn) (*nftables.Table, error) {
 }
 
 func reconcileFirewall(f Firewall) error {
+	var policyRules, metadataRules []*nftables.Rule
+	if f.Policies != nil {
+		if len(f.Rules) != 0 {
+			return fmt.Errorf("cannot mix legacy and host/interface firewall rules")
+		}
+		var err error
+		policyRules, err = policyForwardRules(f.Policies)
+		if err != nil {
+			return err
+		}
+		metadataRules, err = policyMetadataRules(f.Policies)
+		if err != nil {
+			return err
+		}
+	}
 	conn := &nftables.Conn{}
 	table, err := ownedFirewallTable(conn)
 	if err != nil {
@@ -96,6 +111,17 @@ func reconcileFirewall(f Firewall) error {
 	}
 	chain := conn.AddChain(&nftables.Chain{Name: "forward", Table: table, Type: nftables.ChainTypeFilter,
 		Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityFilter, Policy: &policy})
+	if f.Policies != nil {
+		metadataChain := conn.AddChain(&nftables.Chain{Name: firewallMetadataChain, Table: table})
+		for _, rule := range metadataRules {
+			rule.Table, rule.Chain = table, metadataChain
+			conn.AddRule(rule)
+		}
+		for _, rule := range policyRules {
+			rule.Table, rule.Chain = table, chain
+			conn.AddRule(rule)
+		}
+	}
 	for _, r := range f.Rules {
 		data, err := json.Marshal(r)
 		if err != nil {
@@ -133,9 +159,16 @@ func observeFirewall() (Firewall, error) {
 	if err != nil {
 		return f, err
 	}
-	var chain, postrouting *nftables.Chain
+	var chain, postrouting, metadataChain *nftables.Chain
 	for _, c := range chains {
 		if c.Table.Name != firewallTable {
+			continue
+		}
+		if c.Name == firewallMetadataChain {
+			if metadataChain != nil || c.Hooknum != nil || c.Priority != nil || c.Policy != nil || c.Device != "" || c.Type != "" {
+				return f, fmt.Errorf("owned firewall metadata chain has unsupported settings")
+			}
+			metadataChain = c
 			continue
 		}
 		if c.Hooknum == nil || c.Priority == nil || c.Policy == nil || c.Device != "" {
@@ -177,20 +210,31 @@ func observeFirewall() (Firewall, error) {
 	if err != nil {
 		return f, err
 	}
-	for _, rule := range rules {
-		var r FirewallRule
-		if err := json.Unmarshal(rule.UserData, &r); err != nil {
-			return f, fmt.Errorf("owned firewall rule has invalid metadata")
+	if metadataChain != nil {
+		metadata, err := conn.GetRules(table, metadataChain)
+		if err != nil {
+			return f, err
 		}
-		check := EmptyConfig()
-		check.Firewall.Rules = []FirewallRule{r}
-		if err := check.Validate(); err != nil {
-			return f, fmt.Errorf("owned firewall rule metadata: %w", err)
+		f.Policies, err = observePolicyFirewall(metadata, rules)
+		if err != nil {
+			return f, err
 		}
-		if !reflect.DeepEqual(rule.Exprs, firewallExpressions(r)) {
-			return f, fmt.Errorf("owned firewall rule expressions differ from metadata")
+	} else {
+		for _, rule := range rules {
+			var r FirewallRule
+			if err := json.Unmarshal(rule.UserData, &r); err != nil {
+				return f, fmt.Errorf("owned firewall rule has invalid metadata")
+			}
+			check := EmptyConfig()
+			check.Firewall.Rules = []FirewallRule{r}
+			if err := check.Validate(); err != nil {
+				return f, fmt.Errorf("owned firewall rule metadata: %w", err)
+			}
+			if !reflect.DeepEqual(rule.Exprs, firewallExpressions(r)) {
+				return f, fmt.Errorf("owned firewall rule expressions differ from metadata")
+			}
+			f.Rules = append(f.Rules, r)
 		}
-		f.Rules = append(f.Rules, r)
 	}
 	if postrouting != nil {
 		rules, err := conn.GetRules(table, postrouting)

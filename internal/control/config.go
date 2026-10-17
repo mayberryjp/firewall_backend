@@ -57,9 +57,10 @@ type Rule struct {
 
 // Firewall owns only the inet/netcontrol table.
 type Firewall struct {
-	Policy string         `json:"policy"`
-	Rules  []FirewallRule `json:"rules"`
-	NAT    NAT            `json:"nat"`
+	Policy   string            `json:"policy"`
+	Rules    []FirewallRule    `json:"rules"`
+	NAT      NAT               `json:"nat"`
+	Policies *FirewallPolicies `json:"policies,omitempty"`
 }
 
 type NAT struct {
@@ -121,6 +122,9 @@ func (c *Config) Normalize() {
 	slices.SortFunc(c.Softflowd, func(a, b SoftflowdConfig) int { return strings.Compare(a.Name, b.Name) })
 	if c.Firewall.Rules == nil {
 		c.Firewall.Rules = []FirewallRule{}
+	}
+	if c.Firewall.Policies != nil {
+		c.Firewall.Policies.normalize()
 	}
 	if c.Firewall.NAT.Masquerade == nil {
 		c.Firewall.NAT.Masquerade = []MasqueradeRule{}
@@ -284,6 +288,14 @@ func (c Config) Validate() error {
 	}
 	if c.Firewall.Policy != "accept" && c.Firewall.Policy != "drop" {
 		return fmt.Errorf("firewall policy must be accept or drop")
+	}
+	if c.Firewall.Policies != nil {
+		if len(c.Firewall.Rules) != 0 {
+			return fmt.Errorf("legacy firewall rules cannot be mixed with host/interface policies")
+		}
+		if _, err := compileFirewallPolicies(c.Firewall.Policies); err != nil {
+			return err
+		}
 	}
 	for _, r := range c.Firewall.Rules {
 		if r.Action != "accept" && r.Action != "drop" {

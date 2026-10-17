@@ -175,6 +175,13 @@ func (a *linuxAdapter) privateKey(ref string) (wgtypes.Key, error) {
 }
 
 func (a *linuxAdapter) Preflight(ctx context.Context, c Config) error {
+	var parents []string
+	for name := range a.parents {
+		parents = append(parents, name)
+	}
+	if err := validateFirewallInterfaces(c, parents); err != nil {
+		return err
+	}
 	for _, link := range c.Interfaces {
 		if link.WireGuard != nil {
 			if _, err := a.privateKey(link.WireGuard.KeyRef); err != nil {

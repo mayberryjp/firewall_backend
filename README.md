@@ -85,7 +85,7 @@ not cancel apply/recovery.
 | Addresses | Exact global-unicast IPv4/IPv6 prefixes on managed links; host bits retained |
 | Routes | Unicast destination/gateway/device/positive metric, tables 10000..19999, protocol 242 |
 | Policy routing | Source-prefix table lookup; unique priorities and tables 10000..19999 |
-| Firewall | Owned `inet netcontrol` table, `forward` filter chain, ordered source/destination accept/drop rules and default policy |
+| Firewall | Owned `inet netcontrol` table; legacy ordered source/destination rules or stateful host policies with ingress-interface overrides, TCP/UDP destination ports, and global/host defaults |
 | NAT | IPv4/IPv6 masquerading in the same table's `postrouting` NAT chain, with explicit family, optional source network, and required managed egress interface |
 | WireGuard | Private-key references, stable listen ports, peers, numeric endpoints, allowed IPs and keepalive |
 | softflowd | Typed foreground instances: enable/disable, capture interface/filter, numeric collector, NetFlow/IPFIX version, sampling, max flows, snaplen, promiscuity, and timeouts |
@@ -121,7 +121,8 @@ name, or separately confirm deletion before recreating it. Forwarding sysctls
 are not changed.
 
 Physical-device provisioning/moving, bridges, namespaces as API resources, SNAT/DNAT/port forwarding,
-ports/protocols/sets/conntrack, traffic control, device tuning, hardware offload,
+arbitrary protocol matches, port ranges, user-defined sets/conntrack controls,
+traffic control, device tuning, hardware offload,
 distributed coordination, and automatic drift reconciliation are **not**
 implemented. The firewall API is deliberately not a full nftables language.
 Transaction history is retained in the journal without automatic pruning.
@@ -751,7 +752,9 @@ Every request requires `Authorization: Bearer <token>`.
 | GET | `/api/v1/statistics/protocols` | Namespace IP/TCP/UDP/ICMP and extended kernel statistics |
 | GET | `/api/v1/routes` | Observed owned routes |
 | GET | `/api/v1/policy-rules` | Observed owned source-policy rules |
-| GET | `/api/v1/firewall/rules` | Observed owned default policy and ordered rules |
+| GET | `/api/v1/firewall/rules` | Entire observed firewall: global policy, legacy rules or host/interface policies, and NAT |
+| GET | `/api/v1/firewall/hosts` | Observed host inventory with outbound defaults/rules; `[]` in legacy mode |
+| GET | `/api/v1/firewall/interface-policies` | Observed ordered ingress-interface override rules; `[]` in legacy mode |
 | GET | `/api/v1/firewall/nat` | Observed owned masquerade rules, as `{"masquerade": [...]}` |
 | GET | `/api/v1/wireguard` | Observed owned WireGuard interfaces, without private keys |
 | GET | `/api/v1/transactions` | Journaled transactions keyed by ID |
@@ -854,6 +857,109 @@ If restore fails, expires, or is rolled back, the committed revision and history
 remain unchanged. The old transaction `/rollback` action is still for the active
 provisional transaction, not for historical restoration. History and dates persist
 in the same JSON journal; retain and back up that journal to retain the archive.
+
+### Host-centric and interface firewall policies
+
+Host policies attach to named devices, **not interfaces**. A host has a stable
+`id`, a display `name`, explicit IPv4/IPv6 `addresses` (no subnet suffix), an
+outbound default `policy`, and ordered `rules`. Moving the host between interfaces
+does not change its policy as long as its configured IP address stays the same.
+Addresses must be unique across hosts. This is IP matching, not authenticated
+device identity: spoofing, DHCP lease changes, MAC discovery, and automatic
+address tracking are not handled. Update address assignments transactionally.
+
+Enable the new model by including `config.firewall.policies`:
+
+```json
+{
+  "policy": "drop",
+  "rules": [],
+  "policies": {
+    "hosts": [
+      {
+        "id": "laptop",
+        "name": "Laptop",
+        "addresses": ["192.0.2.10", "2001:db8::10"],
+        "policy": "drop",
+        "rules": [
+          {"protocol": "tcp", "destination_ports": [443], "action": "accept"}
+        ]
+      }
+    ],
+    "interfaces": [
+      {
+        "interface": "lan",
+        "rules": [
+          {"protocol": "tcp", "destination_ports": [22], "action": "drop"}
+        ]
+      }
+    ]
+  },
+  "nat": {"masquerade": []}
+}
+```
+
+This is a fragment of a complete package. The ingress `lan` interface must be in
+the package's managed interfaces or explicitly operator-adopted on Linux. Interface
+policies are optional and have **no interface default action**; an unmatched
+interface rule must fall through to the source host, not override its default.
+Host-only, interface-only, and combined policies are supported.
+
+Evaluation order for forwarded traffic:
+
+1. Accept **established/related** conntrack traffic, including replies.
+2. Evaluate the matching **ingress-interface** rule list in order. The first
+   matching rule accepts or drops, overriding any host policy.
+3. Identify the **source host** by its exact IP and evaluate its rules in order.
+   If none matches, use that host's default.
+4. If the source has no host entry, use the global `firewall.policy`.
+
+The destination host's outbound default is **not** consulted. A rule can use
+`destination_host` to reference an existing host ID (all its configured addresses),
+or `destination` for a canonical IP network, but not both. Omitting both means
+any destination. `protocol` is omitted for any protocol, or `tcp`/`udp`.
+`destination_ports` is an optional list of 1..65535 ports and requires TCP/UDP;
+omitting it matches all ports. Host source/destination pairs only expand within
+the same IP family; a rule with no compatible family is rejected.
+
+Both types of rule list are first-match-wins, **not universal deny-wins**. An
+interface catch-all fully overrides hosts on that interface; an interface allow
+can override a host drop as well as the reverse. Host inventory, IP-address, and
+port-list ordering are normalized; rule order is preserved. An empty rule list
+is valid. Catch-all rules may intentionally shadow subsequent rules.
+
+**Existing connections survive policy changes and rollback.** The API does not
+flush conntrack, and the established/related rule runs before interface blocks.
+New blocks govern new connections, not guaranteed termination of active sessions.
+This is a forwarding policy, not the device's input/output firewall or protection
+of its management listener. NAT remains separate and still uses an egress
+interface. Firewall policy edits, host address/name edits, and interface overrides
+require `firewall.write` plus `transactions.write`; NAT and link edits retain
+their own permissions.
+
+Limits: 128 hosts, 16 addresses per host, 32 interface policies, 64 ordered rules
+per host/interface, 32 unique destination ports per rule, 64 KiB of serialized
+policy metadata, and at most 4096 expanded forwarding rules (including the
+stateful rule and per-address defaults). Host IDs use
+`^[a-zA-Z0-9_-]{1,64}$`; names are unique, nonblank, at most 80 bytes, and have
+no outer whitespace or control characters. Hosts require canonical unicast IPs,
+not loopback, link-local, multicast, IPv4-mapped IPv6, or zone-qualified addresses.
+
+Omitting `policies` (or setting it to `null`) retains the existing **stateless
+legacy** `rules` behavior and JSON shape. A nonempty legacy list cannot be mixed
+with `policies`; switching models is an explicit full-package transaction.
+History, restoration, confirmation, drift detection, and rollback include the
+abstract inventory. On Linux the inventory is chunked into bounded userdata in an
+unhooked `policy_metadata` chain; observed forwarding expressions and their order
+must exactly match the compiled policy. Metadata alone is not trusted.
+
+Use [examples/host-policies.json](examples/host-policies.json) for a complete
+simulator request demonstrating host HTTPS/SSH rules, an ingress SSH block,
+an ingress DNS exception, a destination-host reference, and separate masquerading.
+Its dummy links are lab scaffolding, not a working physical network.
+The read-only `/api/v1/firewall/hosts` and `/api/v1/firewall/interface-policies`
+endpoints return the observed lists. All edits still use the complete-package
+transaction API; there are no standalone host writes.
 
 ### Masquerading
 

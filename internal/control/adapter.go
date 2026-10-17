@@ -48,7 +48,12 @@ func (s *Simulator) Observe(ctx context.Context, _ Config) (Config, error) {
 	return actual, ctx.Err()
 }
 
-func (s *Simulator) Preflight(ctx context.Context, _ Config) error { return ctx.Err() }
+func (s *Simulator) Preflight(ctx context.Context, c Config) error {
+	if err := validateFirewallInterfaces(c, nil); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
 
 func (s *Simulator) Reconcile(ctx context.Context, c Config) error {
 	if err := ctx.Err(); err != nil {

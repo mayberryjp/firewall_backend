@@ -35,6 +35,8 @@ Support:
 - Read-only adopted parent inventory.
 - Unicast routes and source-policy routing.
 - Ordered forward-chain source/destination accept/drop rules and default policy.
+- Named IP-based outbound host policies, ingress-interface rule overrides,
+  TCP/UDP destination ports, and automatic established/related return traffic.
 - IPv4/IPv6 masquerading.
 - WireGuard key references, peers, endpoints, allowed networks, and keepalive.
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
@@ -47,15 +49,16 @@ Do not present as supported:
 
 - Physical-device provisioning, parent adoption, namespace creation or selection
   through the API, bridges, DHCP, DNS management, or forwarding sysctl management.
-- SNAT, DNAT, port forwarding, port/protocol firewall matches, sets, conntrack
+- SNAT, DNAT, port forwarding, arbitrary protocol matches/port ranges, sets, conntrack
   controls, traffic control, device tuning, or hardware offload.
 - Private-key upload/generation, key-file listing, package installation, arbitrary
   commands, process identity configuration, or systemd control.
 - Server-computed throughput/history, flow records, WireGuard handshake/peer
   telemetry, collector-delivery verification, or real-time server push.
   Client-derived interface rate charts are optional, subject to section 6.1.1.
-- User/credential administration, token creation/revocation, permission discovery,
-  a tamper-evident audit log, or multi-host coordination.
+- Multi-user account administration, networking-token permission discovery,
+  a tamper-evident audit log, or multi-device coordination. Single-device setup
+  and named API-key creation/revocation are provided by the embedded website.
 
 Label the product **Isolated lab control plane**. Do not market it as a production
 host-network manager or describe a package apply as an atomic kernel transaction.
@@ -93,7 +96,7 @@ routes, not backend endpoints.
 | `/parents` | Read-only adopted parent inventory |
 | `/routes` | Routes |
 | `/policy-rules` | Source-policy rules |
-| `/firewall` | Forward filter policy and ordered rules |
+| `/firewall` | Host inventory/outbound policies, ingress overrides, global default, or explicit legacy ordered-rule view |
 | `/nat` | Masquerade rules |
 | `/wireguard` | WireGuard-focused interface/peer view |
 | `/services/softflowd` | Configured instances joined with runtime status |
@@ -451,17 +454,45 @@ only priorities must be unique.
 
 ### 6.6 Firewall forwarding
 
-- Default policy selector: Accept or Drop.
-- Ordered rule list: position, source or Any, destination or Any, action.
-- Add/edit/delete, move up/down, and optional drag reorder with keyboard equivalent.
-- Show a catch-all warning when both prefixes are omitted; subsequent filter
-  rules can be unreachable. This is a warning, not a backend validation error.
-- Require an explicit review acknowledgement for a default drop policy or a
-  catch-all drop. Explain that this owns only the `inet netcontrol` forward chain,
-  not a full host firewall or the management listener's input policy.
+The primary policy view pivots around **hosts**, not interfaces. Host inventory:
+stable ID, unique display name, one or more explicit IPv4/IPv6 addresses, outbound
+default Accept/Drop, and ordered rules. Show hosts as independently editable
+devices; do not nest them under an interface. IP-based identity is not
+authenticated identity and does not track DHCP/MAC changes automatically.
 
-Do not alphabetically sort rules before sending. Do not add port, protocol,
-ingress/egress-interface, logging, or stateful-match controls.
+Rules: destination Any, another host by ID, or a canonical network; protocol Any,
+TCP, or UDP; optional explicit destination ports for TCP/UDP; Accept/Drop.
+Changing a host address updates all destination-host references in the package.
+Deletion must first remove or replace references; never silently broaden them.
+Offer add/edit/delete and keyboard-accessible reordering.
+
+A separate **Interface overrides** view configures ordered rules for an ingress
+interface (managed draft link or adopted parent). There is no interface default.
+Display the effective precedence prominently:
+
+1. Established/related traffic is accepted, including existing connections.
+2. First matching ingress-interface rule wins, overriding host policy.
+3. Otherwise evaluate the source host's ordered rules, then its default.
+4. Unknown source hosts use the global default.
+
+The destination host's own outbound policy is not evaluated. Interface allows
+override host drops as well as interface drops overriding host allows. Warn about
+interface catch-alls that shadow all host policies. Existing connections can
+survive a newly applied block until conntrack expires; no connection-flush action
+exists. This applies only to forwarded traffic, not management input or local
+device output. NAT remains separate.
+
+Include explicit **Legacy ordered rules** mode for existing configurations:
+source/destination prefixes or Any, Accept/Drop, and global default; stateless.
+It is selected by absent/null `firewall.policies`. New host/interface mode sends
+`policies` and an empty legacy `rules` list; never mix the models. Switching models
+must show the full difference and require acknowledgement, not silently translate
+or discard rules. Host-only, interface-only, and combined configurations are valid.
+
+Never sort rules before sending. Host inventory and port lists may be sorted.
+Require review acknowledgement for drop defaults and catch-all drops. Do not add
+egress matches, arbitrary protocol choices, port ranges, logging, or configurable
+conntrack controls: these are not implemented.
 
 ### 6.7 NAT masquerading
 
@@ -733,6 +764,13 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Policy table | 10000..19999; reuse across rules allowed |
 | Filter policy/action | Exactly `accept` or `drop` |
 | Filter prefixes | Optional canonical source/destination networks; same family when both supplied; both may be empty |
+| Host inventory | At most 128; unique ID `^[a-zA-Z0-9_-]{1,64}$`; unique nonblank name <=80 bytes, no outer whitespace/control characters |
+| Host addresses/default | 1..16 canonical unicast IPv4/IPv6 addresses, globally unique across hosts; no CIDR, mapped IPv6, zones, loopback or link-local; required accept/drop default |
+| Host/interface rules | At most 64 ordered rules per host/interface; Any or TCP/UDP; accept/drop |
+| Policy destination | Omitted = Any; existing `destination_host` ID or canonical `destination` network, mutually exclusive; host rule needs at least one compatible source/destination family |
+| Destination ports | Optional <=32 unique integers 1..65535; requires TCP/UDP |
+| Interface overrides | <=32 unique valid ingress names, managed in draft or operator-adopted; no interface default/final verdict for unmatched traffic |
+| Policy expansion | <=64 KiB serialized policy metadata and <=4096 generated forwarding rules, counting stateful and host defaults; backend authoritative |
 | Masquerade family | Exactly `ipv4` or `ipv6` |
 | Masquerade source | Optional canonical network matching explicit family |
 | Masquerade egress | Managed draft interface with at least one configured address of matching family |
@@ -806,6 +844,8 @@ Paths below are relative to `/api/v1`.
 | GET | `/routes` | Observed `Route[]` |
 | GET | `/policy-rules` | Observed `PolicyRule[]` |
 | GET | `/firewall/rules` | Entire observed `Firewall`, including policy and NAT |
+| GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
+| GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
 | GET | `/firewall/nat` | Observed `{ "masquerade": [...] }` |
 | GET | `/services/softflowd` | Observed `SoftflowdConfig[]` |
 | GET | `/services/softflowd/status` | `{ "instances": SoftflowdStatus[], "error": string }` |
@@ -926,6 +966,28 @@ interface Firewall {
   policy: "accept" | "drop";
   rules: Array<{ source?: string; destination?: string; action: "accept" | "drop" }>;
   nat: { masquerade: MasqueradeRule[] };
+  policies?: { hosts: FirewallHost[]; interfaces: InterfacePolicy[] } | null;
+}
+
+interface FirewallHost {
+  id: string;
+  name: string;
+  addresses: string[];
+  policy: "accept" | "drop";
+  rules: HostPolicyRule[];
+}
+
+interface InterfacePolicy {
+  interface: string;
+  rules: HostPolicyRule[];
+}
+
+interface HostPolicyRule {
+  destination_host?: string;
+  destination?: string;
+  protocol?: "tcp" | "udp";
+  destination_ports?: number[];
+  action: "accept" | "drop";
 }
 
 interface MasqueradeRule {
@@ -1255,6 +1317,10 @@ networking or real softflowd delivery.
 | A16 | Browser clock skew/background throttling | Absolute deadline shown; fresh server state determines outcome |
 | A17 | Permission denied on submit/confirm/rollback | `403` explicit; draft/transaction retained; authorized recovery guidance |
 | A18 | Firewall/NAT reorder | Wire payload preserves exact order; diff displays moves |
+| A18-host | Host policy and interface override | Interface first-match verdict overrides host; unmatched interface rules fall back to source-host rules/default; destination host's outbound default is ignored |
+| A18-state | Stateful policy update | Established/related return traffic remains allowed after applying a new block; UI warns that existing sessions are not terminated |
+| A18-address | Host address edit and references | Stable host-ID references follow updated IPv4/IPv6 addresses; duplicate addresses and dangling references are rejected; history/restore retain inventory |
+| A18-legacy | Firewall model switch | Absent/null policies preserve stateless legacy behavior; nonempty legacy rules cannot mix with host/interface policies |
 | A19 | Address versus network input | Host address `/24` retained; non-network selector rejected with suggested correction |
 | A20 | IPv6 and numeric endpoints | Canonicalization, brackets, zones, mapped addresses and family checks exercised |
 | A21 | VLAN cycles/duplicate identity/MTU mismatch | Linked local errors; invalid package not submitted |

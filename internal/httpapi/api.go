@@ -215,7 +215,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.encode(w, t)
 			return
 		}
-		known := []string{"/api/v1/state", "/api/v1/interfaces", "/api/v1/vlans", "/api/v1/services/softflowd", "/api/v1/routes", "/api/v1/policy-rules", "/api/v1/firewall/rules", "/api/v1/firewall/nat", "/api/v1/wireguard"}
+		known := []string{"/api/v1/state", "/api/v1/interfaces", "/api/v1/vlans", "/api/v1/services/softflowd", "/api/v1/routes", "/api/v1/policy-rules", "/api/v1/firewall/rules", "/api/v1/firewall/hosts", "/api/v1/firewall/interface-policies", "/api/v1/firewall/nat", "/api/v1/wireguard"}
 		isInterface := strings.HasPrefix(r.URL.Path, "/api/v1/interfaces/")
 		if !slices.Contains(known, r.URL.Path) && !isInterface {
 			fail(http.StatusNotFound, fmt.Errorf("endpoint not found"), nil)
@@ -247,6 +247,18 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.encode(w, view.Observed.Rules)
 		case "/api/v1/firewall/rules":
 			a.encode(w, view.Observed.Firewall)
+		case "/api/v1/firewall/hosts":
+			hosts := []control.FirewallHost{}
+			if view.Observed.Firewall.Policies != nil {
+				hosts = view.Observed.Firewall.Policies.Hosts
+			}
+			a.encode(w, hosts)
+		case "/api/v1/firewall/interface-policies":
+			policies := []control.InterfacePolicy{}
+			if view.Observed.Firewall.Policies != nil {
+				policies = view.Observed.Firewall.Policies.Interfaces
+			}
+			a.encode(w, policies)
 		case "/api/v1/firewall/nat":
 			a.encode(w, view.Observed.Firewall.NAT)
 		case "/api/v1/wireguard":
