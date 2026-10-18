@@ -1,3 +1,4 @@
+*.go text eol=lf
 *.sh text eol=lf
 *.initd text eol=lf
 *.confd text eol=lf

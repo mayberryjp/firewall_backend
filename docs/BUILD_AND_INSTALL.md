@@ -41,6 +41,12 @@ Actions are pinned to commit IDs with read-only repository permissions.
 Checkout credentials are not persisted. Both check jobs gate artifact creation;
 dependency, test, kernel, signing, or smoke failures fail the build.
 
+Go source files are checked out with LF line endings through
+[Git attributes](../.gitattributes), including on Windows, so checkout conversion
+does not produce false `gofmt` failures. Native discovery tests must remove
+externally created interface fixtures before configuration transactions: extra
+interfaces in the owned namespace are still configuration drift.
+
 ### Version and trust policy
 
 `0_git<TIMESTAMP>-r0` is an APK **development identifier**, using the source

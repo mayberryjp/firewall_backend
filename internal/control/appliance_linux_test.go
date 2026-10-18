@@ -151,6 +151,35 @@ func TestLinuxApplianceVNStatAllInterfacesAndLifecycle(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	view, err := e.View(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !view.Drift {
+		t.Fatal("externally added interface did not cause managed namespace drift")
+	}
+	// Restore the owned namespace before testing configuration transactions.
+	if err := a.inNamespace(context.Background(), func() error {
+		h, err := netlink.NewHandle()
+		if err != nil {
+			return err
+		}
+		defer h.Close()
+		link, err := h.LinkByName("discovered0")
+		if err != nil {
+			return err
+		}
+		return h.LinkDel(link)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	view, err = e.View(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Drift {
+		t.Fatal("managed namespace drift remained after removing the discovery fixture")
+	}
 	// Generate real loopback traffic in each namespace without touching host routes.
 	sendTraffic := func() error {
 		server, err := net.ListenPacket("udp4", "127.0.0.1:0")

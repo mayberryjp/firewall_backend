@@ -57,6 +57,10 @@
 
 ### Fixed
 
+- Windows CI preserves LF Go source line endings for formatting checks.
+  The native vnStat lifecycle test removes its externally created discovery
+  interface before transactions, preserving managed-namespace drift protection.
+
 - DHCP relay reconciliation runs independently of the softflowd instance loop;
   relay-only native updates no longer skip service reconciliation.
 
