@@ -170,6 +170,72 @@ new one. Do not delete existing journals or credentials to force startup. A
 native boot-time deployment needs an explicitly designed provisioning/recovery
 process; this is not implemented by the APK or OpenRC unit.
 
+### Optional appliance NTP, syslog, and vnStat
+
+These explicitly extend ownership beyond the managed namespace: NTP adjusts
+the real appliance clock, syslog-ng owns the whole system logger, and vnstatd
+tracks host and managed-namespace interfaces in separate databases.
+NTP/syslog outbound traffic uses host networking, DNS and routes.
+
+```sh
+apk add chrony syslog-ng vnstat ca-certificates
+```
+
+Before enabling, explicitly stop competing clock/logging OpenRC services and
+prevent them from starting independently at boot. Do not automatically stop
+unknown host services. Verify `/dev/log` ownership; existing/stale sockets or
+symlinks require explicit operator resolution, not automatic takeover.
+
+Append to existing native arguments in `/etc/conf.d/netcontrold`:
+
+```sh
+netcontrold_args="$netcontrold_args -allow-host-services \
+  -ntp-binary /usr/sbin/chronyd -syslog-binary /usr/sbin/syslog-ng \
+  -vnstatd-binary /usr/sbin/vnstatd -vnstat-binary /usr/bin/vnstat"
+```
+
+Restart, then stage service settings through complete API transactions. Keep
+the OpenRC backend log redirection to `/var/log/netcontrold.log`, which syslog-ng
+tails alongside system/kernel logs. Other launchers must arrange their own
+regular backend log source with `-backend-log-file`.
+
+One exclusive host-service owner is allowed. Root needs namespace privileges,
+`CAP_SYS_TIME` for NTP and `CAP_SYSLOG` for system/kernel logging. Container
+clock privileges can affect the real host. No NTP serving, stepping, NTS, remote
+delivery guarantee, or automatic firewall/network provisioning is provided.
+Disabling managed syslog stops the whole logger; provision an alternative
+before relying on local logging after disabling/rollback.
+
+Default private root-owned mode-0700 directories are `/run/netcontrol-services`
+and persistent `/var/lib/netcontrol/services`; they must be separate.
+vnStat databases are never automatically deleted. Runtime reports their active
+paths. Managed scope changes create a different database; existing native
+namespace/journal reboot limits still apply.
+See the [full contract and recovery cautions](../README.md#appliance-time-remote-logging-and-vnstat)
+and [complete synthetic example](../examples/appliance-services.json).
+
+### Optional native gateway monitoring
+
+Native IPv4/IPv6 ICMP monitoring needs no dpinger package or additional daemon.
+After configuring native namespace/journal arguments above, append in
+`/etc/conf.d/netcontrold`:
+
+```sh
+netcontrold_args="$netcontrold_args -gateway-monitoring"
+```
+
+Restart the service, then submit monitors with their explicit source/interface,
+route, next hop, and source-policy rule. The root OpenRC service needs
+`CAP_NET_RAW` plus its existing namespace/network administration privileges;
+restricted/container deployments must supply those capabilities explicitly.
+No route, firewall permission, or automatic failover is installed by monitoring.
+Verify ICMP/ICMPv6 return paths yourself. Simulator mode never sends probes.
+
+See the [configuration, metrics, and native test instructions](../README.md#native-gateway-monitoring)
+and [dual-stack example](../examples/gateway-monitoring.json).
+Monitor settings persist, while in-memory metrics reset after restart.
+The namespace/reboot limitations above still apply.
+
 ### Optional DHCP relay
 
 Install only if needed; neither the daemon nor the APK requires dnsmasq for

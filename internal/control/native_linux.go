@@ -25,14 +25,17 @@ import (
 const ownedProtocol = 242
 
 type linuxAdapter struct {
-	namespace        netns.NsHandle
-	scope            string
-	keys             string
-	parents          map[string]ParentInterface
-	flows            *softflowdManager
-	relay            *dhcpRelayManager
-	hostNamespace    netns.NsHandle
-	hostTunablesLock *flock.Flock
+	appliance              *applianceManager
+	gateways               *gatewayManager
+	allowGatewayMonitoring bool
+	namespace              netns.NsHandle
+	scope                  string
+	keys                   string
+	parents                map[string]ParentInterface
+	flows                  *softflowdManager
+	relay                  *dhcpRelayManager
+	hostNamespace          netns.NsHandle
+	hostTunablesLock       *flock.Flock
 }
 
 func NewLinuxAdapter(namespace, keyDirectory string, options ...LinuxOptions) (Adapter, error) {
@@ -61,6 +64,8 @@ func NewLinuxAdapter(namespace, keyDirectory string, options ...LinuxOptions) (A
 		return nil, err
 	}
 	a := &linuxAdapter{namespace: handle, keys: keyDirectory, parents: map[string]ParentInterface{}, scope: fmt.Sprintf("linux:%s:%d:%d", strings.TrimSpace(string(boot)), stat.Dev, stat.Ino)}
+	a.gateways = newGatewayManager(openNativeGatewaySession, option.Logger)
+	a.allowGatewayMonitoring = option.AllowGatewayMonitoring
 	if err := a.initializeParents(option.ParentInterfaces); err != nil {
 		handle.Close()
 		return nil, err
@@ -82,14 +87,26 @@ func NewLinuxAdapter(namespace, keyDirectory string, options ...LinuxOptions) (A
 			return nil, errors.Join(err, a.Close())
 		}
 	}
+	if option.NTPBinary != "" || option.SyslogBinary != "" || option.VNStatBinary != "" {
+		a.appliance, err = newApplianceManager(a, option)
+		if err != nil {
+			return nil, errors.Join(err, a.Close())
+		}
+	}
 	return a, nil
 }
 
 func (a *linuxAdapter) Scope() string { return a.scope }
 func (a *linuxAdapter) Close() error {
 	var err error
+	if a.appliance != nil {
+		err = a.appliance.Close()
+	}
+	if a.gateways != nil {
+		err = errors.Join(err, a.gateways.Close())
+	}
 	if a.flows != nil {
-		err = a.flows.Close()
+		err = errors.Join(err, a.flows.Close())
 	}
 	if a.relay != nil {
 		err = errors.Join(err, a.relay.Close())
@@ -185,6 +202,9 @@ func (a *linuxAdapter) privateKey(ref string) (wgtypes.Key, error) {
 }
 
 func (a *linuxAdapter) Preflight(ctx context.Context, c Config) error {
+	if err := a.preflightAppliance(ctx, c); err != nil {
+		return err
+	}
 	var parents []string
 	for name := range a.parents {
 		parents = append(parents, name)
@@ -211,6 +231,9 @@ func (a *linuxAdapter) Preflight(ctx context.Context, c Config) error {
 		if err := a.preflightDHCPRelay(ctx, c.Interfaces); err != nil {
 			return err
 		}
+		if err := a.preflightGateways(c); err != nil {
+			return err
+		}
 		if a.flows != nil {
 			return a.flows.Preflight(ctx, c.Softflowd)
 		}
@@ -229,6 +252,8 @@ func (a *linuxAdapter) Preflight(ctx context.Context, c Config) error {
 
 func (a *linuxAdapter) Observe(ctx context.Context, hints Config) (Config, error) {
 	var observed Config
+	observed.NTP, observed.Syslog, observed.VNStat = Clone(hints.NTP), Clone(hints.Syslog), hints.VNStat
+	observed.GatewayMonitors = Clone(hints.GatewayMonitors)
 	// Roles are configuration metadata, not kernel link attributes.
 	metadata := make(map[string]Interface, len(hints.Interfaces))
 	for _, link := range hints.Interfaces {
@@ -481,6 +506,17 @@ func decodeOwnedRule(data []byte) (netlink.Rule, bool, error) {
 }
 
 func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
+	if err := a.preflightAppliance(ctx, target); err != nil {
+		return err
+	}
+	if a.appliance != nil {
+		if err := a.appliance.StopChanged(ctx, target); err != nil {
+			return err
+		}
+	}
+	if err := a.gateways.StopChanged(target); err != nil {
+		return err
+	}
 	if err := a.WriteKernel(ctx, target.Kernel); err != nil {
 		return err
 	}
@@ -494,6 +530,9 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 			return err
 		}
 		if err := a.preflightDHCPRelay(ctx, target.Interfaces); err != nil {
+			return err
+		}
+		if err := a.preflightGateways(target); err != nil {
 			return err
 		}
 		if a.relay != nil {
@@ -627,11 +666,18 @@ func (a *linuxAdapter) Reconcile(ctx context.Context, target Config) error {
 			if service.Enabled && a.flows == nil {
 				return fmt.Errorf("softflowd integration is unavailable")
 			}
-			if a.relay != nil {
-				return a.relay.Reconcile(ctx, target.Interfaces)
+		}
+		if a.relay != nil {
+			if err := a.relay.Reconcile(ctx, target.Interfaces); err != nil {
+				return err
 			}
 		}
-		return ctx.Err()
+		if a.appliance != nil {
+			if err := a.appliance.Reconcile(ctx, target); err != nil {
+				return err
+			}
+		}
+		return a.gateways.Reconcile(ctx, target)
 	})
 }
 

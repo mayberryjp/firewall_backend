@@ -146,10 +146,307 @@ drift; status remains accessible without successful full observation.
 `POST /api/v1/services/dhcp-relay/reconcile` takes no body and requires
 `state.read`, `transactions.write`, and `interfaces.write`. It repairs all managed
 services, so `softflowd.write` is also required if any softflowd instance is
-enabled. Conversely, softflowd's repair endpoint requires `interfaces.write`
+enabled, and `gateway_monitors.write` if any gateway monitor is enabled.
+Conversely, softflowd's repair endpoint requires `interfaces.write`
 when a DHCP relay is enabled. These checks use the current committed/pending
 configuration under the engine lock. Repair creates no revision and does not
 reapply links/routes/firewall. Do not automatically retry a repair.
+
+## Appliance time, remote logging, and vnStat
+
+Persistent `config.ntp`, `config.syslog`, and `config.vnstat` are available
+through the complete transaction workflow. All default to `enabled: false`.
+Disabling retains validated server lists. See the
+[complete example](examples/appliance-services.json); its synthetic addresses
+must be replaced, and a complete replacement also removes omitted networking.
+
+```json
+"ntp": {
+  "enabled": true,
+  "servers": ["ntp.example.invalid", "192.0.2.123"]
+},
+"syslog": {
+  "enabled": true,
+  "servers": [
+    {"host": "logs.example.invalid", "port": 6514, "transport": "tls"}
+  ]
+},
+"vnstat": {"enabled": true}
+```
+
+- **NTP:** supervised chronyd synchronizes the appliance-wide system clock using
+  **host networking**. Client only: no NTP server or network command listener.
+  Slew-only, including leap corrections: no `makestep`, boot clock step, or RTC
+  changes. A badly wrong clock may take significant time to converge. This does
+  not provide NTS authentication. Running does not prove synchronization.
+  Rollback restores server settings, **not elapsed time or previous clock state**.
+- **Syslog:** supervised syslog-ng owns the **whole system logger** in host
+  networking: local system/kernel/internal sources plus the backend log file,
+  local `/var/log/messages`, and fan-out to every configured remote destination.
+  UDP/TCP/TLS are supported; port is explicit, 1..65535. TLS verifies trust using
+  the operator CA bundle, with no insecure fallback. UDP/TCP are unencrypted;
+  UDP has no delivery acknowledgment. Running does not prove remote delivery.
+  Queues use syslog-ng defaults, not durable store-and-forward guarantees.
+  Backend JSON is preserved as message text, including its original level.
+- **vnStat:** one supervised vnstatd observes **all host interfaces**, another
+  observes **all managed-namespace interfaces**, including unmanaged links and
+  loopback. Databases are separate; same-named interfaces cannot mix across
+  scopes. Existing interfaces are explicitly inserted before startup; a bounded
+  inventory pass every 5 seconds covers new interfaces and pseudo-interfaces
+  vnstatd's built-in discovery excludes. A failed pass is logged and marks the
+  instance unhealthy; later successful passes recover it. New manually inserted
+  entries can take up to the 1-minute save/rescan interval to start collection.
+  Kernel counter polling/update is 5 seconds; database save interval is 1 minute.
+  Removed interface history is retained. Physical/VLAN/veth traffic can overlap:
+  do not sum interfaces/scopes into a device-wide total.
+
+NTP servers and syslog hosts accept canonical numeric unicast/loopback IPs or
+lowercase DNS labels (253 characters maximum; labels 1..63). No ports embedded
+in hosts, URI syntax, zones, mapped IPv6, trailing dot, quotes, or whitespace.
+Enabled NTP/syslog requires 1..8 unique servers; disabled permits 0..8 validated
+entries. Syslog uniqueness is `(transport, host, port)`; transport is explicitly
+`udp`, `tcp`, or `tls`, with no default port or transport. DNS resolution and
+outbound routes use the host's existing resolver/network, not the managed WAN.
+Syslog DNS destinations use syslog-ng's IPv4 default; use an IPv6 literal for
+IPv6 collectors (which explicitly selects IPv6 transport).
+No host networking, resolver settings, routes, or firewall exceptions are added.
+
+### Appliance service API and permissions
+
+For each `SERVICE` in `ntp`, `syslog`, `vnstat`:
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/api/v1/services/SERVICE` | Observed configured settings, not synchronization/delivery proof |
+| GET | `/api/v1/services/SERVICE/status` | `{instances, error}` |
+| POST | `/api/v1/services/SERVICE/reconcile` | Bodyless repair of all stored enabled services; `RuntimeState` |
+
+All reads require `state.read`. Changes require `transactions.write` and the
+corresponding `ntp.write`, `syslog.write`, or `vnstat.write`; confirmations,
+rollback, and historical restore authorize the same changed areas. Repair also
+requires `state.read` plus its endpoint's write permission, and **every enabled
+service's** write permission under the engine lock. This applies to existing
+DHCP/softflowd/gateway repair endpoints too. Repair never applies a draft,
+replays networking, creates a revision, or continuously restarts failed children.
+
+`/api/v1/runtime.appliance_services` contains four rows: `ntp`, `syslog`,
+`vnstat-host`, `vnstat-managed`. Each has `name`, `scope` (`host`/`managed`),
+`state` (`disabled`, `simulated`, `unavailable`, `not_running`, `running`,
+`unhealthy`, `exited`), optional `pid`, `started_at`, `database_directory` for
+vnStat, and `error`. Named status endpoints filter these rows (two for vnStat).
+Per-row failures can be HTTP 200; display errors and the runtime's top-level
+error. Native namespace/PID/socket/database readiness is checked, not NTP sync
+or collector receipt. Configuration metadata is not rewritten from failed
+process state; failures do not by themselves create configuration drift.
+The simulator retains settings but never launches daemons, changes time, or
+produces real vnStat history.
+
+### Host-service ownership and installation
+
+This is an explicit exception to namespace-only management, not general host
+administration. Only one netcontrold host-service owner is allowed: a fixed
+exclusive host lock protects all three integrations. Start Linux mode with:
+
+```sh
+-allow-host-services \
+-ntp-binary /usr/sbin/chronyd \
+-syslog-binary /usr/sbin/syslog-ng \
+-vnstatd-binary /usr/sbin/vnstatd -vnstat-binary /usr/bin/vnstat
+```
+
+Install optional Alpine packages `chrony syslog-ng vnstat ca-certificates`.
+Do not run their independent OpenRC services against these owned processes.
+**Before enabling:** explicitly stop competing time clients and system loggers;
+netcontrold will not stop/adopt arbitrary host processes or overwrite their
+configuration. Existing `/dev/log`, including stale sockets/symlinks, blocks
+takeover unless it belongs to the currently supervised logger. Resolve it
+explicitly after verifying the old logger has stopped. A crash with an
+unverified stale socket/ownership marker may require operator cleanup; never
+remove a socket or PID marker without checking ownership/liveness.
+
+Root and existing namespace privileges are required, plus `CAP_SYS_TIME` for
+NTP and `CAP_SYSLOG` for whole-system/kernel logging. Containers do **not**
+isolate the real-time clock; granting clock privileges can affect the host.
+Binaries must be trusted root-owned non-set-ID executables without file
+capabilities/group-other writability, as with existing managed daemons.
+Runtime/state paths must be separate clean absolute root-owned mode-0700
+directories (no whitespace/quoting); defaults:
+`/run/netcontrol-services`, `/var/lib/netcontrol/services`.
+Never put persistent state under `/run`.
+
+The existing OpenRC unit redirects backend stderr to `/var/log/netcontrold.log`.
+For other launch methods, arrange a root-owned regular log file and configure
+`-backend-log-file`; otherwise enabling syslog fails explicitly. Set
+`-syslog-ca-file` for a different trusted CA bundle (default `/etc/ssl/cert.pem`).
+Existing local logs, rotation, disk capacity, credential privacy, and remote
+retention remain operator responsibilities. Changes restart affected daemons.
+**Disabling managed syslog stops the whole managed logger**, not just forwarding;
+arrange an alternative logger if local logging must continue.
+
+Graceful shutdown stops/joins owned children and inventory workers and preserves
+vnStat databases; forced termination logs possible unsaved-data loss. Host
+history survives restart. Managed history is bound to boot/namespace identity:
+a different namespace gets a separate database, not reused history; old
+databases are never automatically deleted. Existing native journal/reboot
+limitations still apply. Status reports each active database directory; read it
+with `vnstat --dbdir DIRECTORY --json`. No vnStat history HTTP endpoint is added.
+
+CI adds dual-scope vnStat lifecycle/discovery/traffic tests and inert Alpine
+configuration syntax checks for all three daemons. The syntax checks do not
+set the host clock or take over the host logger. Actual clock discipline,
+whole-appliance capture, and remote UDP/TCP/TLS delivery require an explicitly
+prepared disposable appliance and are not inferred from simulation or builds.
+
+## Native gateway monitoring
+
+Netcontrol can continuously probe IPv4/IPv6 gateways or upstream targets using
+native ICMP, without dpinger or another daemon. This provides **monitoring only**:
+health never changes routes, policy rules, NAT, or firewall settings.
+See the [complete dual-stack example](examples/gateway-monitoring.json).
+
+Add `gateway_monitors` to the complete transaction's `config`:
+
+```json
+"gateway_monitors": [
+  {
+    "name": "wan1",
+    "enabled": true,
+    "interface": "wan0",
+    "source_address": "192.0.2.2",
+    "gateway": "192.0.2.1",
+    "target": "198.51.100.10",
+    "routing_table": 10000
+  }
+]
+```
+
+This is a fragment, not a standalone request. Gateway monitors default to an
+empty list. Names are unique, case-sensitive `[a-zA-Z0-9_-]` identifiers of
+1..32 characters; at most 64 monitors are allowed. Disabled monitors retain
+validated addresses/timing settings but do not require a live interface or
+matching routes/rules.
+
+Enabled monitors require an up managed interface, its explicit source address,
+a matching configured route in table 10000..19999, and a source-policy rule into
+that table. Source/gateway/target are canonical numeric addresses of one family;
+hostnames, zones, mapped IPv6, loopback, multicast, and unspecified addresses are
+rejected. The source must be a configured global-unicast address (including
+private/ULA); it cannot equal the gateway or target. IPv6 link-local gateways/
+targets are allowed and scoped by the configured interface, not an input `%zone`.
+An on-link route without a gateway is valid when the target is the gateway.
+
+The gateway selects the intended next hop; the target chooses what is tested.
+Pinging a gateway tests next-hop reachability, not general Internet access.
+An upstream target requires the corresponding explicit route through the
+gateway and a valid return path. No route or firewall exception is inserted
+automatically, and WAN/LAN roles do not select monitor behavior.
+
+### Probe settings and health
+
+All timing/threshold fields below are integers. Omission or zero selects the
+listed default, except `rtt_variation_threshold_ms`, where zero disables that
+threshold:
+
+| Field | Default | Bounds |
+|---|---:|---|
+| `probe_interval_ms` | 1000 | 100..60000 |
+| `loss_timeout_ms` | 2000 | 100..60000, at most 10 probe intervals |
+| `window_ms` | 30000 | 1000..300000, at least 2 timeouts and 3 intervals, at most 1024 intervals |
+| `latency_threshold_ms` | 150 | 1..60000 |
+| `loss_threshold_percent` | 20 | 1..100 |
+| `rtt_variation_threshold_ms` | 0 | 0..60000 |
+| `failure_hold_ms` | 3000 | 100..60000 |
+| `recovery_hold_ms` | 5000 | 100..60000 |
+
+Measurements warm up for a full window. Health remains `unknown` until a
+candidate classification persists for its hold: 100% completed-probe loss is
+`down`; threshold-level loss, mean RTT, or enabled RTT variation is `degraded`;
+otherwise it is `up`. Worsening uses the failure hold; improving uses the
+recovery hold. Initial `up` uses recovery hold, initial failures use failure hold.
+The rolling window also affects detection/recovery time; a 5-second recovery
+hold does not mean recovery necessarily takes only 5 seconds.
+
+### Measurements and JSON APIs
+
+- `GET /api/v1/gateway-monitors`: observed configuration metadata.
+- `GET /api/v1/statistics/gateways`: `{sample, monitors}` from cached samples.
+- `GET /api/v1/statistics/gateways/{name}`: `{sample, monitor}`; unknown name 404.
+- `GET /api/v1/services/gateway-monitoring/status`: `{monitors, error}`.
+- `/api/v1/runtime` adds `gateway_monitors`.
+- Combined `/api/v1/statistics` adds `gateways` when nonempty.
+- `POST /api/v1/services/gateway-monitoring/reconcile`: repair stored services,
+  returning runtime state, without a revision or network replay.
+
+Reads require `state.read`; configuration changes/confirmation/rollback require
+`transactions.write` plus `gateway_monitors.write` and any other changed-area
+permissions. Repair requires read/transaction/monitor-write permissions and
+permissions for every enabled softflowd/DHCP relay service. Existing service
+repair endpoints now likewise require `gateway_monitors.write` when monitors
+are enabled. Authorization uses stored committed/pending settings under lock.
+Statistics reads accept no query parameters and perform no probe/socket I/O.
+
+Each monitor reports `process_state` (the in-process worker, not a child PID),
+`sample_status`, `health`, nullable timestamps `started_at`, `collected_at`,
+`health_changed_at`, `last_success_at`, window counts `sent`, `received`, `lost`,
+`pending`, `variation_pairs`, and nullable numeric measurements:
+
+- `loss_percent`: lost / (received + lost) * 100; pending probes are excluded.
+- `rtt_min_ms`, `rtt_max_ms`, `rtt_avg_ms`, `rtt_stddev_ms`: population deviation.
+- `rtt_p50_ms`, `rtt_p95_ms`: nearest-rank percentiles of successful probes.
+- `rtt_variation_ms`: mean absolute RTT difference between consecutive
+  transmitted probes that both succeeded. Never bridge a lost/pending probe.
+
+**RTT variation is not one-way or RTP jitter.** Loss is not a zero-RTT sample.
+Duplicate, foreign-session, malformed, and late replies do not improve metrics.
+Fewer than two adjacent successful probes means null variation; no completed
+probes means null loss; no successes means null RTTs. Genuine measured zero is
+preserved. Window counts and measurements use JSON numbers, unlike kernel
+uint64 counters. Last success is since worker start, even outside the window.
+
+Render worker `disabled`, `simulated`, `not_running`, `running`, or `exited`
+separately from sample `disabled`, `simulated`, `warming_up`, `available`, `stale`,
+or `unavailable`, and health `unknown`, `up`, `degraded`, or `down`.
+Individual failures remain HTTP 200 with explicit per-monitor errors; do not
+plot stale/unavailable values as current. Per-monitor `collected_at` describes
+cached measurement time, whereas the envelope timestamps describe retrieval.
+
+### Native setup and lifecycle
+
+Enable the operator `-gateway-monitoring` flag with `-backend linux`.
+The process needs raw-socket privileges (`CAP_NET_RAW`) in addition to its normal
+namespace/kernel privileges. No new package dependency is required on Alpine.
+The simulator stores settings but reports simulated/unknown with null metrics,
+never actual reachability. It sends no packets.
+
+Sockets bind to the configured source and interface in the managed namespace.
+Before starting and before every send, effective kernel routing is checked
+against the expected interface, table, and next hop. A mismatched path exits
+the worker with unavailable/unknown data instead of probing another WAN.
+Interface binding prevents cross-interface fallback; external route mutations
+are not atomic with checks/sends and remain unsupported configuration drift.
+Local socket/path failures are not interpreted as 100% remote packet loss.
+Verify ICMP/ICMPv6 access and return routes through other firewalls yourself.
+
+Settings persist across transactions, revision restore, rollback, and restart;
+measurements do not. Affected workers stop before networking edits and restart
+afterward. Network/interface/firewall/kernel changes reset all monitor windows;
+monitor-only changes reset affected windows; unrelated softflowd edits preserve
+them. Service repair restarts failed workers without changing routes.
+Gateway health and worker failures do not rewrite desired settings or create
+configuration drift by themselves; inspect runtime errors separately.
+No automatic failover, Prometheus endpoint, or persistent metrics history is
+implemented.
+
+Native validation on a privileged Linux test host:
+
+```sh
+sudo env NETCONTROL_INTEGRATION=1 go test ./internal/control \
+  -run '^TestLinuxGatewayMonitoring' -count=1 -v
+```
+
+The isolated dual-stack test covers replies, metrics, policy-path failure,
+explicit repair, loss/recovery, pending restart, and rollback. The existing
+native CI job includes these tests; local cross-compilation is not execution.
 
 ## Frontend developer handoff
 
@@ -238,6 +535,8 @@ not cancel apply/recovery.
 | WireGuard | Private-key references, stable listen ports, peers, numeric endpoints, allowed IPs and keepalive |
 | softflowd | Typed foreground instances: enable/disable, capture interface/filter, numeric collector, NetFlow/IPFIX version, sampling, max flows, snaplen, promiscuity, and timeouts |
 | DHCPv4 relay | Per-interface enable/server list; supervised relay-only dnsmasq on up dummy/VLAN links; runtime inspection and repair |
+| Gateway monitoring | Native IPv4/IPv6 ICMP, explicit source/interface/next-hop/table, cached loss/RTT/RTT variation and health; no failover |
+| Appliance services | Explicit host-clock/client NTP, whole-system remote syslog, and all-interface host/managed vnStat supervision; host-wide operator opt-in |
 | Kernel TCP/IP tuning | Allowlisted, validated namespace tunables, plus separately opted-in host-global network tunables; original-value capture, drift checks and transaction recovery |
 
 The Linux backend requires an **explicit, pre-created, initially empty network
@@ -377,6 +676,10 @@ client, and place its lowercase SHA-256 hash in a private `auth.json`:
       "nat.write",
       "wireguard.write",
       "softflowd.write",
+      "gateway_monitors.write",
+      "ntp.write",
+      "syslog.write",
+      "vnstat.write",
       "kernel.namespace.write",
       "kernel.host.write"
     ]
@@ -606,8 +909,9 @@ POST /api/v1/services/softflowd/reconcile
 ```
 
 This bodyless action requires `state.read`, `transactions.write`, and
-`softflowd.write`, plus `interfaces.write` when a DHCP relay is enabled because
-it repairs all managed services. It uses the server's current committed/pending configuration,
+`softflowd.write`, plus `interfaces.write` when a DHCP relay is enabled and
+`gateway_monitors.write` when a gateway monitor is enabled because it repairs
+all managed services. It uses the server's current committed/pending configuration,
 repairs only managed service processes, never replays networking or accepts new
 configuration, and does not create a configuration revision. Unresolved
 transaction recovery blocks it. `/api/v1/runtime` and the status endpoint expose
@@ -807,7 +1111,10 @@ GET /api/v1/statistics/interfaces/wan
 GET /api/v1/statistics/protocols
 ```
 
-The combined response has `sample`, `interfaces`, and `protocols`. The interfaces
+The combined response has `sample`, `interfaces`, and `protocols`, plus optional
+cached `gateways` when monitors exist. See [Native gateway monitoring](#native-gateway-monitoring)
+for its dedicated endpoints, numeric metrics, and separate availability states.
+The interfaces
 and protocols endpoints return `sample` plus their respective array; a named
 interface returns `sample` and one `interface` object. Empty lists are `[]`.
 There are no query parameters, counter-reset operations, or statistics writes.
@@ -904,6 +1211,11 @@ Every request requires `Authorization: Bearer <token>`.
 | GET | `/api/v1/statistics/interfaces` | All namespace links, metadata and counters |
 | GET | `/api/v1/statistics/interfaces/{name}` | One namespace link's metadata and counters |
 | GET | `/api/v1/statistics/protocols` | Namespace IP/TCP/UDP/ICMP and extended kernel statistics |
+| GET | `/api/v1/gateway-monitors` | Observed gateway monitor configuration metadata |
+| GET | `/api/v1/statistics/gateways` | `{sample, monitors}` cached gateway measurements |
+| GET | `/api/v1/statistics/gateways/{name}` | `{sample, monitor}` cached measurements for one monitor |
+| GET | `/api/v1/services/gateway-monitoring/status` | `{monitors, error}` native worker/sample/health status |
+| POST | `/api/v1/services/gateway-monitoring/reconcile` | Repair all managed services using stored configuration; no body |
 | GET | `/api/v1/routes` | Observed owned routes |
 | GET | `/api/v1/policy-rules` | Observed owned source-policy rules |
 | GET | `/api/v1/firewall/rules` | Entire observed firewall: global policy, legacy rules or host/interface policies, and NAT |

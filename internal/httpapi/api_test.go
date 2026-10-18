@@ -43,6 +43,10 @@ func fixture(t *testing.T) (http.Handler, *control.Engine) {
 		{Name: "nat", TokenSHA256: hash("nat-test-token"), Permissions: []string{"state.read", "transactions.write", "nat.write"}},
 		{Name: "softflowd", TokenSHA256: hash("softflowd-test-token"), Permissions: []string{"state.read", "transactions.write", "softflowd.write"}},
 		{Name: "interfaces", TokenSHA256: hash("interfaces-test-token"), Permissions: []string{"state.read", "transactions.write", "interfaces.write"}},
+		{Name: "gateways", TokenSHA256: hash("gateways-test-token"), Permissions: []string{"state.read", "transactions.write", "gateway_monitors.write"}},
+		{Name: "ntp", TokenSHA256: hash("ntp-test-token"), Permissions: []string{"state.read", "transactions.write", "ntp.write"}},
+		{Name: "syslog", TokenSHA256: hash("syslog-test-token"), Permissions: []string{"state.read", "transactions.write", "syslog.write"}},
+		{Name: "vnstat", TokenSHA256: hash("vnstat-test-token"), Permissions: []string{"state.read", "transactions.write", "vnstat.write"}},
 		{Name: "kernel-namespace", TokenSHA256: hash("kernel-namespace-test-token"), Permissions: []string{"state.read", "transactions.write", "kernel.namespace.write"}},
 		{Name: "kernel-host", TokenSHA256: hash("kernel-host-test-token"), Permissions: []string{"state.read", "transactions.write", "kernel.host.write"}},
 	}, log)

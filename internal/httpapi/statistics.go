@@ -26,7 +26,17 @@ func statisticsQuery(r *http.Request) (control.StatisticsQuery, error) {
 		return control.StatisticsQuery{Section: control.StatisticsInterfaces}, nil
 	case "/api/v1/statistics/protocols":
 		return control.StatisticsQuery{Section: control.StatisticsProtocols}, nil
+	case "/api/v1/statistics/gateways":
+		return control.StatisticsQuery{Section: control.StatisticsGateways}, nil
 	default:
+		if strings.HasPrefix(r.URL.Path, "/api/v1/statistics/gateways/") {
+			name := strings.TrimPrefix(r.URL.Path, "/api/v1/statistics/gateways/")
+			if name == "" || strings.Contains(name, "/") {
+				return control.StatisticsQuery{}, errStatisticsEndpointNotFound
+			}
+			query := control.StatisticsQuery{Section: control.StatisticsGateways, Monitor: name}
+			return query, query.Validate()
+		}
 		prefix := "/api/v1/statistics/interfaces/"
 		if !strings.HasPrefix(r.URL.Path, prefix) {
 			return control.StatisticsQuery{}, errStatisticsEndpointNotFound

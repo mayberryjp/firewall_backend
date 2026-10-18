@@ -13,24 +13,11 @@ import (
 )
 
 func daemonOwnsUDPPort(pid, port int) error {
-	root := filepath.Join("/proc", strconv.Itoa(pid))
-	fds, err := os.ReadDir(filepath.Join(root, "fd"))
+	inodes, err := daemonSocketInodes(pid)
 	if err != nil {
-		return fmt.Errorf("inspect daemon descriptors: %w", err)
+		return err
 	}
-	inodes := map[string]bool{}
-	for _, fd := range fds {
-		target, err := os.Readlink(filepath.Join(root, "fd", fd.Name()))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("inspect daemon socket ownership: %w", err)
-		}
-		if strings.HasPrefix(target, "socket:[") && strings.HasSuffix(target, "]") {
-			inodes[strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")] = true
-		}
-	}
+	root := filepath.Join("/proc", strconv.Itoa(pid))
 	data, err := os.ReadFile(filepath.Join(root, "net", "udp"))
 	if err != nil {
 		return err
@@ -50,6 +37,46 @@ func daemonOwnsUDPPort(pid, port int) error {
 		}
 	}
 	return fmt.Errorf("daemon does not own an IPv4 UDP socket on port %d", port)
+}
+
+func daemonSocketInodes(pid int) (map[string]bool, error) {
+	root := filepath.Join("/proc", strconv.Itoa(pid))
+	fds, err := os.ReadDir(filepath.Join(root, "fd"))
+	if err != nil {
+		return nil, fmt.Errorf("inspect daemon descriptors: %w", err)
+	}
+	inodes := map[string]bool{}
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join(root, "fd", fd.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect daemon socket ownership: %w", err)
+		}
+		if strings.HasPrefix(target, "socket:[") && strings.HasSuffix(target, "]") {
+			inodes[strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")] = true
+		}
+	}
+	return inodes, nil
+}
+
+func daemonOwnsUnixSocket(pid int, path string) error {
+	inodes, err := daemonSocketInodes(pid)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "net", "unix"))
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 8 && fields[7] == path && inodes[fields[6]] {
+			return nil
+		}
+	}
+	return fmt.Errorf("daemon does not own Unix socket %s", path)
 }
 
 func validateDaemonBinary(path, service string) (string, error) {

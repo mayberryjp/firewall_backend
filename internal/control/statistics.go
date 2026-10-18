@@ -12,6 +12,7 @@ import (
 )
 
 var ErrStatisticsInterfaceNotFound = errors.New("statistics interface not found")
+var ErrGatewayMonitorNotFound = errors.New("gateway monitor not found")
 
 type StatisticsSection string
 
@@ -19,19 +20,24 @@ const (
 	StatisticsAll        StatisticsSection = "all"
 	StatisticsInterfaces StatisticsSection = "interfaces"
 	StatisticsProtocols  StatisticsSection = "protocols"
+	StatisticsGateways   StatisticsSection = "gateways"
 )
 
 type StatisticsQuery struct {
 	Section   StatisticsSection
 	Interface string
+	Monitor   string
 }
 
 func (q StatisticsQuery) Validate() error {
-	if q.Section != StatisticsAll && q.Section != StatisticsInterfaces && q.Section != StatisticsProtocols {
+	if q.Section != StatisticsAll && q.Section != StatisticsInterfaces && q.Section != StatisticsProtocols && q.Section != StatisticsGateways {
 		return fmt.Errorf("%w: unknown statistics section", ErrValidation)
 	}
 	if q.Interface != "" && (q.Section != StatisticsInterfaces || !validStatisticsName(q.Interface)) {
 		return fmt.Errorf("%w: invalid statistics interface", ErrValidation)
+	}
+	if q.Monitor != "" && (q.Section != StatisticsGateways || !serviceNamePattern.MatchString(q.Monitor)) {
+		return fmt.Errorf("%w: invalid statistics monitor", ErrValidation)
 	}
 	return nil
 }
@@ -48,9 +54,10 @@ type StatisticsSample struct {
 }
 
 type NetworkStatistics struct {
-	Sample     StatisticsSample      `json:"sample"`
-	Interfaces []InterfaceStatistics `json:"interfaces"`
-	Protocols  []ProtocolStatistics  `json:"protocols"`
+	Gateways   []GatewayMonitorStatistics `json:"gateways,omitempty"`
+	Sample     StatisticsSample           `json:"sample"`
+	Interfaces []InterfaceStatistics      `json:"interfaces"`
+	Protocols  []ProtocolStatistics       `json:"protocols"`
 }
 
 type InterfaceStatistics struct {
@@ -107,6 +114,10 @@ type StatisticsAdapter interface {
 	Statistics(context.Context, StatisticsQuery, Config) (NetworkStatistics, error)
 }
 
+type GatewayStatisticsAdapter interface {
+	GatewayStatistics(context.Context, Config) ([]GatewayMonitorStatistics, error)
+}
+
 func newNetworkStatistics(scope string) NetworkStatistics {
 	return NetworkStatistics{Sample: StatisticsSample{Scope: scope, StartedAt: time.Now().UTC(), Status: "available"},
 		Interfaces: []InterfaceStatistics{}, Protocols: []ProtocolStatistics{}}
@@ -115,6 +126,40 @@ func newNetworkStatistics(scope string) NetworkStatistics {
 func (e *Engine) Statistics(ctx context.Context, query StatisticsQuery) (NetworkStatistics, error) {
 	if err := query.Validate(); err != nil {
 		return NetworkStatistics{}, err
+	}
+	if query.Section == StatisticsGateways {
+		e.mu.Lock()
+		expected, scope := Clone(e.runtimeConfig()), e.adapter.Scope()
+		adapter, ok := e.adapter.(GatewayStatisticsAdapter)
+		e.mu.Unlock()
+		if !ok {
+			return NetworkStatistics{}, fmt.Errorf("adapter does not expose gateway statistics")
+		}
+		gateways, err := adapter.GatewayStatistics(ctx, expected)
+		if err != nil {
+			return NetworkStatistics{}, err
+		}
+		result := newNetworkStatistics(scope)
+		if scope == "simulator" {
+			result.Sample.Status = "simulated"
+		}
+		result.Gateways = []GatewayMonitorStatistics{}
+		for _, gateway := range gateways {
+			if query.Monitor != "" && gateway.Name != query.Monitor {
+				continue
+			}
+			result.Gateways = append(result.Gateways, gateway)
+			if gateway.SampleStatus == "simulated" {
+				result.Sample.Status = "simulated"
+			} else if gateway.SampleStatus != "available" && gateway.SampleStatus != "disabled" {
+				result.Sample.Status = "partial"
+			}
+		}
+		if query.Monitor != "" && len(result.Gateways) == 0 {
+			return NetworkStatistics{}, ErrGatewayMonitorNotFound
+		}
+		result.Sample.CollectedAt = time.Now().UTC()
+		return Clone(result), ctx.Err()
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -143,6 +188,9 @@ func (s *Simulator) Statistics(ctx context.Context, query StatisticsQuery, _ Con
 	defer s.mu.Unlock()
 	result := newNetworkStatistics(s.Scope())
 	result.Sample.Status = "simulated"
+	if query.Section == StatisticsAll {
+		result.Gateways = inactiveGatewayStatistics(s.state.GatewayMonitors, "simulated")
+	}
 	if query.Section != StatisticsProtocols {
 		for _, link := range s.state.Interfaces {
 			if query.Interface != "" && link.Name != query.Interface {

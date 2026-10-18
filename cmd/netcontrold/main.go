@@ -31,6 +31,7 @@ func main() {
 
 func run(logger *slog.Logger) error {
 	backend := flag.String("backend", "simulator", "simulator or linux")
+	gatewayMonitoring := flag.Bool("gateway-monitoring", false, "allow native IPv4/IPv6 ICMP gateway monitoring in the managed namespace")
 	namespace := flag.String("namespace", "", "exclusive pre-created Linux network namespace")
 	stateFile := flag.String("state", "state.json", "durable journal path (local filesystem)")
 	keyDir := flag.String("keys", "", "directory of pre-provisioned private WireGuard key files")
@@ -44,6 +45,15 @@ func run(logger *slog.Logger) error {
 	relayUID := flag.Int("dhcp-relay-uid", -1, "non-root numeric UID of an existing account for the DHCP relay child")
 	relayGID := flag.Int("dhcp-relay-gid", -1, "non-root numeric GID of an existing group for the DHCP relay child")
 	hostTunables := flag.Bool("allow-host-tunables", false, "explicitly allow allowlisted host-global network sysctls; takes an exclusive host tuning lock")
+	hostServices := flag.Bool("allow-host-services", false, "explicitly allow appliance-wide clock/logging and host plus managed-namespace vnstat supervision; takes an exclusive host lock")
+	ntpBinary := flag.String("ntp-binary", "", "absolute operator-installed chronyd path (disabled when empty)")
+	syslogBinary := flag.String("syslog-binary", "", "absolute operator-installed syslog-ng path (disabled when empty)")
+	vnstatBinary := flag.String("vnstatd-binary", "", "absolute operator-installed vnstatd path (disabled when empty)")
+	vnstatClient := flag.String("vnstat-binary", "", "absolute vnstat CLI path, required with vnstatd for all-interface inventory including loopback")
+	servicesRuntime := flag.String("services-runtime-dir", "/run/netcontrol-services", "private root-owned appliance service runtime directory")
+	servicesState := flag.String("services-state-dir", "/var/lib/netcontrol/services", "private persistent root-owned service state directory")
+	backendLog := flag.String("backend-log-file", "/var/log/netcontrold.log", "regular file containing backend stderr for system syslog forwarding; arrange redirection before enabling")
+	syslogCA := flag.String("syslog-ca-file", "/etc/ssl/cert.pem", "operator-provisioned CA bundle for verified TLS syslog")
 	authFile := flag.String("auth-file", "", "JSON credential file containing token hashes and permissions")
 	credentialDB := flag.String("credential-db", "", "device credential database (default: <state>.credentials.db); mutually exclusive with -auth-file")
 	listen := flag.String("listen", "127.0.0.1:8080", "management listener outside the target namespace")
@@ -137,7 +147,12 @@ func run(logger *slog.Logger) error {
 			parentNames = strings.Split(*parents, ",")
 		}
 		adapter, err = control.NewLinuxAdapter(*namespace, *keyDir, control.LinuxOptions{
-			ParentInterfaces: parentNames, SoftflowdBinary: *flowBinary, RuntimeDirectory: *flowRuntime,
+			AllowHostServices: *hostServices, NTPBinary: *ntpBinary, SyslogBinary: *syslogBinary, VNStatBinary: *vnstatBinary,
+			VNStatClientBinary:       *vnstatClient,
+			ServicesRuntimeDirectory: *servicesRuntime, ServicesStateDirectory: *servicesState,
+			BackendLogFile: *backendLog, SyslogCAFile: *syslogCA,
+			AllowGatewayMonitoring: *gatewayMonitoring,
+			ParentInterfaces:       parentNames, SoftflowdBinary: *flowBinary, RuntimeDirectory: *flowRuntime,
 			SoftflowdUID: *flowUID, SoftflowdGID: *flowGID, Logger: logger,
 			AllowHostTunables: *hostTunables,
 			DHCPRelayBinary:   *relayBinary, DHCPRelayRuntimeDirectory: *relayRuntime,

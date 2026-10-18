@@ -25,7 +25,7 @@ type Credential struct {
 	Permissions []string `json:"permissions"`
 }
 
-var permissions = []string{"state.read", "transactions.write", "interfaces.write", "routes.write", "policy.write", "firewall.write", "nat.write", "wireguard.write", "softflowd.write", "kernel.namespace.write", "kernel.host.write"}
+var permissions = []string{"state.read", "transactions.write", "interfaces.write", "routes.write", "policy.write", "firewall.write", "nat.write", "wireguard.write", "softflowd.write", "gateway_monitors.write", "ntp.write", "syslog.write", "vnstat.write", "kernel.namespace.write", "kernel.host.write"}
 
 type API struct {
 	engine       *control.Engine
@@ -117,13 +117,21 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			snapshot, err := a.engine.Statistics(r.Context(), query)
 			if err != nil {
 				code := http.StatusServiceUnavailable
-				if errors.Is(err, control.ErrStatisticsInterfaceNotFound) {
+				if errors.Is(err, control.ErrStatisticsInterfaceNotFound) || errors.Is(err, control.ErrGatewayMonitorNotFound) {
 					code = http.StatusNotFound
 				}
 				fail(code, err, nil)
 				return
 			}
 			switch {
+			case query.Monitor != "":
+				if len(snapshot.Gateways) != 1 || snapshot.Gateways[0].Name != query.Monitor {
+					fail(http.StatusServiceUnavailable, fmt.Errorf("adapter returned an inconsistent gateway sample"), nil)
+					return
+				}
+				a.encode(w, map[string]any{"sample": snapshot.Sample, "monitor": snapshot.Gateways[0]})
+			case query.Section == control.StatisticsGateways:
+				a.encode(w, map[string]any{"sample": snapshot.Sample, "monitors": snapshot.Gateways})
 			case query.Interface != "":
 				if len(snapshot.Interfaces) != 1 || snapshot.Interfaces[0].Name != query.Interface {
 					fail(http.StatusServiceUnavailable, fmt.Errorf("adapter returned an inconsistent interface sample"), nil)
@@ -153,13 +161,25 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.URL.Path == "/api/v1/runtime" || r.URL.Path == "/api/v1/parent-interfaces" ||
-			r.URL.Path == "/api/v1/services/softflowd/status" || r.URL.Path == "/api/v1/services/dhcp-relay/status" {
+			r.URL.Path == "/api/v1/services/softflowd/status" || r.URL.Path == "/api/v1/services/dhcp-relay/status" ||
+			r.URL.Path == "/api/v1/services/gateway-monitoring/status" || applianceServicePath(r.URL.Path, "status") != "" {
 			runtime, err := a.engine.Runtime(r.Context())
 			if err != nil {
 				fail(http.StatusServiceUnavailable, err, nil)
 				return
 			}
 			switch r.URL.Path {
+			case "/api/v1/services/ntp/status", "/api/v1/services/syslog/status", "/api/v1/services/vnstat/status":
+				name := applianceServicePath(r.URL.Path, "status")
+				instances := []control.ApplianceServiceStatus{}
+				for _, instance := range runtime.Appliance {
+					if instance.Name == name || name == "vnstat" && strings.HasPrefix(instance.Name, "vnstat-") {
+						instances = append(instances, instance)
+					}
+				}
+				a.encode(w, map[string]any{"instances": instances, "error": runtime.Error})
+			case "/api/v1/services/gateway-monitoring/status":
+				a.encode(w, map[string]any{"monitors": runtime.Gateways, "error": runtime.Error})
 			case "/api/v1/parent-interfaces":
 				a.encode(w, runtime.Parents)
 			case "/api/v1/services/softflowd/status":
@@ -218,9 +238,9 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.encode(w, t)
 			return
 		}
-		known := []string{"/api/v1/state", "/api/v1/interfaces", "/api/v1/vlans", "/api/v1/services/softflowd", "/api/v1/routes", "/api/v1/policy-rules", "/api/v1/firewall/rules", "/api/v1/firewall/hosts", "/api/v1/firewall/interface-policies", "/api/v1/firewall/nat", "/api/v1/wireguard"}
+		known := []string{"/api/v1/state", "/api/v1/interfaces", "/api/v1/vlans", "/api/v1/gateway-monitors", "/api/v1/services/softflowd", "/api/v1/routes", "/api/v1/policy-rules", "/api/v1/firewall/rules", "/api/v1/firewall/hosts", "/api/v1/firewall/interface-policies", "/api/v1/firewall/nat", "/api/v1/wireguard"}
 		isInterface := strings.HasPrefix(r.URL.Path, "/api/v1/interfaces/")
-		if !slices.Contains(known, r.URL.Path) && !isInterface {
+		if !slices.Contains(known, r.URL.Path) && !isInterface && applianceServicePath(r.URL.Path, "") == "" {
 			fail(http.StatusNotFound, fmt.Errorf("endpoint not found"), nil)
 			return
 		}
@@ -230,6 +250,14 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch r.URL.Path {
+		case "/api/v1/services/ntp":
+			a.encode(w, view.Observed.NTP)
+		case "/api/v1/services/syslog":
+			a.encode(w, view.Observed.Syslog)
+		case "/api/v1/services/vnstat":
+			a.encode(w, view.Observed.VNStat)
+		case "/api/v1/gateway-monitors":
+			a.encode(w, view.Observed.GatewayMonitors)
 		case "/api/v1/state":
 			a.encode(w, view)
 		case "/api/v1/interfaces":
@@ -298,10 +326,17 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusForbidden, fmt.Errorf("transactions.write permission required"), nil)
 		return
 	}
-	if r.URL.Path == "/api/v1/services/softflowd/reconcile" || r.URL.Path == "/api/v1/services/dhcp-relay/reconcile" {
+	if r.URL.Path == "/api/v1/services/softflowd/reconcile" || r.URL.Path == "/api/v1/services/dhcp-relay/reconcile" ||
+		r.URL.Path == "/api/v1/services/gateway-monitoring/reconcile" || applianceServicePath(r.URL.Path, "reconcile") != "" {
 		permission := "softflowd.write"
 		if r.URL.Path == "/api/v1/services/dhcp-relay/reconcile" {
 			permission = "interfaces.write"
+		}
+		if r.URL.Path == "/api/v1/services/gateway-monitoring/reconcile" {
+			permission = "gateway_monitors.write"
+		}
+		if service := applianceServicePath(r.URL.Path, "reconcile"); service != "" {
+			permission = service + ".write"
 		}
 		if !has("state.read") || !has(permission) {
 			fail(http.StatusForbidden, fmt.Errorf("state.read and %s permissions required", permission), nil)
@@ -488,6 +523,19 @@ func authorizeAtRevision(c Credential, state control.State, base uint64, target 
 }
 
 func authorizeServiceReconcile(c Credential, expected control.Config) error {
+	for _, service := range []struct {
+		name    string
+		enabled bool
+	}{{"ntp", expected.NTP.Enabled}, {"syslog", expected.Syslog.Enabled}, {"vnstat", expected.VNStat.Enabled}} {
+		if service.enabled && !slices.Contains(c.Permissions, service.name+".write") {
+			return fmt.Errorf("%s.write permission required to reconcile enabled host services", service.name)
+		}
+	}
+	for _, monitor := range expected.GatewayMonitors {
+		if monitor.Enabled && !slices.Contains(c.Permissions, "gateway_monitors.write") {
+			return fmt.Errorf("gateway_monitors.write permission required to reconcile enabled monitors")
+		}
+	}
 	for _, service := range expected.Softflowd {
 		if service.Enabled && !slices.Contains(c.Permissions, "softflowd.write") {
 			return fmt.Errorf("softflowd.write permission required to reconcile enabled services")
@@ -543,6 +591,17 @@ func authorize(c Credential, before, after control.Config) error {
 	}
 	if err := need("softflowd.write", !equal(before.Softflowd, after.Softflowd)); err != nil {
 		return err
+	}
+	if err := need("gateway_monitors.write", !equal(before.GatewayMonitors, after.GatewayMonitors)); err != nil {
+		return err
+	}
+	for _, service := range []struct {
+		name          string
+		before, after any
+	}{{"ntp", before.NTP, after.NTP}, {"syslog", before.Syslog, after.Syslog}, {"vnstat", before.VNStat, after.VNStat}} {
+		if err := need(service.name+".write", !equal(service.before, service.after)); err != nil {
+			return err
+		}
 	}
 	if err := need("kernel.namespace.write", !equal(before.Kernel.Namespace, after.Kernel.Namespace)); err != nil {
 		return err

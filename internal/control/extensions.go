@@ -51,10 +51,12 @@ type SoftflowdStatus struct {
 }
 
 type RuntimeState struct {
-	DHCPRelay []DHCPRelayStatus `json:"dhcp_relay"`
-	Parents   []ParentInterface `json:"parent_interfaces"`
-	Softflowd []SoftflowdStatus `json:"softflowd"`
-	Error     string            `json:"error,omitempty"`
+	Appliance []ApplianceServiceStatus   `json:"appliance_services"`
+	Gateways  []GatewayMonitorStatistics `json:"gateway_monitors"`
+	DHCPRelay []DHCPRelayStatus          `json:"dhcp_relay"`
+	Parents   []ParentInterface          `json:"parent_interfaces"`
+	Softflowd []SoftflowdStatus          `json:"softflowd"`
+	Error     string                     `json:"error,omitempty"`
 }
 
 type RuntimeAdapter interface {
@@ -63,6 +65,16 @@ type RuntimeAdapter interface {
 }
 
 type LinuxOptions struct {
+	AllowHostServices         bool
+	NTPBinary                 string
+	SyslogBinary              string
+	VNStatBinary              string
+	VNStatClientBinary        string
+	ServicesRuntimeDirectory  string
+	ServicesStateDirectory    string
+	BackendLogFile            string
+	SyslogCAFile              string
+	AllowGatewayMonitoring    bool
 	DHCPRelayBinary           string
 	DHCPRelayRuntimeDirectory string
 	DHCPRelayUID              int

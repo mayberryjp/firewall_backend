@@ -114,6 +114,8 @@ func (s *Simulator) Resume(ctx context.Context, config Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.Softflowd = Clone(config.Softflowd)
+	s.state.NTP, s.state.Syslog, s.state.VNStat = Clone(config.NTP), Clone(config.Syslog), config.VNStat
+	s.state.GatewayMonitors = Clone(config.GatewayMonitors)
 	relays := make(map[string]DHCPRelayConfig, len(config.Interfaces))
 	for _, link := range config.Interfaces {
 		relays[link.Name] = link.DHCPRelay
@@ -128,6 +130,8 @@ func (s *Simulator) Runtime(ctx context.Context, _ Config) (RuntimeState, error)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state := RuntimeState{Parents: []ParentInterface{}, Softflowd: []SoftflowdStatus{}}
+	state.Appliance = applianceStatuses(s.state, "simulated", "")
+	state.Gateways = inactiveGatewayStatistics(s.state.GatewayMonitors, "simulated")
 	state.DHCPRelay = dhcpRelayStatuses(s.state.Interfaces, "simulated", "")
 	for _, config := range s.state.Softflowd {
 		status := SoftflowdStatus{Name: config.Name, State: "disabled"}
@@ -137,4 +141,8 @@ func (s *Simulator) Runtime(ctx context.Context, _ Config) (RuntimeState, error)
 		state.Softflowd = append(state.Softflowd, status)
 	}
 	return state, ctx.Err()
+}
+
+func (s *Simulator) GatewayStatistics(ctx context.Context, config Config) ([]GatewayMonitorStatistics, error) {
+	return inactiveGatewayStatistics(config.GatewayMonitors, "simulated"), ctx.Err()
 }

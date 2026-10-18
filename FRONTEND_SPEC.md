@@ -42,6 +42,9 @@ Support:
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
 - Per-interface DHCPv4 relay server lists and enable flags, managed dnsmasq relay,
   runtime inspection, and explicit service repair.
+- Explicit opt-in host-clock NTP and whole-appliance remote syslog supervision,
+  using host networking; dual host/managed-namespace vnstatd with persistent
+  separate databases, all-interface discovery, status and repair.
 - Complete-package transactions, confirmation, rollback, and recovery.
 - Committed configuration history, comparison, export, and historical restore.
 - Read-only namespace interface counters and IP/TCP/UDP/ICMP protocol statistics,
@@ -257,16 +260,27 @@ Configuration changes additionally require permissions for every changed area:
 | Filter policy/rules | `firewall.write` |
 | Masquerading | `nat.write` |
 | softflowd configuration | `softflowd.write` |
+| Gateway monitor configuration | `gateway_monitors.write` |
+| NTP server/client settings | `ntp.write` |
+| Whole-appliance syslog/remote destinations | `syslog.write` |
+| Host plus managed-namespace vnstatd enablement | `vnstat.write` |
 
 Creating/removing a WireGuard interface typically needs both interface and
 WireGuard permissions. Confirm/rollback requires the permissions for the original
 transaction's full previous-to-candidate difference, even for another submitter.
 Restore also requires `state.read`. Service reconciliation requires `state.read`
 and `transactions.write`, plus `softflowd.write` for the softflowd repair endpoint
-or `interfaces.write` for DHCP relay repair. Both actions repair all enabled
+or `interfaces.write` for DHCP relay repair, or `gateway_monitors.write` for
+gateway monitoring repair. All service repair actions repair all enabled
 services: also require `softflowd.write` when any softflowd instance is enabled,
-and `interfaces.write` when any DHCP relay is enabled. Authorization uses the
+`interfaces.write` when any DHCP relay is enabled, and `gateway_monitors.write`
+when any gateway monitor is enabled. Authorization uses the
 current committed/pending configuration under the engine lock, not the draft.
+
+This shared-service permission rule also includes enabled NTP (`ntp.write`),
+syslog (`syslog.write`), and vnStat (`vnstat.write`) on **all six** service repair
+endpoints. Each new endpoint additionally requires its own service write
+permission even when disabled. See section 6.1.3 for host-wide effects.
 
 There is no current-user or permissions endpoint. Do not probe authorization by
 issuing writes. Deployment-supplied UI permission hints may disable controls, but
@@ -321,7 +335,7 @@ outside this UI.
 
 Show additions, modifications, deletions, and ordered-list moves by subsystem:
 
-- Interfaces and softflowd instances: identity by `name`.
+- Interfaces, softflowd instances, and gateway monitors: identity by `name`.
 - WireGuard peers: identity by public key within an interface.
 - Routes: identity by `(table, destination, metric)`.
 - Policy rules: identity by priority.
@@ -330,7 +344,7 @@ Show additions, modifications, deletions, and ordered-list moves by subsystem:
 - Interface rename is delete/create, not an API rename operation.
 
 Ignore ordering differences the backend normalizes: interfaces by name, addresses
-lexically, peers by public key, allowed IPs lexically, softflowd by name, policy
+lexically, peers by public key, allowed IPs lexically, softflowd and gateway monitors by name, policy
 rules by priority, and routes by the backend's route-key string. Ignore JSON map
 key order. Preserve filter and masquerade rule order.
 
@@ -362,10 +376,12 @@ All statistics reads require `state.read` and accept no query parameters:
 
 | GET endpoint | Response |
 | --- | --- |
-| `/api/v1/statistics` | `{sample, interfaces, protocols}` |
+| `/api/v1/statistics` | `{sample, interfaces, protocols, gateways?}` |
 | `/api/v1/statistics/interfaces` | `{sample, interfaces}` |
 | `/api/v1/statistics/interfaces/{name}` | `{sample, interface}` |
 | `/api/v1/statistics/protocols` | `{sample, protocols}` |
+| `/api/v1/statistics/gateways` | `{sample, monitors}` |
+| `/api/v1/statistics/gateways/{name}` | `{sample, monitor}` |
 
 `sample` contains `scope`, `started_at`, `collected_at`, and `status`:
 `available`, `partial`, or `simulated`. Treat timestamps as a collection window,
@@ -388,10 +404,12 @@ strings; IPv6 fields retain full names under `IPv6`. Preserve unknown fields and
 do not assume identical groups across kernels. Some values are gauges/constants,
 not counters; `Tcp.MaxConn` can be `"-1"`.
 
-**Precision:** All statistics values are quoted decimal strings on the wire,
+**Precision:** Kernel counter/protocol values are quoted decimal strings on the wire,
 unlike revision numbers. Keep them as strings or validated `BigInt`; never route
 them through `Number` or the revision serializer's unquoted-number encoding.
 Use arbitrary-precision deltas before deliberately rounding a displayed rate.
+Gateway window counts/measurements are bounded JSON numbers, with null for
+missing measurements; they must not use the kernel-counter decoder.
 
 **Frontend decision:** Poll visible statistics every 2-5 seconds, without
 overlapping requests. Prefer the combined endpoint when displaying several
@@ -412,6 +430,148 @@ replace, or rebase a configuration draft, alter pending transactions, or imply
 counter history can be restored with a revision. Statistics remain independent
 of full configuration observation errors. No per-flow, driver-specific,
 host-global softnet/sockstat, WireGuard peer, or streaming API is implied.
+
+### 6.1.2 Gateway health and RTT variation
+
+Native IPv4/IPv6 ICMP monitoring is available, without dpinger. No automatic
+failover, route changes, Prometheus endpoint, or persistent metric history is
+implemented. Gateways are independent named resources in `config.gateway_monitors`.
+Edit them in the shared draft and submit a complete transaction, never through
+service repair. Disabled monitors retain their validated settings.
+
+Editor fields: name, enabled, managed interface, explicit source address,
+gateway, target, routing table, and all timing/threshold fields in the type
+below. Do not infer path from WAN/LAN role. Names are unique/case-sensitive,
+1..32 `[a-zA-Z0-9_-]` characters, maximum 64 monitors. Numeric addresses must be
+canonical and same-family; reject hostnames, zones, mapped IPv6, loopback,
+multicast, and unspecified addresses. Source must be configured on an up
+managed interface, cannot be link-local or equal the gateway/target. Private/ULA
+sources are valid. IPv6 gateway/target can be link-local; interface supplies
+the scope. Enabled monitors require matching explicit route and source-policy
+rule into table 10000..19999. Disabled monitors need not retain those network
+references. Never silently add routes, rules, or firewall exceptions.
+
+Defaults and exact bounds are in the
+[backend settings table](README.md#probe-settings-and-health).
+Zero/omission selects defaults except zero variation threshold means disabled.
+Display units as milliseconds or percent, not seconds/microseconds. Validate
+cross-field timeout/window limits and preserve disabled settings in review,
+serialization, revision history, rollback, and restore.
+
+Show three independent status columns:
+
+- `process_state`: native worker lifecycle, not an external process/PID.
+- `sample_status`: disabled/simulated/warming_up/available/stale/unavailable.
+- `health`: unknown/up/degraded/down.
+
+Socket/path failure is unavailable/unknown, **not** gateway down. Do not use
+missing/null as zero, draw simulated samples as successful probes, hide errors,
+or infer health from the configuration's `enabled`. Full-window warmup precedes
+classification. Down means 100% finalized loss; degraded means configured
+loss/mean-RTT/optional-variation threshold reached. Worsening must persist for
+failure hold, improvement for recovery hold; initial Up also uses recovery hold.
+Default window is 30 seconds, failure hold 3 seconds, recovery hold 5 seconds,
+degraded thresholds 20% loss / 150 ms average RTT. Explain that rolling-window
+effects add to hold time. ICMP reachability is not proof of application health.
+
+Display loss percentage; sent/received/lost/pending window counts; min/max/mean,
+population RTT standard deviation, nearest-rank p50/p95; last success and
+freshness; and **RTT variation (not one-way/RTP jitter)**:
+
+`mean(abs(RTT[n] - RTT[n-1]))` only over adjacent transmitted probes with replies.
+
+Never bridge losses/pending probes or turn loss into zero RTT. Null variation
+with no pairs is normal. `sent = received + lost + pending`; loss excludes
+pending from its denominator. Last success may precede the current window.
+Do not derive cumulative packet totals or rates from these rolling-window
+counts. Histories reset on affected settings/network changes, repair/restart;
+configuration revisions do not restore measurements.
+
+Poll cached APIs using the existing 2-5 second, non-overlapping policy.
+Collection endpoint returns `monitors: []` when empty. Single-name lookup is
+case-sensitive, 404 when absent. All statistics query parameters are rejected.
+Individual failed monitors can return HTTP 200 with errors; display them.
+Gateway sample envelope is `available`, `partial`, or `simulated`; individual
+sample statuses remain authoritative. Per-monitor `collected_at` is cached
+measurement time, not the envelope retrieval time. Cached samples become stale
+after max(1000 ms, 3 probe intervals); render Unknown and stop live graphing.
+Keep last-known data visibly stale rather than current.
+
+Runtime includes `gateway_monitors`; dedicated service status returns
+`{monitors, error}`. Render top-level and row errors. Offer explicit repair with
+confirmation and all enabled-service permissions; it uses stored settings,
+does not apply the draft, and does not create a revision. Health/worker failure
+does not mutate configured enabled or create modeled drift by itself.
+
+Operator prerequisite: Linux `-gateway-monitoring`, raw ICMP/namespace privileges,
+correct routes/rules/return paths, and ICMP/ICMPv6 permission through other
+firewalls. The API cannot install packages, grant capabilities, or set that flag.
+Use the [complete dual-stack example](examples/gateway-monitoring.json).
+
+### 6.1.3 Appliance NTP, syslog, and vnStat
+
+Add shared-draft editors for `config.ntp`, `config.syslog`, `config.vnstat`.
+All integrations default disabled. Exact server limits, canonical host syntax,
+timing, lifecycle semantics, operator prerequisites and warnings are in the
+[appliance service contract](README.md#appliance-time-remote-logging-and-vnstat).
+Use the [complete example](examples/appliance-services.json), replacing synthetic
+servers and preserving the actual complete network configuration.
+
+- NTP editor: enabled toggle and 0..8 unique server host/IP strings; enabling
+  requires at least one. This synchronizes the **whole appliance clock**, not an
+  isolated clock, with host networking. Client only, slew-only, no NTP serving
+  or NTS. Running is not synchronized. Rollback restores settings, not time.
+- Syslog editor: enabled toggle and 0..8 unique `(host, port, transport)` rows;
+  enabling requires at least one. Explicit `udp`/`tcp`/`tls`, integer port
+  1..65535, canonical IP or lowercase DNS host. TLS uses verified operator trust;
+  no insecure fallback. Warn that UDP/TCP are unencrypted and UDP can lose logs.
+  Fan-out includes system/kernel/backend logs; backend JSON remains message text.
+  This owns the entire system logger: disabling stops local logging too unless
+  an alternative is arranged. Show this warning before submission/rollback.
+- vnStat editor: one enabled toggle for **both scopes/all interfaces**, not a
+  selected-interface list. Host and managed namespace have different PIDs and
+  persistent databases. Include unmanaged/loopback and newly created interfaces.
+  Inventory every 5 seconds; new manual additions can take a minute to enter
+  daemon sampling. Counter polling/update is 5 seconds, save/rescan 1 minute.
+  Traffic across VLAN/parent/veth/loopback/scopes overlaps: never sum it.
+
+Per service in `ntp`, `syslog`, `vnstat`:
+
+| Method | Path | Shape |
+|---|---|---|
+| GET | `/api/v1/services/{service}` | `NTPConfig`, `SyslogConfig`, or `VNStatConfig` |
+| GET | `/api/v1/services/{service}/status` | `{instances: ApplianceServiceStatus[], error: string}` |
+| POST | `/api/v1/services/{service}/reconcile` | No body, `RuntimeState`; all enabled services |
+
+`RuntimeState.appliance_services` always contains `ntp`, `syslog`, `vnstat-host`,
+`vnstat-managed` rows; service-specific status filters to one/two instances.
+Render lifecycle state, scope, optional PID/start time, optional active vnStat
+database directory and errors. Disabled/simulated/unavailable/not_running/
+running/unhealthy/exited are distinct. HTTP 200 can contain row errors.
+Running proves local process/namespace/readiness only, **not** synchronized
+clock, complete capture, or remote delivery. There are no API time-offset,
+NTP-sync, delivery-ack, or vnStat historical counter metrics; do not invent them.
+Poll visible status at the existing non-overlapping 2-5 second cadence.
+Failures do not rewrite desired enabled settings or create drift by themselves.
+
+Stage and review normally; confirmation/rollback/restore requires changed-area
+permissions. Repair is explicit, confirmed, revision-free, uses stored settings,
+and requires permissions for all enabled services. It never applies a draft.
+Preserve drafts on 403/409/422/500; expose validation/runtime errors. Existing
+401/403/404/405 and transaction revision/recovery behavior applies.
+
+Operator prerequisites are not API settings: explicit `-allow-host-services`,
+installed trusted chronyd/syslog-ng/vnstatd/vnstat, namespace/host capabilities,
+exclusive host-service ownership, an arranged backend log file, trust bundle,
+host DNS/routing, and stopping competing clock/logging services. No packages,
+arbitrary commands, OpenRC service management, or host-network edits are exposed.
+Host clock/logging/statistics are narrowly opted-in exceptions to isolated scope.
+
+Settings persist through transactions/revisions/restart; vnStat databases survive
+graceful stop/repair. Managed database identity includes boot/namespace identity;
+a new scope gets a new database. No history is automatically deleted. Abrupt
+kill can lose unsaved samples and leave ownership requiring operator recovery.
+Simulator status is simulated without processes, time changes, or real history.
 
 ### 6.2 Managed interfaces and VLANs
 
@@ -962,6 +1122,10 @@ Paths below are relative to `/api/v1`.
 | GET | `/services/softflowd` | Observed `SoftflowdConfig[]` |
 | GET | `/services/softflowd/status` | `{ "instances": SoftflowdStatus[], "error": string }` |
 | GET | `/services/dhcp-relay/status` | `{ "interfaces": DHCPRelayStatus[], "error": string }` |
+| GET | `/gateway-monitors` | Observed `GatewayMonitor[]` metadata |
+| GET | `/statistics/gateways` | `{sample, monitors: GatewayMonitorStatistics[]}` |
+| GET | `/statistics/gateways/{name}` | `{sample, monitor: GatewayMonitorStatistics}` |
+| GET | `/services/gateway-monitoring/status` | `{monitors: GatewayMonitorStatistics[], error: string}` |
 | GET | `/transactions` | `Record<string, Transaction>` |
 | GET | `/transactions/{id}` | `Transaction` |
 | GET | `/revisions?limit=50&before_revision=N` | `RevisionPage` |
@@ -972,6 +1136,16 @@ Paths below are relative to `/api/v1`.
 | POST | `/revisions/{revision}/restore` | Restore request -> `Transaction` |
 | POST | `/services/softflowd/reconcile` | No body -> `RuntimeState` |
 | POST | `/services/dhcp-relay/reconcile` | No body -> `RuntimeState`; repairs all managed services |
+| POST | `/services/gateway-monitoring/reconcile` | No body -> `RuntimeState`; repairs all managed services |
+| GET | `/services/ntp` | Configured `NTPConfig` metadata |
+| GET | `/services/syslog` | Configured `SyslogConfig` metadata |
+| GET | `/services/vnstat` | Configured `VNStatConfig` metadata |
+| GET | `/services/ntp/status` | `{instances: ApplianceServiceStatus[], error}` |
+| GET | `/services/syslog/status` | `{instances: ApplianceServiceStatus[], error}` |
+| GET | `/services/vnstat/status` | `{instances: ApplianceServiceStatus[], error}`; two scopes |
+| POST | `/services/ntp/reconcile` | No body -> `RuntimeState`; all enabled services |
+| POST | `/services/syslog/reconcile` | No body -> `RuntimeState`; all enabled services |
+| POST | `/services/vnstat/reconcile` | No body -> `RuntimeState`; all enabled services |
 
 For revision lists, `limit` defaults to 50, accepts 1..100, and
 `before_revision` is an exclusive uint64 cursor. Unknown, duplicated, empty, or
@@ -1026,19 +1200,82 @@ lossless JSON boundary: parse revision/cursor values to validated decimal string
 and serialize them back as unquoted integer tokens using a tested lossless
 serializer. Ordinary `JSON.stringify` of these application strings is not a valid
 request encoding. Do not use an unsafe `number` cast or regex JSON rewriting.
-Statistics are the deliberate exception: counter/protocol values already arrive
-as quoted decimal strings and must remain quoted; see section 6.1.1.
+Kernel counter/protocol statistics are the deliberate exception: they already
+arrive as quoted decimal strings and must remain quoted; see section 6.1.1.
+Gateway window counts and measurements are ordinary JSON numbers, not uint64
+revision/counter values.
 
 ```ts
 type RevisionNumber = string; // Validated decimal uint64 in application state.
 type Timestamp = string; // RFC 3339.
 
 interface Config {
+  ntp: NTPConfig;
+  syslog: SyslogConfig;
+  vnstat: VNStatConfig;
   interfaces: ManagedInterface[];
   routes: Route[];
   policy_rules: PolicyRule[];
   firewall: Firewall;
   softflowd: SoftflowdConfig[];
+  gateway_monitors: GatewayMonitor[];
+}
+
+interface NTPConfig { enabled: boolean; servers: string[] }
+interface SyslogServer { host: string; port: number; transport: "udp" | "tcp" | "tls" }
+interface SyslogConfig { enabled: boolean; servers: SyslogServer[] }
+interface VNStatConfig { enabled: boolean }
+interface ApplianceServiceStatus {
+  name: "ntp" | "syslog" | "vnstat-host" | "vnstat-managed";
+  scope: "host" | "managed";
+  state: "disabled" | "simulated" | "unavailable" | "not_running" | "running" | "unhealthy" | "exited";
+  pid?: number;
+  started_at?: Timestamp;
+  database_directory?: string;
+  error?: string;
+}
+
+interface GatewayMonitor {
+  name: string;
+  enabled: boolean;
+  interface: string;
+  source_address: string;
+  gateway: string;
+  target: string;
+  routing_table: number;
+  probe_interval_ms: number;
+  loss_timeout_ms: number;
+  window_ms: number;
+  latency_threshold_ms: number;
+  loss_threshold_percent: number;
+  rtt_variation_threshold_ms: number;
+  failure_hold_ms: number;
+  recovery_hold_ms: number;
+}
+
+interface GatewayMonitorStatistics {
+  name: string;
+  process_state: "disabled" | "simulated" | "not_running" | "running" | "exited";
+  sample_status: "disabled" | "simulated" | "warming_up" | "available" | "stale" | "unavailable";
+  health: "unknown" | "up" | "degraded" | "down";
+  started_at: Timestamp | null;
+  collected_at: Timestamp | null;
+  health_changed_at: Timestamp | null;
+  last_success_at: Timestamp | null;
+  sent: number;
+  received: number;
+  lost: number;
+  pending: number;
+  variation_pairs: number;
+  loss_percent: number | null;
+  rtt_min_ms: number | null;
+  rtt_max_ms: number | null;
+  rtt_avg_ms: number | null;
+  rtt_stddev_ms: number | null;
+  rtt_p50_ms: number | null;
+  rtt_p95_ms: number | null;
+  rtt_variation_ms: number | null;
+  error?: string;
 }
 
 interface ManagedInterface {
@@ -1178,9 +1415,11 @@ interface SoftflowdStatus {
 }
 
 interface RuntimeState {
+  appliance_services: ApplianceServiceStatus[];
   parent_interfaces: ParentInterface[];
   softflowd: SoftflowdStatus[];
   dhcp_relay: DHCPRelayStatus[];
+  gateway_monitors: GatewayMonitorStatistics[];
   error?: string;
 }
 

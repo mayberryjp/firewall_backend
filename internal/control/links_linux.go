@@ -138,6 +138,11 @@ func deletionOrder(links []netlink.Link) []netlink.Link {
 
 func (a *linuxAdapter) Runtime(ctx context.Context, hints Config) (RuntimeState, error) {
 	result := RuntimeState{Parents: []ParentInterface{}, Softflowd: []SoftflowdStatus{}, DHCPRelay: []DHCPRelayStatus{}}
+	result.Appliance = applianceStatuses(hints, "unavailable", "host service integration is not configured")
+	if a.appliance != nil {
+		result.Appliance = a.appliance.Status(hints)
+	}
+	result.Gateways = a.gateways.Statistics(hints.GatewayMonitors)
 	err := a.inNamespace(ctx, func() error {
 		h, err := netlink.NewHandle()
 		if err != nil {
@@ -179,6 +184,9 @@ func (a *linuxAdapter) Runtime(ctx context.Context, hints Config) (RuntimeState,
 }
 
 func (a *linuxAdapter) Resume(ctx context.Context, c Config) error {
+	if err := a.preflightAppliance(ctx, c); err != nil {
+		return err
+	}
 	if a.flows == nil {
 		for _, s := range c.Softflowd {
 			if s.Enabled {
@@ -198,6 +206,9 @@ func (a *linuxAdapter) Resume(ctx context.Context, c Config) error {
 		if err := a.preflightDHCPRelay(ctx, c.Interfaces); err != nil {
 			return err
 		}
+		if err := a.preflightGateways(c); err != nil {
+			return err
+		}
 		if a.flows != nil {
 			if err := a.flows.Preflight(ctx, c.Softflowd); err != nil {
 				return err
@@ -207,9 +218,16 @@ func (a *linuxAdapter) Resume(ctx context.Context, c Config) error {
 			}
 		}
 		if a.relay != nil {
-			return a.relay.Reconcile(ctx, c.Interfaces)
+			if err := a.relay.Reconcile(ctx, c.Interfaces); err != nil {
+				return err
+			}
 		}
-		return ctx.Err()
+		if a.appliance != nil {
+			if err := a.appliance.Reconcile(ctx, c); err != nil {
+				return err
+			}
+		}
+		return a.gateways.Reconcile(ctx, c)
 	})
 }
 

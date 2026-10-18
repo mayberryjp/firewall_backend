@@ -21,6 +21,14 @@ func (a *linuxAdapter) Statistics(ctx context.Context, query StatisticsQuery, hi
 		return NetworkStatistics{}, err
 	}
 	result := newNetworkStatistics(a.Scope())
+	if query.Section == StatisticsAll {
+		result.Gateways = a.gateways.Statistics(hints.GatewayMonitors)
+		for _, m := range result.Gateways {
+			if m.SampleStatus != "available" && m.SampleStatus != "disabled" {
+				result.Sample.Status = "partial"
+			}
+		}
+	}
 	err := a.inNamespace(ctx, func() error {
 		if query.Section != StatisticsProtocols {
 			links, err := readInterfaceStatistics(ctx, query.Interface)

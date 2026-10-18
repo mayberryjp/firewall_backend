@@ -1,0 +1,29 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 120,
+  "description": "Enable appliance NTP, remote logging and dual-scope vnstat",
+  "config": {
+    "interfaces": [],
+    "routes": [],
+    "policy_rules": [],
+    "firewall": {
+      "allow_all_icmp": true,
+      "policy": "accept",
+      "rules": [],
+      "nat": { "masquerade": [] }
+    },
+    "softflowd": [],
+    "gateway_monitors": [],
+    "ntp": {
+      "enabled": true,
+      "servers": ["ntp.example.invalid", "192.0.2.123"]
+    },
+    "syslog": {
+      "enabled": true,
+      "servers": [
+        { "host": "logs.example.invalid", "port": 6514, "transport": "tls" }
+      ]
+    },
+    "vnstat": { "enabled": true }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 120,
+  "description": "Monitor IPv4 and IPv6 next-hop health on an adopted VLAN trunk",
+  "config": {
+    "interfaces": [
+      {
+        "name": "wan0",
+        "kind": "vlan",
+        "role": "wan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": ["192.0.2.2/24", "2001:db8::2/64"],
+        "vlan": {"parent": "uplink", "id": 100}
+      }
+    ],
+    "routes": [
+      {"destination": "192.0.2.1/32", "interface": "wan0", "table": 10000, "metric": 100},
+      {"destination": "2001:db8::1/128", "interface": "wan0", "table": 10001, "metric": 100}
+    ],
+    "policy_rules": [
+      {"source": "192.0.2.2/32", "table": 10000, "priority": 10000},
+      {"source": "2001:db8::2/128", "table": 10001, "priority": 10001}
+    ],
+    "gateway_monitors": [
+      {
+        "name": "wan1-v4",
+        "enabled": true,
+        "interface": "wan0",
+        "source_address": "192.0.2.2",
+        "gateway": "192.0.2.1",
+        "target": "192.0.2.1",
+        "routing_table": 10000,
+        "probe_interval_ms": 1000,
+        "loss_timeout_ms": 2000,
+        "window_ms": 30000
+      },
+      {
+        "name": "wan1-v6",
+        "enabled": true,
+        "interface": "wan0",
+        "source_address": "2001:db8::2",
+        "gateway": "2001:db8::1",
+        "target": "2001:db8::1",
+        "routing_table": 10001
+      }
+    ],
+    "firewall": {
+      "allow_all_icmp": true,
+      "policy": "accept",
+      "rules": [],
+      "nat": {"masquerade": []}
+    },
+    "softflowd": [],
+    "kernel": {"namespace": {}, "host": {}}
+  }
+}

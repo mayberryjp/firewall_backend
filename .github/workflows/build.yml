@@ -66,7 +66,7 @@ jobs:
       - name: Prepare native test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y dnsmasq-base softflowd
+          sudo apt-get install --no-install-recommends -y dnsmasq-base softflowd vnstat
           for module in dummy 8021q wireguard nf_tables nf_conntrack nf_nat; do
             sudo modprobe "$module"
           done
@@ -80,7 +80,16 @@ jobs:
             NETCONTROL_SOFTFLOWD_BINARY=/usr/sbin/softflowd \
             NETCONTROL_SOFTFLOWD_UID="$(id -u nobody)" \
             NETCONTROL_SOFTFLOWD_GID="$(id -g nobody)" \
+            NETCONTROL_VNSTATD_BINARY=/usr/sbin/vnstatd \
+            NETCONTROL_VNSTAT_BINARY=/usr/bin/vnstat \
             go test ./internal/control -count=1 -v
+      - name: Race-check dual-scope appliance supervision
+        run: |
+          sudo env "PATH=$PATH" \
+            NETCONTROL_INTEGRATION=1 \
+            NETCONTROL_VNSTATD_BINARY=/usr/sbin/vnstatd \
+            NETCONTROL_VNSTAT_BINARY=/usr/bin/vnstat \
+            go test -race ./internal/control -run '^TestLinuxAppliance' -count=1 -v
 
   apk:
     name: Alpine 3.23 APK (${{ matrix.arch }})
@@ -106,12 +115,18 @@ jobs:
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
             --mount "type=bind,src=$GITHUB_WORKSPACE/dist,dst=/out" \
             alpine:3.23 sh -euc '
-              apk add --no-cache alpine-sdk go openrc curl
+              apk add --no-cache alpine-sdk go openrc curl chrony syslog-ng vnstat ca-certificates
               adduser -D builder
               addgroup builder abuild
               cp -a /source /work
               chown -R builder:abuild /work /out
               su builder -c "cd /work && OUTDIR=/out sh packaging/alpine/build.sh"
+              cd /work
+              NETCONTROL_APPLIANCE_SYNTAX=1 \
+                NETCONTROL_NTP_BINARY=/usr/sbin/chronyd \
+                NETCONTROL_SYSLOG_BINARY=/usr/sbin/syslog-ng \
+                NETCONTROL_VNSTATD_BINARY=/usr/sbin/vnstatd \
+                go test ./internal/control -run TestLinuxApplianceConfigurationSyntax -count=1 -v
               cp /out/*.rsa.pub /etc/apk/keys/
               apk add /out/*.apk
               mkdir -p /run/openrc

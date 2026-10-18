@@ -10,12 +10,16 @@ import (
 )
 
 type Config struct {
-	Interfaces []Interface       `json:"interfaces"`
-	Routes     []Route           `json:"routes"`
-	Rules      []Rule            `json:"policy_rules"`
-	Firewall   Firewall          `json:"firewall"`
-	Softflowd  []SoftflowdConfig `json:"softflowd"`
-	Kernel     KernelConfig      `json:"kernel"`
+	NTP             NTPConfig         `json:"ntp"`
+	Syslog          SyslogConfig      `json:"syslog"`
+	VNStat          VNStatConfig      `json:"vnstat"`
+	GatewayMonitors []GatewayMonitor  `json:"gateway_monitors"`
+	Interfaces      []Interface       `json:"interfaces"`
+	Routes          []Route           `json:"routes"`
+	Rules           []Rule            `json:"policy_rules"`
+	Firewall        Firewall          `json:"firewall"`
+	Softflowd       []SoftflowdConfig `json:"softflowd"`
+	Kernel          KernelConfig      `json:"kernel"`
 }
 
 type Interface struct {
@@ -108,6 +112,14 @@ func Clone[T any](v T) T {
 }
 
 func (c *Config) Normalize() {
+	c.normalizeAppliance()
+	if c.GatewayMonitors == nil {
+		c.GatewayMonitors = []GatewayMonitor{}
+	}
+	for i := range c.GatewayMonitors {
+		c.GatewayMonitors[i].normalize()
+	}
+	slices.SortFunc(c.GatewayMonitors, func(a, b GatewayMonitor) int { return strings.Compare(a.Name, b.Name) })
 	c.Kernel.Normalize()
 	if c.Firewall.AllowAllICMP == nil {
 		enabled := true
@@ -189,6 +201,12 @@ func canonicalPrefix(s string, network bool) (netip.Prefix, error) {
 }
 
 func (c Config) Validate() error {
+	if err := c.validateAppliance(); err != nil {
+		return err
+	}
+	if err := validateGatewayMonitors(c); err != nil {
+		return err
+	}
 	if err := c.Kernel.Validate(); err != nil {
 		return err
 	}
