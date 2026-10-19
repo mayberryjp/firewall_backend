@@ -42,7 +42,7 @@ func New(engine *control.Engine, credentials []Credential, logger *slog.Logger) 
 	for _, c := range credentials {
 		hash, err := hex.DecodeString(c.TokenSHA256)
 		if err != nil || len(hash) != sha256.Size || strings.TrimSpace(c.Name) == "" || names[c.Name] || hashes[strings.ToLower(c.TokenSHA256)] {
-			return nil, fmt.Errorf("credential names and SHA-256 token hashes must be valid and unique")
+			return nil, fmt.Errorf("credential names and SHA-256 API key hashes must be valid and unique")
 		}
 		names[c.Name], hashes[strings.ToLower(c.TokenSHA256)] = true, true
 		for _, p := range c.Permissions {
@@ -116,7 +116,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if credential == nil {
 		w.Header().Set("WWW-Authenticate", "Bearer")
-		fail(http.StatusUnauthorized, fmt.Errorf("valid bearer credential required"), nil)
+		fail(http.StatusUnauthorized, fmt.Errorf("valid API key required"), nil)
 		return
 	}
 	actor = credential.Name

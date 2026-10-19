@@ -593,13 +593,18 @@ go build ./cmd/netcontrold
 Authentication is mandatory for the networking API, including in the simulator.
 There are two mutually exclusive startup modes.
 
+The firewall access credential is called an **API key**. `Bearer` is the HTTP
+authorization scheme used to send the API key, not its user-facing name.
+Existing wire/configuration fields `token` and `token_sha256` refer to the API
+key and its SHA-256 hash respectively; session tokens are separate credentials.
+
 #### Cross-origin dashboard access
 
 In both modes, `/api/v1/` allows browser calls from any origin with
 `Access-Control-Allow-Origin: *`. Unauthenticated CORS preflight `OPTIONS`
 requests return `204` for `GET`/`POST` with `Authorization` and `Content-Type`
 headers. Unsupported preflight methods return `405`; unsupported requested
-headers return `400`. Actual requests still require a valid bearer API key and
+headers return `400`. Actual requests still require a valid API key and
 the appropriate permissions, including setup completion in device mode.
 CORS headers are included on API errors, and `Location`, `WWW-Authenticate`,
 and `Retry-After` are exposed to browser clients.
@@ -679,17 +684,17 @@ networking dashboard described in the frontend handoff.
 
 #### Pre-provisioned auth-file mode (legacy, optional)
 
-Supplying `-auth-file auth.json` explicitly selects the existing static-token
+Supplying `-auth-file auth.json` explicitly selects the existing static API key
 behavior and disables the device website/session endpoints. It cannot be combined
-with `-credential-db`; no automatic migration of existing tokens is performed.
-Generate a strong random bearer token locally, retain the plaintext only on the
+with `-credential-db`; no automatic migration of existing API keys is performed.
+Generate a strong random API key locally, retain the plaintext only on the
 client, and place its lowercase SHA-256 hash in a private `auth.json`:
 
 ```json
 [
   {
     "name": "lab-admin",
-    "token_sha256": "<64 hexadecimal characters: SHA-256 of your random token>",
+    "token_sha256": "<64 hexadecimal characters: SHA-256 of your random API key>",
     "permissions": [
       "state.read",
       "transactions.write",
@@ -711,18 +716,18 @@ client, and place its lowercase SHA-256 hash in a private `auth.json`:
 ]
 ```
 
-For example, generate a token and hash in PowerShell:
+For example, generate an API key and hash in PowerShell:
 
 ```powershell
 $bytes = New-Object byte[] 32
 $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 $rng.GetBytes($bytes)
 $rng.Dispose()
-$token = [Convert]::ToBase64String($bytes)
+$apiKey = [Convert]::ToBase64String($bytes)
 $sha = [System.Security.Cryptography.SHA256]::Create()
-$hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($token)))).Replace("-", "").ToLowerInvariant()
+$hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($apiKey)))).Replace("-", "").ToLowerInvariant()
 $sha.Dispose()
-# Retain $token securely on the client; put $hash in auth.json.
+# Retain $apiKey securely on the client; put $hash in auth.json.
 ```
 
 `state.read` allows all modeled configuration reads. Mutations require
@@ -748,13 +753,13 @@ still needs `transactions.write` and must submit a complete package preserving
 the other subsystems. Existing credentials do not automatically gain NAT write
 permission; add it explicitly where needed.
 
-Tokens are matched using constant-time hash comparisons. Non-loopback listeners
+API keys are matched using constant-time hash comparisons. Non-loopback listeners
 require `-tls-cert` and `-tls-key`; default plaintext loopback access is intended
 for local development or a trusted TLS-terminating proxy. Do not forward
 unauthenticated remote traffic to the loopback listener.
 
 Structured HTTP audit and transaction lifecycle events go to stderr; authorization
-failures are logged, and bearer tokens/private keys are not. Deployments must
+failures are logged, and API keys/private keys are not. Deployments must
 collect and protect these logs; this is not a tamper-evident audit store. In legacy
 mode credential reload, expiry, and rate limiting are not implemented. Managed
 keys are checked against the database on each networking request.

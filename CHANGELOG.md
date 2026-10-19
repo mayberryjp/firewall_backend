@@ -63,6 +63,11 @@
 
 ### Fixed
 
+- Standardized firewall access terminology as "API key" in current operator and
+  frontend documentation and authentication errors. HTTP Bearer authentication
+  and existing JSON/configuration field names are unchanged. Recommended bump:
+  patch; aggregate Unreleased recommendation remains unchanged.
+
 - Windows CI preserves LF Go source line endings for formatting checks.
   The native vnStat lifecycle test removes its externally created discovery
   interface before transactions, preserving managed-namespace drift protection.

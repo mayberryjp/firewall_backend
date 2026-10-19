@@ -142,6 +142,10 @@ func TestHTTPRejectsUnauthorizedAndInvalidRequests(t *testing.T) {
 			if w.Code != test.status {
 				t.Fatalf("%d: %s", w.Code, w.Body.String())
 			}
+			if test.status == http.StatusUnauthorized &&
+				(!strings.Contains(w.Body.String(), `"error":"valid API key required"`) || w.Header().Get("WWW-Authenticate") != "Bearer") {
+				t.Fatalf("expected API key error and Bearer challenge: %v %s", w.Header(), w.Body.String())
+			}
 		})
 	}
 	if e.Snapshot().Active != "" || e.Snapshot().Revision != 0 {

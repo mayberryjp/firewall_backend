@@ -62,7 +62,7 @@ Do not present as supported:
 - Server-computed throughput/history, flow records, WireGuard handshake/peer
   telemetry, collector-delivery verification, or real-time server push.
   Client-derived interface rate charts are optional, subject to section 6.1.1.
-- Multi-user account administration, networking-token permission discovery,
+- Multi-user account administration, API-key permission discovery,
   a tamper-evident audit log, or multi-device coordination. Single-device setup
   and named API-key creation/revocation are provided by the embedded website.
 
@@ -163,7 +163,7 @@ The embedded website requires no separate frontend build.
 
 **Operator prerequisite:** Use trusted HTTPS origins for the frontend and API.
 A same-origin deployment may forward `/api/v1` to Netcontrol; a separate dashboard
-origin may call the configured firewall URL directly using bearer authentication.
+origin may call the configured firewall URL directly using API-key authentication.
 In default device mode the daemon
 serves a small embedded onboarding/key-management website at `/`; the broader
 networking dashboard specified here still needs a separate frontend. Legacy
@@ -175,7 +175,7 @@ header names). Unsupported preflight methods return `405`; unsupported requested
 headers return `400`, with the normal API JSON error shape. Non-preflight
 `OPTIONS` requests still require authentication and are not new API operations.
 Responses expose `Location`, `WWW-Authenticate`, and `Retry-After`.
-Use `credentials: "omit"` and an explicit bearer header for cross-origin API
+Use `credentials: "omit"` and an explicit Authorization Bearer header for cross-origin API
 calls; `Access-Control-Allow-Credentials` is not enabled. Actual authentication,
 permissions, and device setup completion requirements are unchanged.
 A Vite/development proxy may still provide same-origin API paths locally.
@@ -189,9 +189,9 @@ No private-network CORS opt-in is advertised; test the target browser/environmen
 and use operator-approved permissions or a trusted management proxy as needed.
 
 The frontend API base is deployment configuration, not arbitrary user input in
-the initial release. Do not send an operator's token to a URL supplied by a query
+the initial release. Do not send an operator's API key to a URL supplied by a query
 parameter, imported file, or untrusted content. No external analytics or services
-may receive configuration, tokens, keys, or diagnostic payloads.
+may receive configuration, API keys, session tokens, or diagnostic payloads.
 
 **Frontend decision:** Default to a relative `/api/v1` base and a deployment-supplied
 label/mode (`Linux`, `Simulator`, or `Unknown`). No current API exposes backend
@@ -201,6 +201,13 @@ from an empty service list or fabricate a namespace label.
 ### 4.2 Credential flow
 
 #### Device onboarding and key management (implemented)
+
+**Terminology:** Label the firewall access credential **API key** everywhere in
+the UI, help, and user-visible errors, not "bearer token" or "API token".
+`Bearer` names the HTTP authorization scheme, not the credential. The existing
+`token` key-creation response field and `token_sha256` auth-file field still mean
+the API key and its hash; these technical field names are unchanged. Device
+session tokens remain distinct from networking API keys.
 
 Without `-auth-file`, `/` hosts a three-step setup wizard: username/password,
 named automatically generated API key(s), then saved-key acknowledgement and
@@ -218,8 +225,8 @@ replacement, never fetching plaintext. New keys have all networking permissions.
 The device account manages keys using an HttpOnly, SameSite=Strict session cookie
 scoped to `/auth/`, Secure with native HTTPS, expiring after 30 minutes. Mutations
 require `Content-Type: application/json` and a matching `Origin` header. Sign-out
-invalidates the session. Networking API endpoints remain bearer-only; sessions do
-not authorize them, and bearer keys cannot manage device credentials.
+invalidates the session. Networking API endpoints require API keys sent using the
+Bearer scheme; sessions do not authorize them, and API keys cannot manage device credentials.
 
 | Endpoint | Request/response |
 | --- | --- |
@@ -246,8 +253,8 @@ provided. `-auth-file` is an explicit alternative, not an automatic migration.
 
 #### Connecting the broader networking dashboard
 
-1. Show a masked bearer-token input and **Connect**.
-2. Keep the token in memory only. No token in local/session storage, URLs, logs,
+1. Show a masked **API key** input and **Connect**.
+2. Keep the API key in memory only. No API key in local/session storage, URLs, logs,
    error trackers, exported files, or service-worker caches.
 3. Validate access using authenticated reads. A successful transaction-list read
    establishes read access even if `/state` returns an observation error.
@@ -255,13 +262,13 @@ provided. `-auth-file` is an explicit alternative, not an automatic migration.
    history. Show independent failures rather than failing the whole application.
 5. On `401`, stop background requests and request a credential again. Keep an
    in-memory draft until the operator explicitly discards/disconnects; do not
-   silently lose it when a token becomes invalid.
-6. Disconnect clears token, cached server data, and draft after an unsaved-change
+   silently lose it when an API key becomes invalid.
+6. Disconnect clears the API key, cached server data, and draft after an unsaved-change
    warning. If a transaction is pending, explain that disconnecting does not
    confirm, cancel, or reliably trigger immediate rollback.
 
 The device-account session above does not authenticate this networking client.
-A dashboard reload requires API-token re-entry. Clearing a browser token does not
+A dashboard reload requires API-key re-entry. Clearing an API key from the browser does not
 revoke it; use device key management (or operator edits/restart in legacy mode).
 
 ### 4.3 Authorization
@@ -876,7 +883,7 @@ Provide JSON import/export:
 - Import replaces the local draft only after a full diff/deletion preview and
   confirmation. It performs no server write.
 - Export config-only JSON; optionally provide a separately labeled current-base
-  request export. Export no token or frontend-only metadata.
+  request export. Export no API key or frontend-only metadata.
 
 ### 6.11 Transactions
 
@@ -1503,7 +1510,7 @@ Backend errors normally have:
 | Status | Expected interpretation |
 | --- | --- |
 | `400` | Invalid JSON/query/path value, unknown request field, oversized body decoding failure |
-| `401` | Missing/invalid bearer credential |
+| `401` | Missing/invalid API key; API error text is `valid API key required` |
 | `403` | Missing permission |
 | `404` | Endpoint/resource/revision/transaction not found |
 | `405` | Unsupported method (`Allow: GET, POST`) |
@@ -1562,7 +1569,7 @@ existing equivalents over adding parallel frameworks.
 Keep these logical responsibilities separate without over-engineering:
 
 - Authenticated API client: lossless revision encoding, runtime decoding, typed
-  HTTP/transport errors, no automatic mutation retries, token redaction.
+  HTTP/transport errors, no automatic mutation retries, API-key redaction.
 - Server-state queries: refresh/single-flight/freshness.
 - Shared local draft store: captured base, staged configuration, semantic diff,
   cross-resource validation, stale flag.
@@ -1604,7 +1611,7 @@ Do not add invented backend dependencies such as `/me`, `/capabilities`,
 - Never send Authorization headers to another origin through redirects; treat an
   unexpected API redirect as a deployment error.
 - Browser diagnostics may record endpoint templates, status, and duration, but
-  not token, full request/response bodies, or configuration by default.
+  not the API key, full request/response bodies, or configuration by default.
 - Download/export is operator initiated and includes a sensitivity notice.
 - Explain that rollback restores modeled configuration, not lost packets,
   connections, handshakes, flow caches, exported records, interface indices, or
@@ -1619,8 +1626,8 @@ the initial frontend release.
 
 | Gap/prerequisite | Initial frontend treatment |
 | --- | --- |
-| No broader dashboard hosting | Embedded onboarding at `/`; separate trusted dashboard, same-origin or bearer-only cross-origin API |
-| No networking-key permission discovery | Token entry, advisory deployment hints, handle `403`; `/auth/status` only identifies device-account sessions |
+| No broader dashboard hosting | Embedded onboarding at `/`; separate trusted dashboard, same-origin or API-key-authenticated cross-origin API |
+| No networking-key permission discovery | API key entry, advisory deployment hints, handle `403`; `/auth/status` only identifies device-account sessions |
 | No backend/namespace/capability endpoint | Deployment labels or Unknown; no guessed capabilities |
 | No key inventory/private-key API | Manual validated key reference; operator provisions files |
 | No dry-run/diff/validation endpoint | Local validation/diff; server preflight happens during submit |
@@ -1640,7 +1647,7 @@ separately. The release must remain usable without them.
 
 ### P0: Safety foundation
 
-- Same-origin connectivity, token handling, typed/lossless API boundary.
+- Same-origin connectivity, API-key handling, typed/lossless API boundary.
 - Server-state freshness and independent transaction/recovery reads.
 - Shared complete draft and semantic comparison.
 - Apply/confirm/rollback/unknown-outcome lifecycle and persistent global banner.
@@ -1682,7 +1689,7 @@ networking or real softflowd delivery.
 
 | ID | Scenario | Required result |
 | --- | --- | --- |
-| A01 | Missing/invalid credential | `401` shown; no token persistence/logging; no polling loop |
+| A01 | Missing/invalid API key | `401` shown; no API-key persistence/logging; no polling loop |
 | A02 | Valid read credential, `/state` observation fails | Transaction/runtime diagnostics still usable; state marked unavailable |
 | A03 | Stage edits on multiple pages | One shared draft; zero mutation requests until apply |
 | A04 | Edit only a route | Submitted package preserves all unrelated subsystems |
@@ -1695,7 +1702,7 @@ networking or real softflowd delivery.
 | A11 | Stale base/another operator commits | `409`; draft retained and marked stale; no auto-rebase/resubmit |
 | A12 | External modeled drift | Expected-versus-observed comparison; no force/automatic overwrite |
 | A13 | Connection drops after intent is durable | Outcome unknown; transaction discovery; no automatic POST retry |
-| A14 | Reload/reconnect with pending transaction | Token re-entry then active transaction rediscovery and deadline/actions |
+| A14 | Reload/reconnect with pending transaction | API-key re-entry then active transaction rediscovery and deadline/actions |
 | A15 | Submit latency consumes confirmation window | Remaining time uses original server deadline, not response time |
 | A16 | Browser clock skew/background throttling | Absolute deadline shown; fresh server state determines outcome |
 | A17 | Permission denied on submit/confirm/rollback | `403` explicit; draft/transaction retained; authorized recovery guidance |
@@ -1729,7 +1736,7 @@ networking or real softflowd delivery.
 
 Test every inclusive numeric bound and at least one value immediately outside
 each bound. Test required request shape and exact API paths/methods, not only UI
-snapshots. Include an automated assertion that tokens never enter storage, URLs,
+snapshots. Include an automated assertion that API keys never enter storage, URLs,
 exports, or application logs.
 
 ## 17. Source references
