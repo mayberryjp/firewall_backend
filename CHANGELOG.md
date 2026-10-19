@@ -4,6 +4,12 @@
 
 ### Added
 
+- Allow-all-origin CORS for bearer-authenticated `/api/v1/` in both authentication
+  modes, with unauthenticated GET/POST preflights and browser-visible API errors
+  and transaction Location headers. Account/key management remains same-origin;
+  cross-origin cookie credentials are not enabled. Recommended feature bump:
+  minor; aggregate Unreleased recommendation below remains unchanged.
+
 - Persistent NTP, remote syslog, and vnStat settings with scoped permissions,
   simulated/native status and shared repair APIs. Opt-in native supervision
   runs slew-only chronyd and whole-appliance syslog-ng in host networking, plus

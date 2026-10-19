@@ -593,6 +593,30 @@ go build ./cmd/netcontrold
 Authentication is mandatory for the networking API, including in the simulator.
 There are two mutually exclusive startup modes.
 
+#### Cross-origin dashboard access
+
+In both modes, `/api/v1/` allows browser calls from any origin with
+`Access-Control-Allow-Origin: *`. Unauthenticated CORS preflight `OPTIONS`
+requests return `204` for `GET`/`POST` with `Authorization` and `Content-Type`
+headers. Unsupported preflight methods return `405`; unsupported requested
+headers return `400`. Actual requests still require a valid bearer API key and
+the appropriate permissions, including setup completion in device mode.
+CORS headers are included on API errors, and `Location`, `WWW-Authenticate`,
+and `Retry-After` are exposed to browser clients.
+
+Use `credentials: "omit"` with an explicit `Authorization: Bearer <key>` header
+for cross-origin dashboard requests. Cookie-based cross-origin access is not
+enabled. `/auth/` and the embedded website remain same-origin; create/manage
+keys on the firewall's own website. Allow-all CORS does not disclose or generate
+keys: any origin must already possess a valid key to use the API. Only give keys
+to trusted clients and configure their target URLs through trusted deployment
+settings, not untrusted links or imported content.
+
+Remote management still requires HTTPS, trusted certificates, and network
+reachability. CORS does not bypass browser mixed-content or local/private-network
+access restrictions; browser permission or a trusted management proxy may still
+be required. No private-network CORS opt-in is advertised.
+
 #### Device website (default)
 
 Start without `-auth-file`, then open the management listener in a browser:

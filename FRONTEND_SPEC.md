@@ -161,14 +161,32 @@ Packages default to simulator mode with a loopback-only listener; package
 installation must not be presented as proof of native networking readiness.
 The embedded website requires no separate frontend build.
 
-**Operator prerequisite:** Serve the frontend and API through one trusted HTTPS
-origin, with `/api/v1` forwarded to Netcontrol. In default device mode the daemon
+**Operator prerequisite:** Use trusted HTTPS origins for the frontend and API.
+A same-origin deployment may forward `/api/v1` to Netcontrol; a separate dashboard
+origin may call the configured firewall URL directly using bearer authentication.
+In default device mode the daemon
 serves a small embedded onboarding/key-management website at `/`; the broader
 networking dashboard specified here still needs a separate frontend. Legacy
-`-auth-file` mode serves only the networking API. Neither mode implements CORS.
-A Vite/development proxy may provide same-origin networking API paths locally.
+`-auth-file` mode serves only the networking API. Both modes allow all origins
+for `/api/v1/` using `Access-Control-Allow-Origin: *`, including error responses.
+Preflight `OPTIONS` requests need no authentication and return `204` for `GET`
+or `POST` with `Authorization` and `Content-Type` request headers (case-insensitive
+header names). Unsupported preflight methods return `405`; unsupported requested
+headers return `400`, with the normal API JSON error shape. Non-preflight
+`OPTIONS` requests still require authentication and are not new API operations.
+Responses expose `Location`, `WWW-Authenticate`, and `Retry-After`.
+Use `credentials: "omit"` and an explicit bearer header for cross-origin API
+calls; `Access-Control-Allow-Credentials` is not enabled. Actual authentication,
+permissions, and device setup completion requirements are unchanged.
+A Vite/development proxy may still provide same-origin API paths locally.
+`/auth/` and website assets do not enable CORS: onboarding and key management
+remain on the device's own origin, with existing cookie/origin protection.
 Remote device website access should use native TLS; `/auth/` origin and Secure
 cookie checks do not trust forwarded headers.
+Allow-all CORS does not bypass TLS/certificate checks, mixed-content blocking,
+network reachability, or browser local/private-network access restrictions.
+No private-network CORS opt-in is advertised; test the target browser/environment
+and use operator-approved permissions or a trusted management proxy as needed.
 
 The frontend API base is deployment configuration, not arbitrary user input in
 the initial release. Do not send an operator's token to a URL supplied by a query
@@ -1601,7 +1619,7 @@ the initial frontend release.
 
 | Gap/prerequisite | Initial frontend treatment |
 | --- | --- |
-| No broader dashboard hosting/CORS | Embedded onboarding at `/`; separate same-origin dashboard deployment |
+| No broader dashboard hosting | Embedded onboarding at `/`; separate trusted dashboard, same-origin or bearer-only cross-origin API |
 | No networking-key permission discovery | Token entry, advisory deployment hints, handle `403`; `/auth/status` only identifies device-account sessions |
 | No backend/namespace/capability endpoint | Deployment labels or Unknown; no guessed capabilities |
 | No key inventory/private-key API | Manual validated key reference; operator provisions files |

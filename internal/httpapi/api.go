@@ -68,6 +68,28 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(code)
 		a.encode(w, map[string]any{"error": err.Error(), "transaction": t})
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Location, WWW-Authenticate, Retry-After")
+		if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			if method := r.Header.Get("Access-Control-Request-Method"); method != http.MethodGet && method != http.MethodPost {
+				fail(http.StatusMethodNotAllowed, fmt.Errorf("cross-origin method must be GET or POST"), nil)
+				return
+			}
+			for _, header := range strings.Split(r.Header.Get("Access-Control-Request-Headers"), ",") {
+				header = strings.TrimSpace(header)
+				if header != "" && !strings.EqualFold(header, "Authorization") && !strings.EqualFold(header, "Content-Type") {
+					fail(http.StatusBadRequest, fmt.Errorf("unsupported cross-origin request header %q", header), nil)
+					return
+				}
+			}
+			status = http.StatusNoContent
+			w.WriteHeader(status)
+			return
+		}
+	}
 	var credential *Credential
 	header := r.Header.Get("Authorization")
 	if strings.HasPrefix(header, "Bearer ") {
