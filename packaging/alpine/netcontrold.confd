@@ -1,6 +1,7 @@
 # Edit these complete daemon arguments before enabling native networking.
 # The listener stays outside the managed network namespace.
-netcontrold_args="-backend simulator -listen 127.0.0.1:8080 \
+# HTTP is unencrypted and reachable on every IPv4 interface.
+netcontrold_args="-backend simulator -listen 0.0.0.0:8080 \
 	-state /var/lib/netcontrol/state.json \
 	-credential-db /var/lib/netcontrol/credentials.db \
 	-keys /etc/netcontrol/keys"

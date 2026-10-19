@@ -144,9 +144,51 @@ func TestDeviceLoginRateLimit(t *testing.T) {
 		if w.Code != 401 {
 			t.Fatalf("login response: %d", w.Code)
 		}
+
 	}
 	w := deviceRequest(h, "POST", "/auth/login", `{"username":"unknown","password":"incorrect"}`, nil)
 	if w.Code != 429 || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("missing rate limit: %d", w.Code)
+	}
+}
+
+func TestDeviceHTTPOnboarding(t *testing.T) {
+	h := deviceFixture(t)
+	post := func(path, body string, cookie *http.Cookie) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("POST", "http://192.0.2.10:8080"+path, strings.NewReader(body))
+		r.Header.Set("Origin", "http://192.0.2.10:8080")
+		r.Header.Set("Content-Type", "application/json")
+		if cookie != nil {
+			r.AddCookie(cookie)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	w := post("/auth/setup", `{"username":"admin","password":"a unique test password"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("HTTP setup: %d %s", w.Code, w.Body.String())
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Secure || !cookies[0].HttpOnly ||
+		cookies[0].SameSite != http.SameSiteStrictMode || cookies[0].Path != "/auth/" {
+		t.Fatalf("unexpected HTTP session cookie: %+v", cookies)
+	}
+	w = post("/auth/keys", `{"name":"dashboard"}`, cookies[0])
+	var created struct {
+		Token string `json:"token"`
+	}
+	if w.Code != 201 {
+		t.Fatalf("HTTP key creation: %d %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if w = post("/auth/complete", `{"saved":true}`, cookies[0]); w.Code != 200 {
+		t.Fatalf("HTTP setup completion: %d %s", w.Code, w.Body.String())
+	}
+	if w = request(t, h, "GET", "/api/v1/state", created.Token, nil); w.Code != 200 {
+		t.Fatalf("HTTP API access: %d %s", w.Code, w.Body.String())
 	}
 }

@@ -92,17 +92,22 @@ Do not bypass signature verification with `--allow-untrusted`. No public APK
 repository is published by this workflow; install the downloaded local file.
 The package does **not** automatically start or enable itself.
 
-The default configuration is simulator mode, bound to `127.0.0.1:8080`.
-Use the device console, or an existing SSH connection with a local tunnel:
+The default configuration is simulator mode, bound to `0.0.0.0:8080` over HTTP.
+From another machine, open `http://<appliance-LAN-IP>:8080/` in a browser;
+no SSH tunnel or certificate is required. Use the appliance's actual address,
+not `0.0.0.0`, as the browser destination.
 
-```sh
-ssh -L 8080:127.0.0.1:8080 operator@device
-```
-
-Open `http://127.0.0.1:8080/`, create the device account, generate/save an API key,
+Create the device account, generate/save an API key,
 and complete setup. Anyone reaching an unclaimed device can claim it; do not
-expose it to an untrusted network. Simulator changes never affect the OS.
-Use native TLS before changing the listener to a non-loopback address.
+expose it to an untrusted network. The wildcard listener includes WAN-facing
+IPv4 interfaces; it does not automatically restrict management access to LAN.
+HTTP sends passwords, session cookies, and API keys without encryption. TLS is
+optional: configure both `-tls-cert` and `-tls-key` to enable HTTPS. Authentication
+and same-origin protection remain enabled. Simulator changes never affect the OS.
+Browsers may disable automatic clipboard access on LAN HTTP origins; the
+one-time API key can still be selected and copied manually.
+Alpine networking must already provide a reachable address; installation does
+not configure interfaces, DHCP, or host firewall access.
 
 To start the configured service at boot:
 
@@ -149,7 +154,7 @@ Replace `netcontrold_args` in `/etc/conf.d/netcontrold` with:
 
 ```sh
 netcontrold_args="-backend linux -namespace netcontrol-lab \
-  -listen 127.0.0.1:8080 \
+  -listen 0.0.0.0:8080 \
   -state /var/lib/netcontrol/linux-state.json \
   -credential-db /var/lib/netcontrol/credentials.db \
   -keys /etc/netcontrol/keys"

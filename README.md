@@ -617,8 +617,9 @@ keys: any origin must already possess a valid key to use the API. Only give keys
 to trusted clients and configure their target URLs through trusted deployment
 settings, not untrusted links or imported content.
 
-Remote management still requires HTTPS, trusted certificates, and network
-reachability. CORS does not bypass browser mixed-content or local/private-network
+Remote management supports HTTP or optional HTTPS and requires network
+reachability. HTTPS requires a trusted certificate for normal browser access.
+CORS does not bypass browser mixed-content or local/private-network
 access restrictions; browser permission or a trusted management proxy may still
 be required. No private-network CORS opt-in is advertised.
 
@@ -630,7 +631,13 @@ Start without `-auth-file`, then open the management listener in a browser:
 netcontrold -backend simulator -state state.json
 ```
 
-Visit `http://127.0.0.1:8080/` for local development. The embedded website needs no
+The daemon and Alpine package default to `0.0.0.0:8080` over HTTP. Visit
+`http://<appliance-LAN-IP>:8080/` from your browser, or `http://127.0.0.1:8080/`
+on the appliance. No SSH tunnel or certificate is required. All IPv4 interfaces,
+including WAN-facing ones, are covered; there is no automatic LAN-only filter.
+Passwords, session cookies, and API keys travel unencrypted over HTTP; startup
+logs warn when TLS is disabled. Restrict access to trusted networks.
+The embedded website needs no
 separate frontend build and provides:
 
 1. **Device account:** choose a username and a unique 12..72-byte password.
@@ -675,7 +682,8 @@ API keys do not expire automatically. Keys are not saved in browser storage.
 If a key-creation response is lost, sign in, remove that named key and create a
 replacement; the plaintext cannot be fetched again.
 
-Use the daemon's native TLS listener for remote website access. A proxy must
+TLS is optional; supply both `-tls-cert` and `-tls-key` to enable it.
+For HTTPS website access, use the daemon's native TLS listener. A proxy must
 preserve the external Host and scheme as seen by the daemon (TLS re-encryption for
 HTTPS); forwarded headers are not trusted. Do not proxy an HTTPS website to this
 plaintext backend: exact-origin checks and Secure-cookie detection require
@@ -753,10 +761,11 @@ still needs `transactions.write` and must submit a complete package preserving
 the other subsystems. Existing credentials do not automatically gain NAT write
 permission; add it explicitly where needed.
 
-API keys are matched using constant-time hash comparisons. Non-loopback listeners
-require `-tls-cert` and `-tls-key`; default plaintext loopback access is intended
-for local development or a trusted TLS-terminating proxy. Do not forward
-unauthenticated remote traffic to the loopback listener.
+API keys are matched using constant-time hash comparisons. Non-loopback HTTP
+listeners are permitted; the default is all IPv4 interfaces on port 8080.
+Set `-listen 127.0.0.1:8080` for loopback-only access, or configure both
+`-tls-cert` and `-tls-key` for HTTPS. The API still requires authentication;
+the default transport provides no encryption or automatic WAN restriction.
 
 Structured HTTP audit and transaction lifecycle events go to stderr; authorization
 failures are logged, and API keys/private keys are not. Deployments must

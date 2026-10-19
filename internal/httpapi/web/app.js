@@ -92,7 +92,7 @@ async function refresh() {
   $("title").textContent = stage === "ready" ? "Device administration" : "Welcome to your device";
   $("subtitle").textContent = status.authenticated
     ? `Signed in as ${status.username}. Sessions expire after 30 minutes.`
-    : "A secure starting point for your network.";
+    : "Set up your device account and API keys.";
   $("finish-panel").hidden = true;
   $("step-review").setAttribute("aria-current", "false");
   $("ready-panel").hidden = stage !== "ready";

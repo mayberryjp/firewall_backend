@@ -56,23 +56,22 @@ func run(logger *slog.Logger) error {
 	syslogCA := flag.String("syslog-ca-file", "/etc/ssl/cert.pem", "operator-provisioned CA bundle for verified TLS syslog")
 	authFile := flag.String("auth-file", "", "JSON credential file containing token hashes and permissions")
 	credentialDB := flag.String("credential-db", "", "device credential database (default: <state>.credentials.db); mutually exclusive with -auth-file")
-	listen := flag.String("listen", "127.0.0.1:8080", "management listener outside the target namespace")
-	cert := flag.String("tls-cert", "", "TLS certificate; required for non-loopback listeners")
+	listen := flag.String("listen", "0.0.0.0:8080", "management listener outside the target namespace")
+	cert := flag.String("tls-cert", "", "optional TLS certificate; requires -tls-key")
 	key := flag.String("tls-key", "", "TLS private key")
 	flag.Parse()
 	if *authFile != "" && *credentialDB != "" {
 		return fmt.Errorf("-auth-file and -credential-db are mutually exclusive")
 	}
-	host, _, err := net.SplitHostPort(*listen)
+	_, _, err := net.SplitHostPort(*listen)
 	if err != nil {
 		return err
 	}
-	ip := net.ParseIP(host)
 	if (*cert == "") != (*key == "") {
 		return fmt.Errorf("both -tls-cert and -tls-key are required together")
 	}
-	if *cert == "" && (ip == nil || !ip.IsLoopback()) {
-		return fmt.Errorf("non-loopback listeners require TLS")
+	if *cert == "" {
+		logger.Warn("management HTTP is unencrypted", "address", *listen, "warning", "passwords and API keys are transmitted without encryption; restrict access to trusted networks")
 	}
 	var credentials []httpapi.Credential
 	var identities *identity.Store

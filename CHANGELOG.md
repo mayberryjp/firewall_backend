@@ -41,6 +41,13 @@
 
 ### Changed
 
+- Daemon and Alpine package default to unencrypted HTTP on `0.0.0.0:8080` for
+  direct browser onboarding without an SSH tunnel. Non-loopback HTTP is allowed;
+  TLS remains optional with a certificate/key pair. Startup warns about plaintext
+  credentials. This includes WAN-facing IPv4 interfaces unless externally
+  restricted; authentication is unchanged. Recommended bump: major for the
+  changed default management exposure.
+
 - All service repair endpoints require `ntp.write`, `syslog.write`, and
   `vnstat.write` respectively when those services are enabled. Host-wide
   service effects require explicit operator ownership and host-service opt-in;

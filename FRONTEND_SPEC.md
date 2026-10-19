@@ -157,11 +157,17 @@ write outcome, pending confirmation, unavailable/stale state, modeled drift.
 
 Alpine APK/OpenRC installation and automatic build artifacts are documented in
 the [build and installation specification](docs/BUILD_AND_INSTALL.md).
-Packages default to simulator mode with a loopback-only listener; package
+Packages and the daemon default to HTTP on `0.0.0.0:8080` in simulator mode; package
 installation must not be presented as proof of native networking readiness.
 The embedded website requires no separate frontend build.
 
-**Operator prerequisite:** Use trusted HTTPS origins for the frontend and API.
+**Operator prerequisite:** Use operator-configured, reachable frontend/API origins.
+Direct onboarding is available at `http://<appliance-LAN-IP>:8080/` with no SSH
+tunnel or certificate. HTTP is permitted on non-loopback listeners. TLS is
+optional and requires both `-tls-cert` and `-tls-key`; providing only one fails
+startup. Wildcard IPv4 binding includes WAN interfaces and does not establish a
+LAN-only access policy. HTTP sends passwords, session cookies, and API keys
+unencrypted; do not describe it as a secure connection.
 A same-origin deployment may forward `/api/v1` to Netcontrol; a separate dashboard
 origin may call the configured firewall URL directly using API-key authentication.
 In default device mode the daemon
@@ -181,8 +187,12 @@ permissions, and device setup completion requirements are unchanged.
 A Vite/development proxy may still provide same-origin API paths locally.
 `/auth/` and website assets do not enable CORS: onboarding and key management
 remain on the device's own origin, with existing cookie/origin protection.
-Remote device website access should use native TLS; `/auth/` origin and Secure
-cookie checks do not trust forwarded headers.
+For HTTPS device website access use native TLS; `/auth/` origin and Secure cookie
+checks do not trust forwarded headers. HTTP sessions keep HttpOnly and
+SameSite=Strict cookies but do not have the Secure attribute. Authentication,
+same-origin mutation checks, and API-key requirements remain unchanged.
+An HTTPS dashboard may be blocked from calling an HTTP API by mixed-content
+rules even with CORS; use a matching deployment/proxy or enable TLS as appropriate.
 Allow-all CORS does not bypass TLS/certificate checks, mixed-content blocking,
 network reachability, or browser local/private-network access restrictions.
 No private-network CORS opt-in is advertised; test the target browser/environment
