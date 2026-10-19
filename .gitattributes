@@ -1,6 +1,7 @@
-*.go text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+Cargo.lock text eol=lf
 *.sh text eol=lf
 *.initd text eol=lf
 *.confd text eol=lf
-APKBUILD text eol=lf
 *.yml text eol=lf

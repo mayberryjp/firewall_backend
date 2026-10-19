@@ -1,0 +1,244 @@
+//! Explicit privileged Linux checks; all mutations occur on fresh namespace threads.
+#![cfg(all(test, target_os = "linux"))]
+use super::*;
+use std::{
+    net::{SocketAddr, UdpSocket},
+    os::fd::AsRawFd,
+    time::{Duration, Instant},
+};
+
+fn isolated(test: impl FnOnce() -> Result<()> + Send + 'static) {
+    assert_eq!(
+        std::env::var("NETCONTROL_INTEGRATION").as_deref(),
+        Ok("1"),
+        "set NETCONTROL_INTEGRATION=1 to authorize privileged native tests"
+    );
+    std::thread::spawn(move || {
+        ensure!(
+            unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0,
+            "integration requires CAP_SYS_ADMIN/new network namespace: {}",
+            std::io::Error::last_os_error()
+        );
+        let fd = linux::socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        request.ifr_name[0] = b'l' as _;
+        request.ifr_name[1] = b'o' as _;
+        linux::check(unsafe {
+            libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut request)
+        })?;
+        unsafe {
+            request.ifr_ifru.ifru_flags |= libc::IFF_UP as i16;
+        }
+        linux::check(unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request) })?;
+        test()
+    })
+    .join()
+    .expect("native test thread panic")
+    .expect("native integration failed");
+}
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
+fn native_icmp_v4_v6_echo_no_children() {
+    isolated(|| {
+        for v6 in [false, true] {
+            let ip = if v6 { "::1" } else { "127.0.0.1" }.parse::<std::net::IpAddr>()?;
+            let fd = linux::socket(
+                if v6 { libc::AF_INET6 } else { libc::AF_INET },
+                libc::SOCK_RAW,
+                if v6 {
+                    libc::IPPROTO_ICMPV6
+                } else {
+                    libc::IPPROTO_ICMP
+                },
+            )?;
+            linux::bind(fd.as_raw_fd(), SocketAddr::new(ip, 0), 1)?;
+            let nonce = rand::random::<[u8; 16]>();
+            let wire = gateway::echo(45, 27, &nonce, v6);
+            linux::send(fd.as_raw_fd(), &wire, SocketAddr::new(ip, 0), 1)?;
+            let start = Instant::now();
+            let mut buffer = [0; 2048];
+            let mut received = false;
+            while start.elapsed() < Duration::from_secs(2) {
+                if let Some((n, from)) = linux::recv(fd.as_raw_fd(), &mut buffer)? {
+                    if from.ip() == ip && gateway::reply(&buffer[..n], 27, &nonce, v6) == Some(45) {
+                        received = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ensure!(received, "native ICMP echo reply missing for {ip}");
+        }
+        Ok(())
+    });
+}
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace privileges"]
+fn native_counter_worker_persists_history_and_joins() {
+    isolated(|| {
+        let directory =
+            std::env::current_dir()?.join(format!("native-counters-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory)?;
+        let mut worker = worker::Worker::start(
+            "counter-test".into(),
+            None,
+            json!({"name":"counter-test"}),
+            {
+                let directory = directory.clone();
+                move || counters::prepare(directory, "managed".into())
+            },
+        )?;
+        let path = directory.join("traffic-managed-v1.json");
+        let start = Instant::now();
+        while !path.exists() && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let server = UdpSocket::bind("127.0.0.1:0")?;
+        server.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let client = UdpSocket::bind("127.0.0.1:0")?;
+        client.send_to(b"native traffic", server.local_addr()?)?;
+        let mut buffer = [0; 64];
+        server.recv(&mut buffer)?;
+        let sampled = Instant::now();
+        while sampled.elapsed() < Duration::from_secs(8) {
+            if counters::Database::load(&path, "managed")?
+                .interfaces
+                .get("lo")
+                .is_some_and(|value| value.total.rx_packets > 0)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        worker.shutdown()?;
+        ensure!(
+            worker.snapshot()["state"] == "stopped",
+            "counter worker failed: {}",
+            worker.snapshot()
+        );
+        let db = counters::Database::load(&path, "managed")?;
+        ensure!(
+            db.interfaces["lo"].total.rx_bytes >= 14 && db.interfaces["lo"].total.rx_packets > 0,
+            "counter worker did not record loopback traffic"
+        );
+        ensure!(db.history.len() >= 2, "counter history not persisted");
+        let persisted = std::fs::read(&path)?;
+        let loaded = counters::Database::load(&path, "managed")?;
+        ensure!(
+            loaded.interfaces["lo"].total.rx_bytes == db.interfaces["lo"].total.rx_bytes,
+            "counter reload changed history"
+        );
+        ensure!(
+            std::fs::read(&path)? == persisted,
+            "counter read modified file"
+        );
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    });
+}
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace privileges"]
+fn native_ntp_udp_fixture_validates_origin_without_changing_clock() {
+    isolated(|| {
+        let server = UdpSocket::bind("127.0.0.1:123")?;
+        server.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let client = UdpSocket::bind("127.0.0.1:0")?;
+        client.connect("127.0.0.1:123")?;
+        client.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut request = [0; 48];
+        request[0] = 0x23;
+        let t = 1_800_000_000.;
+        let origin = ntp::stamp(t);
+        request[40..48].copy_from_slice(&origin);
+        client.send(&request)?;
+        let mut wire = [0; 48];
+        let (n, from) = server.recv_from(&mut wire)?;
+        ensure!(n == 48, "NTP request length");
+        let mut response = [0; 48];
+        response[0] = 0x24;
+        response[1] = 2;
+        response[24..32].copy_from_slice(&wire[40..48]);
+        response[32..40].copy_from_slice(&ntp::stamp(t + 0.01));
+        response[40..48].copy_from_slice(&ntp::stamp(t + 0.02));
+        server.send_to(&response, from)?;
+        let n = client.recv(&mut wire)?;
+        let (offset, delay) = ntp::sample(&wire[..n], origin, t, t + 0.03)?;
+        ensure!(
+            offset.abs() < 0.001 && delay < 0.021,
+            "invalid native NTP sample"
+        );
+        response[24] ^= 1;
+        ensure!(
+            ntp::sample(&response, origin, t, t + 0.03).is_err(),
+            "spoofed origin accepted"
+        );
+        Ok(())
+    });
+}
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
+fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
+    isolated(|| {
+        let directory =
+            std::env::current_dir()?.join(format!("native-flow-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory)?;
+        let collector = UdpSocket::bind("127.0.0.1:2055")?;
+        collector.set_read_timeout(Some(Duration::from_secs(3)))?;
+        for version in [1u16, 5, 9, 10] {
+            let config = config::Flow {
+                name: "test".into(),
+                enabled: true,
+                interface: "lo".into(),
+                collector: "127.0.0.1:2055".into(),
+                export_version: version,
+                sampling_rate: 1,
+                max_flows: 100,
+                snaplen: 128,
+                promiscuous: false,
+                capture_filter: String::new(),
+                timeouts: std::collections::BTreeMap::from([("general".into(), 1)]),
+            };
+            let mut worker = worker::Worker::start(
+                "flow-test".into(),
+                None,
+                json!({"name":"flow-test"}),
+                move || flow::prepare(config),
+            )?;
+            let target = UdpSocket::bind(if [1, 5].contains(&version) {
+                "127.0.0.1:25001"
+            } else {
+                "[::1]:25001"
+            })?;
+            let sender = UdpSocket::bind(if [1, 5].contains(&version) {
+                "127.0.0.1:25002"
+            } else {
+                "[::1]:25002"
+            })?;
+            sender.send_to(b"flow-test-native", target.local_addr()?)?;
+            let mut buffer = [0; 2048];
+            let n = collector.recv(&mut buffer)?;
+            ensure!(
+                n >= if version == 1 { 64 } else { 72 } && buffer[..2] == version.to_be_bytes(),
+                "invalid native NetFlow export"
+            );
+            ensure!(buffer[2..4] != [0, 0], "empty native flow export");
+            worker.shutdown()?;
+            ensure!(
+                worker.snapshot()["state"] == "stopped",
+                "flow worker shutdown failed: {}",
+                worker.snapshot()
+            );
+            if ![1, 5].contains(&version) {
+                let header = if version == 9 { 20 } else { 16 };
+                let templates =
+                    u16::from_be_bytes(buffer[header + 2..header + 4].try_into()?) as usize;
+                ensure!(
+                    buffer[header + templates..header + templates + 2] == 257u16.to_be_bytes(),
+                    "IPv6 export did not use template257"
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    });
+}

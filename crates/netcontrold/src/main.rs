@@ -1,0 +1,432 @@
+use anyhow::{Context, Result, bail};
+use clap::Parser;
+use netcontrol_core::{Backend, Engine, Simulator};
+use netcontrol_native::{Native, NativeOptions};
+use netcontrold::{
+    http::{App, Authentication, load_credentials, router},
+    identity::Store,
+};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+#[derive(Parser)]
+#[command(name = "netcontrold", about = "Native Rust network control daemon")]
+struct Options {
+    #[arg(long, default_value = "simulator", value_parser = ["simulator", "linux"])]
+    backend: String,
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    listen: String,
+    #[arg(long, default_value = "state.json")]
+    state: PathBuf,
+    #[arg(
+        long,
+        help = "Private schema-1 JSON identity store; default <state>.credentials.json"
+    )]
+    credential_db: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "credential_db",
+        help = "Private schema-1 scoped API-key hash file; disables onboarding"
+    )]
+    auth_file: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    namespace: String,
+    #[arg(long, default_value = "/etc/netcontrol/keys")]
+    keys: PathBuf,
+    #[arg(long, value_delimiter = ',')]
+    adopt_parents: Vec<String>,
+    #[arg(long)]
+    allow_host_tunables: bool,
+    #[arg(long)]
+    allow_host_services: bool,
+    #[arg(long = "gateway-monitoring")]
+    allow_gateway_monitoring: bool,
+    #[arg(long, default_value = "/var/lib/netcontrol/services")]
+    services_state_dir: PathBuf,
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Enable the in-process configuration SSH server, for example 0.0.0.0:2222"
+    )]
+    ssh_listen: Option<String>,
+    #[arg(
+        long,
+        requires = "ssh_listen",
+        help = "Private persistent Ed25519 host key; default <state>.ssh-key"
+    )]
+    ssh_host_key: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run(Options::parse()).await {
+        eprintln!("netcontrold: {error:#}");
+        std::process::exit(1);
+    }
+}
+fn absolute(path: &std::path::Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if path.exists() {
+        return Ok(path.canonicalize()?);
+    }
+    let parent = path.parent().context("path needs parent")?;
+    Ok(if parent.exists() {
+        parent
+            .canonicalize()?
+            .join(path.file_name().context("path needs filename")?)
+    } else {
+        path
+    })
+}
+fn appended(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        first
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&second.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        first == second
+    }
+}
+async fn run(options: Options) -> Result<()> {
+    configure_logging(&options)?;
+    let listen = tokio::net::lookup_host(&options.listen)
+        .await
+        .context("resolve management listener")?
+        .next()
+        .context("management listener resolved to no addresses")?;
+    let tls = if let (Some(cert), Some(key)) = (&options.tls_cert, &options.tls_key) {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .context("load native TLS certificate and key")?,
+        )
+    } else {
+        None
+    };
+    let credential_path = options
+        .credential_db
+        .clone()
+        .unwrap_or_else(|| appended(&options.state, ".credentials.json"));
+    let state = absolute(&options.state)?;
+    let auth_path = options.auth_file.as_ref().unwrap_or(&credential_path);
+    let auth = absolute(auth_path)?;
+    let state_lock = absolute(&appended(&options.state, ".lock"))?;
+    let auth_lock = absolute(&appended(auth_path, ".lock"))?;
+    if same_path(&auth, &state)
+        || same_path(&auth, &state_lock)
+        || (options.auth_file.is_none() && same_path(&auth_lock, &state))
+    {
+        bail!("credentials, network state, and their lock files must use different paths");
+    }
+    let ssh = if let Some(listen) = &options.ssh_listen {
+        let path = options
+            .ssh_host_key
+            .clone()
+            .unwrap_or_else(|| appended(&options.state, ".ssh-key"));
+        let key_path = absolute(&path)?;
+        if [&state, &auth, &state_lock, &auth_lock]
+            .into_iter()
+            .any(|other| same_path(&key_path, other))
+        {
+            bail!(
+                "SSH host key must use a different path from network state, credentials and lock files"
+            );
+        }
+        netcontrold::ssh::load_host_key(&path)?;
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .context("bind configuration SSH listener")?;
+        tracing::info!(address = %listener.local_addr()?, "configuration SSH listener enabled");
+        Some((listener, path))
+    } else {
+        None
+    };
+    let auth = if let Some(path) = &options.auth_file {
+        Authentication::Scoped(load_credentials(path)?)
+    } else {
+        let store = Store::open(&credential_path)?;
+        if !store.status().0 {
+            tracing::warn!("unclaimed device; restrict management access until setup is complete");
+        }
+        Authentication::Device(Mutex::new(store))
+    };
+    if tls.is_none() {
+        tracing::warn!(
+            "HTTP is unencrypted; passwords and API keys require a trusted management network"
+        );
+    }
+    fn configure_logging(options: &Options) -> Result<()> {
+        if options.backend != "linux" || !options.allow_host_services {
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(std::io::stderr)
+                .try_init()
+                .map_err(|_| anyhow::anyhow!("initialize daemon logging"))?;
+            return Ok(());
+        }
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(&options.services_state_dir)?;
+        let path = options.services_state_dir.join("backend.log");
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    bail!("backend log must be a regular file");
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.mode() & 0o077 != 0
+                        || metadata.uid() != unsafe { libc::geteuid() }
+                        || metadata.nlink() != 1
+                    {
+                        bail!(
+                            "backend log must be private, owned by the daemon, and not hard-linked"
+                        );
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = open.open(path)?;
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(Mutex::new(file).and(std::io::stderr))
+            .try_init()
+            .map_err(|_| anyhow::anyhow!("initialize daemon logging"))?;
+        Ok(())
+    }
+    let backend: Box<dyn Backend> = match options.backend.as_str() {
+        "linux" => Box::new(Native::open(NativeOptions {
+            namespace: options.namespace,
+            keys: options.keys,
+            adopted_parents: options.adopt_parents,
+            allow_host_tunables: options.allow_host_tunables,
+            allow_host_services: options.allow_host_services,
+            gateway_monitoring: options.allow_gateway_monitoring,
+            services_state: options.services_state_dir,
+        })?),
+        _ => Box::new(Simulator::new()),
+    };
+    let engine = Arc::new(Mutex::new(Engine::open(&options.state, backend)?));
+    let app = App::new(engine.clone(), auth, tls.is_some());
+    let handle = axum_server::Handle::new();
+    let (ssh_stop_tx, ssh_stop_rx) = tokio::sync::watch::channel(false);
+    let mut ssh_task = ssh.map(|(listener, path)| {
+        let app = app.clone();
+        tokio::spawn(
+            async move { netcontrold::ssh::serve(listener, &path, app, ssh_stop_rx).await },
+        )
+    });
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let tick_engine = engine.clone();
+    let tick_handle = handle.clone();
+    let tick_ssh_stop = ssh_stop_tx.clone();
+    let ticker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() { return Ok::<(), anyhow::Error>(()); }
+                }
+                _ = interval.tick() => {
+                    let engine = tick_engine.clone();
+                    let result = tokio::task::spawn_blocking(move || engine.lock()
+                        .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.tick()).await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("deadline worker failed")));
+                    if let Err(error) = result {
+                        let _ = tick_ssh_stop.send(true);
+                        tick_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+                        return Err(error.context("background transaction deadline tick failed"));
+                    }
+                }
+            }
+        }
+    });
+    let signal_handle = handle.clone();
+    let signal_ssh_stop = ssh_stop_tx.clone();
+    let signals = tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = signal_ssh_stop.send(true);
+        signal_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+    });
+    let service = router(app).into_make_service();
+    let http_handle = handle.clone();
+    let served = async move {
+        match tls {
+            Some(config) => {
+                axum_server::bind_rustls(listen, config)
+                    .handle(http_handle)
+                    .serve(service)
+                    .await
+            }
+            None => {
+                axum_server::bind(listen)
+                    .handle(http_handle)
+                    .serve(service)
+                    .await
+            }
+        }
+    };
+    tokio::pin!(served);
+    let mut ssh_finished = None;
+    let served = if let Some(task) = ssh_task.as_mut() {
+        tokio::select! {
+            result = &mut served => result,
+            result = task => {
+                ssh_finished = Some(result);
+                handle.graceful_shutdown(Some(Duration::from_secs(10)));
+                served.await
+            }
+        }
+    } else {
+        served.await
+    };
+    let stopping = *ssh_stop_tx.borrow();
+    let _ = ssh_stop_tx.send(true);
+    let ssh_result = if let Some(result) = ssh_finished {
+        match result {
+            Ok(Ok(())) if !stopping => Err(anyhow::anyhow!("SSH listener stopped unexpectedly")),
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        }
+    } else if let Some(mut task) = ssh_task {
+        match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(anyhow::anyhow!("SSH server shutdown timed out"))
+            }
+        }
+    } else {
+        Ok(())
+    };
+    let _ = stop_tx.send(true);
+    signals.abort();
+    let tick_result = ticker.await.context("deadline ticker task");
+    let shutdown_result = engine
+        .lock()
+        .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?
+        .shutdown();
+    shutdown_result.context("durable engine shutdown failed")?;
+    tick_result??;
+    ssh_result.context("configuration SSH server failed")?;
+    served.context("HTTP listener failed")
+}
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cli_current_contract_and_rejected_legacy_flags() {
+        let options = Options::try_parse_from(["netcontrold"]).unwrap();
+        assert_eq!(options.listen, "0.0.0.0:8080");
+        assert_eq!(options.backend, "simulator");
+        assert!(options.credential_db.is_none());
+        assert!(options.ssh_listen.is_none());
+        assert!(options.ssh_host_key.is_none());
+        assert!(Options::try_parse_from(["netcontrold", "--ssh-host-key", "host.key"]).is_err());
+        let ssh = Options::try_parse_from([
+            "netcontrold",
+            "--ssh-listen",
+            "127.0.0.1:2222",
+            "--ssh-host-key",
+            "host.key",
+        ])
+        .unwrap();
+        assert_eq!(ssh.ssh_listen.as_deref(), Some("127.0.0.1:2222"));
+        assert!(
+            Options::try_parse_from([
+                "netcontrold",
+                "--credential-db",
+                "identity.json",
+                "--auth-file",
+                "auth.json"
+            ])
+            .is_err()
+        );
+        assert!(Options::try_parse_from(["netcontrold", "--tls-cert", "cert.pem"]).is_err());
+        assert!(Options::try_parse_from(["netcontrold", "--tls-key", "key.pem"]).is_err());
+        for flag in [
+            "--softflowd-binary",
+            "--dhcp-relay-binary",
+            "--ntp-binary",
+            "--syslog-binary",
+            "--vnstatd-binary",
+            "--softflowd-uid",
+            "--services-runtime-dir",
+        ] {
+            assert!(Options::try_parse_from(["netcontrold", flag, "old-value"]).is_err());
+        }
+        let options = Options::try_parse_from([
+            "netcontrold",
+            "--backend",
+            "linux",
+            "--namespace",
+            "lab",
+            "--keys",
+            "keys",
+            "--adopt-parents",
+            "eth0,eth1",
+            "--gateway-monitoring",
+            "--allow-host-tunables",
+            "--allow-host-services",
+        ])
+        .unwrap();
+        assert_eq!(options.adopt_parents, vec!["eth0", "eth1"]);
+        assert!(
+            options.allow_gateway_monitoring
+                && options.allow_host_tunables
+                && options.allow_host_services
+        );
+    }
+}

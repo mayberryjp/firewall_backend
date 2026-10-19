@@ -1,0 +1,1156 @@
+use super::*;
+use crate::Simulator;
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+struct Fixture {
+    dir: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let dir = PathBuf::from("target").join("core-tests").join(format!(
+            "{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        Self { dir }
+    }
+    fn path(&self) -> PathBuf {
+        self.dir.join("state.json")
+    }
+    fn engine(&self) -> Engine {
+        Engine::open(&self.path(), Box::new(Simulator::new())).unwrap()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+fn all() -> Vec<String> {
+    PERMISSIONS.iter().map(|s| s.to_string()).collect()
+}
+fn config() -> Config {
+    serde_json::from_value(json!({"interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}]})).unwrap()
+}
+fn request(e: &mut Engine, method: &str, path: &str, body: Value) -> Reply {
+    e.request(
+        method,
+        path,
+        "",
+        "operator",
+        &all(),
+        &serde_json::to_vec(&body).unwrap(),
+    )
+}
+fn submit(e: &mut Engine, c: Config) -> Reply {
+    request(
+        e,
+        "POST",
+        "/api/v1/transactions",
+        json!({"base_revision":e.state.revision,"confirm_timeout_seconds":30,"description":" Update network ","config":c}),
+    )
+}
+fn confirm(e: &mut Engine, id: &str) -> Reply {
+    request(
+        e,
+        "POST",
+        &format!("/api/v1/transactions/{id}/confirm"),
+        Value::Null,
+    )
+}
+
+#[test]
+fn every_example_json_is_a_valid_current_transaction_request() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|crates| crates.parent())
+        .expect("workspace root")
+        .to_path_buf();
+    let mut files: Vec<_> = fs::read_dir(root.join("examples"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "example fixtures must exist");
+    for path in files {
+        let bytes = fs::read(&path).unwrap();
+        let mut request: SubmitRequest =
+            parse(&bytes).unwrap_or_else(|error| panic!("{}: {}", path.display(), error.error));
+        request.config.normalize();
+        request
+            .config
+            .validate()
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        assert!(
+            (10..=300).contains(&request.confirm_timeout_seconds),
+            "{}: invalid confirmation timeout",
+            path.display()
+        );
+        assert!(
+            request.description.trim().len() <= 1024,
+            "{}: description exceeds limit",
+            path.display()
+        );
+        assert_eq!(
+            request.base_revision,
+            0,
+            "{}: fresh-state fixture",
+            path.display()
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn long_windows_state_paths_support_atomic_publication_and_restart() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .dir
+        .join("a".repeat(80))
+        .join("b".repeat(80))
+        .join("state.json");
+    assert!(
+        std::env::current_dir()
+            .unwrap()
+            .join(&path)
+            .as_os_str()
+            .len()
+            > 260
+    );
+    let mut engine = Engine::open(&path, Box::new(Simulator::new())).unwrap();
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    let committed = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
+    assert_eq!(committed.status, 200, "{}", committed.body);
+    drop(engine);
+    let engine = Engine::open(&path, Box::new(Simulator::new())).unwrap();
+    assert_eq!(engine.state.revision, 1);
+    assert_eq!(engine.state.desired, config().normalized());
+}
+
+#[test]
+fn persistent_envelope_shape_is_explicit_and_rust_only() {
+    let fixture = Fixture::new();
+    let _engine = fixture.engine();
+    let envelope: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+    let keys: BTreeSet<_> = envelope
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, BTreeSet::from(["schema", "sha256", "state"]));
+    assert_eq!(envelope["schema"], "netcontrol-rust-state-v1");
+    assert_eq!(envelope["sha256"].as_str().unwrap().len(), 64);
+    let keys: BTreeSet<_> = envelope["state"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "scope",
+            "revision",
+            "desired",
+            "active_transaction",
+            "initialized_at",
+            "transactions"
+        ])
+    );
+    assert!(envelope["state"]["active_transaction"].is_null());
+    assert!(envelope["state"]["initialized_at"].is_string());
+    assert_eq!(envelope["state"]["transactions"], json!({}));
+}
+
+#[test]
+fn transaction_confirmation_history_restore_and_locations() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.body["id"].as_str().unwrap().to_string();
+    assert_eq!(r.location, Some(format!("/api/v1/transactions/{id}")));
+    assert_eq!(r.body["status"], "pending_confirmation");
+    assert_eq!(r.body["description"], "Update network");
+    let state = request(&mut e, "GET", "/api/v1/state", Value::Null);
+    assert_eq!(state.body["revision"], 0);
+    assert_eq!(state.body["desired"]["interfaces"], json!([]));
+    assert_eq!(state.body["observed"]["interfaces"][0]["name"], "lan0");
+    assert_eq!(state.body["drift"], false);
+    assert_eq!(confirm(&mut e, &id).status, 200);
+    assert_eq!(e.state.revision, 1);
+    assert_eq!(confirm(&mut e, &id).status, 200);
+    assert_eq!(e.state.revision, 1);
+    let list = request(&mut e, "GET", "/api/v1/revisions", Value::Null);
+    assert_eq!(list.body["revisions"].as_array().unwrap().len(), 2);
+    assert_eq!(list.body["revisions"][0]["current"], true);
+    let revision = request(&mut e, "GET", "/api/v1/revisions/1", Value::Null);
+    assert_eq!(revision.body["config"], json!(config().normalized()));
+    let restore = request(
+        &mut e,
+        "POST",
+        "/api/v1/revisions/0/restore",
+        json!({"base_revision":1,"confirm_timeout_seconds":30}),
+    );
+    assert_eq!(restore.status, 202, "{}", restore.body);
+    assert_eq!(restore.body["restored_from_revision"], 0);
+    let restored_id = restore.body["id"].as_str().unwrap();
+    assert_eq!(confirm(&mut e, restored_id).status, 200);
+    assert_eq!(e.state.revision, 2);
+    assert_eq!(e.state.desired, Config::empty());
+    drop(e);
+    let e = f.engine();
+    assert_eq!(e.state.revision, 2);
+}
+#[test]
+fn pending_confirmation_survives_restart_and_expiry_rolls_back() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = submit(&mut e, config());
+    let id = r.body["id"].as_str().unwrap().to_string();
+    drop(e);
+    let mut e = f.engine();
+    assert_eq!(e.active().unwrap().id, id);
+    assert_eq!(e.expected(), config().normalized());
+    e.now = Some(e.active().unwrap().confirmation_deadline);
+    e.tick().unwrap();
+    assert!(e.active().is_none());
+    assert_eq!(e.state.transactions[&id].status, "rolled_back");
+    assert_eq!(
+        e.backend.observe(&Config::empty()).unwrap(),
+        Config::empty()
+    );
+    drop(e);
+    assert!(f.engine().active().is_none());
+}
+#[test]
+fn startup_recovers_applying_rolling_back_and_recovery_failed() {
+    for status in ["applying", "rolling_back", "recovery_failed"] {
+        let f = Fixture::new();
+        let mut e = f.engine();
+        let r = submit(&mut e, config());
+        let id = r.body["id"].as_str().unwrap().to_string();
+        e.state.transactions.get_mut(&id).unwrap().status = status.into();
+        e.store.save(&e.state).unwrap();
+        drop(e);
+        let e = f.engine();
+        assert_eq!(e.state.transactions[&id].status, "rolled_back");
+        assert!(e.active().is_none());
+    }
+}
+#[test]
+fn startup_recovers_expired_pending_confirmation() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    // Preserve a valid initial/submission time while placing the whole transaction in the past.
+    e.state.initialized_at = Utc::now() - Duration::hours(2);
+    e.store.save(&e.state).unwrap();
+    e.now = Some(Utc::now() - Duration::hours(1));
+    let r = submit(&mut e, config());
+    let id = r.body["id"].as_str().unwrap().to_string();
+    drop(e);
+    let e = f.engine();
+    assert_eq!(e.state.transactions[&id].status, "rolled_back");
+}
+#[test]
+fn rollback_is_idempotent_and_does_not_advance_revision() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = submit(&mut e, config());
+    let id = r.body["id"].as_str().unwrap();
+    let path = format!("/api/v1/transactions/{id}/rollback");
+    assert_eq!(request(&mut e, "POST", &path, Value::Null).status, 200);
+    assert_eq!(request(&mut e, "POST", &path, Value::Null).status, 200);
+    assert_eq!(e.state.revision, 0);
+    assert_eq!(confirm(&mut e, id).status, 409);
+}
+#[test]
+fn confirmation_at_deadline_is_rejected_and_reverted() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = submit(&mut e, config());
+    let id = r.body["id"].as_str().unwrap();
+    e.now = Some(e.active().unwrap().confirmation_deadline);
+    let r = confirm(&mut e, id);
+    assert_eq!(r.status, 409);
+    assert_eq!(r.body["transaction"]["status"], "rolled_back");
+}
+#[derive(Default)]
+struct Faults {
+    state: Config,
+    fail_applies: usize,
+    apply_count: usize,
+    fail_observe: bool,
+    typed_network_drift: bool,
+    worker_failed: bool,
+    repair_count: usize,
+    post_apply_drift: bool,
+    traffic_response: Option<Value>,
+    traffic_error: Option<String>,
+    statistics_calls: Vec<(String, String)>,
+}
+struct FaultBackend(Arc<Mutex<Faults>>);
+impl Backend for FaultBackend {
+    fn scope(&self) -> Result<String> {
+        Ok("fault-test".into())
+    }
+    fn observe(&mut self, _: &Config) -> Result<Config> {
+        let f = self.0.lock().unwrap();
+        ensure!(!f.fail_observe, "injected observation error");
+        ensure!(!f.worker_failed, "injected worker health error");
+        Ok(f.state.clone())
+    }
+    fn observe_for_repair(&mut self, _: &Config) -> Result<Config> {
+        let f = self.0.lock().unwrap();
+        if f.typed_network_drift {
+            return Err(
+                anyhow::Error::new(crate::BackendDrift("injected network drift".into()))
+                    .context("verify repair ownership"),
+            );
+        }
+        if f.fail_observe {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected observation error",
+            )
+            .into());
+        }
+        Ok(f.state.clone())
+    }
+    fn apply(&mut self, _: &Config, after: &Config) -> Result<()> {
+        let mut f = self.0.lock().unwrap();
+        f.apply_count += 1;
+        f.state = after.clone();
+        if f.fail_applies > 0 {
+            f.fail_applies -= 1;
+            bail!("injected partial apply error");
+        }
+        if f.post_apply_drift {
+            f.state.firewall.allow_all_icmp = !after.firewall.allow_all_icmp;
+        }
+        Ok(())
+    }
+    fn runtime(&mut self, _: &Config) -> Result<Value> {
+        Ok(json!({}))
+    }
+    fn statistics(&mut self, _: &Config, path: &str, query: &str) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.statistics_calls.push((path.into(), query.into()));
+        if let Some(error) = &faults.traffic_error {
+            bail!("{error}");
+        }
+        if let Some(response) = &faults.traffic_response {
+            return Ok(response.clone());
+        }
+        bail!("unsupported test statistics")
+    }
+    fn repair(&mut self, c: &Config) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.state = c.clone();
+        faults.worker_failed = false;
+        faults.repair_count += 1;
+        Ok(json!({}))
+    }
+}
+fn faulty(f: &Fixture) -> (Engine, Arc<Mutex<Faults>>) {
+    let state = Arc::new(Mutex::new(Faults::default()));
+    let e = Engine::open(&f.path(), Box::new(FaultBackend(state.clone()))).unwrap();
+    (e, state)
+}
+#[test]
+fn apply_failure_rolls_back_and_returns_transaction() {
+    let f = Fixture::new();
+    let (mut e, faults) = faulty(&f);
+    faults.lock().unwrap().fail_applies = 1;
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 500);
+    assert_eq!(r.body["transaction"]["status"], "rolled_back");
+    assert_eq!(faults.lock().unwrap().state, Config::empty());
+    assert!(e.active().is_none());
+}
+#[test]
+fn failed_recovery_blocks_writes_and_manual_retry_succeeds() {
+    let f = Fixture::new();
+    let (mut e, faults) = faulty(&f);
+    faults.lock().unwrap().fail_applies = 2;
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 500);
+    assert_eq!(r.body["transaction"]["status"], "recovery_failed");
+    let id = r.body["transaction"]["id"].as_str().unwrap();
+    assert_eq!(submit(&mut e, config()).status, 409);
+    let r = request(
+        &mut e,
+        "POST",
+        &format!("/api/v1/transactions/{id}/rollback"),
+        Value::Null,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(e.active().is_none());
+}
+#[test]
+fn intent_is_durable_before_backend_changes() {
+    let f = Fixture::new();
+    let (mut e, faults) = faulty(&f);
+    e.store.fail_after.set(Some(0));
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 500);
+    assert_eq!(faults.lock().unwrap().apply_count, 0);
+    assert!(e.state.transactions.is_empty());
+    assert!(
+        e.store
+            .load::<State>()
+            .unwrap()
+            .unwrap()
+            .transactions
+            .is_empty()
+    );
+}
+#[test]
+fn pending_save_failure_triggers_rollback() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    e.store.fail_after.set(Some(1));
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 500);
+    assert_eq!(r.body["transaction"]["status"], "rolled_back");
+    assert!(e.active().is_none());
+    assert_eq!(e.state.revision, 0);
+}
+#[test]
+fn failed_confirmation_save_preserves_pending_and_is_retryable() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = submit(&mut e, config());
+    let id = r.body["id"].as_str().unwrap();
+    e.store.fail_after.set(Some(0));
+    assert_eq!(confirm(&mut e, id).status, 500);
+    assert_eq!(e.state.revision, 0);
+    assert_eq!(e.active().unwrap().status, "pending_confirmation");
+    assert_eq!(confirm(&mut e, id).status, 200);
+    assert_eq!(e.state.revision, 1);
+}
+#[test]
+fn failed_rollback_result_save_keeps_durable_recovery_intent() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = submit(&mut e, config());
+    let id = r.body["id"].as_str().unwrap().to_string();
+    e.store.fail_after.set(Some(1));
+    assert!(e.rollback(&id, "test").is_err());
+    assert_eq!(e.active().unwrap().status, "recovery_failed");
+    let durable = e.store.load::<State>().unwrap().unwrap();
+    assert_eq!(durable.transactions[&id].status, "rolling_back");
+    drop(e);
+    let e = f.engine();
+    assert_eq!(e.state.transactions[&id].status, "rolled_back");
+}
+#[test]
+fn drift_blocks_submit_and_confirmation() {
+    let f = Fixture::new();
+    let (mut e, faults) = faulty(&f);
+    faults.lock().unwrap().state.firewall.allow_all_icmp = false;
+    let r = request(&mut e, "GET", "/api/v1/state", Value::Null);
+    assert_eq!(r.body["drift"], true);
+    assert_eq!(submit(&mut e, config()).status, 409);
+    faults.lock().unwrap().state = Config::empty();
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 202, "{}", r.body);
+    let id = r.body["id"].as_str().unwrap();
+    faults.lock().unwrap().state.firewall.allow_all_icmp = false;
+    assert_eq!(confirm(&mut e, id).status, 409);
+    assert_eq!(e.state.revision, 0);
+    assert!(e.active().is_some());
+}
+#[test]
+fn post_apply_verification_mismatch_never_becomes_pending() {
+    let f = Fixture::new();
+    let (mut e, faults) = faulty(&f);
+    faults.lock().unwrap().post_apply_drift = true;
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 500);
+    assert_ne!(r.body["transaction"]["status"], "pending_confirmation");
+}
+#[test]
+fn state_lock_contention_and_release() {
+    let f = Fixture::new();
+    let e = f.engine();
+    assert!(Engine::open(&f.path(), Box::new(Simulator::new())).is_err());
+    drop(e);
+    f.engine();
+}
+#[test]
+fn corrupt_and_incompatible_journals_are_never_reset() {
+    for bytes in [
+        b"".as_slice(),
+        b"{bad",
+        b"{}",
+        br#"{"scope":"simulator","revision":0,"desired":{},"transactions":{}}"#,
+        br#"{"schema":"foreign","sha256":"","state":{}}"#,
+    ] {
+        let f = Fixture::new();
+        fs::write(f.path(), bytes).unwrap();
+        assert!(Engine::open(&f.path(), Box::new(Simulator::new())).is_err());
+        assert_eq!(fs::read(f.path()).unwrap(), bytes);
+    }
+    let f = Fixture::new();
+    let e = f.engine();
+    drop(e);
+    let mut bytes = fs::read(f.path()).unwrap();
+    let offset = bytes.iter().position(|b| *b == b'0').unwrap();
+    bytes[offset] = b'1';
+    fs::write(f.path(), &bytes).unwrap();
+    assert!(Engine::open(&f.path(), Box::new(Simulator::new())).is_err());
+    assert_eq!(fs::read(f.path()).unwrap(), bytes);
+}
+#[test]
+fn typed_history_and_active_pointer_integrity_are_checked() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = submit(&mut e, config());
+    let id = r.body["id"].as_str().unwrap();
+    confirm(&mut e, id);
+    let original = e.state.clone();
+    e.state.transactions.clear();
+    e.store.save(&e.state).unwrap();
+    drop(e);
+    assert!(Engine::open(&f.path(), Box::new(Simulator::new())).is_err());
+    let store = Store::open(&f.path()).unwrap();
+    let mut state = original;
+    state.active_transaction = Some("missing".into());
+    store.save(&state).unwrap();
+    drop(store);
+    assert!(Engine::open(&f.path(), Box::new(Simulator::new())).is_err());
+}
+#[test]
+fn stale_base_active_conflicts_and_invalid_timeout_have_exact_statuses() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let r = request(
+        &mut e,
+        "POST",
+        "/api/v1/transactions",
+        json!({"base_revision":9,"confirm_timeout_seconds":30,"config":{}}),
+    );
+    assert_eq!(r.status, 409);
+    for timeout in [0, 9, 301] {
+        let r = request(
+            &mut e,
+            "POST",
+            "/api/v1/transactions",
+            json!({"confirm_timeout_seconds":timeout,"config":{}}),
+        );
+        assert_eq!(r.status, 422);
+    }
+    let r = submit(&mut e, config());
+    assert_eq!(r.status, 202);
+    assert_eq!(submit(&mut e, config()).status, 409);
+}
+#[test]
+fn strict_json_validation_and_body_limits() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    for body in [
+        br#"{"config":{},"confirm_timeout_seconds":30,"unknown":1}"#.as_slice(),
+        br#"{"config":{},"confirm_timeout_seconds":30}{}"#,
+        b"null",
+        b"[]",
+        b"",
+    ] {
+        assert_eq!(
+            e.request("POST", "/api/v1/transactions", "", "operator", &all(), body)
+                .status,
+            400
+        );
+    }
+    assert_eq!(
+        e.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "operator",
+            &all(),
+            &vec![b' '; (1 << 20) + 1]
+        )
+        .status,
+        400
+    );
+}
+#[test]
+fn fine_grained_permissions_cover_confirmation_and_restore() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let c = config();
+    let body = serde_json::to_vec(&json!({"confirm_timeout_seconds":30,"config":c})).unwrap();
+    let writer = vec!["transactions.write".into()];
+    assert_eq!(
+        e.request("POST", "/api/v1/transactions", "", "writer", &writer, &body)
+            .status,
+        403
+    );
+    let iface = vec!["transactions.write".into(), "interfaces.write".into()];
+    let r = e.request("POST", "/api/v1/transactions", "", "writer", &iface, &body);
+    assert_eq!(r.status, 202);
+    let id = r.body["id"].as_str().unwrap();
+    assert_eq!(
+        e.request(
+            "POST",
+            &format!("/api/v1/transactions/{id}/confirm"),
+            "",
+            "writer",
+            &writer,
+            &[]
+        )
+        .status,
+        403
+    );
+    assert_eq!(confirm(&mut e, id).status, 200);
+    let r = e.request(
+        "POST",
+        "/api/v1/revisions/0/restore",
+        "",
+        "writer",
+        &iface,
+        br#"{"base_revision":1,"confirm_timeout_seconds":30}"#,
+    );
+    assert_eq!(r.status, 403);
+    assert_eq!(
+        e.request("GET", "/api/v1/state", "", "writer", &writer, &[])
+            .status,
+        403
+    );
+    assert_eq!(
+        e.request("GET", "/api/v1/state", "", "", &all(), &[])
+            .status,
+        401
+    );
+}
+#[test]
+fn all_domain_permissions_are_independently_required() {
+    let before = Config::empty();
+    let cases = [
+        (
+            "ntp.write",
+            json!({"ntp":{"enabled":false,"servers":["ntp.invalid"]}}),
+        ),
+        (
+            "syslog.write",
+            json!({"syslog":{"servers":[{"host":"log.invalid","port":514,"transport":"udp"}]}}),
+        ),
+        ("vnstat.write", json!({"vnstat":{"enabled":true}})),
+        (
+            "firewall.write",
+            json!({"firewall":{"allow_all_icmp":false}}),
+        ),
+        (
+            "nat.write",
+            json!({"firewall":{"nat":{"masquerade":[{"family":"ipv4","out_interface":"lan0"}]}}}),
+        ),
+        (
+            "kernel.namespace.write",
+            json!({"kernel":{"namespace":{"net.core.somaxconn":"8192"}}}),
+        ),
+        (
+            "kernel.host.write",
+            json!({"kernel":{"host":{"net.core.rmem_max":"4194304"}}}),
+        ),
+        (
+            "routes.write",
+            json!({"routes":[{"destination":"0.0.0.0/0","interface":"lan0","table":10000,"metric":1}]}),
+        ),
+        (
+            "policy.write",
+            json!({"policy_rules":[{"priority":10000,"source":"0.0.0.0/0","table":10000}]}),
+        ),
+    ];
+    for (permission, v) in cases {
+        let after: Config = serde_json::from_value(v).unwrap();
+        let allowed: Vec<_> = all().into_iter().filter(|p| p != permission).collect();
+        let err = authorize(&allowed, &before, &after).expect_err("must deny");
+        assert_eq!(err.status, 403);
+        assert!(err.error.contains(permission));
+        assert!(authorize(&all(), &before, &after).is_ok());
+    }
+}
+#[test]
+fn reconcile_repairs_failed_workers_without_weakening_normal_observation() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    for service in [
+        "ntp",
+        "syslog",
+        "vnstat",
+        "softflowd",
+        "dhcp-relay",
+        "gateway-monitoring",
+    ] {
+        backend.lock().unwrap().worker_failed = true;
+        assert_eq!(
+            request(&mut engine, "GET", "/api/v1/state", Value::Null).status,
+            503
+        );
+        let before_repairs = backend.lock().unwrap().repair_count;
+        let reply = request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/services/{service}/reconcile"),
+            Value::Null,
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!(backend.lock().unwrap().repair_count, before_repairs + 1);
+        assert!(!backend.lock().unwrap().worker_failed);
+        assert_eq!(
+            request(&mut engine, "GET", "/api/v1/state", Value::Null).status,
+            200
+        );
+        assert_eq!(engine.state.revision, 0);
+        assert_eq!(engine.state.desired, Config::empty());
+    }
+}
+
+#[test]
+fn reconcile_still_rejects_network_drift_and_observation_errors() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let before_repairs = backend.lock().unwrap().repair_count;
+    {
+        let mut faults = backend.lock().unwrap();
+        faults.worker_failed = true;
+        faults.state.firewall.allow_all_icmp = false;
+    }
+    let reply = request(
+        &mut engine,
+        "POST",
+        "/api/v1/services/softflowd/reconcile",
+        Value::Null,
+    );
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(backend.lock().unwrap().repair_count, before_repairs);
+    assert!(backend.lock().unwrap().worker_failed);
+    {
+        let mut faults = backend.lock().unwrap();
+        faults.state = Config::empty();
+        faults.typed_network_drift = true;
+    }
+    let reply = request(
+        &mut engine,
+        "POST",
+        "/api/v1/services/softflowd/reconcile",
+        Value::Null,
+    );
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(backend.lock().unwrap().repair_count, before_repairs);
+    assert!(backend.lock().unwrap().worker_failed);
+    {
+        let mut faults = backend.lock().unwrap();
+        faults.state = Config::empty();
+        faults.typed_network_drift = false;
+        faults.fail_observe = true;
+    }
+    let reply = request(
+        &mut engine,
+        "POST",
+        "/api/v1/services/softflowd/reconcile",
+        Value::Null,
+    );
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(backend.lock().unwrap().repair_count, before_repairs);
+    assert!(backend.lock().unwrap().worker_failed);
+}
+
+#[test]
+fn unsupported_flow_filters_and_v5_sampling_fail_validation_before_backend_apply() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut config = config();
+    config.softflowd = vec![
+        serde_json::from_value(json!({
+            "name":"flow0","enabled":true,"interface":"lan0","collector":"192.0.2.10:9995",
+            "export_version":10,"sampling_rate":100,"max_flows":1024,"snaplen":128,
+            "promiscuous":false,"capture_filter":""
+        }))
+        .unwrap(),
+    ];
+    for filter in ["", "ip", "ip6", "tcp", "udp", "icmp", "icmp6"] {
+        config.softflowd[0].capture_filter = filter.into();
+        config.normalize();
+        config.validate().unwrap();
+    }
+    for filter in [
+        "ip or ip6",
+        "tcp port 443",
+        "TCP",
+        " tcp",
+        "tcp ",
+        "icmp\n",
+        "\0",
+    ] {
+        config.softflowd[0].capture_filter = filter.into();
+        let reply = submit(&mut engine, config.clone());
+        assert_eq!(reply.status, 422, "{filter:?}: {}", reply.body);
+        assert!(engine.state.transactions.is_empty());
+    }
+    config.softflowd[0].capture_filter.clear();
+    config.softflowd[0].export_version = 5;
+    config.softflowd[0].sampling_rate = 16383;
+    config.validate().unwrap();
+    config.softflowd[0].sampling_rate = 16384;
+    let reply = submit(&mut engine, config.clone());
+    assert_eq!(reply.status, 422, "{}", reply.body);
+    assert!(engine.state.transactions.is_empty());
+    for version in [1, 9, 10] {
+        config.softflowd[0].export_version = version;
+        config.softflowd[0].sampling_rate = 1000000;
+        config.validate().unwrap();
+    }
+}
+
+#[test]
+fn read_routes_runtime_statistics_and_reconcile_contract() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let paths = [
+        "state",
+        "interfaces",
+        "vlans",
+        "gateway-monitors",
+        "services/softflowd",
+        "services/ntp",
+        "services/syslog",
+        "services/vnstat",
+        "routes",
+        "policy-rules",
+        "firewall/rules",
+        "firewall/hosts",
+        "firewall/interface-policies",
+        "firewall/nat",
+        "wireguard",
+        "runtime",
+        "parent-interfaces",
+        "services/softflowd/status",
+        "services/dhcp-relay/status",
+        "services/gateway-monitoring/status",
+        "services/ntp/status",
+        "services/syslog/status",
+        "services/vnstat/status",
+        "kernel/tunables/catalog",
+        "kernel/tunables",
+        "statistics",
+        "statistics/interfaces",
+        "statistics/protocols",
+        "statistics/gateways",
+    ];
+    for path in paths {
+        let r = request(&mut e, "GET", &format!("/api/v1/{path}"), Value::Null);
+        assert_eq!(r.status, 200, "{path}: {}", r.body);
+    }
+    for service in [
+        "softflowd",
+        "dhcp-relay",
+        "gateway-monitoring",
+        "ntp",
+        "syslog",
+        "vnstat",
+    ] {
+        let r = request(
+            &mut e,
+            "POST",
+            &format!("/api/v1/services/{service}/reconcile"),
+            Value::Null,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    assert_eq!(
+        request(
+            &mut e,
+            "GET",
+            "/api/v1/statistics/interfaces/missing",
+            Value::Null
+        )
+        .status,
+        404
+    );
+    assert_eq!(
+        request(
+            &mut e,
+            "GET",
+            "/api/v1/statistics/gateways/missing",
+            Value::Null
+        )
+        .status,
+        404
+    );
+    assert_eq!(
+        e.request("GET", "/api/v1/statistics", "x=1", "operator", &all(), &[])
+            .status,
+        400
+    );
+    assert_eq!(
+        request(&mut e, "POST", "/api/v1/statistics", Value::Null).status,
+        405
+    );
+    assert_eq!(
+        request(&mut e, "PUT", "/api/v1/state", Value::Null).status,
+        405
+    );
+    assert_eq!(
+        request(&mut e, "GET", "/api/v1/unknown", Value::Null).status,
+        404
+    );
+    assert_eq!(
+        request(
+            &mut e,
+            "GET",
+            "/api/v1/services/unknown/status",
+            Value::Null
+        )
+        .status,
+        404
+    );
+    assert_eq!(
+        request(&mut e, "GET", "/api/v1/interfaces/missing", Value::Null).status,
+        404
+    );
+}
+#[test]
+fn revision_pagination_and_strict_queries() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    for _ in 0..3 {
+        let r = submit(&mut e, Config::empty());
+        assert_eq!(r.status, 202, "{}", r.body);
+        let committed = confirm(&mut e, r.body["id"].as_str().unwrap());
+        assert_eq!(committed.status, 200, "{}", committed.body);
+    }
+    let r = e.request("GET", "/api/v1/revisions", "limit=2", "reader", &all(), &[]);
+    assert_eq!(r.body["revisions"][0]["revision"], 3);
+    assert_eq!(r.body["next_before_revision"], 2);
+    let r = e.request(
+        "GET",
+        "/api/v1/revisions",
+        "limit=2&before_revision=2",
+        "reader",
+        &all(),
+        &[],
+    );
+    assert_eq!(r.body["revisions"][0]["revision"], 1);
+    assert!(r.body.get("next_before_revision").is_none());
+    for query in [
+        "limit=0",
+        "limit=101",
+        "limit=",
+        "limit=1&limit=2",
+        "unknown=1",
+        "before_revision=-1",
+        "before_revision=18446744073709551616",
+    ] {
+        assert_eq!(
+            e.request("GET", "/api/v1/revisions", query, "reader", &all(), &[])
+                .status,
+            400,
+            "{query}"
+        );
+    }
+}
+#[test]
+fn simulator_kernel_removal_and_rollback_restore_original_values() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let mut config = Config::empty();
+    config
+        .kernel
+        .namespace
+        .insert("net.core.somaxconn".into(), "8192".into());
+    let r = submit(&mut e, config);
+    let kernel = request(&mut e, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(kernel.body["desired"], json!(KernelConfig::default()));
+    assert_eq!(
+        kernel.body["configured"]["namespace"]["net.core.somaxconn"],
+        "8192"
+    );
+    assert_eq!(
+        kernel.body["captured_original"]["namespace"]["net.core.somaxconn"],
+        "4096"
+    );
+    assert_eq!(confirm(&mut e, r.body["id"].as_str().unwrap()).status, 200);
+    let r = submit(&mut e, Config::empty());
+    let kernel = request(&mut e, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(
+        kernel.body["effective"]["namespace"]["net.core.somaxconn"],
+        "4096"
+    );
+    let rollback = request(
+        &mut e,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            r.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200);
+    let kernel = request(&mut e, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(
+        kernel.body["effective"]["namespace"]["net.core.somaxconn"],
+        "8192"
+    );
+}
+
+#[test]
+fn traffic_history_routes_reach_backend_and_preserve_canonical_history() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    for (path, scopes) in [
+        ("/api/v1/statistics/vnstat", vec!["host", "managed"]),
+        ("/api/v1/statistics/vnstat/host", vec!["host"]),
+        ("/api/v1/statistics/vnstat/managed", vec!["managed"]),
+    ] {
+        let mut databases = serde_json::Map::new();
+        for scope in scopes {
+            databases.insert(scope.into(), json!({
+                "schema":"netcontrol-services/counters/v1",
+                "scope":scope,
+                "interfaces":{},
+                "history":[{
+                    "collected_at":"2026-10-19T06:30:00Z",
+                    "interface":"lan0",
+                    "delta":{"rx_bytes":"1000","tx_bytes":"2000","rx_packets":"10","tx_packets":"20"},
+                    "reset":false
+                }]
+            }));
+        }
+        let expected = json!({"schema":"netcontrol-services/counters/v1","scopes":databases});
+        backend.lock().unwrap().traffic_response = Some(expected.clone());
+        let reply = request(&mut engine, "GET", path, Value::Null);
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!(reply.body, expected);
+        assert_eq!(
+            backend.lock().unwrap().statistics_calls.last(),
+            Some(&(path.to_owned(), String::new()))
+        );
+    }
+}
+
+#[test]
+fn traffic_history_auth_query_scope_and_backend_errors_are_not_hidden() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let path = "/api/v1/statistics/vnstat";
+    assert_eq!(
+        engine.request("GET", path, "", "reader", &[], &[]).status,
+        403
+    );
+    for query in ["limit=10", "scope=host", "unused="] {
+        assert_eq!(
+            engine
+                .request("GET", path, query, "reader", &all(), &[])
+                .status,
+            400
+        );
+    }
+    for invalid in [
+        "/api/v1/statistics/vnstat/",
+        "/api/v1/statistics/vnstat/unknown",
+        "/api/v1/statistics/vnstat/host/extra",
+    ] {
+        assert_eq!(
+            request(&mut engine, "GET", invalid, Value::Null).status,
+            404
+        );
+    }
+    assert!(backend.lock().unwrap().statistics_calls.is_empty());
+    for error in [
+        "vnstat is disabled",
+        "traffic worker unavailable",
+        "traffic history unavailable: worker stopped",
+    ] {
+        backend.lock().unwrap().traffic_error = Some(error.into());
+        let reply = request(&mut engine, "GET", path, Value::Null);
+        assert_eq!(reply.status, 503, "{}", reply.body);
+        assert_eq!(reply.body["error"], error);
+        assert!(reply.body["transaction"].is_null());
+    }
+    assert_eq!(request(&mut engine, "POST", path, Value::Null).status, 405);
+}
+
+#[test]
+fn simulator_traffic_history_never_fabricates_measured_counters() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    for path in [
+        "/api/v1/statistics/vnstat",
+        "/api/v1/statistics/vnstat/host",
+        "/api/v1/statistics/vnstat/managed",
+    ] {
+        let disabled = request(&mut engine, "GET", path, Value::Null);
+        assert_eq!(disabled.status, 503);
+        assert_eq!(disabled.body["error"], "vnstat is disabled");
+    }
+    let mut config = Config::empty();
+    config.vnstat.enabled = true;
+    assert_eq!(submit(&mut engine, config).status, 202);
+    for path in [
+        "/api/v1/statistics/vnstat",
+        "/api/v1/statistics/vnstat/host",
+        "/api/v1/statistics/vnstat/managed",
+    ] {
+        let unavailable = request(&mut engine, "GET", path, Value::Null);
+        assert_eq!(unavailable.status, 503);
+        assert!(
+            unavailable.body["error"]
+                .as_str()
+                .unwrap()
+                .contains("simulator does not collect")
+        );
+        assert!(unavailable.body.get("scopes").is_none());
+    }
+}
+
+#[test]
+fn simulator_statistics_are_explicitly_unmeasured() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let transaction = submit(&mut e, config());
+    assert_eq!(transaction.status, 202);
+    let r = request(
+        &mut e,
+        "GET",
+        "/api/v1/statistics/interfaces/lan0",
+        Value::Null,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body["sample"]["status"], "simulated");
+    assert_eq!(r.body["interface"]["status"], "simulated");
+    assert!(r.body["interface"]["counters"].is_null());
+    assert!(r.body["interface"].get("pid").is_none());
+    let runtime = request(&mut e, "GET", "/api/v1/runtime", Value::Null);
+    assert!(
+        runtime.body["appliance_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|service| service.get("pid").is_none())
+    );
+}
+
+#[test]
+fn shutdown_is_idempotent_and_stops_requests() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    e.shutdown().unwrap();
+    e.shutdown().unwrap();
+    assert_eq!(
+        request(&mut e, "GET", "/api/v1/state", Value::Null).status,
+        503
+    );
+}

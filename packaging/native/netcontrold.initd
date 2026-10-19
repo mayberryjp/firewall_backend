@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+
+description="Native Rust Netcontrol daemon"
+command="/usr/sbin/netcontrold"
+command_args="${netcontrold_args}"
+command_background="yes"
+pidfile="/run/netcontrold.pid"
+output_log="/var/log/netcontrold.log"
+error_log="/var/log/netcontrold.log"
+retry="TERM/90/KILL/5"
+umask="0077"
+
+depend() {
+	need localmount
+	after net
+}
+
+start_pre() {
+	checkpath --directory --mode 0700 --owner root:root /var/lib/netcontrol
+	checkpath --directory --mode 0700 --owner root:root /etc/netcontrol/keys
+	checkpath --file --mode 0600 --owner root:root /var/log/netcontrold.log
+}

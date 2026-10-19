@@ -1,0 +1,32 @@
+[package]
+name = "netcontrol-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["tls", "nftables"]
+tls = ["netcontrol-services/tls"]
+nftables = ["dep:rustables"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+netcontrol-core = { path = "../netcontrol-core" }
+netcontrol-services = { path = "../netcontrol-services", default-features = false }
+ipnet = { version = "2", features = ["serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+tokio.workspace = true
+futures-util = "0.3"
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"
+rustables = { version = "0.9", optional = true }
+ipnetwork = "0.21"
+wireguard-control = "1.7"
+time = { version = "0.3", features = ["formatting"] }

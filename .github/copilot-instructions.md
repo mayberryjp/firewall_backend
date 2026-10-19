@@ -2,8 +2,9 @@
 
 ## Project context
 
-- This is the `netcontrol` Go backend. Use Go 1.24 or later.
-- Application entry point: `cmd/netcontrold`; domain and backend logic: `internal/control`; HTTP API and embedded UI: `internal/httpapi`; identity persistence: `internal/identity`.
+- This is the `netcontrol` Rust workspace. Use the stable Rust toolchain and the committed Cargo lockfile.
+- Application, HTTP API, identity, and embedded UI: `crates/netcontrold`; domain, transactions, and persistence: `crates/netcontrol-core`; Linux networking: `crates/netcontrol-native`; native protocol workers: `crates/netcontrol-services`; custom signed packaging: `crates/netcontrol-package`.
+- Implement services in-process in Rust. Do not wrap Go or supervise external dnsmasq, chronyd, syslog-ng, vnstatd, or softflowd programs. Do not reintroduce the removed Go implementation or APK/abuild packaging.
 - Read [README.md](../README.md) for architecture, operation, and validation commands. Treat [FRONTEND_SPEC.md](../FRONTEND_SPEC.md) as the frontend contract; keep it consistent with implemented backend behavior.
 - Preserve unrelated working-tree changes. Never store credentials, tokens, private keys, customer data, or sensitive runtime configuration in documentation or journal entries.
 
@@ -20,8 +21,8 @@
 
 - Before implementation, read the relevant code, tests, contract documentation, and change memory described below. Reuse existing patterns and keep changes scoped to the request.
 - Update directly affected documentation and tests alongside behavior changes. Document current contract changes explicitly without treating backward compatibility as a constraint.
-- Run the smallest relevant tests first, such as `go test ./internal/httpapi` or `go test ./internal/control`. For cross-package changes, run `go test ./...`; use `go vet ./...` and `go build ./cmd/netcontrold` as appropriate.
-- Use `go test -race ./internal/...` when concurrency is affected and the platform has a supported C toolchain. Linux-native integration requires Linux and the documented namespace privileges; simulator checks on Windows do not prove native behavior.
+- Run the smallest relevant tests first, such as `cargo test -p netcontrold` or `cargo test -p netcontrol-core`. For cross-crate changes run `cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, and `cargo build --workspace --locked`.
+- Test worker shutdown, synchronization, persistence, and rollback when concurrency changes. Linux-native integration requires Linux and the documented namespace privileges; portable tests on Windows do not prove native behavior.
 - Report exactly which checks passed, failed, or were not run and why. Never describe an unexecuted check as successful.
 
 ## Versioning and release history

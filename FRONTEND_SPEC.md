@@ -6,7 +6,7 @@ Build an administrative web application for the Netcontrol isolated-lab network
 control plane. Operators must be able to inspect owned networking, prepare a
 complete desired configuration, review its effects, provisionally apply it, and
 explicitly confirm or roll it back. They must also be able to inspect transaction
-recovery, restore committed revisions, and diagnose managed softflowd processes.
+recovery, restore committed revisions, and diagnose native protocol workers.
 
 This document specifies frontend behavior against the backend in this repository.
 Statements marked **Frontend decision** are proposed UI choices, not existing
@@ -40,10 +40,10 @@ Support:
 - IPv4/IPv6 masquerading.
 - WireGuard key references, peers, endpoints, allowed networks, and keepalive.
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
-- Per-interface DHCPv4 relay server lists and enable flags, managed dnsmasq relay,
+- Per-interface DHCPv4 relay server lists and enable flags, native Rust relay,
   runtime inspection, and explicit service repair.
-- Explicit opt-in host-clock NTP and whole-appliance remote syslog supervision,
-  using host networking; dual host/managed-namespace vnstatd with persistent
+- Explicit opt-in host-clock NTP and whole-appliance remote syslog workers,
+  using host networking; dual host/managed-namespace native traffic accounting with persistent
   separate databases, all-interface discovery, status and repair.
 - Complete-package transactions, confirmation, rollback, and recovery.
 - Committed configuration history, comparison, export, and historical restore.
@@ -59,8 +59,8 @@ Do not present as supported:
   controls, traffic control, device tuning, or hardware offload.
 - Private-key upload/generation, key-file listing, package installation, arbitrary
   commands, process identity configuration, or systemd control.
-- Server-computed throughput/history, flow records, WireGuard handshake/peer
-  telemetry, collector-delivery verification, or real-time server push.
+- Calendar-aggregated throughput/history, flow records, collector-delivery
+  verification, or real-time server push.
   Client-derived interface rate charts are optional, subject to section 6.1.1.
 - Multi-user account administration, API-key permission discovery,
   a tamper-evident audit log, or multi-device coordination. Single-device setup
@@ -68,6 +68,76 @@ Do not present as supported:
 
 Label the product **Isolated lab control plane**. Do not market it as a production
 host-network manager or describe a package apply as an atomic kernel transaction.
+
+### 1.3 Rust request and persistence contract
+
+The backend is a Rust-only workspace. There is no Go executable, state importer,
+protocol-daemon wrapper, or compatibility endpoint. Packages use the signed
+`.ncpkg` format and native package tool, not APK/abuild.
+
+Request JSON rejects unknown fields. Non-optional fields, arrays, and maps reject
+explicit `null`; omitted defaultable collections become empty. Optional
+`wireguard`, `vlan`, and `firewall.policies` may be null/omitted. Measurement
+nullability in responses is separate from request validation.
+
+Missing structurally required fields return `400`, rather than being decoded as
+zero values and subsequently failing semantic validation. Required fields:
+
+| Object | Required fields |
+| --- | --- |
+| Transaction submit | `config`, `confirm_timeout_seconds` |
+| Revision restore | `confirm_timeout_seconds` |
+| Interface | `name`, `kind`, `role`, `mtu`, `up` |
+| WireGuard / peer | `key_ref`, `listen_port` / `public_key` |
+| VLAN | `parent`, `id` |
+| Route | `destination`, `interface`, `table`, `metric` |
+| Policy rule | `priority`, `source`, `table` |
+| Firewall/host rule | `action` |
+| Masquerade rule | `family`, `out_interface` |
+| Firewall host | `id`, `name`, `addresses`, `policy` |
+| Ingress policy | `interface` |
+| Syslog destination | `host`, `port`, `transport` |
+| Flow exporter | All configuration fields except `capture_filter`, `timeouts` |
+| Gateway monitor | Identity/enabled/interface/address/table fields; timing fields remain defaultable |
+
+`firewall.allow_all_icmp` defaults to true only when omitted; explicit null is
+`400`. An omitted firewall/policy defaults to `"accept"`. Invalid semantic values
+still return `422`.
+
+Transaction responses no longer expose `kernel_before` or `kernel_after`;
+kernel-original ownership belongs to native persistence. Use the kernel
+inspection endpoint. Runtime may include `kernel_tunables` with `desired`,
+`configured`, `effective`, `observed`, `captured_original`, and `drift`.
+Service repair rejects observed networking drift with `409`. Native observation
+errors return `503`; startup reconciliation errors fail startup rather than
+advertising a successfully initialized but unreconciled engine.
+The repair precheck verifies network/kernel ownership independently of worker
+health, so a failed enabled worker does not itself block explicit service repair.
+Repair never bypasses networking drift protection.
+
+Network state uses the checksummed `netcontrol-rust-state-v1` envelope with
+`schema`, `sha256`, and `state` fields, limited to 256 MiB. The state contains
+scope, revision, desired configuration, nullable active transaction ID,
+initialization timestamp, and transaction map. Incompatible/corrupt data is
+rejected without import, deletion, or reset. Revisions retain
+`{revisions,next_before_revision?}` and flattened detail metadata plus `config`;
+default list limit 50, range 1..100, exclusive uint64 `before_revision`.
+
+Identity and scoped-auth files require their own `schema: 1` JSON roots; these
+are not the network-state envelope. A scoped file is
+`{"schema":1,"credentials":[{"name":"dashboard","token_sha256":"<64 hex characters>","permissions":["state.read"]}]}`.
+It requires 1..100 unique credentials, known nonduplicated permissions, and a
+maximum file size of 1 MiB. Empty permissions grant nothing. Unknown fields,
+bare credential arrays, and unsupported schemas are rejected. `--auth-file`
+and explicit `--credential-db` are mutually exclusive. Scoped-file revocation
+requires restart; device-managed key revocation is immediate for future requests.
+No old identity, network-state, or vnStat database importer/reset is provided.
+
+CLI options use `--long-options`. External executable, child UID/GID,
+runtime-directory, `--backend-log-file`, and `--syslog-ca-file` settings are
+removed. The backend log source is `<services-state-dir>/backend.log`; syslog TLS
+uses system CA trust. See the [daemon contract](crates/netcontrold/README.md)
+and [installation guide](docs/BUILD_AND_INSTALL.md) for current deployment flags.
 
 ## 2. Product and interaction principles
 
@@ -155,7 +225,7 @@ write outcome, pending confirmation, unavailable/stale state, modeled drift.
 
 ### 4.1 Deployment contract
 
-Alpine APK/OpenRC installation and automatic build artifacts are documented in
+Custom signed native package/OpenRC installation and automatic build artifacts are documented in
 the [build and installation specification](docs/BUILD_AND_INSTALL.md).
 Packages and the daemon default to HTTP on `0.0.0.0:8080` in simulator mode; package
 installation must not be presented as proof of native networking readiness.
@@ -164,7 +234,7 @@ The embedded website requires no separate frontend build.
 **Operator prerequisite:** Use operator-configured, reachable frontend/API origins.
 Direct onboarding is available at `http://<appliance-LAN-IP>:8080/` with no SSH
 tunnel or certificate. HTTP is permitted on non-loopback listeners. TLS is
-optional and requires both `-tls-cert` and `-tls-key`; providing only one fails
+optional and requires both `--tls-cert` and `--tls-key`; providing only one fails
 startup. Wildcard IPv4 binding includes WAN interfaces and does not establish a
 LAN-only access policy. HTTP sends passwords, session cookies, and API keys
 unencrypted; do not describe it as a secure connection.
@@ -172,8 +242,8 @@ A same-origin deployment may forward `/api/v1` to Netcontrol; a separate dashboa
 origin may call the configured firewall URL directly using API-key authentication.
 In default device mode the daemon
 serves a small embedded onboarding/key-management website at `/`; the broader
-networking dashboard specified here still needs a separate frontend. Legacy
-`-auth-file` mode serves only the networking API. Both modes allow all origins
+networking dashboard specified here still needs a separate frontend. Scoped
+`--auth-file` mode serves only the networking API. Both modes allow all origins
 for `/api/v1/` using `Access-Control-Allow-Origin: *`, including error responses.
 Preflight `OPTIONS` requests need no authentication and return `204` for `GET`
 or `POST` with `Authorization` and `Content-Type` request headers (case-insensitive
@@ -219,14 +289,16 @@ the UI, help, and user-visible errors, not "bearer token" or "API token".
 the API key and its hash; these technical field names are unchanged. Device
 session tokens remain distinct from networking API keys.
 
-Without `-auth-file`, `/` hosts a three-step setup wizard: username/password,
+Without `--auth-file`, `/` hosts a three-step setup wizard: username/password,
 named automatically generated API key(s), then saved-key acknowledgement and
 completion. Anyone reaching an unclaimed device can claim it; restrict management
 network access until setup completes. Networking API keys do not work before
 completion. An interrupted account setup resumes through password sign-in.
 
-Credentials live in an owner-restricted bbolt database, separate from network JSON,
-using bcrypt password hashes and SHA-256 hashes of random 256-bit keys. API-key
+Credentials live in an owner-restricted Rust credential store, separate from
+network state, using Argon2id password hashes and SHA-256 hashes of random
+256-bit API keys. Persisted Rust formats are not Go/bbolt import formats; an
+incompatible store must fail explicitly, never be reset or silently imported. API-key
 plaintext is returned only by creation, shown in a one-time dialog, cleared when
 hidden, and never persisted in browser storage. Lists show name, creation time,
 and a masked suffix (last four characters). Lost-response recovery is removal and
@@ -256,10 +328,20 @@ Auth responses are `no-store`; errors are `{error: string}`. Common failures:
 `500` credential-store failure. Usernames are 1..64 bytes, passwords 12..72 UTF-8
 bytes, key names 1..80 bytes and unique. Names cannot have outer whitespace or
 control characters. At most 100 keys and 32 active sessions are allowed.
+The 32-session limit returns `409`; duplicate key names/key-count limits return
+`400`. Sessions have a fixed, non-sliding 1,800-second lifetime, persisted across
+restart. The cookie is `netcontrol_session`, with `Path=/auth/`, `Max-Age=1800`,
+HttpOnly and SameSite=Strict; Secure is set only on the actual TLS listener.
+Setup/login request bodies are limited to 4,096 bytes; other bodies to 1 MiB.
+Unknown fields, missing required fields, null bodies, and trailing JSON return
+`400`. Body-read timeout after ten seconds currently also returns the
+`400` body-too-large error. After an identity write failure, credential operations
+fail closed until restart; API-key lookup returns
+`503 {"error":"credential store unavailable","transaction":null}`.
 
 The account can remove even the last key and generate replacements; no password
 reset, remote recovery, API-key expiration, or managed-key permission editor is
-provided. `-auth-file` is an explicit alternative, not an automatic migration.
+provided. `--auth-file` is an explicit alternative, not an automatic migration.
 
 #### Connecting the broader networking dashboard
 
@@ -298,7 +380,7 @@ Configuration changes additionally require permissions for every changed area:
 | Gateway monitor configuration | `gateway_monitors.write` |
 | NTP server/client settings | `ntp.write` |
 | Whole-appliance syslog/remote destinations | `syslog.write` |
-| Host plus managed-namespace vnstatd enablement | `vnstat.write` |
+| Host plus managed-namespace native traffic accounting | `vnstat.write` |
 
 Creating/removing a WireGuard interface typically needs both interface and
 WireGuard permissions. Confirm/rollback requires the permissions for the original
@@ -322,6 +404,38 @@ issuing writes. Deployment-supplied UI permission hints may disable controls, bu
 must be labeled advisory; otherwise offer actions and handle `403` explicitly.
 Show permission errors near the action, preserve the draft, and explain that
 another appropriately authorized operator may need to confirm or recover.
+
+### 4.4 Transactional SSH configuration CLI
+
+Operators may also enable the daemon's in-process SSH server with `--ssh-listen`
+and optional `--ssh-host-key` (default `<state>.ssh-key`). It is disabled by
+default; it is not a system shell or an HTTP endpoint. The literal SSH username
+is `apikey` and its password is the existing API key, with the same permissions,
+device setup gate, immediate managed-key revocation and fail-closed identity
+health. SSH never makes account passwords authorize networking operations.
+
+Each shell stages a private candidate against a captured committed revision.
+`commit confirmed 10..300` submits a complete package to the existing engine;
+confirmation, rollback, deadlines, revision history and recovery are shared with
+HTTP. No immediate commit, per-command live edits, parallel write bypass or
+automatic merge exists. Disconnect discards local draft only, never confirms or
+cancels an already applied transaction. Either surface can recover a transaction
+with appropriate permissions.
+
+Interactive shells require a PTY; SSH exec accepts one command, not a script.
+Commands are limited to 65,536 bytes, private candidates to 1 MiB and rendered
+output to 4 MiB. Output overflow returns an explicit error and nonzero exec
+status instead of partial successful JSON. The command may already have applied
+changes; inspect state/transactions before retrying. Ctrl-C cancels input only;
+Ctrl-D exits without confirming pending work. Transport/session limits and
+terminal behavior are detailed in the [CLI guide](docs/CLI.md#ssh-transport-limits).
+
+HTTP paths, schemas, CORS, authentication and status/error behavior are unchanged.
+Treat CLI commits as other-manager writes: keep polling, handle revision/active
+transaction conflicts, preserve drafts and uncertain-write recovery. No frontend
+client or UI changes are required to use SSH; optional operator help may link
+to the [CLI guide](docs/CLI.md). Host management access, key fingerprint trust,
+namespace provisioning and exposure are operator responsibilities.
 
 ## 5. State and draft model
 
@@ -428,7 +542,8 @@ Interface records include `name`, optional `index`, `kind`, `ownership`, `mtu`,
 `admin_up`, `oper_state`, optional `mac`, `status`, optional `counter_bits`
 (32 or 64), nullable `counters`, and optional `error`. Counter keys cover RX/TX
 bytes, packets, errors, drops, and detailed link errors; see
-[Networking statistics](README.md#networking-statistics) for the complete scope.
+[Native networking statistics](crates/netcontrol-native/README.md#runtime-statistics-and-limitations)
+for the measurement scope.
 Statistics include unmanaged links and loopback, not just editable resources.
 Do not turn their presence into provisioning/edit controls. A changed adopted
 parent identity is labeled `adopted_parent_identity_changed`.
@@ -486,9 +601,24 @@ the scope. Enabled monitors require matching explicit route and source-policy
 rule into table 10000..19999. Disabled monitors need not retain those network
 references. Never silently add routes, rules, or firewall exceptions.
 
-Defaults and exact bounds are in the
-[backend settings table](README.md#probe-settings-and-health).
-Zero/omission selects defaults except zero variation threshold means disabled.
+Gateway timing fields use these inclusive bounds (milliseconds except percent):
+
+| Field | Default | Bounds |
+| --- | --- | --- |
+| `probe_interval_ms` | 1000 | 100..60000 |
+| `loss_timeout_ms` | 2000 | 100..60000 |
+| `window_ms` | 30000 | 1000..300000 |
+| `latency_threshold_ms` | 150 | 1..60000 |
+| `loss_threshold_percent` | 20 | 1..100 |
+| `rtt_variation_threshold_ms` | 0 | 0..60000 |
+| `failure_hold_ms` | 3000 | 100..60000 |
+| `recovery_hold_ms` | 5000 | 100..60000 |
+
+Explicit zero or omission selects defaults except zero variation threshold means
+disabled. Null/type errors return `400`; invalid normalized bounds return `422`.
+Disabled monitors still undergo validation. Loss timeout must be at most ten
+probe intervals; window must be at least two loss timeouts and three probe
+intervals, and at most 1024 probe intervals.
 Display units as milliseconds or percent, not seconds/microseconds. Validate
 cross-field timeout/window limits and preserve disabled settings in review,
 serialization, revision history, rollback, and restore.
@@ -548,26 +678,28 @@ Use the [complete dual-stack example](examples/gateway-monitoring.json).
 Add shared-draft editors for `config.ntp`, `config.syslog`, `config.vnstat`.
 All integrations default disabled. Exact server limits, canonical host syntax,
 timing, lifecycle semantics, operator prerequisites and warnings are in the
-[appliance service contract](README.md#appliance-time-remote-logging-and-vnstat).
+[native protocol service implementation](crates/netcontrol-services).
 Use the [complete example](examples/appliance-services.json), replacing synthetic
 servers and preserving the actual complete network configuration.
 
 - NTP editor: enabled toggle and 0..8 unique server host/IP strings; enabling
-  requires at least one. This synchronizes the **whole appliance clock**, not an
+  requires at least one. This disciplines the **whole appliance clock**, not an
   isolated clock, with host networking. Client only, slew-only, no NTP serving
-  or NTS. Running is not synchronized. Rollback restores settings, not time.
+  or NTS. Each correction is bounded to +/-500 ms, with continued polling for
+  larger residual offsets. Running is not synchronized. Rollback restores
+  settings, not time. No server-consensus/falseticker algorithm is provided.
 - Syslog editor: enabled toggle and 0..8 unique `(host, port, transport)` rows;
   enabling requires at least one. Explicit `udp`/`tcp`/`tls`, integer port
   1..65535, canonical IP or lowercase DNS host. TLS uses verified operator trust;
   no insecure fallback. Warn that UDP/TCP are unencrypted and UDP can lose logs.
   Fan-out includes system/kernel/backend logs; backend JSON remains message text.
-  This owns the entire system logger: disabling stops local logging too unless
-  an alternative is arranged. Show this warning before submission/rollback.
+  The Rust worker does not start/stop a system syslog daemon. Describe its actual
+  captured sources and unavailable sources explicitly; do not imply complete
+  system/kernel/backend delivery merely because a worker is running.
 - vnStat editor: one enabled toggle for **both scopes/all interfaces**, not a
-  selected-interface list. Host and managed namespace have different PIDs and
-  persistent databases. Include unmanaged/loopback and newly created interfaces.
-  Inventory every 5 seconds; new manual additions can take a minute to enter
-  daemon sampling. Counter polling/update is 5 seconds, save/rescan 1 minute.
+  selected-interface list. Host and managed namespace have separate native workers
+  and persistent histories. Include unmanaged/loopback and newly created interfaces.
+  Inventory, sampling and synchronized history publication occur every 5 seconds.
   Traffic across VLAN/parent/veth/loopback/scopes overlaps: never sum it.
 
 Per service in `ntp`, `syslog`, `vnstat`:
@@ -580,12 +712,19 @@ Per service in `ntp`, `syslog`, `vnstat`:
 
 `RuntimeState.appliance_services` always contains `ntp`, `syslog`, `vnstat-host`,
 `vnstat-managed` rows; service-specific status filters to one/two instances.
-Render lifecycle state, scope, optional PID/start time, optional active vnStat
-database directory and errors. Disabled/simulated/unavailable/not_running/
-running/unhealthy/exited are distinct. HTTP 200 can contain row errors.
-Running proves local process/namespace/readiness only, **not** synchronized
-clock, complete capture, or remote delivery. There are no API time-offset,
-NTP-sync, delivery-ack, or vnStat historical counter metrics; do not invent them.
+Render lifecycle state, scope, optional start time, optional active traffic-history
+database directory and errors. Native workers use `disabled`, `running`, `error`,
+or `stopped`; simulator rows are `simulated`. Preserve unknown states rather than
+relabeling them as success. HTTP 200 can contain row errors.
+Running proves local worker/namespace/readiness only, **not** synchronized
+clock, complete capture, or remote delivery. NTP exposes optional sample
+`offset_ms`, `delay_ms`, `requested_slew_ms`, `uncorrected_offset_ms`, `server`,
+`collected_at`, `discipline: "slew_only"`, and
+`sample_status: "warming_up"|"available"|"unavailable"`. Offsets are signed
+milliseconds; delay is nonnegative. Requested slew is bounded to +/-500 ms.
+Uncorrected offset is sample offset minus the requested correction, not proof
+that the asynchronous adjustment completed. Preserve sample timestamps on stale
+samples; no synchronization or remote-delivery acknowledgment is provided.
 Poll visible status at the existing non-overlapping 2-5 second cadence.
 Failures do not rewrite desired enabled settings or create drift by themselves.
 
@@ -595,18 +734,42 @@ and requires permissions for all enabled services. It never applies a draft.
 Preserve drafts on 403/409/422/500; expose validation/runtime errors. Existing
 401/403/404/405 and transaction revision/recovery behavior applies.
 
-Operator prerequisites are not API settings: explicit `-allow-host-services`,
-installed trusted chronyd/syslog-ng/vnstatd/vnstat, namespace/host capabilities,
-exclusive host-service ownership, an arranged backend log file, trust bundle,
+Operator prerequisites are not API settings: explicit `--allow-host-services`,
+namespace/host capabilities, exclusive host-service ownership, an arranged backend log source, trust bundle,
 host DNS/routing, and stopping competing clock/logging services. No packages,
 arbitrary commands, OpenRC service management, or host-network edits are exposed.
 Host clock/logging/statistics are narrowly opted-in exceptions to isolated scope.
 
-Settings persist through transactions/revisions/restart; vnStat databases survive
+Settings persist through transactions/revisions/restart; traffic histories survive
 graceful stop/repair. Managed database identity includes boot/namespace identity;
 a new scope gets a new database. No history is automatically deleted. Abrupt
 kill can lose unsaved samples and leave ownership requiring operator recovery.
 Simulator status is simulated without processes, time changes, or real history.
+
+#### Native traffic history
+
+Authenticated `state.read` GETs:
+
+- `/api/v1/statistics/vnstat`: both `host` and `managed` databases.
+- `/api/v1/statistics/vnstat/host`: only `host`.
+- `/api/v1/statistics/vnstat/managed`: only `managed`.
+
+No query parameters are supported (`400`); unknown scopes/suffixes are `404`,
+non-GET methods are `405`. Disabled, failed, not-yet-ready or simulator collectors
+return `503`, never fabricated measured empty data. The response is
+`{schema:"netcontrol-services/counters/v1",scope:string,scopes:{host?:TrafficDatabase,managed?:TrafficDatabase}}`.
+Top-level `scope` is the opaque actual native boot/namespace identity; do not parse
+it as a UI label. Each database contains the same schema, its `"host"|"managed"`
+scope, `interfaces`, and `history`. Interface records contain `ifindex`,
+`boot_id`, `namespace_id`, `last`, `total`, `resets`, `last_seen`, and `present`.
+`last` and `total` contain decimal-string `rx_bytes`, `tx_bytes`, `rx_packets`,
+`tx_packets`; history rows contain timestamp/interface/delta/reset. Preserve
+counter strings losslessly. See the [exact JSON reference](crates/netcontrol-services/README.md#json-field-reference).
+The first sample establishes a baseline; it is not previous lifetime usage.
+Only the latest 10,000 per-interface history records are retained, while
+cumulative totals persist; removed interfaces and reset boundaries remain visible.
+No calendar aggregation, Go/vnStat database compatibility, or chart-ready rate
+series is supplied. Do not sum overlapping interfaces or scopes.
 
 ### 6.2 Managed interfaces and VLANs
 
@@ -673,30 +836,29 @@ is the relay address (`giaddr`). Show it in the editor/review when more than one
 IPv4 address is present; do not infer a different subnet. Enabled interfaces must
 use distinct relay addresses. IPv6 DHCP is not implemented.
 
-Linux uses operator-installed dnsmasq in relay-only mode with DNS disabled.
-Simulator status is `simulated`, never actual packet forwarding. Missing daemon
-integration rejects enabled configurations during preflight. Operators supply
-the trusted binary, dedicated runtime directory, service UID/GID, capabilities,
-namespace/procfs access, routes, server return paths, and UDP 67/68 firewall
+Linux uses an in-process Rust DHCPv4 relay, not a DNS or DHCP address server.
+Simulator status is `simulated`, never actual packet forwarding. Unsupported
+configurations must fail explicitly during preflight. Operators supply capabilities,
+namespace access, routes, server return paths, and UDP 67/68 firewall
 permissions. Do not imply automatic routing/NAT/firewall changes.
 
 Use interface write permissions and full-package transaction workflows;
 confirmation, rollback, restart, and revision restoration preserve settings.
-One process serves all enabled interfaces, so edits to any enabled interface's
-servers/selected relay address can briefly interrupt others. Show this warning
+Worker reconfiguration can briefly interrupt enabled interfaces. Show this warning
 in review. Disabled server lists still persist.
 
 Read `GET /api/v1/services/dhcp-relay/status` as
 `{ interfaces: DHCPRelayStatus[], error: string }`, or use runtime's `dhcp_relay`
-array. Join rows by interface name. Show disabled, simulated, unavailable,
-not_running, running, unhealthy, and exited distinctly; preserve errors and
-unknown values. Enabled rows share one PID. Running verifies supervised process
-identity/namespace and owned UDP 67 socket, not server reachability or lease
+array. Join rows by interface name. Show disabled, simulated and native
+running/error/stopped states distinctly; preserve errors and
+unknown values. Do not show or infer child-process PIDs. Running verifies worker
+namespace and owned UDP 67 socket, not server reachability or lease
 delivery. Missing runtime data is Unknown, not Disabled.
 
-If the daemon fails, observed `dhcp_relay.enabled` becomes false and creates
-drift; do not replace the desired enabled setting with that observed value.
-Runtime remains accessible even when full observation fails.
+If an enabled relay/exporter worker fails, native observation returns `503`;
+it does not toggle the configured `enabled` field. Preserve desired configuration
+and drafts, and use runtime errors for diagnosis. Runtime remains accessible
+even when full observation fails.
 Offer explicit bodyless `POST /api/v1/services/dhcp-relay/reconcile` using stored
 committed/pending settings, not drafts. It repairs all managed services, creates
 no revision, does not replay networking, and requires permissions described in
@@ -732,7 +894,7 @@ only priorities must be unique.
 
 Provide a global **Allow all IPv4 ICMP (protocol 1)** toggle bound to
 `config.firewall.allow_all_icmp`, with `firewall.write` and `transactions.write`
-required to change it. It defaults to `true` when omitted or `null`; normalized
+required to change it. It defaults to `true` when omitted; null returns `400`. Normalized
 reads return a boolean. Preserve explicit `false` in full-package submissions,
 revision restore, and draft editing; do not use a truthy fallback.
 
@@ -821,22 +983,29 @@ reveal, upload, download, or browser key generation. Explain immutable operator
 key files and retention of old references for recovery/history.
 
 Public keys may be truncated in tables with accessible full-text/copy controls.
-Do not label a configured peer connected. No handshake/transfer metrics exist.
+Do not label a configured peer connected. Native runtime diagnostics can include
+measured public peer handshake/transfer information; these are optional
+observations, not a dedicated peer-statistics API or proof of reachability.
+Do not fabricate telemetry when absent or simulated.
 Endpoint roaming can create modeled drift; surface it without overwriting the
 draft automatically.
 
 ### 6.9 softflowd
 
 Table: name, desired enabled, observed enabled, capture interface, collector,
-export version, runtime state, PID/start time when supplied, error, staged state.
+export version, native worker state/start time when supplied, error, staged state.
 
 Editor: name, enabled, capture interface, numeric collector address/port, export
 version, sampling rate, maximum flows, snap length, promiscuous capture, optional
-single-line capture filter, and optional timeout overrides.
+capture filter chosen from empty, `ip`, `ip6`, `tcp`, `udp`, `icmp`, `icmp6`,
+and optional timeout overrides. Arbitrary BPF expressions are not supported.
+Fragments and IPv6 jumbograms are excluded. Versions 1/5 export IPv4;
+9/IPFIX support IPv4 and IPv6. Version 1 cannot convey sampling metadata:
+show `sampling_metadata: false` without inventing unsampled traffic totals.
 
 Capture interface options include managed draft interfaces and available adopted
 parents. Mark adopted parents protected. Timeout overrides are optional named
-entries; absence means executable defaults, not zero.
+entries; absence means native worker defaults, not zero.
 
 Display runtime states:
 
@@ -845,10 +1014,8 @@ Display runtime states:
 | `running` | Running; local responsiveness checked, delivery not verified |
 | `disabled` | Disabled |
 | `simulated` | Simulated; no real capture process |
-| `not_running` | Not running |
-| `unhealthy` | Unhealthy |
-| `exited` | Exited |
-| `unavailable` | Integration unavailable |
+| `error` | Worker failed; display error |
+| `stopped` | Worker stopped |
 | Unknown future value | Unknown status, retaining raw value |
 
 Missing runtime data means Unknown, not Disabled. Keep top-level runtime error
@@ -861,7 +1028,7 @@ not replay networking, and creates no revision. Do not suggest per-instance rest
 or automatically retry it. Block it during applying/rolling-back/recovery-failed
 states; it is allowed by the backend during pending confirmation.
 
-This includes the shared DHCP relay process. Require permissions for all enabled
+This includes the shared DHCP relay worker. Require permissions for all enabled
 services and warn that repair may briefly interrupt DHCP relay on every enabled
 interface, not just softflowd.
 
@@ -1034,7 +1201,7 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 
 - Use a tested IP parser; regex alone is insufficient.
 - IPv4-mapped IPv6 prefixes are not accepted.
-- Prefix spelling must match Go `netip` canonical output, including compressed
+- Prefix spelling must match canonical IP prefix output, including compressed
   lowercase IPv6. Network fields must have host bits cleared.
 - Interface address prefixes retain host bits: `192.0.2.10/24` is valid and must
   not silently become `192.0.2.0/24`.
@@ -1097,15 +1264,14 @@ unsupported route-table/port-uniqueness restrictions.
 | Capture interface | Valid interface name; managed or operator-adopted interface; server preflight remains authoritative |
 | Collector | Canonical numeric unicast or loopback IP:port; nonzero port; bracketed IPv6; no zone/mapped IPv6/DNS |
 | Export version | 1, 5, 9, or 10; label 10 as IPFIX |
-| Sampling rate | 1..1000000; 1 means unsampled |
+| Sampling rate | 1..1000000; 1 means unsampled; native v5 is limited to 16383 |
 | Max flows | 1..1000000 |
 | Snap length | 64..65535 bytes |
-| Capture filter | Optional; at most 4096 UTF-8 bytes; no NUL, CR, or LF |
+| Capture filter | Optional; exactly empty, `ip`, `ip6`, `tcp`, `udp`, `icmp`, or `icmp6` |
 | Timeout names | Only `general`, `tcp`, `tcp.rst`, `tcp.fin`, `udp`, `icmp`, `maxlife`, `expint` |
 | Timeout values | 0..604800 seconds; `general`, when present, must be >= 1 |
 
-Disabled entries still require valid fields. Filter compilation, executable
-availability, capture capability, and native integration are preflight/runtime
+Disabled entries still require valid fields. Capture capability and native integration are preflight/runtime
 concerns; the UI cannot certify them locally. There are no server-provided
 defaults for mandatory numeric fields; new-record presets must be visibly
 identified as frontend presets and never applied silently to existing records.
@@ -1178,6 +1344,9 @@ Paths below are relative to `/api/v1`.
 | GET | `/services/ntp/status` | `{instances: ApplianceServiceStatus[], error}` |
 | GET | `/services/syslog/status` | `{instances: ApplianceServiceStatus[], error}` |
 | GET | `/services/vnstat/status` | `{instances: ApplianceServiceStatus[], error}`; two scopes |
+| GET | `/statistics/vnstat` | Native traffic schema, opaque scope and both scope databases |
+| GET | `/statistics/vnstat/host` | Same envelope, only host database |
+| GET | `/statistics/vnstat/managed` | Same envelope, only managed database |
 | POST | `/services/ntp/reconcile` | No body -> `RuntimeState`; all enabled services |
 | POST | `/services/syslog/reconcile` | No body -> `RuntimeState`; all enabled services |
 | POST | `/services/vnstat/reconcile` | No body -> `RuntimeState`; all enabled services |
@@ -1227,7 +1396,7 @@ restore description defaults server-side to `Restore revision N`.
 
 The following TypeScript describes the application-level contract, not a generated
 SDK. Optional fields can be absent; timestamp fields explicitly marked nullable
-can be null for legacy data.
+can be null when specified by the current response contract.
 
 **Revision precision:** The backend emits uint64 values as JSON numbers. Native
 `JSON.parse` can silently round values above `Number.MAX_SAFE_INTEGER`. Use a
@@ -1263,11 +1432,18 @@ interface VNStatConfig { enabled: boolean }
 interface ApplianceServiceStatus {
   name: "ntp" | "syslog" | "vnstat-host" | "vnstat-managed";
   scope: "host" | "managed";
-  state: "disabled" | "simulated" | "unavailable" | "not_running" | "running" | "unhealthy" | "exited";
-  pid?: number;
+  state: "disabled" | "simulated" | "running" | "error" | "stopped";
   started_at?: Timestamp;
   database_directory?: string;
   error?: string;
+  sample_status?: "warming_up" | "available" | "unavailable";
+  server?: string;
+  offset_ms?: number;
+  delay_ms?: number;
+  requested_slew_ms?: number;
+  uncorrected_offset_ms?: number;
+  discipline?: "slew_only";
+  collected_at?: Timestamp;
 }
 
 interface GatewayMonitor {
@@ -1290,8 +1466,8 @@ interface GatewayMonitor {
 
 interface GatewayMonitorStatistics {
   name: string;
-  process_state: "disabled" | "simulated" | "not_running" | "running" | "exited";
-  sample_status: "disabled" | "simulated" | "warming_up" | "available" | "stale" | "unavailable";
+  process_state: "disabled" | "simulated" | "running" | "error" | "stopped";
+  sample_status: "disabled" | "simulated" | "stopped" | "warming_up" | "available" | "unavailable";
   health: "unknown" | "up" | "degraded" | "down";
   started_at: Timestamp | null;
   collected_at: Timestamp | null;
@@ -1351,7 +1527,7 @@ interface PolicyRule {
 }
 
 interface Firewall {
-  allow_all_icmp: boolean; // Omitted/null input defaults to true; normalized output is explicit.
+  allow_all_icmp: boolean; // Omitted input defaults to true; null is invalid.
   policy: "accept" | "drop";
   rules: Array<{ source?: string; destination?: string; action: "accept" | "drop" }>;
   nat: { masquerade: MasqueradeRule[] };
@@ -1444,7 +1620,6 @@ interface ParentInterface {
 interface SoftflowdStatus {
   name: string;
   state: string;
-  pid?: number;
   started_at?: Timestamp;
   error?: string;
 }
@@ -1461,7 +1636,6 @@ interface RuntimeState {
 interface DHCPRelayStatus {
   interface: string;
   state: string;
-  pid?: number;
   started_at?: Timestamp;
   error?: string;
 }
@@ -1642,12 +1816,12 @@ the initial frontend release.
 | No key inventory/private-key API | Manual validated key reference; operator provisions files |
 | No dry-run/diff/validation endpoint | Local validation/diff; server preflight happens during submit |
 | No idempotency key | Freeze uncertain writes; reconcile transaction records; never blind retry |
-| No event stream/server-side rate history | Bounded polling of statistics and modeled/runtime views |
+| No event stream/calendar-aggregated rate history | Bounded polling; native per-sample counters/history are available |
 | No general drift repair | Diagnostic comparison and operator guidance; no “force apply” |
 | No history pruning/server transaction pagination | Client pagination; document scaling limitation |
 | No persisted rollback actor/time fields | Display reason/raw error, avoid fabricated metadata |
 | Revisions/cursors emitted as JSON numbers | Lossless parsing/serialization; statistics values are already decimal strings |
-| Linux namespace/parents/forwarding/executable setup | Operator-owned provisioning outside application |
+| Linux namespace/parents/forwarding/capability setup | Operator-owned provisioning outside application |
 
 Future enhancements such as capabilities, structured error codes, idempotency
 keys, paginated transaction summaries, and explicit server clock can be proposed
@@ -1730,7 +1904,7 @@ networking or real softflowd delivery.
 | A25 | Masquerade egress missing family address | Local error; family-correct managed options only |
 | A26 | WireGuard field/key/allowed-IP validation | Constraints enforced; no private-key input or unsupported tunnel-health claims |
 | A27 | softflowd limits and disabled entries | 16-instance limit, full disabled-entry validation, timeout/filter byte boundaries |
-| A28 | Running/unhealthy/exited/simulated service | Correct labels; PID only when supplied; no delivery claim |
+| A28 | Running/error/stopped/disabled/simulated worker | Correct labels; no fabricated PID or delivery claim |
 | A29 | Reconcile services with unsent draft | Bodyless action uses stored state; draft unchanged; no revision created |
 | A30 | Paginate committed history | Correct exclusive cursor, descending revisions, exhausted/empty handling |
 | A31 | Legacy metadata | Null timestamps/unknown actors displayed honestly; no guessed dates |
@@ -1752,16 +1926,16 @@ exports, or application logs.
 ## 17. Source references
 
 - [README](README.md): supported scope, deployment, lifecycle and ownership.
-- [HTTP routing and authorization](internal/httpapi/api.go): endpoint behavior,
+- [HTTP routing and authorization](crates/netcontrold): endpoint behavior,
   error statuses, body limits and permission checks.
-- [Configuration model and validation](internal/control/config.go): core resources,
+- [Configuration model and validation](crates/netcontrol-core): core resources,
   normalization, addresses, routes, policy, filtering and NAT.
-- [VLAN/softflowd/runtime models](internal/control/extensions.go): extended fields
+- [Native protocol workers](crates/netcontrol-services): extended fields
   and constraints.
-- [Transaction engine](internal/control/engine.go): state machine, confirmation,
+- [Transaction engine](crates/netcontrol-core): state machine, confirmation,
   rollback, deadlines and persistence behavior.
-- [Runtime reconciliation](internal/control/runtime.go): service-only repair.
-- [Revision archive](internal/control/revisions.go): history, metadata and restore.
-- [Daemon setup](cmd/netcontrold/main.go): listener, TLS, backend and operator flags.
+- [Native networking](crates/netcontrol-native): Linux ownership and reconciliation.
+- [Revision archive](crates/netcontrol-core): history, metadata and restore.
+- [Daemon setup](crates/netcontrold): listener, TLS, backend and operator flags.
 - [Migration example](examples/migration.json) and
   [VLAN/softflowd example](examples/vlan-softflowd.json): complete request examples.

@@ -1,0 +1,22 @@
+[package]
+name = "netcontrol-services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["tls"]
+tls = ["dep:rustls", "dep:rustls-native-certs"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+rand.workspace = true
+time = { version = "0.3", features = ["formatting"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = { version = "0.8", optional = true }

@@ -1,0 +1,447 @@
+use netcontrol_core::{Config, Engine, PERMISSIONS, Simulator};
+use netcontrold::{
+    cli::{CliSession, CommandResult, LINE_LIMIT},
+    http::{App, Authentication, Credential},
+};
+use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
+
+struct Fixture {
+    app: Arc<App>,
+    principal: Credential,
+    directory: tempfile::TempDir,
+}
+impl Fixture {
+    fn new(permissions: &[&str]) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::open(
+            &directory.path().join("state.json"),
+            Box::new(Simulator::new()),
+        )
+        .unwrap();
+        let principal = Credential {
+            name: "cli-test".into(),
+            token_sha256: String::new(),
+            permissions: permissions.iter().map(|p| (*p).to_owned()).collect(),
+        };
+        let app = App::new(
+            Arc::new(Mutex::new(engine)),
+            Authentication::Scoped(Vec::new()),
+            false,
+        );
+        Self {
+            app,
+            principal,
+            directory,
+        }
+    }
+    fn command(&self, cli: &mut CliSession, command: &str) -> CommandResult {
+        cli.execute(&self.app, &self.principal, command)
+    }
+    fn ok(&self, cli: &mut CliSession, command: &str) -> String {
+        let result = self.command(cli, command);
+        assert!(!result.failed, "{command}: {}", result.output);
+        result.output
+    }
+    fn fail(&self, cli: &mut CliSession, command: &str, message: &str) {
+        let result = self.command(cli, command);
+        assert!(result.failed, "{command}: unexpectedly succeeded");
+        assert!(
+            result.output.contains(message),
+            "{command}: {}",
+            result.output
+        );
+    }
+    fn request(&self, path: &str) -> Value {
+        let reply = self.app.engine.lock().unwrap().request(
+            "GET",
+            path,
+            "",
+            "test",
+            &PERMISSIONS
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        reply.body
+    }
+    fn configure(&self, cli: &mut CliSession) {
+        self.ok(cli, "enable");
+        self.ok(cli, "configure terminal");
+    }
+    fn interface(&self, cli: &mut CliSession, name: &str) {
+        self.ok(cli, &format!("interface {name} dummy"));
+        self.ok(cli, "role lan");
+        self.ok(cli, "no shutdown");
+        self.ok(cli, "ip address 192.0.2.1/24");
+        self.ok(cli, "exit");
+    }
+}
+
+#[test]
+fn candidate_is_private_until_explicit_commit_and_confirmation_is_durable() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    assert_eq!(cli.prompt(), "netcontrol> ");
+    f.configure(&mut cli);
+    f.interface(&mut cli, "lan0");
+    assert!(f.ok(&mut cli, "show candidate-config").contains("lan0"));
+    assert!(f.ok(&mut cli, "compare").contains("/interfaces"));
+    assert!(
+        f.request("/api/v1/state")["desired"]["interfaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30 CLI change");
+    assert_eq!(cli.prompt(), "netcontrol# ");
+    let state = f.request("/api/v1/state");
+    assert_eq!(state["revision"], 0);
+    assert!(
+        state["desired"]["interfaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(state["observed"]["interfaces"][0]["name"], "lan0");
+    assert_eq!(
+        state["active_transaction"]["status"],
+        "pending_confirmation"
+    );
+    f.ok(&mut cli, "confirm");
+    assert_eq!(f.request("/api/v1/state")["revision"], 1);
+    assert!(f.ok(&mut cli, "show running-config").contains("lan0"));
+    f.app.engine.lock().unwrap().shutdown().unwrap();
+    let path = f.directory.path().join("state.json");
+    drop(f.app);
+    let mut reopened = Engine::open(&path, Box::new(Simulator::new())).unwrap();
+    let reply = reopened.request(
+        "GET",
+        "/api/v1/revisions/1",
+        "",
+        "test",
+        &["state.read".into()],
+        &[],
+    );
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["config"]["interfaces"][0]["name"], "lan0");
+}
+
+#[test]
+fn session_isolation_stale_revision_conflict_and_http_interoperation() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut first = CliSession::new();
+    let mut second = CliSession::new();
+    f.configure(&mut first);
+    f.configure(&mut second);
+    f.interface(&mut first, "lan0");
+    assert!(!f.ok(&mut second, "show candidate-config").contains("lan0"));
+    f.ok(&mut first, "commit confirmed 30");
+    let state = f.request("/api/v1/state");
+    let id = state["active_transaction"]["id"].as_str().unwrap();
+    let reply = f.app.engine.lock().unwrap().request(
+        "POST",
+        &format!("/api/v1/transactions/{id}/confirm"),
+        "",
+        "http-client",
+        &PERMISSIONS
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>(),
+        &[],
+    );
+    assert_eq!(reply.status, 200);
+    f.ok(&mut second, "firewall policy drop");
+    f.fail(&mut second, "commit confirmed 30", "409");
+    assert!(
+        f.ok(&mut second, "show candidate-config")
+            .contains("\"drop\"")
+    );
+    assert_eq!(
+        f.request("/api/v1/state")["desired"]["firewall"]["policy"],
+        "accept"
+    );
+}
+
+#[test]
+fn disconnect_exit_discard_and_rollback_never_imply_confirmation() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.interface(&mut cli, "lan0");
+    f.ok(&mut cli, "commit confirmed 30");
+    let result = f.command(&mut cli, "exit");
+    assert!(result.exit);
+    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    let state = f.request("/api/v1/state");
+    let id = state["active_transaction"]["id"].as_str().unwrap();
+    let mut recovery = CliSession::new();
+    f.ok(&mut recovery, "enable");
+    f.ok(&mut recovery, &format!("rollback {id}"));
+    assert!(
+        f.request("/api/v1/state")["observed"]["interfaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    f.ok(&mut recovery, "configure terminal");
+    f.interface(&mut recovery, "lan1");
+    f.ok(&mut recovery, "end");
+    f.ok(&mut recovery, "discard");
+    f.fail(&mut recovery, "show candidate-config", "no candidate");
+    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+}
+
+#[test]
+fn enable_does_not_elevate_scoped_permissions() {
+    let f = Fixture::new(&["state.read"]);
+    let mut cli = CliSession::new();
+    f.ok(&mut cli, "enable");
+    f.ok(&mut cli, "show running-config");
+    f.fail(&mut cli, "configure terminal", "transactions.write");
+    f.fail(&mut cli, "confirm unknown", "403");
+    let f = Fixture::new(&["state.read", "transactions.write", "interfaces.write"]);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "firewall policy drop");
+    f.fail(&mut cli, "commit confirmed 30", "firewall.write");
+    assert!(f.request("/api/v1/state")["active_transaction"].is_null());
+    assert!(f.ok(&mut cli, "show candidate-config").contains("\"drop\""));
+}
+
+#[test]
+fn edits_are_schema_checked_atomic_and_semantic_errors_preserve_candidate() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    let before = f.ok(&mut cli, "show candidate-config");
+    for command in [
+        "set /invented true",
+        "set /interfaces null",
+        "set /firewall/allow_all_icmp null",
+        "delete /does-not-exist",
+        "set /interfaces/00 {}",
+        "set /kernel/namespace/invalid~escape \"x\"",
+        "load candidate {\"unknown\":true}",
+    ] {
+        assert!(f.command(&mut cli, command).failed, "{command}");
+        assert_eq!(f.ok(&mut cli, "show candidate-config"), before);
+    }
+    f.ok(&mut cli, "set /ntp/enabled true");
+    f.fail(&mut cli, "commit check", "422");
+    f.fail(&mut cli, "commit confirmed 30", "422");
+    f.ok(&mut cli, "ntp server time.example.test");
+    f.ok(&mut cli, "commit check");
+    assert_eq!(
+        f.request("/api/v1/state")["desired"]["ntp"]["enabled"],
+        false
+    );
+}
+
+#[test]
+fn generic_json_edits_cover_all_configuration_fields_and_pointer_escaping() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    let config: Value =
+        serde_json::from_str(include_str!("../../../examples/appliance-services.json")).unwrap();
+    let config = config.get("config").unwrap_or(&config);
+    f.ok(&mut cli, &format!("load candidate {config}"));
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "set /kernel/namespace/net.ipv4.ip_forward \"1\"");
+    f.ok(&mut cli, "delete /kernel/namespace/net.ipv4.ip_forward");
+    f.ok(&mut cli, "set /ntp/servers/- \"backup.example.test\"");
+    f.ok(&mut cli, "delete /ntp/servers/0");
+    f.ok(&mut cli, "set /kernel/namespace/a~1b~0c \"1\"");
+    assert!(f.ok(&mut cli, "show candidate-config").contains("a/b~c"));
+    f.ok(&mut cli, "delete /kernel/namespace/a~1b~0c");
+    f.ok(&mut cli, "commit check");
+}
+
+#[test]
+fn ergonomic_interfaces_routes_policies_and_services_preserve_complete_config() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.interface(&mut cli, "uplink");
+    f.ok(&mut cli, "interface uplink.10 vlan");
+    f.ok(&mut cli, "vlan parent uplink");
+    f.ok(&mut cli, "vlan id 10");
+    f.ok(&mut cli, "mtu 1400");
+    f.ok(&mut cli, "role wan");
+    f.ok(&mut cli, "ip address 198.51.100.1/24");
+    f.ok(&mut cli, "ipv6 address 2001:db8::1/64");
+    f.ok(&mut cli, "no shutdown");
+    f.ok(&mut cli, "dhcp-relay server 203.0.113.10");
+    f.ok(&mut cli, "dhcp-relay enable");
+    f.ok(&mut cli, "exit");
+    f.ok(
+        &mut cli,
+        "ip route 203.0.113.0/24 uplink.10 198.51.100.2 10000 10",
+    );
+    f.ok(
+        &mut cli,
+        "ip route 198.51.100.0/24 uplink.10 direct 10001 20",
+    );
+    f.ok(
+        &mut cli,
+        "no ip route 198.51.100.0/24 uplink.10 direct 10001 20",
+    );
+    f.ok(&mut cli, "policy-rule 10000 192.0.2.0/24 10000");
+    f.ok(&mut cli, "firewall policy drop");
+    f.ok(&mut cli, "firewall allow-all-icmp disable");
+    f.ok(&mut cli, "firewall rule 192.0.2.0/24 any accept");
+    f.ok(&mut cli, "nat masquerade ipv4 uplink.10 192.0.2.0/24");
+    f.ok(&mut cli, "syslog server logs.example.test 6514 tls");
+    f.ok(&mut cli, "syslog enable");
+    f.ok(&mut cli, "vnstat enable");
+    f.ok(
+        &mut cli,
+        "kernel namespace net.ipv4.tcp_congestion_control cubic",
+    );
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    let config = &f.request("/api/v1/state")["desired"];
+    assert_eq!(config["interfaces"].as_array().unwrap().len(), 2);
+    assert_eq!(config["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(config["firewall"]["policy"], "drop");
+    assert_eq!(config["syslog"]["enabled"], true);
+    assert_eq!(config["vnstat"]["enabled"], true);
+}
+
+#[test]
+fn restore_uses_new_transaction_and_requires_explicit_confirmation() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "firewall policy drop");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    f.ok(
+        &mut cli,
+        "restore revision 0 confirmed 30 return to initial",
+    );
+    assert_eq!(f.request("/api/v1/state")["revision"], 1);
+    f.ok(&mut cli, "confirm");
+    assert_eq!(f.request("/api/v1/state")["revision"], 2);
+    assert_eq!(
+        f.request("/api/v1/state")["desired"]["firewall"]["policy"],
+        "accept"
+    );
+    assert!(
+        f.ok(&mut cli, "show revisions")
+            .contains("restored_from_revision")
+    );
+    f.ok(&mut cli, "configure terminal");
+    f.fail(&mut cli, "restore revision 0 confirmed 30", "discard");
+}
+
+#[test]
+fn commands_are_bounded_and_not_shell_or_immediate_writes() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    for command in [
+        "show runtime\nshow state",
+        "show runtime\r",
+        "show \u{1b}[2J",
+        "show\tstate",
+        "sh -c id",
+        "enable; configure terminal",
+    ] {
+        assert!(f.command(&mut cli, command).failed, "{command:?}");
+    }
+    f.fail(&mut cli, &"x".repeat(LINE_LIMIT + 1), "exceeds");
+    f.configure(&mut cli);
+    f.fail(&mut cli, "commit", "commit confirmed");
+    f.fail(&mut cli, "commit confirmed 9", "10..300");
+    f.fail(&mut cli, "commit confirmed 301", "10..300");
+    f.ok(&mut cli, "load candidate {}");
+    f.ok(&mut cli, "load   candidate   {\"ntp\":{\"servers\":[]}}");
+    f.ok(&mut cli, "set    /ntp/enabled    false");
+    assert_eq!(
+        serde_json::from_value::<Config>(json!({})).unwrap(),
+        Config::empty()
+    );
+    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+}
+
+#[test]
+fn every_current_example_can_be_loaded_checked_and_edited_without_live_writes() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    for input in [
+        include_str!("../../../examples/appliance-services.json"),
+        include_str!("../../../examples/dhcp-relay.json"),
+        include_str!("../../../examples/gateway-monitoring.json"),
+        include_str!("../../../examples/host-policies.json"),
+        include_str!("../../../examples/kernel-mixed-conservative.json"),
+        include_str!("../../../examples/migration.json"),
+        include_str!("../../../examples/vlan-softflowd.json"),
+    ] {
+        let input: Value = serde_json::from_str(input).unwrap();
+        let config = input.get("config").unwrap_or(&input);
+        f.ok(&mut cli, &format!("load candidate {config}"));
+        f.ok(&mut cli, "commit check");
+        f.ok(&mut cli, "set /firewall/allow_all_icmp false");
+        f.ok(&mut cli, "commit check");
+    }
+    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+}
+
+#[test]
+fn wireguard_peer_staging_and_removal_preserve_interface_settings() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "interface wg0 wireguard");
+    f.ok(&mut cli, "role wan");
+    f.ok(&mut cli, "mtu 1420");
+    f.ok(&mut cli, "wireguard key-ref wg0");
+    f.ok(&mut cli, "wireguard listen-port 51820");
+    let public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    let peer = json!({
+        "public_key":public_key,"endpoint":"203.0.113.1:51820",
+        "allowed_ips":["198.51.100.0/24"],"persistent_keepalive_seconds":25
+    });
+    f.ok(&mut cli, &format!("wireguard peer {peer}"));
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, &format!("no wireguard peer {public_key}"));
+    f.ok(&mut cli, "commit check");
+    assert!(!f.ok(&mut cli, "show candidate-config").contains(public_key));
+    f.fail(&mut cli, "vlan id 10", "not a VLAN");
+    f.ok(&mut cli, "exit");
+    f.fail(&mut cli, "interface wg0 dummy", "kind differs");
+}
+
+#[test]
+fn confirmation_timeout_rolls_back_even_after_cli_session_is_dropped() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.interface(&mut cli, "lan0");
+    f.ok(&mut cli, "commit confirmed 10");
+    let state = f.request("/api/v1/state");
+    let id = state["active_transaction"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(cli);
+    std::thread::sleep(std::time::Duration::from_millis(10_100));
+    f.app.engine.lock().unwrap().tick().unwrap();
+    assert_eq!(
+        f.request(&format!("/api/v1/transactions/{id}"))["status"],
+        "rolled_back"
+    );
+    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert!(
+        f.request("/api/v1/state")["observed"]["interfaces"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

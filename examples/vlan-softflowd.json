@@ -32,7 +32,7 @@
         "max_flows": 65536,
         "snaplen": 256,
         "promiscuous": false,
-        "capture_filter": "ip or ip6",
+        "capture_filter": "",
         "timeouts": {"general": 60, "tcp": 300, "tcp.fin": 10, "tcp.rst": 5, "udp": 30, "icmp": 30, "maxlife": 3600, "expint": 10}
       }
     ]

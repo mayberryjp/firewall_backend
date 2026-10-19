@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      upload_packages:
+        description: "Upload development packages only after reviewing distribution licensing, including rustables GPL-3.0-or-later"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,85 +19,56 @@ concurrency:
 
 jobs:
   checks:
-    name: Go checks (${{ matrix.os }})
+    name: Rust checks (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: stable
-          cache: true
-      - name: Check formatting
-        shell: bash
-        run: |
-          files="$(gofmt -l cmd internal)"
-          if [ -n "$files" ]; then
-            printf 'Unformatted Go files:\n%s\n' "$files" >&2
-            exit 1
-          fi
-      - run: go mod verify
-      - name: Check packaging shell syntax
+      - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - name: Install native build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
+      - run: cargo +stable fmt --all -- --check
+      - run: cargo +stable test --workspace --locked
+      - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo +stable build --workspace --release --locked
+      - name: Check OpenRC configuration syntax
         if: runner.os == 'Linux'
         run: |
-          for script in packaging/alpine/*.sh packaging/alpine/*.initd packaging/alpine/*.confd packaging/alpine/APKBUILD; do
-            sh -n "$script"
-          done
-      - run: go test ./...
-      - run: go vet ./...
-      - run: go build ./cmd/netcontrold
-      - name: Race detection
-        if: runner.os == 'Linux'
-        run: go test -race ./internal/...
+          sh -n packaging/native/netcontrold.initd
+          sh -n packaging/native/netcontrold.confd
 
   native:
-    name: Isolated Linux integration
+    name: Privileged native Rust integration
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: stable
-          cache: true
-      - name: Prepare native test dependencies
+      - run: rustup toolchain install stable --profile minimal
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
+      - name: Prepare kernel modules
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y dnsmasq-base softflowd vnstat
           for module in dummy 8021q wireguard nf_tables nf_conntrack nf_nat; do
             sudo modprobe "$module"
           done
-      - name: Test kernel networking and managed daemons
+      - run: cargo +stable test -p netcontrol-native -p netcontrol-services --locked --no-run
+      - name: Test native kernel and protocol workers
         run: |
-          sudo env "PATH=$PATH" \
-            NETCONTROL_INTEGRATION=1 \
-            NETCONTROL_DHCP_RELAY_BINARY=/usr/sbin/dnsmasq \
-            NETCONTROL_DHCP_RELAY_UID="$(id -u nobody)" \
-            NETCONTROL_DHCP_RELAY_GID="$(id -g nobody)" \
-            NETCONTROL_SOFTFLOWD_BINARY=/usr/sbin/softflowd \
-            NETCONTROL_SOFTFLOWD_UID="$(id -u nobody)" \
-            NETCONTROL_SOFTFLOWD_GID="$(id -g nobody)" \
-            NETCONTROL_VNSTATD_BINARY=/usr/sbin/vnstatd \
-            NETCONTROL_VNSTAT_BINARY=/usr/bin/vnstat \
-            go test ./internal/control -count=1 -v
-      - name: Race-check dual-scope appliance supervision
-        run: |
-          sudo env "PATH=$PATH" \
-            NETCONTROL_INTEGRATION=1 \
-            NETCONTROL_VNSTATD_BINARY=/usr/sbin/vnstatd \
-            NETCONTROL_VNSTAT_BINARY=/usr/bin/vnstat \
-            go test -race ./internal/control -run '^TestLinuxAppliance' -count=1 -v
+          sudo env "PATH=$PATH" NETCONTROL_INTEGRATION=1 \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            cargo +stable test -p netcontrol-native -p netcontrol-services --locked -- --ignored
 
-  apk:
-    name: Alpine 3.23 APK (${{ matrix.arch }})
+  package:
+    name: Signed native package (${{ matrix.arch }})
     needs: [checks, native]
     strategy:
       fail-fast: false
@@ -100,43 +76,56 @@ jobs:
         include:
           - runner: ubuntu-24.04
             arch: x86_64
+            target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             arch: aarch64
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Build and install-test APK in Alpine
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y musl-tools libclang-dev linux-libc-dev
+      - name: Build static native binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          RUSTFLAGS: "-C linker=rust-lld -C link-self-contained=yes"
         run: |
+          export "CC_${TARGET//-/_}=musl-gcc"
+          export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/$ARCH-linux-musl -I/usr/include -I/usr/include/$ARCH-linux-gnu"
+          cargo +stable build --release --locked --target "$TARGET" -p netcontrold -p netcontrol-package
+      - name: Create, verify and installation-test custom package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
           mkdir -p dist
-          docker run --rm \
-            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
-            --mount "type=bind,src=$GITHUB_WORKSPACE/dist,dst=/out" \
-            alpine:3.23 sh -euc '
-              apk add --no-cache alpine-sdk go openrc curl chrony syslog-ng vnstat ca-certificates
-              adduser -D builder
-              addgroup builder abuild
-              cp -a /source /work
-              chown -R builder:abuild /work /out
-              su builder -c "cd /work && OUTDIR=/out sh packaging/alpine/build.sh"
-              cd /work
-              NETCONTROL_APPLIANCE_SYNTAX=1 \
-                NETCONTROL_NTP_BINARY=/usr/sbin/chronyd \
-                NETCONTROL_SYSLOG_BINARY=/usr/sbin/syslog-ng \
-                NETCONTROL_VNSTATD_BINARY=/usr/sbin/vnstatd \
-                go test ./internal/control -run TestLinuxApplianceConfigurationSyntax -count=1 -v
-              cp /out/*.rsa.pub /etc/apk/keys/
-              apk add /out/*.apk
-              mkdir -p /run/openrc
-              touch /run/openrc/softlevel
-              NETCONTROL_PACKAGE_SMOKE=1 sh /work/packaging/alpine/smoke-test.sh
-            '
-      - name: Upload APK, public key, provenance and checksums
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+          temporary="$(mktemp -d)"
+          trap 'rm -f "$temporary/signing.key"; rmdir "$temporary"' EXIT
+          package_tool="target/$TARGET/release/netcontrol-package"
+          "$package_tool" keygen --private-key "$temporary/signing.key" --public-key dist/signing.pub
+          "$package_tool" build \
+            --daemon "target/$TARGET/release/netcontrold" \
+            --installer "$package_tool" \
+            --target "$TARGET" --signing-key "$temporary/signing.key" \
+            --output "dist/netcontrol-$TARGET-${GITHUB_SHA}.ncpkg"
+          "$package_tool" verify "dist/netcontrol-$TARGET-${GITHUB_SHA}.ncpkg" \
+            --public-key dist/signing.pub
+          staging="$(mktemp -d)"
+          "$package_tool" install "dist/netcontrol-$TARGET-${GITHUB_SHA}.ncpkg" \
+            --public-key dist/signing.pub --root "$staging"
+          "$staging/usr/sbin/netcontrold" --help
+          cp "$package_tool" dist/
+          printf '{"commit":"%s","target":"%s","release":null}\n' "$GITHUB_SHA" "$TARGET" > dist/BUILDINFO.json
+          (cd dist && sha256sum *.ncpkg signing.pub netcontrol-package BUILDINFO.json > SHA256SUMS)
+      - name: Upload custom package, installer, public key and provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: netcontrol-alpine3.23-${{ matrix.arch }}-${{ github.sha }}
+          name: netcontrol-native-${{ matrix.arch }}-${{ github.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 14

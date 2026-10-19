@@ -1,0 +1,198 @@
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+struct Daemon(Child);
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.0.try_wait().unwrap().is_none() {
+            self.0.kill().unwrap();
+        }
+        self.0.wait().unwrap();
+    }
+}
+
+fn available() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+fn connect(child: &mut Daemon, address: SocketAddr) -> TcpStream {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            let mut error = String::new();
+            child
+                .0
+                .stderr
+                .as_mut()
+                .unwrap()
+                .read_to_string(&mut error)
+                .unwrap();
+            panic!("daemon exited before readiness: {status}: {error}");
+        }
+        if let Ok(stream) = TcpStream::connect(address) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            return stream;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "daemon never became ready"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state.json");
+    let identity = directory.path().join("identity.json");
+    let key = directory.path().join("host.ssh-key");
+    let mut public_identity = None;
+    for _ in 0..2 {
+        let http = available();
+        let ssh = loop {
+            let address = available();
+            if address != http {
+                break address;
+            }
+        };
+        let mut child = Daemon(
+            Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+                .args([
+                    "--listen",
+                    &http.to_string(),
+                    "--ssh-listen",
+                    &ssh.to_string(),
+                ])
+                .arg("--state")
+                .arg(&state)
+                .arg("--credential-db")
+                .arg(&identity)
+                .arg("--ssh-host-key")
+                .arg(&key)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stream = connect(&mut child, http);
+        stream
+            .write_all(b"GET /auth/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"stage\":\"account\""), "{response}");
+        let mut stream = connect(&mut child, ssh);
+        let mut banner = [0; 256];
+        let len = stream.read(&mut banner).unwrap();
+        assert!(
+            banner[..len].starts_with(b"SSH-2.0-"),
+            "{:?}",
+            &banner[..len]
+        );
+        let data = std::fs::read(&key).unwrap();
+        if let Some(expected) = &public_identity {
+            assert_eq!(&data, expected, "host key changed across restart");
+        } else {
+            public_identity = Some(data);
+        }
+    }
+}
+
+#[test]
+fn invalid_existing_host_key_and_state_alias_fail_startup_without_reset() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state.json");
+    let key = directory.path().join("host.ssh-key");
+    std::fs::write(&key, b"not a host key").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+        .args(["--listen", "127.0.0.1:0", "--ssh-listen", "127.0.0.1:0"])
+        .arg("--state")
+        .arg(&state)
+        .arg("--ssh-host-key")
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(&key).unwrap(), b"not a host key");
+    assert!(!state.exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+        .args(["--listen", "127.0.0.1:0", "--ssh-listen", "127.0.0.1:0"])
+        .arg("--state")
+        .arg(&state)
+        .arg("--ssh-host-key")
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("SSH host key must use a different path")
+    );
+    assert!(!state.exists());
+}
+
+#[test]
+fn http_bind_failure_stops_custom_ssh_and_exits_without_hanging() {
+    let directory = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http = occupied.local_addr().unwrap();
+    let ssh = available();
+    let mut child = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+            .args([
+                "--listen",
+                &http.to_string(),
+                "--ssh-listen",
+                &ssh.to_string(),
+            ])
+            .arg("--state")
+            .arg(directory.path().join("state.json"))
+            .arg("--credential-db")
+            .arg(directory.path().join("identity.json"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            let mut error = String::new();
+            child
+                .0
+                .stderr
+                .as_mut()
+                .unwrap()
+                .read_to_string(&mut error)
+                .unwrap();
+            assert!(!status.success());
+            assert!(error.contains("HTTP listener failed"), "{error}");
+            assert!(
+                TcpStream::connect(ssh).is_err(),
+                "SSH listener outlived failed daemon"
+            );
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "failed HTTP startup did not stop SSH"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}

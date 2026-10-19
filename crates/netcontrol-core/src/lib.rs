@@ -1,0 +1,37 @@
+//! Typed networking domain, durable transactions, and deterministic simulator.
+mod engine;
+mod model;
+mod simulator;
+mod store;
+
+pub use engine::{Engine, PERMISSIONS, Reply, Transaction};
+pub use model::*;
+pub use simulator::Simulator;
+
+use anyhow::Result;
+use serde_json::Value;
+
+#[derive(Debug)]
+pub struct BackendDrift(pub String);
+impl std::fmt::Display for BackendDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for BackendDrift {}
+
+/// Implementations must observe real state and report unsupported operations as errors.
+pub trait Backend: Send {
+    fn scope(&self) -> Result<String>;
+    fn observe(&mut self, expected: &Config) -> Result<Config>;
+    fn observe_for_repair(&mut self, expected: &Config) -> Result<Config> {
+        self.observe(expected)
+    }
+    fn apply(&mut self, before: &Config, after: &Config) -> Result<()>;
+    fn runtime(&mut self, config: &Config) -> Result<Value>;
+    fn statistics(&mut self, config: &Config, path: &str, query: &str) -> Result<Value>;
+    fn repair(&mut self, config: &Config) -> Result<Value>;
+}
+
+#[cfg(test)]
+mod model_tests;

@@ -3,8 +3,15 @@
 /state.json
 /state.json.lock
 /auth.json
+/credentials.json
+/credentials.json.lock
+/signing.key
+*.ssh-key
+/ssh-host-key
 /keys/
 /coverage.out
 /coverage.html
 /dist/
+/target/
+*.ncpkg
 *.test
