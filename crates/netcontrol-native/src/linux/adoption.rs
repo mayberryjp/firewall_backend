@@ -628,6 +628,8 @@ pub fn handover(receipt: &Receipt) -> Result<()> {
                 "handover file changed: {}",
                 path.display()
             );
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+            fs::File::open(&path)?.sync_all()?;
         } else {
             let temporary = directory.join(format!(
                 ".netcontrol-{}-{}-{}.tmp",
@@ -644,6 +646,7 @@ pub fn handover(receipt: &Receipt) -> Result<()> {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&temporary)?;
             file.write_all(contents.as_bytes())?;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
             file.sync_all()?;
             fs::hard_link(&temporary, &path)
                 .context("publish networkd handover without replacing an existing file")?;
@@ -655,10 +658,17 @@ pub fn handover(receipt: &Receipt) -> Result<()> {
     networkd(indices.clone())?;
     for (snapshot, index) in receipt.originals.values().zip(indices) {
         let state = fields(Path::new(&format!("/run/systemd/netif/links/{}", index)))?;
+        let admin_state = state
+            .get("default", "ADMIN_STATE")
+            .unwrap_or_else(|| "missing".into());
+        let network_file = state
+            .get("default", "NETWORK_FILE")
+            .unwrap_or_else(|| "missing".into());
         ensure!(
-            state.get("default", "ADMIN_STATE").as_deref() == Some("unmanaged"),
-            "networkd did not relinquish {}",
-            snapshot.name
+            admin_state == "unmanaged",
+            "networkd did not relinquish {}; ADMIN_STATE={admin_state}, NETWORK_FILE={network_file}; expected override {}",
+            snapshot.name,
+            override_path(&snapshot.name).display()
         );
     }
     Ok(())
@@ -681,7 +691,11 @@ pub async fn transfer_routes(handle: &Handle, receipt: &Receipt, restore: bool) 
             .values()
             .find(|snapshot| snapshot.index == old_index)
             .context("inherited route snapshot missing")?;
-        if message.header.protocol == RouteProtocol::Dhcp
+        let dynamic = matches!(
+            message.header.protocol,
+            RouteProtocol::Dhcp | RouteProtocol::Kernel
+        );
+        if dynamic
             && !receipt
                 .leases
                 .get(&snapshot.name)
@@ -701,7 +715,7 @@ pub async fn transfer_routes(handle: &Handle, receipt: &Receipt, restore: bool) 
             }
         }
         let original = message.clone();
-        message.header.protocol = if original.header.protocol == RouteProtocol::Dhcp {
+        message.header.protocol = if dynamic {
             RouteProtocol::Other(super::dhcp_client::PROTOCOL)
         } else {
             RouteProtocol::Other(PROTOCOL)

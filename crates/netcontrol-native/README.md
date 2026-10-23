@@ -91,6 +91,13 @@ networkd ownership files make those interfaces unmanaged before Netcontrol
 starts its in-process clients. Existing OS/supplicant configuration remains.
 See [installation prerequisites and acceptance limits](../../docs/BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
 
+Ownership exclusions are non-secret root-owned `0644` files so the
+`systemd-network` service account can read them. Temporary files remain `0600`
+while written, then become `0644` before fsync/publication; matched existing
+receipt files receive the same readable mode on retry. This does not relax
+private receipt/lease permissions. An unsuccessful ownership check includes the
+observed administrative state, selected network file and expected override.
+
 Top-level `dhcp_clients` and `dns` maps participate in core transactions and
 interface authorization. DHCP addresses and routes are separate live lease
 state, guarded by a shared lock during native verify/reconcile. DHCP routes use
@@ -131,6 +138,8 @@ The initial handover explicitly retags captured static/DHCP routes and the
 DHCP lease's matching kernel connected-subnet route. Keeping that subnet route
 in lease state preserves gateway reachability when applying NOPREFIXROUTE.
 Other kernel routes are not adopted through this exception.
+Both DHCP-protocol routes and the captured matching kernel subnet route transfer
+to protocol 243 and use lease-expiry checks; neither becomes a static 242 route.
 
 The initial policy-rule check recognizes only standard local/main/default
 priority/table pairs with no selectors or active flags. Linux's `u32::MAX`

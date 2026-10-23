@@ -31,6 +31,14 @@
 
 ### Fixed
 
+- Physical-NIC handover publishes non-secret networkd exclusion files as `0644`
+  so the unprivileged networkd service can read them; matching prepared-receipt
+  files receive the same mode on retry. Failures now report the observed
+  administrative state and selected network file. Captured DHCP connected-subnet
+  routes retain DHCP protocol 243 and expire with their lease instead of being
+  misclassified as static routes. Recommended fix bump: patch; aggregate
+  Unreleased remains major. Linux rebuild/runtime verification pending.
+
 - Initial physical-NIC inheritance now accepts Linux's disabled rule-suppression
   sentinel on otherwise standard local/main/default policy rules. Previously it
   misclassified that default netlink metadata as custom routing and aborted

@@ -491,8 +491,11 @@ DHCP servers and Wi-Fi association configuration are not imported.
 
 The daemon writes an adoption receipt under the private native state directory
 and per-NIC `/etc/systemd/network/00-netcontrol-NAME.network` ownership files.
+Those non-secret ownership files are root-owned and mode `0644`, readable by
+networkd's unprivileged account. Adoption receipts and lease data remain private.
 It reloads/reconfigures networkd through D-Bus and checks that each NIC is
-unmanaged before taking ownership. No manager is globally disabled; original
+unmanaged before taking ownership. A failed check reports `ADMIN_STATE`, the
+selected `NETWORK_FILE` and the expected override path. No manager is globally disabled; original
 Netplan/networkd and supplicant files remain. Caught handover failures attempt
 snapshot/route restoration and remove only matching ownership files; failed
 recovery retains its receipt for diagnosis/retry. Preserve both core and native
