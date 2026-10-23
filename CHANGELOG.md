@@ -17,6 +17,12 @@
 
 ### Added
 
+- Ubuntu amd64 incremental development upgrade script using a persistent Cargo
+  cache and debug builds, with build-only mode, staged replacement of the active
+  systemd daemon and best-effort previous-binary recovery. No Docker, Git fetch,
+  automatic prerequisite installation or state rollback. Recommended bump: minor;
+  aggregate Unreleased remains major, with no approved baseline.
+
 - Ubuntu systemd service installed by the source bootstrap, with private state
   directories, native host-mode arguments, journald logging and explicit
   operator-controlled start/boot enablement. Differing existing unit files are

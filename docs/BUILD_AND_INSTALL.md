@@ -44,6 +44,97 @@ Use an aarch64 Linux host and the aarch64 target for ARM64 builds unless an
 appropriate cross-linker is explicitly configured. Merely adding a Rust target
 does not install a cross-architecture linker.
 
+## Incremental Ubuntu development upgrades
+
+[in-place-upgrade.sh](../in-place-upgrade.sh) builds the current checkout on an
+Ubuntu amd64 firewall and upgrades an already installed, active
+`netcontrold.service` executing `/usr/local/sbin/netcontrold`. It does not use
+Docker, wait for CI, fetch code, install prerequisites, change the systemd unit,
+or explicitly modify credentials/configuration. This is a development path,
+not a signed-package installation or a substitute for full CI validation.
+
+Install build prerequisites once:
+
+```sh
+sudo apt-get update
+sudo apt-get install --no-install-recommends -y \
+  build-essential pkg-config libclang-dev linux-libc-dev util-linux \
+  git curl ca-certificates sudo
+```
+
+If rustup is not installed, download and review the official installer, then
+install Rust as the account that will build the code:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+# Review /tmp/rustup-init.sh before executing it.
+sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable
+. "$HOME/.cargo/env"
+rustup toolchain install stable --profile minimal
+rustup target add --toolchain stable x86_64-unknown-linux-gnu
+```
+
+Keep a persistent repository checkout on the firewall. Clone it once if needed
+(private repositories require separately configured Git authentication):
+
+```sh
+git clone https://github.com/mayberryjp/firewall_backend.git
+cd firewall_backend
+```
+
+For each iteration, update the checkout deliberately, review the changes, and
+run the script as that same build account; it requests sudo only for service
+inspection and binary installation:
+
+```sh
+git pull --ff-only
+bash in-place-upgrade.sh
+```
+
+The script runs `cargo +stable build --locked --target
+x86_64-unknown-linux-gnu -p netcontrold` with incremental compilation enabled.
+The debug-profile binary avoids release optimization time. Build outputs live
+under `target/in-place-upgrade`, and Cargo's downloads remain in the account's
+normal Cargo cache. Do not clean these between iterations. The first build is
+expensive; dependency/toolchain changes can also trigger larger rebuilds.
+Compiler memory/CPU load and the larger debug binary are development trade-offs.
+The native GNU binary is built for this Ubuntu host, not a static distribution
+artifact. Keep environment/toolchain settings consistent to reuse the cache.
+
+Use `bash in-place-upgrade.sh --build-only` to compile and run the binary's
+`--help` smoke check without sudo or a service restart. Failed builds/smoke
+checks leave the running daemon untouched. A checkout-local lock rejects
+concurrent invocations; do not run other installers or upgrades, including
+from another checkout, at the same time.
+
+For deployment, the script stages the new binary beside the installed binary,
+saves `/usr/local/sbin/netcontrold.previous` (overwritten on each deployment),
+stops the service, atomically renames the staged binary and starts the service.
+It requires the unit to remain active across five one-second checks. Failed
+restart/checks or catchable interruption trigger best-effort binary restoration
+and restart. Restoration failure is reported explicitly. A power loss or
+`SIGKILL` cannot be recovered automatically by shell traps.
+
+Use a local console or the OS's independent SSH service, not netcontrold's
+configuration SSH listener, which restarts with the daemon. Expect interruption
+to managed networking/workers. Active systemd status is only a startup check:
+verify the management API, logs and actual network connectivity afterward.
+The new daemon can change persisted state during startup; binary restoration
+does not undo those changes or guarantee an older binary can load that state.
+Review persisted-contract changes and take protected, consistent backups before
+deploying them. No backward-compatibility or automatic state reset is provided.
+
+For manual binary recovery from the local console (state compatibility still
+must be checked):
+
+```sh
+sudo systemctl stop netcontrold.service
+sudo install -o root -g root -m 0755 /usr/local/sbin/netcontrold.previous \
+  /usr/local/sbin/netcontrold
+sudo systemctl start netcontrold.service
+sudo journalctl -u netcontrold.service -n 50 --no-pager
+```
+
 ## Ubuntu prebuilt installation (amd64)
 
 The repository provides [install.sh](../install.sh) for an internet-connected

@@ -58,3 +58,56 @@ check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
 printf 'Prebuilt download verification and service-installation tests passed (mocked GitHub/system commands).\n'
+
+for scenario in success fail_stage fail_restart fail_health; do
+    destination="$temporary/upgrade-$scenario"
+    mkdir "$destination"
+    printf 'old binary\n' > "$destination/netcontrold"
+    printf 'new binary\n' > "$destination/new"
+    if UPGRADE_TEST_DIRECTORY="$destination" UPGRADE_TEST_SCENARIO="$scenario" bash -c '
+        set -euo pipefail
+        source ./in-place-upgrade.sh
+        sleep() { :; }
+        root_command() {
+            printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"
+            case $1 in
+                install)
+                    [[ $UPGRADE_TEST_SCENARIO != fail_stage ]] || return 1
+                    command cp -- "${@: -2}"
+                    ;;
+                systemctl)
+                    case $2 in
+                        start)
+                            if [[ ! -f $UPGRADE_TEST_DIRECTORY/started ]]; then
+                                touch "$UPGRADE_TEST_DIRECTORY/started"
+                                [[ $UPGRADE_TEST_SCENARIO != fail_restart ]] || return 1
+                            fi
+                            ;;
+                        is-active)
+                            [[ $UPGRADE_TEST_SCENARIO != fail_health || ! -f $UPGRADE_TEST_DIRECTORY/started ]] || return 1
+                            ;;
+                    esac
+                    ;;
+                *) command "$@" ;;
+            esac
+        }
+        upgrade_binary "$UPGRADE_TEST_DIRECTORY/new" "$UPGRADE_TEST_DIRECTORY/netcontrold"
+    '; then
+        [[ $scenario == success ]] || { printf 'Unexpected upgrade success: %s\n' "$scenario" >&2; exit 1; }
+        cmp "$destination/new" "$destination/netcontrold"
+    else
+        [[ $scenario != success ]] || { printf 'Valid upgrade failed\n' >&2; exit 1; }
+        [[ $(< "$destination/netcontrold") == 'old binary' ]]
+        if [[ $scenario == fail_stage ]]; then
+            ! grep -q 'systemctl stop' "$destination/commands"
+        else
+            [[ $(grep -c 'systemctl stop' "$destination/commands") -eq 2 ]]
+            [[ $(grep -c 'systemctl start' "$destination/commands") -eq 2 ]]
+        fi
+    fi
+    if [[ $scenario != fail_stage ]]; then
+        [[ $(< "$destination/netcontrold.previous") == 'old binary' ]]
+    fi
+    [[ -z $(find "$destination" -name 'netcontrold.upgrade.*' -print) ]]
+done
+printf 'Incremental upgrade replacement and recovery tests passed (mocked service commands).\n'
