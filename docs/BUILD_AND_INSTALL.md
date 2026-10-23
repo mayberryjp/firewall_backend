@@ -48,7 +48,11 @@ does not install a cross-architecture linker.
 
 [in-place-upgrade.sh](../in-place-upgrade.sh) builds the current checkout on an
 Ubuntu amd64 firewall and upgrades an already installed, active
-`netcontrold.service` executing `/usr/local/sbin/netcontrold`. It does not use
+`netcontrold.service`. It discovers the installed executable from systemd's
+effective `ExecStart` instead of assuming a fixed installation directory.
+Exactly one direct, absolute executable named `netcontrold` is required;
+wrappers, missing/ambiguous commands and symlink executables are rejected.
+The detected destination is printed before building. It does not use
 Docker, wait for CI, fetch code, install prerequisites, change the systemd unit,
 or explicitly modify credentials/configuration. This is a development path,
 not a signed-package installation or a substitute for full CI validation.
@@ -108,7 +112,7 @@ concurrent invocations; do not run other installers or upgrades, including
 from another checkout, at the same time.
 
 For deployment, the script stages the new binary beside the installed binary,
-saves `/usr/local/sbin/netcontrold.previous` (overwritten on each deployment),
+saves `<installed-executable>.previous` (overwritten on each deployment),
 stops the service, atomically renames the staged binary and starts the service.
 It requires the unit to remain active across five one-second checks. Failed
 restart/checks or catchable interruption trigger best-effort binary restoration
@@ -125,12 +129,13 @@ Review persisted-contract changes and take protected, consistent backups before
 deploying them. No backward-compatibility or automatic state reset is provided.
 
 For manual binary recovery from the local console (state compatibility still
-must be checked):
+must be checked), set `installed` to the exact destination printed by the script.
+The following example uses the repository installer's default destination:
 
 ```sh
+installed=/usr/local/sbin/netcontrold
 sudo systemctl stop netcontrold.service
-sudo install -o root -g root -m 0755 /usr/local/sbin/netcontrold.previous \
-  /usr/local/sbin/netcontrold
+sudo install -o root -g root -m 0755 "$installed.previous" "$installed"
 sudo systemctl start netcontrold.service
 sudo journalctl -u netcontrold.service -n 50 --no-pager
 ```

@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Incremental upgrades discover the active service's direct executable from
+  systemd rather than requiring `/usr/local/sbin/netcontrold`. Replacement and
+  backup now use that installed path; wrappers/ambiguous commands are rejected
+  with diagnostic output. Recommended fix bump: patch; no release assigned.
+
 - Native direct IPv6 route creation/observation now uses Linux universe scope
   instead of expecting IPv4 link scope. Fixes apply/rollback failures and the
   privileged integration gate that blocked CI packaging. Unexpected route

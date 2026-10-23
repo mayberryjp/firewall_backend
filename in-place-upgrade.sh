@@ -5,9 +5,29 @@ root_command() {
     if [[ $EUID -eq 0 ]]; then "$@"; else sudo -- "$@"; fi
 }
 
+service_binary() {
+    local command_line destination remainder
+    local pattern='\{[[:space:]]*path=([^[:space:];]+)[[:space:]]*;'
+    command_line=$(root_command systemctl show netcontrold.service --property=ExecStart --value) || {
+        printf 'Cannot inspect netcontrold.service ExecStart.\n' >&2
+        return 1
+    }
+    if [[ ! $command_line =~ $pattern ]]; then
+        printf 'Expected a direct netcontrold ExecStart; systemd reported: %s\n' "$command_line" >&2
+        return 1
+    fi
+    destination=${BASH_REMATCH[1]}
+    remainder=${command_line#*"${BASH_REMATCH[0]}"}
+    if [[ $destination != /*/netcontrold || $remainder =~ $pattern ]]; then
+        printf 'Expected exactly one absolute netcontrold executable, not a wrapper; systemd reported: %s\n' "$command_line" >&2
+        return 1
+    fi
+    printf '%s\n' "$destination"
+}
+
 upgrade_binary() (
     set -euo pipefail
-    local binary=$1 destination=${2:-/usr/local/sbin/netcontrold}
+    local binary=$1 destination=$2
     local staged='' backup="$destination.previous" stopped=false committed=false
     recover() {
         local status=$?
@@ -58,7 +78,7 @@ main() {
     local ID
     . /etc/os-release
     [[ ${ID:-} == ubuntu && $(dpkg --print-architecture) == amd64 ]] || { printf 'Ubuntu amd64 is required.\n' >&2; return 1; }
-    local repository binary executable
+    local repository binary executable destination
     repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     cd "$repository"
     for executable in cargo rustup flock; do
@@ -71,8 +91,9 @@ main() {
     flock -n 9 || { printf 'Another upgrade is running from this checkout.\n' >&2; return 1; }
     if [[ $# -eq 0 ]]; then
         [[ -d /run/systemd/system ]] || { printf 'A running systemd installation is required.\n' >&2; return 1; }
-        root_command systemctl show netcontrold.service --property=ExecStart --value |
-            grep -Fq 'path=/usr/local/sbin/netcontrold ;' || { printf 'Service must execute /usr/local/sbin/netcontrold.\n' >&2; return 1; }
+        destination=$(service_binary) || return 1
+        [[ -f $destination && ! -L $destination ]] || { printf 'Service executable must be an existing regular file, not a symlink: %s\n' "$destination" >&2; return 1; }
+        printf 'Installed service executable: %s\n' "$destination"
         root_command systemctl is-active --quiet netcontrold.service || { printf 'The existing service must be active.\n' >&2; return 1; }
     fi
     CARGO_INCREMENTAL=1 cargo +stable build --locked --target x86_64-unknown-linux-gnu -p netcontrold
@@ -81,7 +102,7 @@ main() {
     printf 'Built %s\n' "$binary"
     if [[ $# -eq 0 ]]; then
         printf 'Restarting the firewall daemon; use a local console or independent OS SSH session.\n'
-        upgrade_binary "$binary"
+        upgrade_binary "$binary" "$destination"
     fi
 }
 

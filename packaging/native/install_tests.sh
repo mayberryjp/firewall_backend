@@ -59,6 +59,19 @@ if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
 printf 'Prebuilt download verification and service-installation tests passed (mocked GitHub/system commands).\n'
 
+source ./in-place-upgrade.sh
+for executable_path in /usr/local/sbin/netcontrold /usr/sbin/netcontrold /opt/netcontrol/netcontrold; do
+    root_command() { printf '{ path=%s ; argv[]=%s --backend linux ; ignore_errors=no ; }\n' "$executable_path" "$executable_path"; }
+    [[ $(service_binary) == "$executable_path" ]]
+done
+for fixture_command_line in '' '{ path=/bin/sh ; argv[]=/bin/sh -c netcontrold ; }' '{ path=netcontrold ; }' '{ path=/usr/sbin/netcontrold-other ; }' '{ path=/usr/sbin/netcontrold ; } { path=/opt/netcontrold ; }'; do
+    root_command() { printf '%s\n' "$fixture_command_line"; }
+    if service_binary; then printf 'Unsafe ExecStart accepted: %s\n' "$fixture_command_line" >&2; exit 1; fi
+done
+root_command() { return 1; }
+if service_binary; then printf 'Failed systemd query accepted\n' >&2; exit 1; fi
+printf 'Service executable discovery tests passed (mocked systemd).\n'
+
 for scenario in success fail_stage fail_restart fail_health; do
     destination="$temporary/upgrade-$scenario"
     mkdir "$destination"
