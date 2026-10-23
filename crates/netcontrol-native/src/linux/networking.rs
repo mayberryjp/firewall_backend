@@ -536,7 +536,7 @@ fn route_ip(address: &RouteAddress) -> Result<IpAddr> {
     }
 }
 
-fn route_key(message: &RouteMessage) -> Result<(u32, u32, String)> {
+pub(super) fn route_key(message: &RouteMessage) -> Result<(u32, u32, String)> {
     let table = message
         .attributes
         .iter()

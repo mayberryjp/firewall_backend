@@ -56,7 +56,9 @@ impl DhcpTimer {
                 remains.as_secs(),
                 remains.subsec_millis(),
             );
-            let _ = AsyncFd::new(OwnedFd::from(fd))?.readable().await?;
+            let fd = unsafe { AsyncFd::register(OwnedFd::from(fd)) }
+                .map_err(std::io::Error::from)?;
+            let _ = fd.readable().await?;
         }
         Ok(())
     }

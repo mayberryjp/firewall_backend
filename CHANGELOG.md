@@ -31,6 +31,14 @@
 
 ### Fixed
 
+- Fixed native inheritance compilation: imported the missing `bail!` macro,
+  exposed route-key decoding only to sibling Linux modules, and compared DHCP
+  preferred sources using netlink's IPv4 `RouteAddress` type. Vendored DHCP timer
+  and raw-socket registration now use Tokio's `AsyncFd::register` with owned
+  descriptors and explicit I/O-error conversion, removing deprecated constructor
+  usage. Recommended fix bump: patch; aggregate Unreleased remains major.
+  Linux build/runtime verification is still pending.
+
 - Incremental upgrades discover the active service's direct executable from
   systemd rather than requiring `/usr/local/sbin/netcontrold`. Replacement and
   backup now use that installed path; wrappers/ambiguous commands are rejected

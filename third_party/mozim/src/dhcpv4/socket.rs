@@ -111,7 +111,7 @@ impl DhcpRawSocket {
 
         log::debug!("Raw socket created {}", fd.as_raw_fd());
         Ok(DhcpRawSocket {
-            fd: AsyncFd::new(fd)?,
+            fd: unsafe { AsyncFd::register(fd) }.map_err(std::io::Error::from)?,
         })
     }
 }

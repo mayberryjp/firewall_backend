@@ -3,14 +3,14 @@ use super::{
     networking,
 };
 use crate::model::{EthernetSnapshot, Network, PROTOCOL};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use configparser::ini::Ini;
 use futures_util::TryStreamExt;
 use netcontrol_core::{Config, DHCPClientConfig, DHCPRelayConfig, DNSConfig, DNSDomain, Interface};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressScope},
     link::LinkAttribute,
-    route::{RouteAttribute, RouteMessage, RouteMessageBuffer, RouteProtocol},
+    route::{RouteAddress, RouteAttribute, RouteMessage, RouteMessageBuffer, RouteProtocol},
 };
 use netlink_packet_utils::{Emitable, Parseable};
 use rtnetlink::{Handle, IpVersion};
@@ -528,7 +528,7 @@ pub async fn capture(
                     leases.contains_key(interface),
                     "DHCP route has no inherited DHCP client"
                 );
-                let lease_ip: std::net::IpAddr = leases[interface]
+                let lease_ip: Ipv4Addr = leases[interface]
                     .address
                     .split_once('/')
                     .context("inherited DHCP address prefix missing")?
@@ -537,7 +537,7 @@ pub async fn capture(
                 ensure!(
                     message.attributes.iter().all(|attribute| !matches!(
                         attribute,
-                        RouteAttribute::PrefSource(source) if *source != lease_ip
+                        RouteAttribute::PrefSource(source) if *source != RouteAddress::Inet(lease_ip)
                     )),
                     "inherited DHCP route preferred source differs from the lease address"
                 );
