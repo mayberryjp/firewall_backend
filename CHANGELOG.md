@@ -87,6 +87,10 @@
 
 ### Changed
 
+- CI now runs only on Ubuntu x86-64: removed Windows checks and ARM64 package
+  jobs while retaining native integration, systemd/installer validation and
+  gated x86-64 package artifacts. CI-only change; recommended bump: none.
+
 - Ubuntu installer now requires `--run-id` and downloads checksum-verified
   prebuilt daemon/unit artifacts from successful manually dispatched GitHub
   Actions builds; source compilation and `--ref` are removed. GitHub Actions

@@ -19,12 +19,8 @@ concurrency:
 
 jobs:
   checks:
-    name: Rust checks (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: Rust checks (Ubuntu x86-64)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -32,14 +28,12 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
       - name: Install native build dependencies
-        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
       - run: cargo +stable fmt --all -- --check
       - run: cargo +stable test --workspace --locked
       - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo +stable build --workspace --release --locked
-      - name: Check OpenRC configuration syntax
-        if: runner.os == 'Linux'
+      - name: Check service units and installer
         run: |
           sh -n packaging/native/netcontrold.initd
           sh -n packaging/native/netcontrold.confd
@@ -72,38 +66,27 @@ jobs:
             cargo +stable test -p netcontrol-native -p netcontrol-services --locked -- --ignored
 
   package:
-    name: Signed native package (${{ matrix.arch }})
+    name: Signed native package (Ubuntu x86-64)
     needs: [checks, native]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            arch: x86_64
-            target: x86_64-unknown-linux-musl
-          - runner: ubuntu-24.04-arm
-            arch: aarch64
-            target: aarch64-unknown-linux-musl
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      ARCH: x86_64
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y musl-tools libclang-dev linux-libc-dev
       - name: Build static native binaries
         env:
-          TARGET: ${{ matrix.target }}
-          ARCH: ${{ matrix.arch }}
           RUSTFLAGS: "-C linker=rust-lld -C link-self-contained=yes"
         run: |
           export "CC_${TARGET//-/_}=musl-gcc"
           export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/$ARCH-linux-musl -I/usr/include -I/usr/include/$ARCH-linux-gnu"
           cargo +stable build --release --locked --target "$TARGET" -p netcontrold -p netcontrol-package
       - name: Create, verify and installation-test custom package
-        env:
-          TARGET: ${{ matrix.target }}
         run: |
           set -eu
           mkdir -p dist
@@ -126,9 +109,6 @@ jobs:
           printf '{"commit":"%s","target":"%s","release":null}\n' "$GITHUB_SHA" "$TARGET" > dist/BUILDINFO.json
           (cd dist && sha256sum *.ncpkg signing.pub netcontrol-package BUILDINFO.json > SHA256SUMS)
       - name: Prepare prebuilt Ubuntu installer artifacts
-        if: matrix.arch == 'x86_64'
-        env:
-          TARGET: ${{ matrix.target }}
         run: |
           set -eu
           mkdir -p ubuntu-dist
@@ -136,7 +116,7 @@ jobs:
           cp packaging/native/netcontrold.service ubuntu-dist/netcontrold.service
           (cd ubuntu-dist && sha256sum --binary netcontrold netcontrold.service > SHA256SUMS)
       - name: Upload prebuilt Ubuntu daemon and systemd unit
-        if: matrix.arch == 'x86_64' && github.event_name == 'workflow_dispatch' && inputs.upload_packages
+        if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: netcontrol-ubuntu-amd64-${{ github.sha }}
@@ -147,7 +127,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: netcontrol-native-${{ matrix.arch }}-${{ github.sha }}
+          name: netcontrol-native-x86_64-${{ github.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 14

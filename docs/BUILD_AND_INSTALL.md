@@ -400,8 +400,11 @@ checks the package target against the running machine.
 ## Automatic builds
 
 [CI](../.github/workflows/build.yml) checks Rust formatting, tests, clippy, and
-builds on Linux/Windows, and runs privileged Linux integration separately.
-Successful checks gate static musl package builds for x86-64 and ARM64.
+builds on Ubuntu 24.04 x86-64, and runs privileged Linux integration separately
+on the same runner platform. Windows and ARM64 jobs are not run. Successful
+checks gate a single `x86_64-unknown-linux-musl` package build on Ubuntu; the
+static daemon is also used by the Ubuntu amd64 prebuilt installer. Package
+format support for other architectures does not imply CI coverage.
 Artifacts contain the package, standalone installer, public key, commit/target
 build information, and SHA-256 checksums.
 The amd64 job also prepares `netcontrol-ubuntu-amd64-<commit>` with the static
