@@ -69,9 +69,67 @@ BRANCH_TAG_OR_COMMIT` to select reviewed source; for a pinned deployment also
 replace `main` in the script download URL with the same reviewed commit.
 APT must provide rustup (Ubuntu 26.04 does). Existing rustup is reused.
 An already running daemon causes an explicit stop-and-retry error; the script
-does not stop it for you. It does not create a systemd unit or start/enable any
-service, configure networking, or remove runtime state. Source builds take time
+does not stop it for you. It installs the systemd unit and private directories
+described below and reloads systemd, but never starts/enables the service,
+configures networking, or removes runtime state. Source builds take time
 and require access to Ubuntu, GitHub, Rust toolchain and Cargo registries.
+The host must be running systemd, not merely have `systemctl` installed.
+
+### Ubuntu systemd service
+
+The bootstrap installs [netcontrold.service](../packaging/native/netcontrold.service)
+at `/etc/systemd/system/netcontrold.service`. It creates root-only directories
+`/var/lib/netcontrol`, `/var/lib/netcontrol/services` and `/etc/netcontrol/keys`.
+The unit runs as root in native host mode, with private file creation (`0077`),
+journald logging, restart on failure and a 60-second shutdown allowance.
+It does not isolate the network namespace: native operations must reach the
+host networking. Host services, tunables, gateway monitoring and configuration
+SSH remain disabled unless explicitly added to `ExecStart`.
+
+Persistent paths match the manual Ubuntu startup command:
+`/var/lib/netcontrol/native-state.json`, `/var/lib/netcontrol/credentials.json`
+and `/var/lib/netcontrol/services`. Existing files are not deleted, reset or
+imported from another state path. If you used different paths, retain them in
+a reviewed systemd override before startup; do not accidentally onboard into a
+new credential store.
+
+The default listener is unencrypted HTTP on **`0.0.0.0:8080`**, including reachable
+WAN interfaces. Restrict management access before starting an unclaimed device.
+Keep console access and leave Ubuntu's Wi-Fi authentication under its existing
+manager. Review host-NIC ownership before applying configurations.
+
+```sh
+sudo systemctl start netcontrold
+sudo systemctl status netcontrold --no-pager
+sudo journalctl -u netcontrold -f
+```
+
+Complete onboarding at `http://<management-IP>:8080/`. Only after connectivity,
+shutdown/restart and configuration recovery are verified, opt into boot startup:
+
+```sh
+sudo systemctl enable netcontrold
+```
+
+Use `sudo systemctl edit netcontrold` for operator drop-ins. To change arguments,
+clear `ExecStart=` and supply the complete replacement command under `[Service]`;
+then reload systemd and explicitly restart during a safe maintenance window.
+The installer accepts an identical existing unit but refuses differing units
+or symlinks rather than overwriting operator changes. Drop-ins are preserved.
+It does not restart or change the boot-enabled state of an existing service.
+
+For a previously installed binary without a unit, no rebuild is needed. After
+the unit is pushed to GitHub, run the following only when no unit exists at the
+destination (the checks refuse to replace one):
+
+```sh
+curl -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/packaging/native/netcontrold.service -o /tmp/netcontrold.service
+sudo install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys
+test ! -e /etc/systemd/system/netcontrold.service && test ! -L /etc/systemd/system/netcontrold.service && sudo install -m 0644 /tmp/netcontrold.service /etc/systemd/system/netcontrold.service
+sudo systemctl daemon-reload
+```
+
+Stop any foreground instance using the same state before `systemctl start`.
 
 ### From an existing checkout
 

@@ -11,6 +11,11 @@
 
 ### Added
 
+- Ubuntu systemd service installed by the source bootstrap, with private state
+  directories, native host-mode arguments, journald logging and explicit
+  operator-controlled start/boot enablement. Differing existing unit files are
+  not overwritten. Recommended feature bump: minor; no release assigned.
+
 - Ubuntu amd64 `install.sh` source bootstrap: installs native build dependencies
   and stable Rust, fetches a selectable GitHub ref and installs the daemon.
   Does not configure networking, start services or change signed packaging.

@@ -143,7 +143,9 @@ using historical examples.
 An Ubuntu amd64 [source installer](install.sh) installs build dependencies and
 stable Rust, fetches source and installs the daemon. See the
 [download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-source-installation-amd64).
-It does not configure networking or install/start a systemd service. The GitHub
+It installs a systemd unit and private directories, but does not configure
+networking or start/enable the service. See the
+[service commands](docs/BUILD_AND_INSTALL.md#ubuntu-systemd-service). The GitHub
 download command requires the installer and desired source to be pushed first.
 
 ## Install on Alpine
