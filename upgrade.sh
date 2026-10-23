@@ -59,11 +59,17 @@ upgrade_binary() (
     set -euo pipefail
     local binary=$1 destination=$2
     local staged='' backup="$destination.previous" stopped=false committed=false
-    local had_binary=false was_active=false active_state
+    local had_binary=false was_active=false active_state phase='prepare replacement'
     recover() {
         local status=$?
         trap - EXIT INT TERM HUP
         if [[ $stopped == true && $committed == false ]]; then
+            printf 'Deployment failed during %s (exit %s). Service diagnostics before recovery:\n' "$phase" "$status" >&2
+            root_command systemctl show netcontrold.service \
+                --property=ActiveState --property=SubState --property=Result \
+                --property=ExecMainCode --property=ExecMainStatus >&2 || true
+            root_command journalctl -u netcontrold.service --no-pager \
+                --lines=60 --output=short-iso >&2 || true
             printf 'Deployment interrupted or failed; recovering the previous installation.\n' >&2
             if ! root_command systemctl stop netcontrold.service; then
                 printf 'RECOVERY FAILED: cannot stop service; inspect %s from the local console.\n' "$backup" >&2
@@ -105,9 +111,13 @@ upgrade_binary() (
         had_binary=true
     fi
     stopped=true
+    phase='stop previous service'
     root_command systemctl stop netcontrold.service
+    phase='install replacement binary'
     root_command mv -fT -- "$staged" "$destination"
+    phase='start replacement service'
     root_command systemctl start netcontrold.service
+    phase='check replacement service stability'
     local attempt
     for attempt in 1 2 3 4 5; do
         sleep 1

@@ -31,6 +31,18 @@
 
 ### Fixed
 
+- Initial physical-NIC inheritance now accepts Linux's disabled rule-suppression
+  sentinel on otherwise standard local/main/default policy rules. Previously it
+  misclassified that default netlink metadata as custom routing and aborted
+  startup. Active suppression, selectors and custom rules remain rejected; the
+  startup error now identifies the offending rule. Recommended fix bump: patch;
+  aggregate Unreleased remains major. Linux rebuild/runtime validation pending.
+
+- Incremental deployment failures now print the failed phase/exit code, systemd
+  process result and bounded service journal before binary recovery. Diagnostic
+  failures do not block restoration. No health-check, state rollback or frontend
+  contract change. Recommended fix bump: patch; aggregate Unreleased stays major.
+
 - Fixed native inheritance compilation: imported the missing `bail!` macro,
   exposed route-key decoding only to sibling Linux modules, and compared DHCP
   preferred sources using netlink's IPv4 `RouteAddress` type. Vendored DHCP timer

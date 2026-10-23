@@ -132,6 +132,12 @@ DHCP lease's matching kernel connected-subnet route. Keeping that subnet route
 in lease state preserves gateway reachability when applying NOPREFIXROUTE.
 Other kernel routes are not adopted through this exception.
 
+The initial policy-rule check recognizes only standard local/main/default
+priority/table pairs with no selectors or active flags. Linux's `u32::MAX`
+suppression values mean disabled suppression and are accepted as default
+metadata; active suppression and other attributes remain rejected. A rejection
+includes the offending netlink rule and happens before ownership handover.
+
 The firewall owns only `inet/netcontrol`. Each update atomically replaces its
 table, chains and ordered rules in one batch. It implements ordered forwarding
 rules, host/interface policy expansion (4096 compiled-rule limit), established/

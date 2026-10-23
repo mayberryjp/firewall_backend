@@ -602,13 +602,15 @@ pub async fn check_initial_policy_rules(handle: &Handle) -> Result<()> {
                     && message.header.action == RuleAction::ToTable
                     && message.header.tos == 0
                     && message.header.flags.is_empty()
-                    && message.attributes.iter().all(|attribute| matches!(
-                        attribute,
+                    && message.attributes.iter().all(|attribute| match attribute {
                         RuleAttribute::Priority(_)
-                            | RuleAttribute::Table(_)
-                            | RuleAttribute::Protocol(_)
-                    )),
-                "automatic inheritance cannot preserve custom policy routing; host configuration was not changed"
+                        | RuleAttribute::Table(_)
+                        | RuleAttribute::Protocol(_) => true,
+                        RuleAttribute::SuppressPrefixLen(value)
+                        | RuleAttribute::SuppressIfGroup(value) => *value == u32::MAX,
+                        _ => false,
+                    }),
+                "automatic inheritance cannot preserve custom policy routing; host configuration was not changed; rejected rule: {message:?}"
             );
         }
     }

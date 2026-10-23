@@ -122,6 +122,12 @@ saves `<installed-executable>.previous` if a binary exists (overwritten on each 
 stops the service, atomically renames the staged binary and starts the service.
 It requires the unit to remain active across five one-second checks. Failed
 restart/checks or catchable interruption trigger best-effort binary restoration.
+Before recovery stops the replacement, the script prints the failed deployment
+phase/exit code, systemd result/main-process exit status and the last 60 service
+journal lines. Diagnostic-command failures do not prevent restoration. Review
+these logs for sensitive runtime details before sharing them. For a failure from
+an older script, inspect `journalctl -u netcontrold.service -n 100 --no-pager -o short-iso`
+before retrying; the generic recovery message alone does not identify the cause.
 A previously active service is restarted; a previously inactive service stays
 stopped. With no previous binary, a failed first deployment removes the new
 binary. A newly installed unit/directories remain for inspection and retry;
