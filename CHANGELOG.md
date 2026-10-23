@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Native direct IPv6 route creation/observation now uses Linux universe scope
+  instead of expecting IPv4 link scope. Fixes apply/rollback failures and the
+  privileged integration gate that blocked CI packaging. Unexpected route
+  scopes remain rejected. Recommended fix bump: patch; aggregate Unreleased
+  remains major, with no approved baseline.
+
 - Documented an Ubuntu amd64 source-install command that installs stable Rust
   through rustup as well as native build dependencies, checks the checkout
   directory, and selects the GNU target explicitly. Documentation only;
@@ -80,6 +86,13 @@
   instructions.
 
 ### Changed
+
+- Ubuntu installer now requires `--run-id` and downloads checksum-verified
+  prebuilt daemon/unit artifacts from successful manually dispatched GitHub
+  Actions builds; source compilation and `--ref` are removed. GitHub Actions
+  authentication and an opt-in uploaded artifact are required. Existing CI
+  release/publication gates remain unchanged. Recommended bump: major for the
+  installer CLI/deployment contract; no approved release baseline assigned.
 
 - Native Linux networking now defaults to the daemon's host network namespace;
   an explicit namespace is optional for isolated labs. Alpine package arguments

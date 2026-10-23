@@ -43,6 +43,10 @@ jobs:
         run: |
           sh -n packaging/native/netcontrold.initd
           sh -n packaging/native/netcontrold.confd
+          bash -n install.sh
+          bash packaging/native/install_tests.sh
+          sudo install -m 0755 target/release/netcontrold /usr/local/sbin/netcontrold
+          systemd-analyze verify packaging/native/netcontrold.service 2>unit-check.log || { cat unit-check.log; exit 1; }
 
   native:
     name: Privileged native Rust integration
@@ -121,6 +125,24 @@ jobs:
           cp "$package_tool" dist/
           printf '{"commit":"%s","target":"%s","release":null}\n' "$GITHUB_SHA" "$TARGET" > dist/BUILDINFO.json
           (cd dist && sha256sum *.ncpkg signing.pub netcontrol-package BUILDINFO.json > SHA256SUMS)
+      - name: Prepare prebuilt Ubuntu installer artifacts
+        if: matrix.arch == 'x86_64'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          mkdir -p ubuntu-dist
+          cp "target/$TARGET/release/netcontrold" ubuntu-dist/netcontrold
+          cp packaging/native/netcontrold.service ubuntu-dist/netcontrold.service
+          (cd ubuntu-dist && sha256sum --binary netcontrold netcontrold.service > SHA256SUMS)
+      - name: Upload prebuilt Ubuntu daemon and systemd unit
+        if: matrix.arch == 'x86_64' && github.event_name == 'workflow_dispatch' && inputs.upload_packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: netcontrol-ubuntu-amd64-${{ github.sha }}
+          path: ubuntu-dist/
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload custom package, installer, public key and provenance
         if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

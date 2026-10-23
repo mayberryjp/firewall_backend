@@ -140,13 +140,16 @@ using historical examples.
 
 ## Install on Ubuntu
 
-An Ubuntu amd64 [source installer](install.sh) installs build dependencies and
-stable Rust, fetches source and installs the daemon. See the
-[download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-source-installation-amd64).
+An Ubuntu amd64 [prebuilt installer](install.sh) downloads verified binaries
+from a successful manually dispatched GitHub Actions run. No Rust/compiler
+installation is needed on the firewall. GitHub authentication and an approved
+artifact-producing workflow run are required; there is no public release yet.
+See the [download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-prebuilt-installation-amd64).
 It installs a systemd unit and private directories, but does not configure
 networking or start/enable the service. See the
 [service commands](docs/BUILD_AND_INSTALL.md#ubuntu-systemd-service). The GitHub
-download command requires the installer and desired source to be pushed first.
+download command requires the installer to be pushed and the reviewed artifacts
+to be built and uploaded first.
 
 ## Install on Alpine
 

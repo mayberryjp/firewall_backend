@@ -5,7 +5,7 @@
 Netcontrol uses its own signed `.ncpkg` format and the Rust
 `netcontrol-package` executable. The signed-package installer does not use APK,
 abuild, tar extraction, shell-driven installation, or an external package-manager
-subprocess. The Ubuntu source bootstrap below is a separate manual deployment.
+subprocess. The Ubuntu prebuilt installer below is a separate deployment path.
 Alpine Linux remains a deployment target, using static musl executables and
 OpenRC to start the single Rust daemon. No dnsmasq, chronyd, softflowd,
 syslog-ng, or vnstatd service is installed or supervised.
@@ -44,40 +44,65 @@ Use an aarch64 Linux host and the aarch64 target for ARM64 builds unless an
 appropriate cross-linker is explicitly configured. Merely adding a Rust target
 does not install a cross-architecture linker.
 
-## Ubuntu source installation (amd64)
+## Ubuntu prebuilt installation (amd64)
 
 The repository provides [install.sh](../install.sh) for an internet-connected
-Ubuntu amd64 host. Once this file is committed and pushed to GitHub `main`, run
-from any directory:
+Ubuntu amd64 systemd host. It installs prebuilt static musl binaries from a
+successful, manually dispatched GitHub Actions build, not source code. No
+Rust, Cargo, compiler, libclang or build headers are installed on the appliance.
+
+There is no approved release or public release-download channel. After reviewing
+distribution licensing, an authorized operator must run the existing Build and
+test workflow with `upload_packages: true` on reviewed source containing these
+changes. The installer needs that successful run's numeric ID. Uploads remain
+disabled by default, including push/PR builds. No workflow is dispatched and no
+artifact is published automatically by changing this code.
+
+GitHub Actions artifacts require authentication even for public repositories.
+Install/authenticate GitHub CLI for the account performing installation:
 
 ```sh
-curl -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh && sudo bash /tmp/netcontrol-install.sh
+sudo apt-get update && sudo apt-get install --no-install-recommends -y gh curl ca-certificates
+sudo gh auth login
 ```
 
-If curl is absent, first run `sudo apt-get update && sudo apt-get install -y
-curl ca-certificates`. Downloading fully before execution prevents running a
-partial response. Inspect the script before running it as root; both the script
-and fetched source must be trusted. Public raw access and Git clone must be
-available; private repositories require a separately authenticated checkout,
-not credentials embedded in the command.
+Use an account with access to the repository's Actions artifacts. Never embed
+tokens in download URLs or shell history. Download and inspect the installer
+before running it as root. Once these changes are pushed and an approved build
+has uploaded its artifacts, run from any directory, replacing `123456789` with
+the actual successful workflow run ID:
 
-The bootstrap installs native build dependencies and APT rustup when missing,
-provisions stable Rust, fetches `main` into a temporary checkout, prints its
-commit, builds using the lockfile and installs `/usr/local/sbin/netcontrold`.
-No existing checkout is needed. Use `sudo bash /tmp/netcontrol-install.sh --ref
-BRANCH_TAG_OR_COMMIT` to select reviewed source; for a pinned deployment also
-replace `main` in the script download URL with the same reviewed commit.
-APT must provide rustup (Ubuntu 26.04 does). Existing rustup is reused.
+```sh
+curl -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh && sudo bash /tmp/netcontrol-install.sh --run-id 123456789
+```
+
+Downloading fully before execution prevents running a partial response. For a
+pinned installer replace `main` in its URL with the reviewed source commit.
+Public raw access is required for that command; private repositories require
+an authenticated download without credentials embedded in the URL.
+
+The installer installs only `ca-certificates`, `gh` and `procps` through APT,
+checks the successful workflow's repository/path/event/commit, downloads
+`netcontrol-ubuntu-amd64-<commit>`, verifies SHA-256 for the exact daemon and
+unit files and installs `/usr/local/sbin/netcontrold`. `--run-id` is required;
+there is no source-build fallback or `--ref` option. No checkout is needed.
+Checksums detect corruption; authenticity relies on the reviewed source and
+authenticated GitHub workflow/artifact channel, not an independently trusted
+publisher signature. This is not a signed `.ncpkg` installation.
+Artifacts expire after 14 days; missing/expired artifacts or failed/unapproved
+workflow kinds cause an error rather than installing a different build.
+The workflow's manual upload input is an operator approval gate, not proof that
+licensing has been resolved. No release version is inferred from a run ID.
 An already running daemon causes an explicit stop-and-retry error; the script
 does not stop it for you. It installs the systemd unit and private directories
 described below and reloads systemd, but never starts/enables the service,
-configures networking, or removes runtime state. Source builds take time
-and require access to Ubuntu, GitHub, Rust toolchain and Cargo registries.
+configures networking, or removes runtime state. Existing compiler/toolchain
+packages from prior source installs are not automatically removed.
 The host must be running systemd, not merely have `systemctl` installed.
 
 ### Ubuntu systemd service
 
-The bootstrap installs [netcontrold.service](../packaging/native/netcontrold.service)
+The installer installs [netcontrold.service](../packaging/native/netcontrold.service)
 at `/etc/systemd/system/netcontrold.service`. It creates root-only directories
 `/var/lib/netcontrol`, `/var/lib/netcontrol/services` and `/etc/netcontrol/keys`.
 The unit runs as root in native host mode, with private file creation (`0077`),
@@ -379,6 +404,10 @@ builds on Linux/Windows, and runs privileged Linux integration separately.
 Successful checks gate static musl package builds for x86-64 and ARM64.
 Artifacts contain the package, standalone installer, public key, commit/target
 build information, and SHA-256 checksums.
+The amd64 job also prepares `netcontrol-ubuntu-amd64-<commit>` with the static
+daemon, systemd unit and strict binary-mode SHA-256 manifest. It uses the same
+opt-in upload gate and 14-day retention. The Ubuntu bootstrap selects that
+artifact by successful workflow run ID rather than installing OpenRC payloads.
 
 CI generates a temporary signing key and retains only its public key. This
 verifies consistency but is not a stable publisher identity: trust only

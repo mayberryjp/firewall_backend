@@ -21,6 +21,69 @@ use std::{
     path::Path,
 };
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_route_scope_matches_linux_address_family_semantics() -> Result<()> {
+        let names = BTreeMap::from([(7, "test0".to_string())]);
+        for (family, destination, gateway, scope) in [
+            (AddressFamily::Inet, "203.0.113.0", None, RouteScope::Link),
+            (
+                AddressFamily::Inet,
+                "203.0.113.0",
+                Some("192.0.2.1"),
+                RouteScope::Universe,
+            ),
+            (
+                AddressFamily::Inet6,
+                "2001:db8:300::",
+                None,
+                RouteScope::Universe,
+            ),
+            (
+                AddressFamily::Inet6,
+                "2001:db8:300::",
+                Some("2001:db8::1"),
+                RouteScope::Universe,
+            ),
+        ] {
+            let mut message = RouteMessage::default();
+            message.header.address_family = family;
+            message.header.kind = RouteType::Unicast;
+            message.header.scope = scope;
+            message.header.table = 254;
+            message.header.destination_prefix_length = if family == AddressFamily::Inet {
+                24
+            } else {
+                64
+            };
+            let address = |value: &str| -> Result<RouteAddress> {
+                Ok(match value.parse::<IpAddr>()? {
+                    IpAddr::V4(ip) => RouteAddress::Inet(ip),
+                    IpAddr::V6(ip) => RouteAddress::Inet6(ip),
+                })
+            };
+            message.attributes = vec![
+                RouteAttribute::Destination(address(destination)?),
+                RouteAttribute::Oif(7),
+            ];
+            if let Some(gateway) = gateway {
+                message
+                    .attributes
+                    .push(RouteAttribute::Gateway(address(gateway)?));
+            }
+            let decoded = decode_route(&message, &names)?;
+            assert_eq!(decoded.interface, "test0");
+            assert_eq!(decoded.gateway, gateway.unwrap_or_default());
+            message.header.scope = RouteScope::Host;
+            assert!(decode_route(&message, &names).is_err());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Parent {
     pub name: String,
@@ -527,7 +590,7 @@ fn decode_route(message: &RouteMessage, names: &BTreeMap<u32, String>) -> Result
             _ => bail!("unsupported owned route attribute"),
         }
     }
-    let scope = if gateway.is_empty() {
+    let scope = if destination.is_ipv4() && gateway.is_empty() {
         RouteScope::Link
     } else {
         RouteScope::Universe
@@ -1052,7 +1115,7 @@ pub async fn reconcile(
             .header
             .index;
         let (destination, length) = parse_prefix(&route.destination, true)?;
-        let scope = if route.gateway.is_empty() {
+        let scope = if destination.is_ipv4() && route.gateway.is_empty() {
             RouteScope::Link
         } else {
             RouteScope::Universe
