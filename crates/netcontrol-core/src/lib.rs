@@ -23,6 +23,9 @@ impl std::error::Error for BackendDrift {}
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
     fn scope(&self) -> Result<String>;
+    fn initial_configuration(&mut self) -> Result<Config> {
+        Ok(Config::empty())
+    }
     fn observe(&mut self, expected: &Config) -> Result<Config>;
     fn discover_interfaces(&mut self) -> Result<Value> {
         anyhow::bail!("interface discovery is not supported by this backend")

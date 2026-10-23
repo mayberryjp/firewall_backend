@@ -30,4 +30,7 @@ netlink-packet-utils = "0.5"
 rustables = { version = "0.9", optional = true }
 ipnetwork = "0.21"
 wireguard-control = "1.7"
+mozim = { version = "0.3.3", default-features = false }
+configparser = "3"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "tokio"] }
 time = { version = "0.3", features = ["formatting"] }

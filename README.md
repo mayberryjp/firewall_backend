@@ -127,17 +127,29 @@ edits:
 
 Do not treat `202 Accepted` as a committed revision. An uncertain HTTP write
 must be reconciled through transaction reads, not blindly retried.
-Interfaces require an explicit `wan` or `lan` role; roles do not automatically
+Interfaces require an explicit `wan`, `lan`, or `unassigned` role; roles do not automatically
 configure firewall policy, bind management to LAN, or enable forwarding.
 
-In native mode, `GET /api/v1/interfaces/discovered` inventories the host's real
-NICs without changing them. Select an existing Ethernet/veth device using
-`kind: "ethernet"` in a candidate to manage its static addresses, MTU and
-administrative state. Discovery is separate from committed configuration;
-unselected NICs are not automatically assigned roles or reconfigured.
-`GET /api/v1/interfaces` continues to return only managed configuration.
-Routes may target the main table (`254`) or reserved tables `10000..19999`.
-There is no DHCP client, automatic WAN lease acquisition or DNS-server feature.
+On first native host startup, a new or untouched empty revision-zero journal
+inherits physical NICs, their static addresses/routes, MTU, administrative state,
+DHCPv4 client identity and resolver configuration. Imported roles are `unassigned`.
+Netcontrold takes per-NIC IP/DHCP ownership from systemd-networkd; it does not
+guess WAN/LAN, reset configured journals, or copy DHCP addresses as static ones.
+The installer still does not start the service; `upgrade.sh` starts it by default.
+
+This implementation targets systemd-networkd/systemd-resolved hosts. A DHCP NIC
+needs an active finite lease for identity/lifetime inheritance. NetworkManager,
+bridged/bonded ports, dynamic global IPv6, custom policy routing and unsupported
+networkd options fail explicitly. Existing Wi-Fi association remains with its
+supplicant. DHCP runs in Rust, with durable leases and owned routes, not a
+supervised external client. See the [handover prerequisites and acceptance
+limits](docs/BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
+
+Discovery remains read-only: `GET /api/v1/interfaces/discovered` inventories live
+links, while `GET /api/v1/interfaces` returns managed configuration. DHCP settings
+and static DNS are stored in top-level `dhcp_clients` and `dns` maps; active leases
+are separate in `GET /api/v1/runtime` under `dhcp_clients`. There is no DNS server.
+Routes may target main table `254` or reserved tables `10000..19999`.
 
 The [frontend contract](FRONTEND_SPEC.md) records API fields, endpoints,
 permissions and workflow. The Rust rewrite changes persisted implementation and

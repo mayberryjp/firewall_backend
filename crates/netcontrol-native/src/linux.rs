@@ -39,6 +39,8 @@ mod firewall {
         bail!("native backend was built without nftables support")
     }
 }
+mod adoption;
+mod dhcp_client;
 #[cfg(all(test, feature = "nftables"))]
 mod host_integration;
 #[cfg(all(test, feature = "nftables"))]
@@ -57,6 +59,7 @@ pub struct Native {
     identity: String,
     parents: BTreeMap<String, Parent>,
     services: Services,
+    dhcp: dhcp_client::Manager,
     state: PathBuf,
     _lock: File,
     host_namespace: Option<Arc<File>>,
@@ -266,6 +269,7 @@ impl Native {
             allow_gateway_monitoring: options.gateway_monitoring,
         })?;
         let mut native = Self {
+            dhcp: dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode),
             options,
             namespace,
             namespace_path: path,
@@ -399,8 +403,14 @@ impl Native {
 
     fn verify(&self, config: &Value) -> Result<()> {
         self.check_scope()?;
-        let network = Network::parse(config)?;
+        let mut network = Network::parse(config)?;
         network.validate(&self.parents.keys().cloned().collect())?;
+        let leases = self
+            .dhcp
+            .state
+            .lock()
+            .map_err(|_| anyhow!("DHCP state poisoned"))?;
+        dhcp_client::effective(&mut network, &leases);
         firewall::validate(&network.firewall)?;
         let parents = self.parents.clone();
         let ownership = self.ownership()?;
@@ -427,9 +437,11 @@ impl Native {
         effective.host.extend(network.kernel.host.clone());
         self.verify_kernel(&effective)?;
         let keys = self.options.keys.clone();
+        let lease_state = leases.clone();
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::check_ethernet(handle, &originals))?;
             rt.block_on(networking::verify(handle, &network, &parents, &keys))?;
+            rt.block_on(networking::verify_dhcp(handle, &network, &lease_state))?;
             firewall::verify(
                 &network.firewall,
                 &ownership.firewall_config,
@@ -443,6 +455,10 @@ impl Native {
         self.check_scope()?;
         let network = Network::parse(config)?;
         network.validate(&self.parents.keys().cloned().collect())?;
+        ensure!(
+            self.options.namespace.is_empty() || network.dns.is_empty(),
+            "configured DNS publication requires native host mode"
+        );
         ensure!(
             network.kernel.host.is_empty() || self.host_namespace.is_some(),
             "host-global kernel tunables require explicit allow_host_tunables"
@@ -504,12 +520,24 @@ impl Native {
         ownership: &mut Ownership,
     ) -> Result<()> {
         self.check_scope()?;
-        let before = Network::parse(before)?;
-        let after = Network::parse(after)?;
+        let mut before = Network::parse(before)?;
+        let mut after = Network::parse(after)?;
+        let leases = self
+            .dhcp
+            .state
+            .lock()
+            .map_err(|_| anyhow!("DHCP state poisoned"))?;
+        dhcp_client::effective(&mut before, &leases);
+        dhcp_client::effective(&mut after, &leases);
         let parents = self.parents.clone();
         let keys = self.options.keys.clone();
         let namespace_values = kernel.namespace.clone();
         let originals = ownership.ethernet_originals.clone();
+        let lease_state = leases.clone();
+        let host_dns = self.options.namespace.is_empty()
+            && (!after.dns.is_empty()
+                || !after.dhcp_clients.is_empty()
+                || self.state.join("adoption.json").exists());
         let fingerprint = session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::reconcile(
                 handle, &before, &after, &parents, &keys, &originals,
@@ -519,6 +547,10 @@ impl Native {
             let fingerprint = netfilter::fingerprint()?;
             // Verify the result rather than interpreting a netlink ACK as convergence.
             rt.block_on(networking::verify(handle, &after, &parents, &keys))?;
+            rt.block_on(networking::verify_dhcp(handle, &after, &lease_state))?;
+            if host_dns {
+                rt.block_on(networking::configure_dns(handle, &after, &lease_state))?;
+            }
             sysctl::verify_scope(&namespace_values, "namespace")?;
             Ok(fingerprint)
         })?;
@@ -620,6 +652,7 @@ impl Native {
             .ethernet_originals
             .extend(intent.ethernet_originals);
         self.services.shutdown()?;
+        self.dhcp.configure(&intent.before)?;
         self.network_apply(
             &intent.after,
             &intent.before,
@@ -735,6 +768,7 @@ impl Native {
         target.host.extend(desired.kernel.host);
         let result = (|| -> Result<()> {
             self.services.shutdown()?;
+            self.dhcp.configure(after)?;
             self.network_apply(&before, after, target, &mut ownership)?;
             self.services.repair(after)?;
             ownership.firewall_config = Some(Network::parse(after)?.firewall);
@@ -766,6 +800,114 @@ impl Native {
 }
 
 impl Backend for Native {
+    fn initial_configuration(&mut self) -> Result<Config> {
+        if !self.options.namespace.is_empty() {
+            return Ok(Config::empty());
+        }
+        let path = self.state.join("adoption.json");
+        let receipt: adoption::Receipt = if path.try_exists()? {
+            let receipt: adoption::Receipt = read_json(&path)?;
+            ensure!(
+                receipt.scope == self.identity,
+                "adoption belongs to another host"
+            );
+            ensure!(
+                !receipt.complete,
+                "completed native adoption exists without its core journal; restore the journal instead of reusing the original baseline"
+            );
+            receipt
+        } else {
+            let ownership = self.ownership()?;
+            ensure!(
+                ownership.managed_interfaces.is_empty(),
+                "managed native state exists without an initial core journal; refusing recapture"
+            );
+            ensure!(
+                ownership
+                    .committed_config
+                    .as_ref()
+                    .is_none_or(|value| serde_json::to_value(Config::empty())
+                        .is_ok_and(|empty| *value == empty)),
+                "configured native state exists without its initial core journal; state is not reset"
+            );
+            let scope = self.identity.clone();
+            let previous = serde_json::to_value(&ownership)?;
+            let readonly = self.parents.keys().cloned().collect();
+            let receipt = session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(adoption::capture(handle, scope, previous, readonly))
+            })?;
+            if receipt.config.interfaces.is_empty() {
+                return Ok(Config::empty());
+            }
+            write_json(&path, &receipt)?;
+            receipt
+        };
+        receipt
+            .config
+            .validate()
+            .context("invalid inherited baseline")?;
+        ensure!(
+            receipt.config.interfaces.len() == receipt.originals.len()
+                && receipt.config.interfaces.iter().all(|link| receipt
+                    .originals
+                    .get(&link.name)
+                    .is_some_and(|snapshot| snapshot.name == link.name)),
+            "inherited interface snapshot identities do not match the baseline"
+        );
+        let originals = receipt.originals.clone();
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::check_ethernet(handle, &originals))
+        })?;
+        let result = (|| -> Result<()> {
+            adoption::handover(&receipt)?;
+            let captured = receipt.clone();
+            session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::restore_ethernet(handle, &captured.originals))?;
+                rt.block_on(adoption::transfer_routes(handle, &captured, false))
+            })?;
+            for (name, lease) in &receipt.leases {
+                write_json(&self.state.join(format!("dhcp-{name}.json")), lease)?;
+            }
+            let mut ownership = self.ownership()?;
+            ownership.scope = self.identity.clone();
+            ownership.ethernet_originals = receipt.originals.clone();
+            ownership.managed_interfaces = receipt.originals.keys().cloned().collect();
+            ownership.committed_config = Some(serde_json::to_value(&receipt.config)?);
+            ownership.boot = self.boot.clone();
+            self.save_ownership(&ownership)?;
+            self.dhcp
+                .configure(&serde_json::to_value(&receipt.config)?)?;
+            let network = Network::parse(&serde_json::to_value(&receipt.config)?)?;
+            let leases = self
+                .dhcp
+                .state
+                .lock()
+                .map_err(|_| anyhow!("DHCP state poisoned"))?;
+            let lease_state = leases.clone();
+            session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::configure_dns(handle, &network, &lease_state))
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.dhcp.shutdown()?;
+            let captured = receipt.clone();
+            session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::restore_ethernet(handle, &captured.originals))?;
+                rt.block_on(adoption::transfer_routes(handle, &captured, true))
+            })
+            .context("adoption recovery failed; durable receipt retained")?;
+            adoption::release(&receipt)
+                .context("networkd ownership recovery failed; receipt retained")?;
+            self.save_ownership(&serde_json::from_value(receipt.ownership_before)?)?;
+            remove_durable(&path)?;
+            return Err(
+                error.context("physical interface inheritance failed; networkd ownership restored")
+            );
+        }
+        Ok(receipt.config)
+    }
+
     fn discover_interfaces(&mut self) -> Result<Value> {
         self.check_scope()?;
         let managed = self.ownership()?.managed_interfaces;
@@ -881,6 +1023,7 @@ impl Backend for Native {
         // Stop services before interface changes; their manager must restore prior workers on failure.
         let operation = (|| -> Result<()> {
             self.services.shutdown()?;
+            self.dhcp.configure(&after)?;
             self.network_apply(&before, &after, kernel_target, &mut ownership)?;
             ownership.firewall_config = Some(Network::parse(&after)?.firewall);
             ownership.managed_interfaces = Network::parse(&after)?
@@ -922,6 +1065,7 @@ impl Backend for Native {
             value = json!({"services":value});
         }
         value["parents"] = parent_status;
+        value["dhcp_clients"] = self.dhcp.status()?;
         value["scope"] = json!(self.identity);
         let desired = Network::parse(&serde_json::to_value(config)?)?.kernel;
         let baseline = self.ownership()?.kernel_baseline;
@@ -990,6 +1134,11 @@ impl Backend for Native {
     fn repair(&mut self, config: &Config) -> Result<Value> {
         self.recover()?;
         let value = serde_json::to_value(config)?;
+        let originals = self.ownership()?.ethernet_originals;
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::check_ethernet(handle, &originals))
+        })?;
+        self.dhcp.configure(&value)?;
         let ownership = self.ownership()?;
         if self.options.namespace.is_empty()
             && !ownership.boot.is_empty()
@@ -1030,12 +1179,21 @@ impl Backend for Native {
             remove_durable(&self.state.join("intent.json"))?;
         }
         self.services.repair(&value)?;
+        let adoption_path = self.state.join("adoption.json");
+        if adoption_path.try_exists()? {
+            let mut receipt: adoption::Receipt = read_json(&adoption_path)?;
+            if !receipt.complete {
+                receipt.complete = true;
+                write_json(&adoption_path, &receipt)?;
+            }
+        }
         Ok(self.services.status())
     }
 }
 
 impl Drop for Native {
     fn drop(&mut self) {
+        let _ = self.dhcp.shutdown();
         let _ = self.services.shutdown();
     }
 }

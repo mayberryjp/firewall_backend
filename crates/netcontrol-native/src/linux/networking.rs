@@ -94,10 +94,10 @@ pub struct Parent {
     pub up: bool,
 }
 
-async fn links(handle: &Handle) -> Result<Vec<LinkMessage>> {
+pub(super) async fn links(handle: &Handle) -> Result<Vec<LinkMessage>> {
     Ok(handle.link().get().execute().try_collect().await?)
 }
-fn name(link: &LinkMessage) -> String {
+pub(super) fn name(link: &LinkMessage) -> String {
     link.attributes
         .iter()
         .find_map(|a| {
@@ -137,7 +137,7 @@ fn mtu(link: &LinkMessage) -> u32 {
         })
         .unwrap_or_default()
 }
-fn parent(link: &LinkMessage) -> Parent {
+pub(super) fn parent(link: &LinkMessage) -> Parent {
     let mac = link
         .attributes
         .iter()
@@ -484,7 +484,7 @@ fn vlan(link: &LinkMessage) -> Result<Option<(u32, u16)>> {
     Ok(Some((parent, id.context("VLAN missing ID")?)))
 }
 
-async fn addresses(handle: &Handle, index: u32) -> Result<Vec<AddressMessage>> {
+pub(super) async fn addresses(handle: &Handle, index: u32) -> Result<Vec<AddressMessage>> {
     Ok(handle
         .address()
         .get()
@@ -493,7 +493,7 @@ async fn addresses(handle: &Handle, index: u32) -> Result<Vec<AddressMessage>> {
         .try_collect()
         .await?)
 }
-fn address_string(address: &AddressMessage) -> Result<Option<String>> {
+pub(super) fn address_string(address: &AddressMessage) -> Result<Option<String>> {
     if address.header.scope == AddressScope::Link {
         return Ok(None);
     }
@@ -535,6 +535,85 @@ fn route_ip(address: &RouteAddress) -> Result<IpAddr> {
         _ => bail!("unsupported route address"),
     }
 }
+
+fn route_key(message: &RouteMessage) -> Result<(u32, u32, String)> {
+    let table = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+        .unwrap_or(u32::from(message.header.table));
+    let metric = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Priority(metric) => Some(*metric),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let destination = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Destination(address) => Some(route_ip(address)),
+            _ => None,
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            if message.header.address_family == AddressFamily::Inet {
+                IpAddr::from([0; 4])
+            } else {
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            }
+        });
+    Ok((
+        table,
+        metric,
+        format!("{destination}/{}", message.header.destination_prefix_length),
+    ))
+}
+
+pub async fn check_initial_policy_rules(handle: &Handle) -> Result<()> {
+    for version in [IpVersion::V4, IpVersion::V6] {
+        let messages: Vec<RuleMessage> = handle.rule().get(version).execute().try_collect().await?;
+        for message in messages {
+            let priority = message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    RuleAttribute::Priority(priority) => Some(*priority),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let table = message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    RuleAttribute::Table(table) => Some(*table),
+                    _ => None,
+                })
+                .unwrap_or(u32::from(message.header.table));
+            ensure!(
+                matches!((priority, table), (0, 255) | (32766, 254) | (32767, 253))
+                    && message.header.src_len == 0
+                    && message.header.dst_len == 0
+                    && message.header.action == RuleAction::ToTable
+                    && message.header.tos == 0
+                    && message.header.flags.is_empty()
+                    && message.attributes.iter().all(|attribute| matches!(
+                        attribute,
+                        RuleAttribute::Priority(_)
+                            | RuleAttribute::Table(_)
+                            | RuleAttribute::Protocol(_)
+                    )),
+                "automatic inheritance cannot preserve custom policy routing; host configuration was not changed"
+            );
+        }
+    }
+    Ok(())
+}
 async fn owned_routes(handle: &Handle) -> Result<Vec<RouteMessage>> {
     let mut owned = Vec::new();
     for version in [IpVersion::V4, IpVersion::V6] {
@@ -561,7 +640,7 @@ async fn owned_routes(handle: &Handle) -> Result<Vec<RouteMessage>> {
     }
     Ok(owned)
 }
-fn decode_route(message: &RouteMessage, names: &BTreeMap<u32, String>) -> Result<Route> {
+pub(super) fn decode_route(message: &RouteMessage, names: &BTreeMap<u32, String>) -> Result<Route> {
     ensure!(
         message.header.kind == RouteType::Unicast
             && message.header.source_prefix_length == 0
@@ -1090,6 +1169,9 @@ pub async fn reconcile(
         }
         for prefix in &desired.addresses {
             let (ip, len) = parse_prefix(prefix, false)?;
+            if after.dhcp_clients.contains_key(&desired.name) && ip.is_ipv4() {
+                continue;
+            }
             let mut request = handle.address().add(index, ip, len).replace();
             request
                 .message_mut()
@@ -1162,6 +1244,209 @@ pub async fn reconcile(
         }
     }
     Ok(())
+}
+
+pub async fn dhcp_lease(
+    handle: &Handle,
+    name: &str,
+    previous: Option<&super::dhcp_client::Lease>,
+    next: Option<&super::dhcp_client::Lease>,
+    addressing: &super::dhcp_client::Addressing,
+    publish_dns: bool,
+) -> Result<()> {
+    let link = links(handle)
+        .await?
+        .into_iter()
+        .find(|link| self::name(link) == name)
+        .context("DHCP interface disappeared")?;
+    let index = link.header.index;
+    let routes: Vec<RouteMessage> = handle
+        .route()
+        .get(IpVersion::V4)
+        .execute()
+        .try_collect()
+        .await?;
+    if let Some(lease) = next {
+        for message in &routes {
+            if message.header.protocol == RouteProtocol::Other(super::dhcp_client::PROTOCOL)
+                && message.attributes.iter().any(
+                    |attribute| matches!(attribute, RouteAttribute::Oif(value) if *value == index),
+                )
+            {
+                continue;
+            }
+            let (table, metric, prefix) = route_key(message)?;
+            ensure!(
+                !lease.routes.iter().any(|route| route.table == table
+                    && route.metric == metric
+                    && route.destination == prefix),
+                "DHCP route {prefix} conflicts with a route not owned by this client"
+            );
+        }
+    }
+    let mtu = next.and_then(|lease| lease.mtu).unwrap_or(addressing.mtu);
+    if mtu != 0 {
+        handle.link().set(index).mtu(mtu).execute().await?;
+    }
+    if let Some(previous) = previous {
+        if next.is_none_or(|lease| lease.address != previous.address) {
+            for address in addresses(handle, index).await? {
+                if address_string(&address)?.as_deref() == Some(previous.address.as_str()) {
+                    handle.address().del(address).execute().await?;
+                }
+            }
+        }
+    }
+    if let Some(lease) = next {
+        let (ip, length) = parse_prefix(&lease.address, false)?;
+        let remaining = lease
+            .acquired_at
+            .saturating_add(u64::from(lease.lifetime))
+            .saturating_sub(super::dhcp_client::now()?)
+            .min(u64::from(u32::MAX)) as u32;
+        ensure!(remaining > 0, "cannot apply an expired DHCP lease");
+        let mut request = handle.address().add(index, ip, length).replace();
+        let mut cache = netlink_packet_route::address::CacheInfo::default();
+        cache.ifa_preferred = remaining;
+        cache.ifa_valid = remaining;
+        request
+            .message_mut()
+            .attributes
+            .push(AddressAttribute::CacheInfo(cache));
+        request
+            .message_mut()
+            .attributes
+            .push(AddressAttribute::Flags(vec![
+                netlink_packet_route::address::AddressFlag::Noprefixroute,
+            ]));
+        request.execute().await?;
+    }
+    let names = BTreeMap::from([(index, name.to_owned())]);
+    for message in routes {
+        if message.header.protocol != RouteProtocol::Other(super::dhcp_client::PROTOCOL)
+            || !message
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, RouteAttribute::Oif(value) if *value == index))
+        {
+            continue;
+        }
+        let mut decoded = message.clone();
+        decoded
+            .attributes
+            .retain(|attribute| !matches!(attribute, RouteAttribute::PrefSource(_)));
+        let observed = decode_route(&decoded, &names)?;
+        if !next.is_some_and(|lease| lease.routes.contains(&observed)) {
+            handle.route().del(message).execute().await?;
+        }
+    }
+    if let Some(lease) = next {
+        for route in &lease.routes {
+            let (destination, length) = parse_prefix(&route.destination, true)?;
+            let IpAddr::V4(destination) = destination else {
+                bail!("DHCPv4 supplied an IPv6 route")
+            };
+            let mut request = handle
+                .route()
+                .add()
+                .v4()
+                .destination_prefix(destination, length)
+                .output_interface(index)
+                .table_id(route.table)
+                .priority(route.metric)
+                .protocol(RouteProtocol::Other(super::dhcp_client::PROTOCOL))
+                .scope(if route.gateway.is_empty() {
+                    RouteScope::Link
+                } else {
+                    RouteScope::Universe
+                })
+                .replace();
+            if !route.gateway.is_empty() {
+                request = request.gateway(route.gateway.parse()?);
+            }
+            request.execute().await?;
+        }
+    }
+    if publish_dns {
+        super::adoption::set_dns(index, &addressing.dns, next)?;
+    }
+    Ok(())
+}
+
+pub async fn configure_dns(
+    handle: &Handle,
+    network: &Network,
+    state: &super::dhcp_client::State,
+) -> Result<()> {
+    let available = links(handle).await?;
+    for desired in &network.interfaces {
+        let link = available
+            .iter()
+            .find(|link| name(link) == desired.name)
+            .context("DNS interface disappeared")?;
+        let configured = network.dns.get(&desired.name).cloned().unwrap_or_default();
+        let lease = state.leases.get(&desired.name).filter(|lease| {
+            lease.valid() && network.dhcp_clients.get(&desired.name) == Some(&lease.client)
+        });
+        super::adoption::set_dns(link.header.index, &configured, lease)?;
+    }
+    Ok(())
+}
+
+pub async fn verify_dhcp(
+    handle: &Handle,
+    network: &Network,
+    state: &super::dhcp_client::State,
+) -> Result<()> {
+    let names: BTreeMap<_, _> = links(handle)
+        .await?
+        .iter()
+        .filter(|link| {
+            network
+                .interfaces
+                .iter()
+                .any(|desired| desired.name == name(link))
+        })
+        .map(|link| (link.header.index, name(link)))
+        .collect();
+    let mut expected: Vec<_> = state
+        .leases
+        .iter()
+        .filter(|(name, lease)| {
+            lease.valid() && network.dhcp_clients.get(*name) == Some(&lease.client)
+        })
+        .flat_map(|(_, lease)| lease.routes.clone())
+        .collect();
+    let mut observed = Vec::new();
+    let routes: Vec<RouteMessage> = handle
+        .route()
+        .get(IpVersion::V4)
+        .execute()
+        .try_collect()
+        .await?;
+    for mut route in routes {
+        if route.header.protocol != RouteProtocol::Other(super::dhcp_client::PROTOCOL)
+            || !route.attributes.iter().any(|attribute| matches!(attribute, RouteAttribute::Oif(index) if names.contains_key(index))) { continue; }
+        for attribute in &route.attributes {
+            if let RouteAttribute::PrefSource(address) = attribute {
+                ensure!(
+                    state.leases.values().any(|lease| lease.valid()
+                        && lease.address.split_once('/').is_some_and(|(ip, _)| ip
+                            == route_ip(address)
+                                .map(|ip| ip.to_string())
+                                .unwrap_or_default())),
+                    "DHCP route preferred source drift"
+                );
+            }
+        }
+        route
+            .attributes
+            .retain(|attribute| !matches!(attribute, RouteAttribute::PrefSource(_)));
+        observed.push(decode_route(&route, &names)?);
+    }
+    expected.sort();
+    observed.sort();
+    crate::ensure_unchanged(expected == observed, "DHCP route drift")
 }
 
 pub async fn statistics(

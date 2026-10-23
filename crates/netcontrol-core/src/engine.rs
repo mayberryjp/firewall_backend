@@ -181,7 +181,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
     if wa != wb {
         require(permissions, "wireguard.write")?;
     }
-    if a.interfaces != b.interfaces {
+    if a.interfaces != b.interfaces || a.dhcp_clients != b.dhcp_clients || a.dns != b.dns {
         require(permissions, "interfaces.write")?;
     }
     Ok(())
@@ -196,17 +196,39 @@ pub struct Engine {
     now: Option<DateTime<Utc>>,
 }
 impl Engine {
-    pub fn open(path: &Path, backend: Box<dyn Backend>) -> Result<Self> {
+    pub fn open(path: &Path, mut backend: Box<dyn Backend>) -> Result<Self> {
         let store = Store::open(path)?;
         let scope = backend.scope().context("backend scope")?;
         ensure!(!scope.is_empty(), "backend scope must not be empty");
         let state = match store.load::<State>()? {
-            Some(s) => s,
+            Some(mut s) => {
+                ensure!(
+                    s.scope == scope,
+                    "state belongs to a different backend scope"
+                );
+                validate_state(&s)?;
+                if s.revision == 0 && s.transactions.is_empty() && s.desired == Config::empty() {
+                    let initial = backend.initial_configuration()?.normalized();
+                    initial.validate()?;
+                    s.desired = initial;
+                    store
+                        .save(&s)
+                        .context("save inherited initial configuration")?;
+                }
+                s
+            }
             None => {
+                let initial = backend
+                    .initial_configuration()
+                    .context("capture initial backend configuration")?
+                    .normalized();
+                initial
+                    .validate()
+                    .context("invalid initial backend configuration")?;
                 let s = State {
                     scope: scope.clone(),
                     revision: 0,
-                    desired: Config::empty(),
+                    desired: initial,
                     active_transaction: None,
                     initialized_at: Utc::now(),
                     transactions: BTreeMap::new(),
@@ -449,7 +471,9 @@ impl Engine {
                 ),
                 (
                     "interfaces.write",
-                    expected.interfaces.iter().any(|l| l.dhcp_relay.enabled),
+                    expected.interfaces.iter().any(|l| l.dhcp_relay.enabled)
+                        || !expected.dhcp_clients.is_empty()
+                        || !expected.dns.is_empty(),
                 ),
             ] {
                 if enabled {

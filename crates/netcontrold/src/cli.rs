@@ -45,7 +45,7 @@ Configuration commands:
   delete /JSON/pointer                 Delete optional/defaulted field or array element
   load candidate JSON                 Replace private candidate, never live state
 Interface mode:
-  role wan|lan / mtu NUMBER / shutdown / no shutdown
+    role wan|lan|unassigned / mtu NUMBER / shutdown / no shutdown
   ip address PREFIX / ipv6 address PREFIX / no ip address PREFIX
   vlan parent NAME / vlan id NUMBER
   wireguard key-ref NAME / wireguard listen-port PORT
@@ -710,7 +710,9 @@ fn upsert(values: &mut Vec<Value>, value: Value, key: &str) -> Result<()> {
 
 fn edit_interface(interface: &mut Value, line: &str, words: &[&str]) -> Result<()> {
     match words {
-        ["role", role] if matches!(*role, "wan" | "lan") => interface["role"] = json!(role),
+        ["role", role] if matches!(*role, "wan" | "lan" | "unassigned") => {
+            interface["role"] = json!(role)
+        }
         ["mtu", value] => interface["mtu"] = json!(number(value)?),
         ["shutdown"] => interface["up"] = json!(false),
         ["no", "shutdown"] => interface["up"] = json!(true),

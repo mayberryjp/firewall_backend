@@ -232,7 +232,9 @@ new credential store.
 The default listener is unencrypted HTTP on **`0.0.0.0:8080`**, including reachable
 WAN interfaces. Restrict management access before starting an unclaimed device.
 Keep console access and leave Ubuntu's Wi-Fi authentication under its existing
-manager. Review host-NIC ownership before applying configurations.
+supplicant. First startup now attempts automatic physical NIC inheritance and
+exclusive IP/DHCP ownership as described below; this is a connectivity-changing
+operation, not only an HTTP service start.
 
 ```sh
 sudo systemctl start netcontrold
@@ -430,7 +432,8 @@ explicit. `GET /api/v1/interfaces` remains managed configuration, not discovery.
 Discovery itself never brings interfaces up/down or removes addresses.
 Use main routing table `254` for ordinary host routes; reserved tables
 `10000..19999` remain available for policy routing. Existing foreign routes
-are not blanket-deleted or automatically imported.
+are not blanket-deleted. Initial physical-NIC inheritance is the explicit
+exception described below; subsequent discovery is not an import operation.
 Original and per-operation Ethernet snapshots protect selected static settings.
 Changes intrinsic to selected addresses/admin state can affect kernel-connected
 or autoconfiguration routes; this is not rollback of another DHCP/routing
@@ -440,8 +443,8 @@ For an isolated lab, `--namespace NAME` explicitly selects an existing namespace
 the daemon does not create it. Use a distinct state/services directory for a
 different scope. Simulator state is not native state; incompatible data is
 rejected without deletion. Do not run competing interface/address managers on
-NICs selected for Netcontrol management. There is no native DHCP client or DNS
-server; static addressing must be deliberate, including management connectivity.
+NICs selected for Netcontrol management. Native DHCPv4 is in-process; DNS
+publication uses systemd-resolved in host mode, not an embedded DNS server.
 
 WireGuard private keys must already exist in the private key
 directory. Add `--allow-host-tunables`, `--allow-host-services`, or
@@ -457,6 +460,51 @@ and [service restrictions](../crates/netcontrol-services/README.md). On a
 disposable Linux host, validate packet forwarding, rollback, management
 reachability, DHCP and collector behavior before enabling unattended native
 startup. Cross-compilation is not that acceptance test.
+
+## Automatic Physical Interface Inheritance
+
+This unreleased implementation needs Linux build and console-assisted runtime
+acceptance before deployment. No runtime acceptance is claimed by local Rust
+syntax checks. Build first with `bash upgrade.sh --build-only` on Ubuntu amd64.
+
+First native host startup seeds only a new journal, or an empty revision-zero
+journal with no transaction history. Existing configurations are never reset or
+recaptured. Lab namespaces and explicitly read-only adopted parents do not
+participate. Physical detection requires a sysfs device, excluding loopback,
+veth and virtual links. All eligible NICs are imported together, with role
+`unassigned`; MTU/up state, supported static addresses/routes, DHCPv4 identity,
+route metric and resolver settings are inherited.
+
+Requirements: root, trusted persistent native/core state, stable machine identity,
+running systemd-networkd and systemd-resolved. NetworkManager is currently
+rejected. Every DHCPv4 NIC needs a live finite lease with its client identifier;
+an unplugged/unleased DHCP NIC is an explicit startup error, not a static-address
+fallback. Bridged/bonded ports, custom policy rules, active dynamic global IPv6
+and unsupported networkd options are rejected before takeover. DHCPv6/SLAAC,
+DHCP servers and Wi-Fi association configuration are not imported.
+
+The daemon writes an adoption receipt under the private native state directory
+and per-NIC `/etc/systemd/network/00-netcontrol-NAME.network` ownership files.
+It reloads/reconfigures networkd through D-Bus and checks that each NIC is
+unmanaged before taking ownership. No manager is globally disabled; original
+Netplan/networkd and supplicant files remain. Caught handover failures attempt
+snapshot/route restoration and remove only matching ownership files; failed
+recovery retains its receipt for diagnosis/retry. Preserve both core and native
+state; the ownership files alone are not a backup.
+
+Netcontrold must remain running for lease renewal. Stopping/uninstalling it does
+not hand IP ownership back to networkd; finite addresses eventually expire.
+Do not revert to an older binary or remove ownership files while this daemon is
+running. A console-assisted operator hand-back must stop the daemon, preserve
+its state, remove only its matching per-NIC ownership files, and reload/reconfigure
+networkd using the retained OS configuration. New leases may change addresses.
+
+Operator acceptance: verify current connectivity and DNS before/after first
+start, static and DHCP NICs, renew/rebind/NAK/expiry, daemon restart/reboot,
+transaction confirmation/timeout rollback, foreign-route protection and an
+interrupted handover. Confirm a second startup does not recapture the host.
+Do not run the runtime checks over the sole management connection without a
+console. No test code was added for this task at the user's request.
 
 ## Optional configuration SSH server
 

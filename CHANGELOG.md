@@ -2,7 +2,27 @@
 
 ## Unreleased
 
+### Added
+
+- Automatic first-start inheritance of physical NICs for an unused native host
+  journal, with `unassigned` roles, networkd per-NIC ownership handover,
+  original snapshot/route recovery and explicit unsupported-host errors.
+- In-process DHCPv4 clients with durable leases/update intents, dynamic routes,
+  resolver publication and runtime lease/error inspection. A vendored Apache-2.0
+  mozim correction propagates DHCP NAKs; the existing netlink stack is reused.
+  Top-level `dhcp_clients` and `dns` configuration maps use `interfaces.write`,
+  including shared repair authorization. No first-party test code added per
+  user direction. Linux compilation and runtime acceptance remain outstanding.
+
 ### Changed
+
+- Interface roles accept `unassigned` in addition to `wan`/`lan`. First native
+  host startup now takes supported physical NIC IP/DHCP ownership instead of
+  always starting empty. Target hosts require networkd/resolved; NetworkManager,
+  dynamic global IPv6, bridged/bonded ports, custom policy rules and unsupported
+  networkd options are rejected. Recommended bump: major for initial ownership,
+  persisted configuration and frontend/deployment contract changes; no approved
+  release baseline or release assigned. See the 2026-10-23 journal/handoff.
 
 - Renamed the operator script from `in-place-upgrade.sh` to `upgrade.sh`; use
   `bash upgrade.sh [--build-only]`. Behavior and build-cache location are unchanged.

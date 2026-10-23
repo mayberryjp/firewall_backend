@@ -50,12 +50,15 @@ Support:
 - Read-only namespace interface counters and IP/TCP/UDP/ICMP protocol statistics,
   including explicit partial/unavailable and simulator states.
 - Read-only host NIC discovery and explicit Ethernet static configuration.
+- Initial physical-NIC inheritance on supported native host installations,
+  in-process DHCPv4 clients and per-interface systemd-resolved configuration.
 
 Do not present as supported:
 
 - Hardware creation, parent adoption, namespace creation or selection
-  through the API, bridges, DHCP server management, DHCPv6 relay, DNS management,
-  a DHCP client, or forwarding sysctl management.
+  through the API, bridges, DHCP server management, DHCPv6 clients/relay, DNS
+  server management, or forwarding sysctl management. NetworkManager takeover
+  and dynamic global IPv6 inheritance are not implemented.
 - SNAT, DNAT, port forwarding, arbitrary protocol matches/port ranges, sets, conntrack
   controls, traffic control, device tuning, or hardware offload.
 - Private-key upload/generation, key-file listing, package installation, arbitrary
@@ -372,7 +375,7 @@ Configuration changes additionally require permissions for every changed area:
 
 | Change | Additional permission |
 | --- | --- |
-| Interface/address/VLAN fields, roles, DHCP relay settings | `interfaces.write` |
+| Interface/address/VLAN fields, roles, DHCP relay/client settings, resolver maps | `interfaces.write` |
 | WireGuard settings and removal of a WireGuard interface | `wireguard.write` |
 | Routes | `routes.write` |
 | Source-policy rules | `policy.write` |
@@ -392,7 +395,8 @@ and `transactions.write`, plus `softflowd.write` for the softflowd repair endpoi
 or `interfaces.write` for DHCP relay repair, or `gateway_monitors.write` for
 gateway monitoring repair. All service repair actions repair all enabled
 services: also require `softflowd.write` when any softflowd instance is enabled,
-`interfaces.write` when any DHCP relay is enabled, and `gateway_monitors.write`
+`interfaces.write` when any DHCP relay is enabled or DHCP client/resolver maps
+are configured, and `gateway_monitors.write`
 when any gateway monitor is enabled. Authorization uses the
 current committed/pending configuration under the engine lock, not the draft.
 
@@ -783,12 +787,12 @@ administrative state, and role. Detail views include desired/observed comparison
 
 Editor fields:
 
-- Name, kind (`ethernet`, `dummy`, `wireguard`, `vlan`), required role (`wan` or `lan`),
+- Name, kind (`ethernet`, `dummy`, `wireguard`, `vlan`), required role (`wan`, `lan`, or `unassigned`),
   MTU, administrative up, address list.
 - VLAN: parent selector and VLAN ID.
 - WireGuard: embedded settings/peers or link to the same shared WireGuard editor.
 
-Show role choices as WAN/LAN but serialize lowercase `wan`/`lan`. Require an
+Show role choices as WAN/LAN/Unassigned but serialize lowercase `wan`/`lan`/`unassigned`. Require an
 explicit selection for every managed interface; do not infer from names, routes,
 or VLAN parents, or silently assign a default. Omitted, null, empty, uppercase,
 and unknown values are invalid (422); non-string JSON values are malformed (400).
@@ -851,7 +855,70 @@ show the exact removals/additions and provisional deadline, require independent
 connectivity verification and never auto-confirm. Ethernet management operates
 on an existing NIC, not hardware creation/deletion; show removal as releasing
 configuration ownership rather than deleting a physical port.
-There is no DHCP client or automatic WAN lease discovery.
+Initial native host inheritance is separate from discovery. A new journal or an
+empty revision-zero journal without transactions inherits supported physical
+NICs with `unassigned` roles; existing configurations are not recaptured. A
+populated interface list at revision zero is therefore valid. This is not WAN
+detection, a browser-side import or an automatically confirmed user transaction.
+
+#### DHCPv4 and resolver configuration
+
+Full `Config` payloads and revision snapshots carry optional `dhcp_clients` and
+`dns` objects keyed by configured interface name. Omitted maps mean empty;
+empty maps may be omitted in responses. Null maps/entries/fields and unknown
+fields are rejected. Preserve these maps in drafts, export, revision restoration
+and unrelated edits; dropping them disables DHCP or removes resolver settings.
+
+`dhcp_clients[interface]` fields are defaultable: `client_id` is empty (MAC
+identity) or hex encoding of 2..255 bytes including the identifier type;
+`hostname` is empty or a canonical hostname, max 253 characters; `route_metric`
+is integer 0..4294967295, default 0; `use_mtu` is boolean, default false;
+`use_domains` is `no` (default), `route`, or `yes`. Clients require a configured
+Ethernet interface, no enabled relay on it and no static IPv4 address in its
+address list. Static IPv6 may coexist. An administratively down NIC does not run
+a client. DHCP-supplied MTU must fit 1280..65535.
+
+`dns[interface]` has default-empty `servers: string[]` (up to 8 unique canonical
+IPv4/IPv6 unicast or loopback literals, no zones/ports/TLS names) and
+`domains: { name: string, route_only: boolean }[]` (up to 32 unique canonical
+domains, with both domain fields required). Routing-only `.` is allowed.
+DNS publication requires native host mode and running systemd-resolved; lab
+namespaces cannot change the host resolver. These are client resolver settings,
+not a DNS server or a hostname-to-address zone editor.
+
+Both maps require `interfaces.write` plus ordinary transaction permissions.
+Shared service-repair POSTs also require `interfaces.write` whenever either map
+is configured, in addition to permissions for all enabled services. Structural
+errors use 400, semantic schema errors 422, missing permissions 403; existing
+transaction conflicts, apply/recovery failures and observation 503 behavior
+remain. No new standalone DHCP/DNS HTTP method/path is introduced.
+
+Native `GET /api/v1/runtime` adds `dhcp_clients: { leases, errors }`. Both are
+objects keyed by NIC name. A lease contains the configured `client`, IPv4 CIDR
+`address`, IPv4 `server`, `acquired_at` (Unix seconds), `lifetime`, `renewal`,
+`rebinding` (seconds), `routes: Route[]`, `dns: string[]`, `domain: string`, and
+`mtu: number | null`. Errors are strings keyed by NIC. Missing lease means no
+currently recorded lease, not a static fallback or an empty successful renewal.
+Native runtime only: simulator does not fabricate real leases; treat an absent
+`dhcp_clients` runtime property as unsupported/simulated, not as a native sample.
+
+Managed-interface and route GETs remain desired/verified static configuration;
+do not copy runtime/discovery DHCP addresses into their static lists. Show DHCP
+mode, active address/expiry/server, dynamic routes and resolver data separately.
+Poll runtime using existing cadence and preserve expired/unavailable/error
+distinctions. Renewal does not create a new configuration revision. Never
+auto-confirm a transaction because a lease exists or the HTTP process is active.
+
+Deployment: takeover currently requires systemd-networkd/systemd-resolved and a
+live finite lease for each DHCPv4 NIC. Physical sysfs NICs only, not veth/loopback;
+read-only adopted parents and lab namespaces are excluded. Bridged/bonded ports,
+custom policy rules, active dynamic global IPv6, unsupported OS-manager settings
+and NetworkManager cause explicit startup errors rather than static snapshots.
+Wi-Fi association stays with its existing supplicant. Persistent per-NIC
+networkd exclusions remain on daemon stop/removal from desired configuration;
+neither operation automatically restores OS DHCP ownership. Require console
+access for first-start, recovery and hand-back. This unreleased work still needs
+Linux compilation and runtime acceptance; it is not proof of production safety.
 
 Forwarding remains an operator prerequisite, never inferred from WAN/LAN roles.
 The API deliberately rejects IPv4/IPv6 forwarding sysctls: changing them can
@@ -1463,6 +1530,8 @@ interface Config {
   syslog: SyslogConfig;
   vnstat: VNStatConfig;
   interfaces: ManagedInterface[];
+  dhcp_clients?: Record<string, DHCPClientConfig>;
+  dns?: Record<string, DNSConfig>;
   routes: Route[];
   policy_rules: PolicyRule[];
   firewall: Firewall;
@@ -1548,7 +1617,7 @@ interface DiscoveredInterface {
 interface ManagedInterface {
   name: string;
   kind: "ethernet" | "dummy" | "wireguard" | "vlan";
-  role: "wan" | "lan";
+  role: "wan" | "lan" | "unassigned";
   mtu: number;
   up: boolean;
   addresses: string[];
@@ -1566,6 +1635,34 @@ interface Peer {
   endpoint?: string;
   allowed_ips: string[];
   persistent_keepalive_seconds: number;
+}
+
+interface DHCPClientConfig {
+  client_id: string;
+  hostname: string;
+  route_metric: number;
+  use_mtu: boolean;
+  use_domains: "no" | "route" | "yes";
+}
+
+interface DNSConfig {
+  servers: string[];
+  domains: { name: string; route_only: boolean }[];
+}
+
+interface DHCPClientRuntime {
+  leases: Record<string, {
+    client: DHCPClientConfig;
+    address: string;
+    server: string;
+    acquired_at: number; // Unix seconds, not RFC 3339.
+    lifetime: number; renewal: number; rebinding: number; // Seconds.
+    routes: Route[];
+    dns: string[];
+    domain: string;
+    mtu: number | null;
+  }>;
+  errors: Record<string, string>;
 }
 
 interface Route {
@@ -1681,6 +1778,7 @@ interface SoftflowdStatus {
 }
 
 interface RuntimeState {
+  dhcp_clients?: DHCPClientRuntime;
   appliance_services: ApplianceServiceStatus[];
   parent_interfaces: ParentInterface[];
   softflowd: SoftflowdStatus[];

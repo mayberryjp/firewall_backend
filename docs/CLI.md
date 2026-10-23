@@ -151,7 +151,7 @@ no kernel host|namespace KEY
 Interface editors include:
 
 ```text
-role wan|lan
+role wan|lan|unassigned
 mtu NUMBER
 shutdown
 no shutdown
@@ -177,6 +177,13 @@ network policy. Use `show interfaces discovered` before staging
 existing Ethernet/veth links; they do not create or delete hardware.
 Explicitly preserve needed management addresses in the candidate; discovery
 does not copy them into desired configuration or automatically assign roles.
+Separately, the first supported native host startup inherits physical NICs into
+an otherwise unused journal with role `unassigned`. That initial baseline is not
+repeated by discovery or normal restart. DHCPv4 and resolver settings are
+top-level `dhcp_clients`/`dns` maps; use complete-schema JSON editing to change
+them, and keep DHCP lease addresses out of static address lists. See the
+[current contract](../FRONTEND_SPEC.md#dhcpv4-and-resolver-configuration) and
+[host prerequisites](BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
 New VLAN/WireGuard interfaces require their specific settings before validation.
 Changing an existing interface's kind requires explicit removal/recreation or
 an explicit typed candidate edit. WireGuard accepts only preprovisioned key-file

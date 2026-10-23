@@ -74,6 +74,10 @@ pub struct Kernel {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Network {
     pub interfaces: Vec<Link>,
+    #[serde(default)]
+    pub dhcp_clients: BTreeMap<String, netcontrol_core::DHCPClientConfig>,
+    #[serde(default)]
+    pub dns: BTreeMap<String, netcontrol_core::DNSConfig>,
     pub routes: Vec<Route>,
     pub policy_rules: Vec<Rule>,
     pub firewall: Value,
@@ -111,8 +115,8 @@ impl Network {
                 link.name
             );
             ensure!(
-                matches!(link.role.as_str(), "wan" | "lan"),
-                "interface role must be wan or lan"
+                matches!(link.role.as_str(), "wan" | "lan" | "unassigned"),
+                "interface role must be wan, lan or unassigned"
             );
             ensure!((576..=65535).contains(&link.mtu), "invalid interface MTU");
             match link.kind.as_str() {

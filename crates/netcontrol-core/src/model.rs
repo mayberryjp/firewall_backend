@@ -21,6 +21,10 @@ pub struct Config {
     pub vnstat: VNStatConfig,
     pub gateway_monitors: Vec<GatewayMonitor>,
     pub interfaces: Vec<Interface>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub dhcp_clients: BTreeMap<String, DHCPClientConfig>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub dns: BTreeMap<String, DNSConfig>,
     pub routes: Vec<Route>,
     pub policy_rules: Vec<Rule>,
     pub firewall: Firewall,
@@ -76,6 +80,41 @@ pub struct VLAN {
 pub struct DHCPRelayConfig {
     pub enabled: bool,
     pub servers: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DHCPClientConfig {
+    pub client_id: String,
+    pub hostname: String,
+    pub route_metric: u32,
+    pub use_mtu: bool,
+    pub use_domains: String,
+}
+impl Default for DHCPClientConfig {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            hostname: String::new(),
+            route_metric: 0,
+            use_mtu: false,
+            use_domains: "no".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DNSConfig {
+    pub servers: Vec<String>,
+    pub domains: Vec<DNSDomain>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DNSDomain {
+    pub name: String,
+    pub route_only: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -371,6 +410,10 @@ impl Config {
                 w.peers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
             }
         }
+        for dns in self.dns.values_mut() {
+            dns.domains
+                .sort_by(|a, b| a.name.cmp(&b.name).then(a.route_only.cmp(&b.route_only)));
+        }
         self.interfaces.sort_by(|a, b| a.name.cmp(&b.name));
         self.routes
             .sort_by_key(|r| format!("{}/{}/{}", r.table, r.destination, r.metric));
@@ -434,8 +477,8 @@ impl Config {
                 l.name
             );
             ensure!(
-                ["wan", "lan"].contains(&l.role.as_str()),
-                "interface {}: role must be wan or lan",
+                ["wan", "lan", "unassigned"].contains(&l.role.as_str()),
+                "interface {}: role must be wan, lan or unassigned",
                 l.name
             );
             ensure!(
@@ -541,6 +584,67 @@ impl Config {
             }
         }
         let mut routes = BTreeSet::new();
+        for (name, client) in &self.dhcp_clients {
+            ensure!(
+                matches!(client.use_domains.as_str(), "no" | "route" | "yes"),
+                "invalid DHCP use_domains"
+            );
+            let interface = self
+                .interfaces
+                .iter()
+                .find(|link| &link.name == name)
+                .ok_or_else(|| anyhow::anyhow!("DHCP client interface {name} is not configured"))?;
+            ensure!(
+                interface.kind == "ethernet" && !interface.dhcp_relay.enabled,
+                "DHCP clients require Ethernet without a DHCP relay"
+            );
+            ensure!(
+                client.hostname.len() <= 253
+                    && (client.hostname.is_empty() || valid_host(&client.hostname)),
+                "invalid DHCP hostname"
+            );
+            if !client.client_id.is_empty() {
+                let identifier = hex::decode(&client.client_id)?;
+                ensure!(
+                    (2..=255).contains(&identifier.len()),
+                    "DHCP client_id must encode 2..255 bytes including its type"
+                );
+            }
+            ensure!(
+                !interface.addresses.iter().any(|prefix| prefix
+                    .split('/')
+                    .next()
+                    .is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())),
+                "DHCP interfaces cannot also have static IPv4 addresses"
+            );
+        }
+        for (name, dns) in &self.dns {
+            ensure!(
+                self.interfaces.iter().any(|link| &link.name == name),
+                "DNS interface {name:?} is not configured"
+            );
+            ensure!(
+                dns.servers.len() <= 8 && dns.domains.len() <= 32,
+                "DNS supports at most 8 servers and 32 domains per interface"
+            );
+            let mut servers = BTreeSet::new();
+            for server in &dns.servers {
+                let ip = canonical_ip(server)?;
+                ensure!(
+                    (global_unicast(ip) || ip.is_loopback()) && servers.insert(server),
+                    "invalid or duplicate DNS server"
+                );
+            }
+            let mut domains = BTreeSet::new();
+            for domain in &dns.domains {
+                ensure!(
+                    ((domain.name == "." && domain.route_only)
+                        || (valid_host(&domain.name) && domain.name.parse::<IpAddr>().is_err()))
+                        && domains.insert(&domain.name),
+                    "invalid or duplicate DNS domain"
+                );
+            }
+        }
         for r in &self.routes {
             let (a, _) = canonical_prefix(&r.destination, true)?;
             ensure!(

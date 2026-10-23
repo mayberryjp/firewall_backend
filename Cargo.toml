@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["third_party/mozim"]
 members = [
     "crates/netcontrol-core",
     "crates/netcontrol-native",
@@ -30,3 +31,6 @@ tokio = { version = "1", features = ["full"] }
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+mozim = { path = "third_party/mozim" }

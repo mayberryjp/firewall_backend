@@ -82,16 +82,42 @@ addresses are not resurrected, and backward wall-clock changes cause an error
 instead of extending a finite lease. External DHCP/network managers must not
 race changes to selected interfaces.
 
+Initial host startup now inherits physical NICs into an otherwise unused core
+journal with role `unassigned`; it does not recapture configured state. Handover
+currently requires networkd/resolved and live finite DHCPv4 leases, preserving
+client identity rather than persisting a lease as static configuration. The
+private adoption receipt records original NIC snapshots/routes; matching per-NIC
+networkd ownership files make those interfaces unmanaged before Netcontrol
+starts its in-process clients. Existing OS/supplicant configuration remains.
+See [installation prerequisites and acceptance limits](../../docs/BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
+
+Top-level `dhcp_clients` and `dns` maps participate in core transactions and
+interface authorization. DHCP addresses and routes are separate live lease
+state, guarded by a shared lock during native verify/reconcile. DHCP routes use
+protocol 243; static routes remain protocol 242. A lease-update intent protects
+address/route/persistence convergence. Renewal, rebind, NAK, expiry, bounded worker
+shutdown and restart are implemented using a locally patched Apache-2.0 mozim
+engine; its optional second netlink implementation is disabled.
+This work is not yet Linux build/runtime validated. No first-party test code was
+added at the user's request; original vendored unit tests remain upstream code.
+
+Removal from desired configuration restores the original NIC snapshot but does
+not remove its persistent networkd exclusion or restart an OS DHCP client.
+Do not treat deletion, daemon stop or binary rollback as an automatic OS-manager
+hand-back. Preserve state and use console-assisted operator recovery.
+
 VLAN dependencies
 are created parent-first and removed child-first; identity changes recreate
-affected descendants. Every managed link has an explicit `wan`/`lan` metadata
+affected descendants. Every managed link has an explicit `wan`/`lan`/`unassigned` metadata
 role. Global addresses are reconciled exactly; unmanaged link-local addresses
 are left alone. New IPv6 addresses use NODAD for synchronous isolated-lab
-verification. Desired addresses are static; production DAD workflows are not
+verification. Desired addresses are static; managed DHCP lease addresses are
+added only to the effective native view. Production DAD workflows are not
 implemented. Existing addresses on unrelated interfaces are not reconciled.
 
 Routes use protocol 242 and table 254 (main) or tables 10000–19999. Policy rules
-use priorities 10000–19999 and those same target tables. Unowned kernel/DHCP/
+use priorities 10000–19999 and those same target tables. Outside validated
+first-start inheritance, unowned kernel/DHCP/
 operator routes are ignored, never replaced or explicitly deleted; a conflicting
 destination/table/metric is an error before mutation. Owned routes are added
 exclusively, not with a replace operation that could overwrite a foreign route.
@@ -100,6 +126,11 @@ colliding with one is rejected. Unsupported owned route/rule attributes or rule
 actions fail explicitly. Selected-link address/admin changes can inherently
 alter the kernel's connected or autoconfigured routes on that selected link;
 this is not a snapshot/restore facility for another routing/DHCP manager.
+
+The initial handover explicitly retags captured static/DHCP routes and the
+DHCP lease's matching kernel connected-subnet route. Keeping that subnet route
+in lease state preserves gateway reachability when applying NOPREFIXROUTE.
+Other kernel routes are not adopted through this exception.
 
 The firewall owns only `inet/netcontrol`. Each update atomically replaces its
 table, chains and ordered rules in one batch. It implements ordered forwarding
