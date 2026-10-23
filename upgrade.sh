@@ -120,7 +120,7 @@ upgrade_binary() (
 
 main() {
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash in-place-upgrade.sh [--build-only]\nIncrementally builds the current checkout on Ubuntu amd64, installs the systemd service if missing, and starts or upgrades netcontrold. No git pull, prerequisite installation or boot enablement.\n'
+        printf 'Usage: bash upgrade.sh [--build-only]\nIncrementally builds the current checkout on Ubuntu amd64, installs the systemd service if missing, and starts or upgrades netcontrold. No git pull, prerequisite installation or boot enablement.\n'
         return
     fi
     [[ $# -eq 0 || $# -eq 1 && $1 == --build-only ]] || { printf 'Use --help for usage.\n' >&2; return 1; }

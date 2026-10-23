@@ -59,7 +59,7 @@ if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
 printf 'Prebuilt download verification and service-installation tests passed (mocked GitHub/system commands).\n'
 
-source ./in-place-upgrade.sh
+source ./upgrade.sh
 for executable_path in /usr/local/sbin/netcontrold /usr/sbin/netcontrold /opt/netcontrol/netcontrold; do
     root_command() { printf '{ path=%s ; argv[]=%s --backend linux ; ignore_errors=no ; }\n' "$executable_path" "$executable_path"; }
     [[ $(service_binary) == "$executable_path" ]]
@@ -78,7 +78,7 @@ for scenario in missing loaded unmanaged conflicting masked install_failure relo
     if [[ $scenario == conflicting ]]; then printf 'custom unit\n' > "$destination/unit"; fi
     if UPGRADE_TEST_DIRECTORY="$destination" UPGRADE_TEST_SCENARIO="$scenario" bash -c '
         set -euo pipefail
-        source ./in-place-upgrade.sh
+        source ./upgrade.sh
         root_command() {
             printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"
             case $1 in
@@ -125,7 +125,7 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
     printf 'new binary\n' > "$destination/new"
     if UPGRADE_TEST_DIRECTORY="$destination" UPGRADE_TEST_SCENARIO="$scenario" bash -c '
         set -euo pipefail
-        source ./in-place-upgrade.sh
+        source ./upgrade.sh
         sleep() { :; }
         root_command() {
             printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"

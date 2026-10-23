@@ -38,7 +38,7 @@ jobs:
           sh -n packaging/native/netcontrold.initd
           sh -n packaging/native/netcontrold.confd
           bash -n install.sh
-          bash -n in-place-upgrade.sh
+          bash -n upgrade.sh
           bash packaging/native/install_tests.sh
           sudo install -m 0755 target/release/netcontrold /usr/local/sbin/netcontrold
           systemd-analyze verify packaging/native/netcontrold.service 2>unit-check.log || { cat unit-check.log; exit 1; }

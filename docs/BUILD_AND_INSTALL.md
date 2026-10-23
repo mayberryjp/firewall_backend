@@ -46,7 +46,7 @@ does not install a cross-architecture linker.
 
 ## Incremental Ubuntu development upgrades
 
-[in-place-upgrade.sh](../in-place-upgrade.sh) builds the current checkout on an
+[upgrade.sh](../upgrade.sh) builds the current checkout on an
 Ubuntu amd64 firewall and installs, starts or upgrades `netcontrold.service`.
 After a successful build and smoke check, it installs the supplied unit if
 systemd reports `LoadState=not-found`, creates the private state/key directories,
@@ -98,7 +98,7 @@ setup and binary installation:
 
 ```sh
 git pull --ff-only
-bash in-place-upgrade.sh
+bash upgrade.sh
 ```
 
 The script runs `cargo +stable build --locked --target
@@ -111,7 +111,7 @@ Compiler memory/CPU load and the larger debug binary are development trade-offs.
 The native GNU binary is built for this Ubuntu host, not a static distribution
 artifact. Keep environment/toolchain settings consistent to reuse the cache.
 
-Use `bash in-place-upgrade.sh --build-only` to compile and run the binary's
+Use `bash upgrade.sh --build-only` to compile and run the binary's
 `--help` smoke check without sudo or a service restart. Failed builds/smoke
 checks leave the running daemon untouched. A checkout-local lock rejects
 concurrent invocations; do not run other installers or upgrades, including

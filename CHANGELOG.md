@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Renamed the operator script from `in-place-upgrade.sh` to `upgrade.sh`; use
+  `bash upgrade.sh [--build-only]`. Behavior and build-cache location are unchanged.
+  Recommended bump: major for the breaking script entry-point rename; no approved
+  release baseline.
+
 ### Fixed
 
 - Incremental upgrades discover the active service's direct executable from
