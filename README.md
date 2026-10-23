@@ -4,11 +4,11 @@ Netcontrol is a Rust network-control daemon with an embedded device setup
 website, API-key-authenticated HTTP API, durable configuration transactions,
 and a custom signed packaging system.
 
-This is a greenfield **isolated-lab control plane**, not a production
-host-network firewall distribution. Linux namespace ownership, forwarding,
-physical-interface provisioning, and native boot recovery must be reviewed
-explicitly. A running process or simulator result is not evidence that real
-networking works.
+This is a greenfield **host-managed firewall appliance**. The native Linux
+backend controls the machine's networking; an isolated namespace is an optional
+lab tool, not an appliance prerequisite. Production readiness still requires
+Linux/Alpine runtime, boot/recovery and connectivity acceptance. A running
+process or simulator result is not evidence that real networking works.
 
 ## Rust-only architecture
 
@@ -16,7 +16,7 @@ networking works.
 | --- | --- |
 | [netcontrold](crates/netcontrold) | HTTP listener, device account, API keys, sessions, embedded UI |
 | [netcontrol-core](crates/netcontrol-core) | Typed configuration, authorization, transactions, rollback, revisions, persistence, simulator |
-| [netcontrol-native](crates/netcontrol-native) | Direct Linux kernel networking and namespace ownership |
+| [netcontrol-native](crates/netcontrol-native) | Direct Linux host networking, interface discovery and owned configuration |
 | [netcontrol-services](crates/netcontrol-services) | Native protocol and statistics workers |
 | [netcontrol-package](crates/netcontrol-package) | Signed `.ncpkg` creation, verification, installation and installation recovery |
 
@@ -124,10 +124,27 @@ must be reconciled through transaction reads, not blindly retried.
 Interfaces require an explicit `wan` or `lan` role; roles do not automatically
 configure firewall policy, bind management to LAN, or enable forwarding.
 
+In native mode, `GET /api/v1/interfaces/discovered` inventories the host's real
+NICs without changing them. Select an existing Ethernet/veth device using
+`kind: "ethernet"` in a candidate to manage its static addresses, MTU and
+administrative state. Discovery is separate from committed configuration;
+unselected NICs are not automatically assigned roles or reconfigured.
+`GET /api/v1/interfaces` continues to return only managed configuration.
+Routes may target the main table (`254`) or reserved tables `10000..19999`.
+There is no DHCP client, automatic WAN lease acquisition or DNS-server feature.
+
 The [frontend contract](FRONTEND_SPEC.md) records API fields, endpoints,
 permissions and workflow. The Rust rewrite changes persisted implementation and
 service lifecycle; see its current implementation notes and handoff before
 using historical examples.
+
+## Install on Ubuntu
+
+An Ubuntu amd64 [source installer](install.sh) installs build dependencies and
+stable Rust, fetches source and installs the daemon. See the
+[download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-source-installation-amd64).
+It does not configure networking or install/start a systemd service. The GitHub
+download command requires the installer and desired source to be pushed first.
 
 ## Install on Alpine
 
@@ -137,10 +154,12 @@ operator configuration. Installation uses the Rust package tool, not APK/abuild.
 Packages are Ed25519-signed and verified before installation; the installer
 has explicit ownership checks and durable rollback information.
 
-The installed default is simulator mode with HTTP on `0.0.0.0:8080`. The
-installer does not configure a LAN address, enable the service at boot,
-start routing, or create a native namespace. Do not delete configuration,
-credentials, or history to work around startup failures.
+The installed package selects native Linux host mode with HTTP on
+`0.0.0.0:8080`; the bare daemon's development default remains simulator mode.
+The installer does not configure a LAN address, enable the service at boot
+or start routing. Discovery does not take ownership of every interface.
+Do not delete configuration, credentials or history to work around startup
+failures. Preserve console access while changing host management networking.
 
 ## Configuration CLI over SSH
 

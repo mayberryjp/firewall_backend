@@ -2,8 +2,8 @@
 
 ## 1. Purpose and contract
 
-Build an administrative web application for the Netcontrol isolated-lab network
-control plane. Operators must be able to inspect owned networking, prepare a
+Build an administrative web application for the Netcontrol host-managed firewall
+appliance. Operators must be able to discover host NICs, inspect owned networking, prepare a
 complete desired configuration, review its effects, provisionally apply it, and
 explicitly confirm or roll it back. They must also be able to inspect transaction
 recovery, restore committed revisions, and diagnose native protocol workers.
@@ -49,12 +49,13 @@ Support:
 - Committed configuration history, comparison, export, and historical restore.
 - Read-only namespace interface counters and IP/TCP/UDP/ICMP protocol statistics,
   including explicit partial/unavailable and simulator states.
+- Read-only host NIC discovery and explicit Ethernet static configuration.
 
 Do not present as supported:
 
-- Physical-device provisioning, parent adoption, namespace creation or selection
+- Hardware creation, parent adoption, namespace creation or selection
   through the API, bridges, DHCP server management, DHCPv6 relay, DNS management,
-  or forwarding sysctl management.
+  a DHCP client, or forwarding sysctl management.
 - SNAT, DNAT, port forwarding, arbitrary protocol matches/port ranges, sets, conntrack
   controls, traffic control, device tuning, or hardware offload.
 - Private-key upload/generation, key-file listing, package installation, arbitrary
@@ -167,7 +168,7 @@ routes, not backend endpoints.
 | --- | --- |
 | `/connect` | Credential entry and connection status |
 | `/overview` | Summary, safety state, active transaction, runtime health |
-| `/interfaces` | All managed interfaces; kind filters for dummy/VLAN/WireGuard |
+| `/interfaces` | Host discovery and managed interfaces; kind filters for Ethernet/dummy/VLAN/WireGuard |
 | `/interfaces/:name` | Interface detail and staged editor |
 | `/parents` | Read-only adopted parent inventory |
 | `/routes` | Routes |
@@ -227,8 +228,9 @@ write outcome, pending confirmation, unavailable/stale state, modeled drift.
 
 Custom signed native package/OpenRC installation and automatic build artifacts are documented in
 the [build and installation specification](docs/BUILD_AND_INSTALL.md).
-Packages and the daemon default to HTTP on `0.0.0.0:8080` in simulator mode; package
-installation must not be presented as proof of native networking readiness.
+Packages and the daemon default to HTTP on `0.0.0.0:8080`. Package arguments select
+native Linux host mode; the bare daemon defaults to simulator development mode.
+Package installation must not be presented as proof of native networking readiness.
 The embedded website requires no separate frontend build.
 
 **Operator prerequisite:** Use operator-configured, reachable frontend/API origins.
@@ -598,7 +600,7 @@ multicast, and unspecified addresses. Source must be configured on an up
 managed interface, cannot be link-local or equal the gateway/target. Private/ULA
 sources are valid. IPv6 gateway/target can be link-local; interface supplies
 the scope. Enabled monitors require matching explicit route and source-policy
-rule into table 10000..19999. Disabled monitors need not retain those network
+rule into table 254 or 10000..19999. Disabled monitors need not retain those network
 references. Never silently add routes, rules, or firewall exceptions.
 
 Gateway timing fields use these inclusive bounds (milliseconds except percent):
@@ -738,7 +740,9 @@ Operator prerequisites are not API settings: explicit `--allow-host-services`,
 namespace/host capabilities, exclusive host-service ownership, an arranged backend log source, trust bundle,
 host DNS/routing, and stopping competing clock/logging services. No packages,
 arbitrary commands, OpenRC service management, or host-network edits are exposed.
-Host clock/logging/statistics are narrowly opted-in exceptions to isolated scope.
+Host clock/logging/statistics retain explicit opt-ins even when native networking
+uses the host namespace. Host-network management does not implicitly authorize
+clock adjustment or take ownership from competing services.
 
 Settings persist through transactions/revisions/restart; traffic histories survive
 graceful stop/repair. Managed database identity includes boot/namespace identity;
@@ -779,7 +783,7 @@ administrative state, and role. Detail views include desired/observed comparison
 
 Editor fields:
 
-- Name, kind (`dummy`, `wireguard`, `vlan`), required role (`wan` or `lan`),
+- Name, kind (`ethernet`, `dummy`, `wireguard`, `vlan`), required role (`wan` or `lan`),
   MTU, administrative up, address list.
 - VLAN: parent selector and VLAN ID.
 - WireGuard: embedded settings/peers or link to the same shared WireGuard editor.
@@ -801,7 +805,7 @@ Adopted read-only parents remain unchanged and do not have editable roles.
 This is a greenfield contract: saved configurations/snapshots without required
 roles are invalid; do not add a compatibility fallback or migration.
 
-Parent selector combines eligible managed dummy/VLAN interfaces in the draft
+Parent selector combines eligible managed Ethernet/dummy/VLAN interfaces in the draft
 with available adopted parents. Identify adopted parents as read-only. Do not
 offer WireGuard, self, or descendants as parents.
 
@@ -815,6 +819,46 @@ masquerade rules, and capture instances. Do not silently cascade. Require explic
 staging of removals/references and block apply until the full package is valid.
 Renames must similarly surface dependencies. Up does not imply carrier/readiness.
 
+#### Host interface discovery and selection
+
+`GET /api/v1/interfaces/discovered` requires the normal API key and `state.read`.
+It returns `DiscoveredInterface[]`, including unmanaged links and loopback in
+the backend's network namespace. Native mode defaults to the daemon's current
+host namespace; `--namespace NAME` optionally selects a lab namespace.
+In Docker this means the container network, never Windows host adapters.
+Simulator inventory describes only simulated links, not real host hardware.
+Native host mode requires a persistent `/etc/machine-id` containing 32 hex
+characters. Empty/missing/invalid identity fails startup; the daemon does not
+silently generate one or reset state. Preserve the state location and machine
+identity across restart/reboot; isolated lab scopes remain boot-bound.
+
+Discovery is read-only, does not require successful configured-state observation
+or healthy service workers, and does not assign roles or take NIC ownership.
+It rejects query parameters with 400, unsupported POST with 405, missing/invalid
+keys with 401 and missing `state.read` with 403. Real read failures return 503,
+not an empty success. `GET /api/v1/interfaces` retains its managed-config meaning.
+
+Provide a separate discovered-NIC list with name, kernel index, MAC, kind,
+current MTU/up state and addresses. Loopback and unsupported kinds remain visible
+but cannot be selected as Ethernet. Existing Ethernet and veth links use the
+configuration kind `ethernet`. Explicitly choose role, desired MTU/up state and
+static addresses before submitting the full candidate; do not infer WAN/LAN.
+Discovery addresses may not satisfy candidate validation, so never blindly copy
+them into a transaction.
+
+Changing host networking may sever API/SSH management. Keep the user's draft,
+show the exact removals/additions and provisional deadline, require independent
+connectivity verification and never auto-confirm. Ethernet management operates
+on an existing NIC, not hardware creation/deletion; show removal as releasing
+configuration ownership rather than deleting a physical port.
+There is no DHCP client or automatic WAN lease discovery.
+
+Forwarding remains an operator prerequisite, never inferred from WAN/LAN roles.
+The API deliberately rejects IPv4/IPv6 forwarding sysctls: changing them can
+change other kernel device/RA settings that are not currently captured for
+transaction rollback. Do not render a supported forwarding toggle or claim
+Netcontrol configures every host subsystem.
+
 ### 6.2.1 Per-interface DHCPv4 relay
 
 Include an **Enable DHCP relay** boolean and an editable server-address list in
@@ -827,7 +871,7 @@ requests; this is not ordered failover.
 Servers must be distinct canonical unicast IPv4 literals: no hostnames, ports,
 prefixes, IPv6, loopback, link-local, multicast, broadcast, or unspecified IPs.
 Validate entries even when disabled. Enabling requires at least one server,
-an administratively up dummy/VLAN interface, and a configured unicast IPv4
+an administratively up Ethernet/dummy/VLAN interface, and a configured unicast IPv4
 address. WireGuard cannot be enabled for relay. WAN/LAN role does not restrict
 relay or select upstream interfaces.
 
@@ -1217,7 +1261,7 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Area | Constraints |
 | --- | --- |
 | Interface name | `^[a-zA-Z0-9_.-]{1,15}$`; not `lo`, `.`, `..`; unique; cannot collide with protected adopted parent |
-| Kind | `dummy`, `wireguard`, `vlan`; existing kind cannot change in place |
+| Kind | `ethernet`, `dummy`, `wireguard`, `vlan`; existing kind cannot change in place; Ethernet must already exist |
 | MTU | 1280..65535 |
 | VLAN | Required only for VLAN kind; parent valid/known, ID 1..4094; unique parent/ID pair; no cycles, self-parent, or WireGuard parent; child MTU <= parent MTU |
 | WireGuard settings | Required only for WireGuard kind; do not send on other kinds |
@@ -1230,12 +1274,12 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Route destination | Canonical network |
 | Route gateway | Optional canonical numeric address; same family as destination, no mapped IPv6 or zone |
 | Route interface | Must exist in managed draft interfaces |
-| Route table | 10000..19999 |
+| Route table | 254 (main) or 10000..19999 |
 | Route metric | 1..2147483647 |
 | Route uniqueness | `(table, destination, metric)` unique, even if device/gateway differs |
 | Policy source | Canonical network |
 | Policy priority | 10000..19999, unique across policy rules |
-| Policy table | 10000..19999; reuse across rules allowed |
+| Policy table | 254 or 10000..19999; reuse across rules allowed |
 | Filter policy/action | Exactly `accept` or `drop` |
 | Filter prefixes | Optional canonical source/destination networks; same family when both supplied; both may be empty |
 | Host inventory | At most 128; unique ID `^[a-zA-Z0-9_-]{1,64}$`; unique nonblank name <=80 bytes, no outer whitespace/control characters |
@@ -1311,6 +1355,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/runtime` | `RuntimeState` |
 | GET | `/parent-interfaces` | `ParentInterface[]` |
 | GET | `/interfaces` | Observed `Interface[]` |
+| GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | GET | `/vlans` | Observed VLAN `Interface[]` |
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |
@@ -1489,9 +1534,20 @@ interface GatewayMonitorStatistics {
   error?: string;
 }
 
+interface DiscoveredInterface {
+  name: string;
+  kind: string; // Ethernet/veth normalize to "ethernet"; other kinds remain visible.
+  index: number | null; // Native kernel index; null for simulated links.
+  mac: string | null;
+  mtu: number;
+  up: boolean;
+  addresses: string[];
+  ownership: "managed" | "unmanaged" | "loopback";
+}
+
 interface ManagedInterface {
   name: string;
-  kind: "dummy" | "wireguard" | "vlan";
+  kind: "ethernet" | "dummy" | "wireguard" | "vlan";
   role: "wan" | "lan";
   mtu: number;
   up: boolean;

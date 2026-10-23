@@ -3,8 +3,9 @@
 ## Packaging contract
 
 Netcontrol uses its own signed `.ncpkg` format and the Rust
-`netcontrol-package` executable. It does not use APK, abuild, tar extraction,
-shell-driven installation, or an external package-manager subprocess.
+`netcontrol-package` executable. The signed-package installer does not use APK,
+abuild, tar extraction, shell-driven installation, or an external package-manager
+subprocess. The Ubuntu source bootstrap below is a separate manual deployment.
 Alpine Linux remains a deployment target, using static musl executables and
 OpenRC to start the single Rust daemon. No dnsmasq, chronyd, softflowd,
 syslog-ng, or vnstatd service is installed or supervised.
@@ -42,6 +43,66 @@ cargo build --release --locked --target x86_64-unknown-linux-musl \
 Use an aarch64 Linux host and the aarch64 target for ARM64 builds unless an
 appropriate cross-linker is explicitly configured. Merely adding a Rust target
 does not install a cross-architecture linker.
+
+## Ubuntu source installation (amd64)
+
+The repository provides [install.sh](../install.sh) for an internet-connected
+Ubuntu amd64 host. Once this file is committed and pushed to GitHub `main`, run
+from any directory:
+
+```sh
+curl -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh && sudo bash /tmp/netcontrol-install.sh
+```
+
+If curl is absent, first run `sudo apt-get update && sudo apt-get install -y
+curl ca-certificates`. Downloading fully before execution prevents running a
+partial response. Inspect the script before running it as root; both the script
+and fetched source must be trusted. Public raw access and Git clone must be
+available; private repositories require a separately authenticated checkout,
+not credentials embedded in the command.
+
+The bootstrap installs native build dependencies and APT rustup when missing,
+provisions stable Rust, fetches `main` into a temporary checkout, prints its
+commit, builds using the lockfile and installs `/usr/local/sbin/netcontrold`.
+No existing checkout is needed. Use `sudo bash /tmp/netcontrol-install.sh --ref
+BRANCH_TAG_OR_COMMIT` to select reviewed source; for a pinned deployment also
+replace `main` in the script download URL with the same reviewed commit.
+APT must provide rustup (Ubuntu 26.04 does). Existing rustup is reused.
+An already running daemon causes an explicit stop-and-retry error; the script
+does not stop it for you. It does not create a systemd unit or start/enable any
+service, configure networking, or remove runtime state. Source builds take time
+and require access to Ubuntu, GitHub, Rust toolchain and Cargo registries.
+
+### From an existing checkout
+
+For an internet-connected Ubuntu amd64 server with `rustup` available through
+APT (including Ubuntu 26.04), run the following from a trusted checkout's
+repository root, not `/etc/netplan`. The initial check stops the command if the
+daemon crate is absent. This installs compiler/linker tools, libclang, Linux
+headers, CA roots, and stable Rust with the repository's rustfmt/clippy
+components before building with the committed lockfile. Rust is installed for
+the invoking user; use the same account throughout the build.
+
+```sh
+test -f crates/netcontrold/Cargo.toml && sudo apt-get update && sudo apt-get install -y build-essential pkg-config libclang-dev linux-libc-dev ca-certificates rustup && rustup toolchain install stable --profile minimal --component rustfmt --component clippy && rustup run stable cargo build --release --locked --target x86_64-unknown-linux-gnu -p netcontrold && sudo install -m 0755 target/x86_64-unknown-linux-gnu/release/netcontrold /usr/local/sbin/netcontrold
+```
+
+The explicit GNU target uses Ubuntu's native linker and does not require musl
+tools. `rustup run stable cargo` does not depend on a shell restart or Cargo's
+user-bin directory being on PATH. This is a manual source deployment of the
+daemon only, not installation of a signed `.ncpkg`: it does not install the
+package tool, OpenRC assets or a systemd unit, start/enable a service, or change
+network configuration. The final command replaces any existing binary at
+`/usr/local/sbin/netcontrold`; stop an existing daemon before replacing it.
+Signed package ownership/recovery guarantees do not apply to this manual path.
+Do not use Alpine's OpenRC startup commands on a standard systemd Ubuntu host.
+Native startup requirements and management exposure warnings below still apply.
+
+Wi-Fi configured through Netplan/networkd also needs Ubuntu's `wpasupplicant`
+package. It is an operating-system connectivity prerequisite, not a Netcontrol
+runtime dependency. If Wi-Fi is the only internet connection and the package
+is absent, transfer it and its missing dependencies offline before running the
+online build command. Netcontrol does not configure Wi-Fi authentication.
 
 ## Create a package
 
@@ -99,9 +160,25 @@ As root:
 chmod 755 ./netcontrol-package
 ./netcontrol-package verify netcontrol-x86_64.ncpkg --public-key signing.pub
 ./netcontrol-package install netcontrol-x86_64.ncpkg --public-key signing.pub
+```
+
+Before starting native host mode, ensure `/etc/machine-id` contains a persistent
+32-hex-character machine identity. Some minimal Alpine/container installations
+do not provision it. On a **new machine with no assigned identity**, provision
+one once as root, preserving any existing valid value:
+
+```sh
+if [ ! -s /etc/machine-id ]; then
+  tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id
+  chmod 444 /etc/machine-id
+fi
 rc-service netcontrold start
 rc-service netcontrold status
 ```
+
+Do not replace an existing identity to work around scope errors. In containers,
+preserve the same machine-id file across replacement along with state/services
+data. Missing, empty or malformed identity fails startup explicitly.
 
 Installation does not start or enable services automatically. OpenRC must
 already be available on the operating system. Package installation does not
@@ -120,26 +197,31 @@ An unclaimed device can be claimed by anyone able to reach its website.
 Automatic clipboard access may be unavailable on HTTP LAN origins; select and
 copy the one-time API key manually if necessary.
 
-Default configuration remains simulator mode: installing or starting the
-package does not make it a live host firewall. After reviewing the configuration:
+The package's OpenRC arguments select native host mode. Startup inventories the
+host but does not automatically select NICs or create a usable firewall
+configuration. Keep a console available, review the candidate and confirm live
+connectivity before enabling unattended startup:
 
 ```sh
 rc-update add netcontrold default
 ```
 
-## Enable native networking deliberately
+## Native host networking
 
-The native backend requires an operator-created isolated network namespace,
-kernel networking support, and namespace/network-administration privileges.
-The daemon does not create the namespace, configure physical ports, enable
-forwarding, or adopt arbitrary existing networking. Its management listener
-remains in the host namespace.
+The native backend manages the network namespace in which the daemon starts:
+the appliance host on Alpine, or the container's own network namespace in Docker.
+It does not require a separate managed namespace. Root/network-administration
+privileges and kernel nftables/link support are required. It never reaches
+through an ordinary container to control the Windows or Docker VM host.
+Same-namespace native operations require `CAP_NET_ADMIN`; entering a different
+lab namespace additionally needs namespace-entry privileges (`CAP_SYS_ADMIN`).
+Raw probes/capture and host clock services require their own capabilities and
+explicit opt-ins; network-administration access alone does not grant those.
 
-After provisioning those prerequisites, stop the simulator and configure
-`netcontrold_args` in `/etc/conf.d/netcontrold` using conventional long options:
+The package supplies native-mode OpenRC arguments. For a manual deployment:
 
 ```sh
-netcontrold_args="--backend linux --namespace netcontrol \
+netcontrold_args="--backend linux \
   --listen 0.0.0.0:8080 \
   --state /var/lib/netcontrol/native-state.json \
   --credential-db /var/lib/netcontrol/credentials.json \
@@ -147,20 +229,34 @@ netcontrold_args="--backend linux --namespace netcontrol \
   --services-state-dir /var/lib/netcontrol/services"
 ```
 
-`netcontrol` above is an example namespace name, resolved under `/run/netns`,
-not a namespace the installer creates. The daemon rejects its own or PID 1's
-network namespace and namespace symlinks. Network state is bound to the actual
-backend scope: a simulator file is not native state, and a different namespace
-is not the same scope. Retain existing files and choose a deliberate separate
-state path when changing scope; do not reset incompatible state.
+Use `GET /api/v1/interfaces/discovered` or `show interfaces discovered` to inspect
+actual links before making a candidate. Existing Ethernet/veth NICs use
+`kind: "ethernet"`; their desired addresses, MTU, up/down state and role must be
+explicit. `GET /api/v1/interfaces` remains managed configuration, not discovery.
+Discovery itself never brings interfaces up/down or removes addresses.
+Use main routing table `254` for ordinary host routes; reserved tables
+`10000..19999` remain available for policy routing. Existing foreign routes
+are not blanket-deleted or automatically imported.
+Original and per-operation Ethernet snapshots protect selected static settings.
+Changes intrinsic to selected addresses/admin state can affect kernel-connected
+or autoconfiguration routes; this is not rollback of another DHCP/routing
+manager's state. Stop competing managers on selected ports.
 
-Pre-created parent interfaces require explicit `--adopt-parents`; they remain
-read-only. WireGuard private keys must already exist in the private key
+For an isolated lab, `--namespace NAME` explicitly selects an existing namespace;
+the daemon does not create it. Use a distinct state/services directory for a
+different scope. Simulator state is not native state; incompatible data is
+rejected without deletion. Do not run competing interface/address managers on
+NICs selected for Netcontrol management. There is no native DHCP client or DNS
+server; static addressing must be deliberate, including management connectivity.
+
+WireGuard private keys must already exist in the private key
 directory. Add `--allow-host-tunables`, `--allow-host-services`, or
 `--gateway-monitoring` only after reviewing their host-wide effects and
 capabilities. Competing clock/logging services must not retain ownership when
 the corresponding native workers are enabled. Syslog TLS needs system CA roots.
 These opt-ins do not configure networking or enable services by themselves.
+Host mode can interrupt the API/SSH connection while applying; use
+`commit confirmed`, independent connectivity verification and console access.
 
 See the exact [native ownership/prerequisites](../crates/netcontrol-native/README.md)
 and [service restrictions](../crates/netcontrol-services/README.md). On a

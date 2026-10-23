@@ -9,6 +9,36 @@ fn candidate() -> Config {
         "firewall":{"policy":"drop","rules":[{"source":"192.0.2.0/24","action":"accept"}]}
     })).expect("valid fixture")
 }
+
+#[test]
+fn host_ethernet_and_main_table_routes_validate_without_relaxing_reserved_values() {
+    let mut config = candidate();
+    config.interfaces[0].kind = "ethernet".into();
+    config.interfaces[0].dhcp_relay = DHCPRelayConfig {
+        enabled: true,
+        servers: vec!["192.0.2.2".into()],
+    };
+    config.routes[0].table = 254;
+    config.policy_rules[0].table = 254;
+    config.validate().unwrap();
+    for table in [0, 1, 253, 255, 9999, 20000] {
+        let mut invalid = config.clone();
+        invalid.routes[0].table = table;
+        assert!(invalid.validate().is_err(), "route table {table}");
+        let mut invalid = config.clone();
+        invalid.policy_rules[0].table = table;
+        assert!(invalid.validate().is_err(), "policy table {table}");
+    }
+    let mut invalid = config.clone();
+    invalid.interfaces[0].kind = "bridge".into();
+    assert!(invalid.validate().is_err());
+    let mut invalid = config;
+    invalid.interfaces[0].vlan = Some(VLAN {
+        parent: "eth1".into(),
+        id: 10,
+    });
+    assert!(invalid.validate().is_err());
+}
 #[test]
 fn empty_and_icmp_defaults_are_explicit() {
     let empty = Config::empty();
@@ -89,7 +119,7 @@ fn interface_route_rule_and_nat_validation_edges() {
             json!(["192.0.2.1/24", "192.0.2.1/24"]),
         ),
         ("/routes/0/destination", json!("192.0.2.1/24")),
-        ("/routes/0/table", json!(254)),
+        ("/routes/0/table", json!(253)),
         ("/routes/0/interface", json!("unknown")),
         ("/routes/0/metric", json!(2147483648i64)),
         ("/routes/0/gateway", json!("2001:db8::1")),

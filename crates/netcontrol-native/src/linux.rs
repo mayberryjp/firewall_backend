@@ -1,6 +1,6 @@
 use crate::{
     NativeOptions,
-    model::{Kernel, Network},
+    model::{EthernetSnapshot, Kernel, Network},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use netcontrol_core::{Backend, Config};
@@ -35,7 +35,12 @@ mod firewall {
     pub fn apply(_: &Value) -> Result<()> {
         bail!("native backend was built without nftables support")
     }
+    pub fn remove_owned(_: &str) -> Result<()> {
+        bail!("native backend was built without nftables support")
+    }
 }
+#[cfg(all(test, feature = "nftables"))]
+mod host_integration;
 #[cfg(all(test, feature = "nftables"))]
 mod integration;
 mod netfilter;
@@ -56,6 +61,7 @@ pub struct Native {
     _lock: File,
     host_namespace: Option<Arc<File>>,
     _host_lock: Option<File>,
+    boot: String,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -65,6 +71,14 @@ struct Ownership {
     firewall_config: Option<Value>,
     firewall_fingerprint: Option<String>,
     kernel_baseline: Kernel,
+    #[serde(default)]
+    ethernet_originals: BTreeMap<String, EthernetSnapshot>,
+    #[serde(default)]
+    managed_interfaces: BTreeSet<String>,
+    #[serde(default)]
+    boot: String,
+    #[serde(default)]
+    committed_config: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -75,6 +89,20 @@ struct Intent {
     after: Value,
     kernel_before: Kernel,
     ownership_before: Ownership,
+    #[serde(default)]
+    ethernet_before: BTreeMap<String, EthernetSnapshot>,
+    #[serde(default)]
+    ethernet_originals: BTreeMap<String, EthernetSnapshot>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HostScope {
+    machine: String,
+    boot: String,
+    device: u64,
+    inode: u64,
+    identity: String,
 }
 
 impl Native {
@@ -83,11 +111,10 @@ impl Native {
             cfg!(feature = "nftables"),
             "native backend was built without nftables support; this build cannot manage networking"
         );
-        ensure!(
-            !options.namespace.is_empty(),
-            "an explicit namespace is required"
-        );
-        let path = if Path::new(&options.namespace).is_absolute() {
+        let host_mode = options.namespace.is_empty();
+        let path = if host_mode {
+            PathBuf::from("/proc/thread-self/ns/net")
+        } else if Path::new(&options.namespace).is_absolute() {
             PathBuf::from(&options.namespace)
         } else {
             ensure!(
@@ -96,13 +123,11 @@ impl Native {
             );
             PathBuf::from("/run/netns").join(&options.namespace)
         };
-        let namespace = Arc::new(open_namespace(&path)?);
-        for forbidden in ["/proc/thread-self/ns/net", "/proc/1/ns/net"] {
-            ensure!(
-                !same_file(&namespace, &File::open(forbidden)?)?,
-                "refusing current or PID 1 network namespace"
-            );
-        }
+        let namespace = Arc::new(if host_mode {
+            File::open(&path)?
+        } else {
+            open_namespace(&path)?
+        });
         ensure!(
             unsafe { libc::flock(namespace.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "network namespace is already owned, or nsfs does not support advisory ownership locking: {}",
@@ -155,6 +180,51 @@ impl Native {
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "another native manager owns this state directory"
         );
+        if host_mode {
+            let machine = fs::read_to_string("/etc/machine-id")
+                .context("host mode requires a stable /etc/machine-id")?;
+            let machine = machine.trim().to_owned();
+            ensure!(
+                machine.len() == 32 && machine.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid /etc/machine-id"
+            );
+            let marker = state.join("host-scope.json");
+            let host = if marker.try_exists()? {
+                let saved: HostScope = read_json(&marker)?;
+                ensure!(
+                    saved.machine == machine,
+                    "host state belongs to a different machine"
+                );
+                ensure!(
+                    saved.boot != boot.trim()
+                        || (saved.device == meta.dev() && saved.inode == meta.ino()),
+                    "host state belongs to a different current-daemon namespace in this boot"
+                );
+                saved
+            } else {
+                HostScope {
+                    machine: machine.clone(),
+                    boot: boot.trim().into(),
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    identity: format!(
+                        "linux:host:{machine}:{}",
+                        hex::encode(Sha256::digest(state.as_os_str().as_encoded_bytes()))
+                    ),
+                }
+            };
+            identity = host.identity;
+            write_json(
+                &marker,
+                &HostScope {
+                    machine,
+                    boot: boot.trim().into(),
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                    identity: identity.clone(),
+                },
+            )?;
+        }
         let (host_namespace, host_lock) = if options.allow_host_tunables {
             let metadata = fs::symlink_metadata("/run")?;
             ensure!(
@@ -178,12 +248,19 @@ impl Native {
                 unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
                 "host tunables already owned by another manager"
             );
-            (Some(Arc::new(File::open("/proc/1/ns/net")?)), Some(lock))
+            (
+                Some(if host_mode {
+                    namespace.clone()
+                } else {
+                    Arc::new(File::open("/proc/thread-self/ns/net")?)
+                }),
+                Some(lock),
+            )
         } else {
             (None, None)
         };
         let services = Services::new(ServiceOptions {
-            namespace: Some(path.clone()),
+            namespace: if host_mode { None } else { Some(path.clone()) },
             state_directory: options.services_state.clone(),
             allow_host_services: options.allow_host_services,
             allow_gateway_monitoring: options.gateway_monitoring,
@@ -199,11 +276,12 @@ impl Native {
             _lock: lock,
             host_namespace,
             _host_lock: host_lock,
+            boot: boot.trim().into(),
         };
         let ownership = native.ownership()?;
         ensure!(
             ownership.scope.is_empty() || ownership.scope == native.identity,
-            "native ownership belongs to another boot/namespace/parent identity"
+            "native ownership belongs to another host/namespace/parent identity; state is not reset"
         );
         ensure!(
             ownership.kernel_baseline.host.is_empty() || native.host_namespace.is_some(),
@@ -214,7 +292,11 @@ impl Native {
     }
 
     fn check_scope(&self) -> Result<()> {
-        let current = open_namespace(&self.namespace_path)?;
+        let current = if self.options.namespace.is_empty() {
+            File::open(&self.namespace_path)?
+        } else {
+            open_namespace(&self.namespace_path)?
+        };
         crate::ensure_unchanged(
             same_file(&self.namespace, &current)?,
             "named namespace was replaced; refusing stale namespace handle",
@@ -222,12 +304,13 @@ impl Native {
         let metadata = self.namespace.metadata()?;
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
         crate::ensure_unchanged(
-            self.identity.starts_with(&format!(
-                "linux:{}:{}:{}",
-                boot.trim(),
-                metadata.dev(),
-                metadata.ino()
-            )),
+            self.options.namespace.is_empty()
+                || self.identity.starts_with(&format!(
+                    "linux:{}:{}:{}",
+                    boot.trim(),
+                    metadata.dev(),
+                    metadata.ino()
+                )),
             "boot/namespace identity changed",
         )?;
         Ok(())
@@ -321,12 +404,31 @@ impl Native {
         firewall::validate(&network.firewall)?;
         let parents = self.parents.clone();
         let ownership = self.ownership()?;
+        let originals = ownership
+            .ethernet_originals
+            .iter()
+            .filter(|(name, _)| {
+                network
+                    .interfaces
+                    .iter()
+                    .any(|l| &l.name == *name && l.kind == "ethernet")
+            })
+            .map(|(name, snapshot)| (name.clone(), snapshot.clone()))
+            .collect();
+        for link in network.interfaces.iter().filter(|l| l.kind == "ethernet") {
+            ensure!(
+                ownership.ethernet_originals.contains_key(&link.name),
+                "managed Ethernet {} has no durable original snapshot",
+                link.name
+            );
+        }
         let mut effective = ownership.kernel_baseline.clone();
         effective.namespace.extend(network.kernel.namespace.clone());
         effective.host.extend(network.kernel.host.clone());
         self.verify_kernel(&effective)?;
         let keys = self.options.keys.clone();
         session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::check_ethernet(handle, &originals))?;
             rt.block_on(networking::verify(handle, &network, &parents, &keys))?;
             firewall::verify(
                 &network.firewall,
@@ -407,9 +509,10 @@ impl Native {
         let parents = self.parents.clone();
         let keys = self.options.keys.clone();
         let namespace_values = kernel.namespace.clone();
+        let originals = ownership.ethernet_originals.clone();
         let fingerprint = session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::reconcile(
-                handle, &before, &after, &parents, &keys,
+                handle, &before, &after, &parents, &keys, &originals,
             ))?;
             sysctl::write_scope(&namespace_values, "namespace")?;
             firewall::apply(&after.firewall)?;
@@ -512,7 +615,10 @@ impl Native {
             "pending native recovery belongs to another namespace"
         );
         self.preflight(&intent.before)?;
-        let mut ownership = intent.ownership_before;
+        let mut ownership = intent.ownership_before.clone();
+        ownership
+            .ethernet_originals
+            .extend(intent.ethernet_originals);
         self.services.shutdown()?;
         self.network_apply(
             &intent.after,
@@ -521,14 +627,152 @@ impl Native {
             &mut ownership,
         )
         .context("recovering interrupted native operation; durable intent retained on failure")?;
-        ownership.firewall_config = Some(Network::parse(&intent.before)?.firewall);
+        let snapshots = intent.ethernet_before;
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::restore_ethernet(handle, &snapshots))
+        })?;
+        ownership.ethernet_originals = intent.ownership_before.ethernet_originals;
+        if intent.ownership_before.firewall_fingerprint.is_none() {
+            let fingerprint = ownership
+                .firewall_fingerprint
+                .clone()
+                .context("missing rollback firewall fingerprint")?;
+            session(self.namespace.clone(), move |_, _| {
+                firewall::remove_owned(&fingerprint)
+            })?;
+            ownership.firewall_config = None;
+            ownership.firewall_fingerprint = None;
+        } else {
+            ownership.firewall_config = Some(Network::parse(&intent.before)?.firewall);
+        }
         self.services.repair(&intent.before)?;
         self.save_ownership(&ownership)?;
         remove_durable(&path)
     }
+
+    fn reconcile_after_boot(
+        &mut self,
+        after: &Value,
+        mut ownership: Ownership,
+        rollback_from: Option<&Value>,
+    ) -> Result<()> {
+        ensure!(
+            ownership.committed_config.as_ref() == Some(after)
+                || (rollback_from.is_some()
+                    && ownership.committed_config.as_ref() == rollback_from),
+            "reboot configuration does not match durable native ownership; refusing implicit adoption"
+        );
+        self.preflight(after)?;
+        let expected = Network::parse(
+            ownership
+                .committed_config
+                .as_ref()
+                .context("missing reboot configuration")?,
+        )?;
+        let originals = ownership.ethernet_originals.clone();
+        let keys = self.options.keys.clone();
+        let (mut before, fingerprint) = session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::check_ethernet(handle, &originals))?;
+            Ok((
+                rt.block_on(networking::boot_snapshot(handle, &expected, &keys))?,
+                netfilter::fingerprint()?,
+            ))
+        })?;
+        let mut previous = ownership.clone();
+        if fingerprint == netfilter::empty_fingerprint() {
+            previous.firewall_config = None;
+            previous.firewall_fingerprint = None;
+        } else {
+            crate::ensure_unchanged(
+                ownership.firewall_fingerprint.as_deref() == Some(&fingerprint),
+                "owned firewall changed across reboot",
+            )?;
+            before["firewall"] = ownership
+                .firewall_config
+                .clone()
+                .context("missing reboot firewall ownership")?;
+        }
+        let a = Network::parse(&before)?;
+        let b = Network::parse(after)?;
+        let ethernet_before = session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::preflight(handle, &a, &b))?;
+            rt.block_on(networking::capture_ethernet(handle, &a, &b))
+        })?;
+        let kernel_before = self.capture_kernel(&before, after)?;
+        for (name, snapshot) in &ethernet_before {
+            ownership
+                .ethernet_originals
+                .entry(name.clone())
+                .or_insert_with(|| snapshot.clone());
+        }
+        for (name, value) in &kernel_before.namespace {
+            ownership
+                .kernel_baseline
+                .namespace
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        for (name, value) in &kernel_before.host {
+            ownership
+                .kernel_baseline
+                .host
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        let intent = Intent {
+            scope: self.identity.clone(),
+            before: before.clone(),
+            after: after.clone(),
+            kernel_before,
+            ownership_before: previous,
+            ethernet_before,
+            ethernet_originals: ownership.ethernet_originals.clone(),
+        };
+        write_json(&self.state.join("intent.json"), &intent)?;
+        let mut target = ownership.kernel_baseline.clone();
+        let desired = Network::parse(after)?;
+        target.namespace.extend(desired.kernel.namespace);
+        target.host.extend(desired.kernel.host);
+        let result = (|| -> Result<()> {
+            self.services.shutdown()?;
+            self.network_apply(&before, after, target, &mut ownership)?;
+            self.services.repair(after)?;
+            ownership.firewall_config = Some(Network::parse(after)?.firewall);
+            ownership.managed_interfaces = Network::parse(after)?
+                .interfaces
+                .into_iter()
+                .map(|l| l.name)
+                .collect();
+            ownership
+                .ethernet_originals
+                .retain(|name, _| ownership.managed_interfaces.contains(name));
+            ownership.committed_config = Some(after.clone());
+            ownership.boot = self.boot.clone();
+            self.save_ownership(&ownership)?;
+            remove_durable(&self.state.join("intent.json"))
+        })();
+        if let Err(error) = result {
+            return match self.recover() {
+                Ok(()) => {
+                    Err(error.context("reboot reconciliation failed; captured boot state restored"))
+                }
+                Err(rollback) => Err(anyhow!(
+                    "reboot reconciliation failed: {error:#}; recovery failed: {rollback:#}; intent retained"
+                )),
+            };
+        }
+        Ok(())
+    }
 }
 
 impl Backend for Native {
+    fn discover_interfaces(&mut self) -> Result<Value> {
+        self.check_scope()?;
+        let managed = self.ownership()?.managed_interfaces;
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::discover(handle, &managed))
+        })
+    }
     fn scope(&self) -> Result<String> {
         self.check_scope()?;
         Ok(self.identity.clone())
@@ -552,10 +796,28 @@ impl Backend for Native {
         let after = serde_json::to_value(after)?;
         self.preflight(&before)?;
         self.preflight(&after)?;
+        let mut ownership = self.ownership()?;
+        if self.options.namespace.is_empty()
+            && !ownership.boot.is_empty()
+            && ownership.boot != self.boot
+        {
+            return self.reconcile_after_boot(&after, ownership, Some(&before));
+        }
         if let Err(drift) = self.verify(&before) {
             // Core recovery may retry rollback after this backend already restored its WAL.
             // Accept only a fully verified target; this does not mutate or excuse drift.
-            if self.verify(&after).is_ok() {
+            let after_names: BTreeSet<_> = Network::parse(&after)?
+                .interfaces
+                .into_iter()
+                .map(|l| l.name)
+                .collect();
+            let recorded_target = ownership.committed_config.as_ref() == Some(&after)
+                || (ownership.committed_config.is_none()
+                    && after == serde_json::to_value(Config::empty())?);
+            if recorded_target
+                && ownership.managed_interfaces == after_names
+                && self.verify(&after).is_ok()
+            {
                 self.services.repair(&after)?;
                 return Ok(());
             }
@@ -563,9 +825,28 @@ impl Backend for Native {
                 drift.context("native drift guard: committed configuration differs from kernel")
             );
         }
-        let mut ownership = self.ownership()?;
+        let before_network = Network::parse(&before)?;
+        let after_network = Network::parse(&after)?;
+        let ethernet_before = session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::preflight(
+                handle,
+                &before_network,
+                &after_network,
+            ))?;
+            rt.block_on(networking::capture_ethernet(
+                handle,
+                &before_network,
+                &after_network,
+            ))
+        })?;
         let captured = self.capture_kernel(&before, &after)?;
         let previous_ownership = ownership.clone();
+        for (name, snapshot) in &ethernet_before {
+            ownership
+                .ethernet_originals
+                .entry(name.clone())
+                .or_insert_with(|| snapshot.clone());
+        }
         for (name, value) in &captured.namespace {
             ownership
                 .kernel_baseline
@@ -593,6 +874,8 @@ impl Backend for Native {
             after: after.clone(),
             kernel_before: captured.clone(),
             ownership_before: previous_ownership,
+            ethernet_before,
+            ethernet_originals: ownership.ethernet_originals.clone(),
         };
         write_json(&self.state.join("intent.json"), &intent)?;
         // Stop services before interface changes; their manager must restore prior workers on failure.
@@ -600,6 +883,16 @@ impl Backend for Native {
             self.services.shutdown()?;
             self.network_apply(&before, &after, kernel_target, &mut ownership)?;
             ownership.firewall_config = Some(Network::parse(&after)?.firewall);
+            ownership.managed_interfaces = Network::parse(&after)?
+                .interfaces
+                .iter()
+                .map(|l| l.name.clone())
+                .collect();
+            ownership
+                .ethernet_originals
+                .retain(|name, _| ownership.managed_interfaces.contains(name));
+            ownership.committed_config = Some(after.clone());
+            ownership.boot = self.boot.clone();
             self.services.apply(&before, &after)?;
             self.log("native networking and services converged")?;
             self.save_ownership(&ownership)?;
@@ -697,11 +990,25 @@ impl Backend for Native {
     fn repair(&mut self, config: &Config) -> Result<Value> {
         self.recover()?;
         let value = serde_json::to_value(config)?;
+        let ownership = self.ownership()?;
+        if self.options.namespace.is_empty()
+            && !ownership.boot.is_empty()
+            && ownership.boot != self.boot
+        {
+            self.reconcile_after_boot(&value, ownership, None)?;
+        }
         self.preflight(&value)?;
         self.verify(&value)?;
         // Empty initial state has no owned nftables table yet. Bootstrap only the verified
         // current firewall; never overwrite a foreign table or repair unrelated drift.
         let mut ownership = self.ownership()?;
+        if self.options.namespace.is_empty()
+            && ownership.firewall_fingerprint.is_none()
+            && config == &Config::empty()
+        {
+            self.services.repair(&value)?;
+            return Ok(self.services.status());
+        }
         if ownership.firewall_fingerprint.is_none() {
             let firewall = Network::parse(&value)?.firewall;
             let captured = self.capture_kernel(&value, &value)?;
@@ -711,6 +1018,8 @@ impl Backend for Native {
                 after: value.clone(),
                 kernel_before: captured.clone(),
                 ownership_before: ownership.clone(),
+                ethernet_before: BTreeMap::new(),
+                ethernet_originals: ownership.ethernet_originals.clone(),
             };
             write_json(&self.state.join("intent.json"), &intent)?;
             self.network_apply(&value, &value, captured, &mut ownership)
@@ -789,31 +1098,25 @@ pub(crate) fn session<T: Send + 'static>(
     target: Arc<File>,
     operation: impl FnOnce(&tokio::runtime::Runtime, &rtnetlink::Handle) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    run_session(target, true, operation)
+    run_session(target, operation)
 }
 
 fn host_session<T: Send + 'static>(
     target: Arc<File>,
     operation: impl FnOnce(&tokio::runtime::Runtime, &rtnetlink::Handle) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    run_session(target, false, operation)
+    run_session(target, operation)
 }
 
 fn run_session<T: Send + 'static>(
     target: Arc<File>,
-    forbid_host: bool,
     operation: impl FnOnce(&tokio::runtime::Runtime, &rtnetlink::Handle) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     std::thread::spawn(move || {
         let original = File::open("/proc/thread-self/ns/net")?;
+        let switched = !same_file(&target, &original)?;
         ensure!(
-            !forbid_host
-                || (!same_file(&target, &original)?
-                    && !same_file(&target, &File::open("/proc/1/ns/net")?)?),
-            "refusing host namespace"
-        );
-        ensure!(
-            unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) } == 0,
+            !switched || unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) } == 0,
             "enter namespace: {}",
             std::io::Error::last_os_error()
         );
@@ -828,7 +1131,11 @@ fn run_session<T: Send + 'static>(
             task.abort();
             result
         })();
-        let restored = unsafe { libc::setns(original.as_raw_fd(), libc::CLONE_NEWNET) };
+        let restored = if switched {
+            unsafe { libc::setns(original.as_raw_fd(), libc::CLONE_NEWNET) }
+        } else {
+            0
+        };
         ensure!(
             restored == 0,
             "restore worker namespace failed: {}",

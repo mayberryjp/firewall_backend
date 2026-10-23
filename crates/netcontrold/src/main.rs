@@ -32,7 +32,11 @@ struct Options {
         help = "Private schema-1 scoped API-key hash file; disables onboarding"
     )]
     auth_file: Option<PathBuf>,
-    #[arg(long, default_value = "")]
+    #[arg(
+        long,
+        default_value = "",
+        help = "Optional isolated lab namespace; native mode defaults to the host network namespace"
+    )]
     namespace: String,
     #[arg(long, default_value = "/etc/netcontrol/keys")]
     keys: PathBuf,

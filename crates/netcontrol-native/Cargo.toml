@@ -26,6 +26,7 @@ tokio.workspace = true
 futures-util = "0.3"
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"
+netlink-packet-utils = "0.5"
 rustables = { version = "0.9", optional = true }
 ipnetwork = "0.21"
 wireguard-control = "1.7"

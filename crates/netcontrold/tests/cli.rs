@@ -81,6 +81,31 @@ impl Fixture {
 }
 
 #[test]
+fn ethernet_candidate_main_routes_and_readonly_discovery_use_shared_engine() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    assert_eq!(f.ok(&mut cli, "show interfaces discovered").trim(), "[]");
+    f.configure(&mut cli);
+    f.ok(&mut cli, "interface eth0 ethernet");
+    f.ok(&mut cli, "no shutdown");
+    f.ok(&mut cli, "ip address 192.0.2.10/24");
+    f.ok(&mut cli, "exit");
+    f.ok(&mut cli, "ip route 0.0.0.0/0 eth0 192.0.2.1 254 100");
+    f.ok(&mut cli, "commit check");
+    assert_eq!(f.request("/api/v1/interfaces/discovered"), json!([]));
+    f.ok(&mut cli, "commit confirmed 30 Host Ethernet");
+    let discovery = f.request("/api/v1/interfaces/discovered");
+    assert_eq!(discovery[0]["kind"], "ethernet");
+    assert_eq!(discovery[0]["ownership"], "managed");
+    f.ok(&mut cli, "rollback");
+    assert_eq!(f.request("/api/v1/interfaces/discovered"), json!([]));
+    let read = Fixture::new(&["state.read"]);
+    read.ok(&mut CliSession::new(), "show interfaces discovered");
+    let denied = Fixture::new(&[]);
+    denied.fail(&mut CliSession::new(), "show interfaces discovered", "403");
+}
+
+#[test]
 fn candidate_is_private_until_explicit_commit_and_confirmation_is_durable() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

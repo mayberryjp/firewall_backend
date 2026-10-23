@@ -117,13 +117,22 @@ impl Services {
         })
     }
     fn preflight(&self, c: &Config) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        let isolated_namespace = {
+            use std::os::unix::fs::MetadataExt;
+            let host = self.host_namespace.metadata()?;
+            let managed = self.managed_namespace.metadata()?;
+            (host.dev(), host.ino()) != (managed.dev(), managed.ino())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let isolated_namespace = self.options.namespace.is_some();
         ensure!(
             !(c.ntp.enabled || c.syslog.enabled || c.vnstat.enabled)
                 || self.options.allow_host_services,
             "host services require explicit allow_host_services opt-in"
         );
         ensure!(
-            self.options.namespace.is_some()
+            isolated_namespace
                 || self.options.allow_host_services
                 || !(c.interfaces.iter().any(|i| i.dhcp_relay.enabled)
                     || c.softflowd.iter().any(|f| f.enabled)
@@ -456,6 +465,35 @@ impl Drop for Services {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_namespace_handle_does_not_bypass_host_service_opt_in() {
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join(format!("services-current-scope-{}", rand::random::<u64>()));
+        let services = Services::new(ServiceOptions {
+            namespace: Some(std::path::PathBuf::from("/proc/thread-self/ns/net")),
+            state_directory: directory.clone(),
+            allow_host_services: false,
+            allow_gateway_monitoring: false,
+        })
+        .unwrap();
+        let config = Config::parse(&json!({"interfaces":[{
+            "name":"nic0","kind":"ethernet","up":true,"addresses":["192.0.2.2/24"],
+            "dhcp_relay":{"enabled":true,"servers":["198.51.100.10"]}
+        }]}))
+        .unwrap();
+        assert!(
+            services
+                .preflight(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit allow_host_services")
+        );
+        drop(services);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn disabled_services_lifecycle_no_fake_pid() {
         let directory = std::env::current_dir()

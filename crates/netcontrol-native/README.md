@@ -10,12 +10,18 @@ optional userspace-program backend is never selected.
 
 - Linux with network namespace, dummy, VLAN, WireGuard, connection-tracking,
   nftables inet/filter/NAT/masquerade support provisioned by the operator.
-- A pre-created **isolated** network namespace, explicitly supplied as
-  `namespace`. A simple name resolves under `/run/netns`; an absolute path to
-  a mounted nsfs network namespace is also accepted. Namespace symlinks,
-  the caller's current network namespace, and PID 1's namespace are rejected.
-  This crate neither creates nor deletes an operator namespace.
-- Namespace-entry/network-administration privileges; host sysctl writes need
+- By default the daemon's **current network namespace**, not a forced entry into
+  PID 1's namespace. In Docker this means the container namespace; host networking
+  must be selected by the operator to manage host links. An optional explicit
+  `namespace` selects a pre-created lab namespace: a simple name resolves under
+  `/run/netns`; an absolute nsfs mount path is also accepted. Explicit namespace
+  symlinks are rejected. This crate neither creates nor deletes namespaces.
+- `CAP_NET_ADMIN` for network configuration and nftables. When target and current
+  namespaces match, networking workers skip `setns`, so namespace entry alone
+  does not require `CAP_SYS_ADMIN`. Entering a different namespace requires
+  applicable `setns` capabilities (normally `CAP_SYS_ADMIN` in the relevant user
+  namespaces). Service-specific capabilities are additional; blanket
+  `--privileged` is not a prerequisite. Host sysctl writes need
   explicit `allow_host_tunables` and exclusive ownership of the trusted
   root-owned `/run/netcontrol-host-tunables.lock`. The normal management listener
   remains outside the managed namespace.
@@ -28,8 +34,8 @@ optional userspace-program backend is never selected.
   descriptor without following symlinks; key contents are not persisted in state,
   logs, runtime replies, or nftables metadata.
 
-`NativeOptions` requires `namespace`; all other fields have deserialization
-defaults: keys `/etc/netcontrol/keys`, services state
+`NativeOptions.namespace` defaults to the empty string (current-daemon host mode).
+Other deserialization defaults are keys `/etc/netcontrol/keys`, services state
 `/var/lib/netcontrol/services`, no adopted parents, and all host/probe opt-ins
 disabled. Unknown option fields are rejected. On non-Linux platforms,
 `Native::open` fails explicitly; portable parsing tests do not imply native
@@ -49,26 +55,51 @@ functional networking build or a permissive firewall fallback.
 
 ## Ownership and reconciliation
 
-Scope identifies the boot ID and pinned namespace device/inode. Adopted parents
-add a stable name/index/kind/MAC identity hash. Every operation rechecks that the
-named namespace still resolves to that inode. Parents are pre-created Ethernet,
+Host mode requires a valid stable `/etc/machine-id`. Its scope combines that ID
+and the absolute native state location, and is retained across reboots. A private
+`host-scope.json` binds that state to the namespace device/inode within each boot;
+using it in another namespace in the same boot fails instead of resetting state.
+This is not a portable machine/container identity or permission to move state
+between namespaces. Explicit lab scopes remain boot/namespace-inode bound.
+Adopted parents add a name/index/kind/MAC identity hash to lab scopes.
+Every operation rechecks the pinned namespace identity. Parents are pre-created Ethernet,
 veth or dummy links; their identity is checked before operations and they are
 never configured, addressed, brought up/down, or deleted. Parent MTU/up changes
 are reported as runtime information, not adopted configuration.
 
-Managed links are dummy, 802.1Q VLAN and kernel WireGuard links. VLAN dependencies
+Managed links include preexisting `ethernet` (kernel device or veth), dummy,
+802.1Q VLAN and kernel WireGuard links. Ethernet links must already exist;
+the backend never creates/deletes them or changes their MAC. Explicit selection
+permits admin up/down, MTU and static IPv4/IPv6 configuration. Before any mutation,
+the intent durably stores the selected Ethernet interfaces' current identity,
+MTU/up state and lossless kernel address messages; ownership retains the first
+original snapshot while the link remains managed. Removal restores that original,
+then releases ownership instead of deleting the link. Failed first adoption and
+interrupted applies restore the per-operation snapshot even when no ownership
+file had yet been saved. Identity checks use name/kind/MAC and, within the same
+boot, interface index. Finite address lifetimes age during rollback; expired
+addresses are not resurrected, and backward wall-clock changes cause an error
+instead of extending a finite lease. External DHCP/network managers must not
+race changes to selected interfaces.
+
+VLAN dependencies
 are created parent-first and removed child-first; identity changes recreate
 affected descendants. Every managed link has an explicit `wan`/`lan` metadata
 role. Global addresses are reconciled exactly; unmanaged link-local addresses
 are left alone. New IPv6 addresses use NODAD for synchronous isolated-lab
-verification. Address lifetime policy and production DAD workflows are not
-implemented.
+verification. Desired addresses are static; production DAD workflows are not
+implemented. Existing addresses on unrelated interfaces are not reconciled.
 
-Routes use protocol 242 and tables 10000–19999. Policy rules use priorities and
-tables 10000–19999. Foreign routes in these reserved tables, unsupported owned
-route/rule attributes or rule actions, and unexpected non-adopted interfaces
-cause explicit drift errors rather than takeover. Only reserved owned routes,
-rules and explicitly managed links may be changed.
+Routes use protocol 242 and table 254 (main) or tables 10000–19999. Policy rules
+use priorities 10000–19999 and those same target tables. Unowned kernel/DHCP/
+operator routes are ignored, never replaced or explicitly deleted; a conflicting
+destination/table/metric is an error before mutation. Owned routes are added
+exclusively, not with a replace operation that could overwrite a foreign route.
+Unmanaged interfaces are allowed and preserved; a new virtual-interface name
+colliding with one is rejected. Unsupported owned route/rule attributes or rule
+actions fail explicitly. Selected-link address/admin changes can inherently
+alter the kernel's connected or autoconfigured routes on that selected link;
+this is not a snapshot/restore facility for another routing/DHCP manager.
 
 The firewall owns only `inet/netcontrol`. Each update atomically replaces its
 table, chains and ordered rules in one batch. It implements ordered forwarding
@@ -82,8 +113,10 @@ The durable ownership file stores the firewall configuration and a lossless
 read-only kernel fingerprint, excluding dynamic handles/use counts but including
 chain policies, full expressions and ordering. Sets, objects and flowtables in
 the owned table are rejected. An existing table without durable ownership is
-never adopted. An initially empty namespace can bootstrap only the empty current
-firewall contract; arbitrary existing networking is not adopted.
+never adopted. Fresh host startup with empty desired configuration performs only
+verification/discovery and starts no firewall table. The first transaction owns
+its table; failed first bootstrap removes it again. Explicit isolated-lab repair
+can bootstrap the empty current firewall contract.
 
 Sysctls use a strict per-scope allowlist, canonical bounded values, procfs
 verification, and already-loaded congestion algorithms only. Original values are
@@ -102,6 +135,19 @@ that scoped rollback. Core-level rollback retries also accept an already fully
 verified target, without relaxing the drift guard or changing unrelated state.
 This is rollback-aware reconciliation, **not** an atomic whole-network update.
 
+On a new host boot, startup repair can replay only the exact configuration saved
+in durable native ownership. Core can also request a rollback before startup
+repair (for example, an expired confirmation): its before configuration must
+match durable native ownership, then native restores the requested target
+directly without first replaying the expired candidate. Both paths check Ethernet identity, foreign-route
+conflicts, existing virtual-link identity and firewall ownership. Current boot
+link/address/route/rule/sysctl state is journaled before replay; failures restore
+that captured state or retain the intent and fail closed. Absent owned virtual
+links and firewall tables can be recreated. Existing conflicting firewall state,
+unexpected owned routes/rules, or WireGuard state that cannot be verified are
+errors, not an implicit reset/adoption. Same-boot drift is never treated as a
+reboot. Reboot/power-loss behavior has not been exercised on Linux hardware.
+
 Service workers are delegated to `netcontrol-services` through the fixed shared
 `Services` interface. They are stopped before network edits and started after
 convergence; edits can therefore interrupt enabled workers. Worker construction
@@ -119,6 +165,11 @@ therefore remain repairable without weakening networking drift protection.
 - Runtime includes adopted parent availability/identity errors, service status,
   public WireGuard/peer handshake and byte statistics, and actual sysctl state.
   It never exposes private keys or invented process IDs.
+- `Backend::discover_interfaces` returns a read-only array of real links:
+  `name`, normalized `kind` (`ethernet` for device/veth), `index`, `mac`, `mtu`,
+  `up`, all observed IPv4/IPv6 `addresses`, and `ownership`
+  (`managed|unmanaged|loopback`). It does not require committed configuration
+  verification and remains usable before adoption and when managed state drifts.
 - `/api/v1/statistics`, `/api/v1/statistics/interfaces`, and
   `/api/v1/statistics/protocols` read routing-netlink 64-bit link counters and
   namespace-specific `/proc/thread-self/net/{snmp,netstat,snmp6}`. Integer counter
@@ -140,10 +191,12 @@ therefore remain repairable without weakening networking drift protection.
 - WireGuard `listen_port=0` is explicitly rejected. A stable nonzero port is
   required for exact committed/effective comparison. DNS endpoints, userspace
   WireGuard, PSKs and fwmarks are not part of this contract.
-- Kernel forwarding toggles, module loading, namespace provisioning, physical
-  link takeover, unsupported netlink features, protocol-counter rate history,
+- Kernel forwarding toggles, module loading, namespace provisioning,
+  unsupported netlink features, protocol-counter rate history,
   and arbitrary statistics query options are not implemented or silently enabled.
-  Provision routing forwarding externally where required.
+  Provision routing forwarding externally where required: `ip_forward` can reset
+  IPv4 devconf defaults and IPv6 forwarding has per-device/RA side effects;
+  named-value sysctl snapshots alone cannot promise safe rollback for these.
 - Privileged Linux integration tests have **not** been executed. Cross compilation is not
   evidence of packet forwarding, firewall/NAT semantics, host tuning, crash/power
   loss behavior, or real service interoperability. In particular, the current
@@ -162,7 +215,8 @@ cargo fmt -p netcontrol-native -- --check
 
 Validation performed on the Windows development host:
 
-- All 15 portable native tests passed; strict Windows Clippy and formatting passed.
+- Portable native tests cover host defaults, Ethernet/VLAN/main-table validation,
+  durable snapshot serialization, and existing native contracts.
 - Full default-feature `x86_64-unknown-linux-musl` source/test checking and strict
   Clippy passed, including the nftables compiler and privileged test fixtures.
 - Linux test executables were cross-linked, not executed. Linux-only key-file
@@ -186,8 +240,15 @@ namespace support or required kernel modules are missing:
 NETCONTROL_INTEGRATION=1 cargo test -p netcontrol-native -- --ignored
 ```
 
-Tests provision and unmount only uniquely named fixture namespace mounts under
-the crate's working directory, never host networking. They cover dummy/VLAN/
+Lab tests provision and unmount only uniquely named fixture namespace mounts
+under the crate's working directory. The host-mode fixture launches a child test
+process and requires it to unshare a fresh network namespace **before** creating
+links or opening host-mode `Native`; it never configures the invoking host.
+It covers read-only discovery through drift, first-adoption failure, Ethernet
+identity/static addresses/MTU/admin state, VLAN parenting, table-254 ownership,
+foreign routes/unmanaged link preservation, durable interrupted apply, and a
+simulated boot replay and pre-repair expired-candidate rollback (not an actual
+machine reboot). Other fixtures cover dummy/VLAN/
 WireGuard, addresses, routes, policy rules, firewall/NAT installation, sysctl
-capture/removal restoration, restart, unexpected-interface drift, read-only
+capture/removal restoration, restart, unmanaged-interface preservation, read-only
 adopted parents, external firewall mutation, and interrupted-intent rollback.

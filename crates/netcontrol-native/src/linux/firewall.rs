@@ -92,6 +92,21 @@ fn icmp(chain: &Chain) -> Result<Rule> {
         .accept())
 }
 
+pub fn remove_owned(expected: &str) -> Result<()> {
+    crate::ensure_unchanged(
+        super::netfilter::fingerprint()? == expected,
+        "firewall changed before bootstrap rollback",
+    )?;
+    let table = Table::new(ProtocolFamily::Inet).with_name(TABLE);
+    let mut batch = Batch::new();
+    batch.add(&table, MsgType::Del);
+    batch.send()?;
+    crate::ensure_unchanged(
+        super::netfilter::fingerprint()? == super::netfilter::empty_fingerprint(),
+        "firewall bootstrap rollback did not remove owned table",
+    )
+}
+
 pub fn apply(value: &Value) -> Result<()> {
     let plans = crate::firewall_plan::compile(value)?;
     let table = Table::new(ProtocolFamily::Inet)

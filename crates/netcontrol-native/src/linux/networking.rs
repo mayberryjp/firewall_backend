@@ -1,13 +1,17 @@
-use crate::model::{Network, PROTOCOL, Route, Rule, parse_prefix};
+use crate::model::{EthernetSnapshot, Network, PROTOCOL, Route, Rule, ethernet_kind, parse_prefix};
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::TryStreamExt;
 use netlink_packet_route::{
     AddressFamily,
-    address::{AddressAttribute, AddressFlag, AddressHeaderFlag, AddressMessage, AddressScope},
+    address::{
+        AddressAttribute, AddressFlag, AddressHeaderFlag, AddressMessage, AddressMessageBuffer,
+        AddressScope,
+    },
     link::{InfoData, InfoVlan, LinkAttribute, LinkFlag, LinkInfo, LinkMessage, VlanProtocol},
     route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
     rule::{RuleAction, RuleAttribute, RuleMessage},
 };
+use netlink_packet_utils::{Emitable, Parseable};
 use rtnetlink::{Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -95,6 +99,218 @@ fn parent(link: &LinkMessage) -> Parent {
         mtu: mtu(link),
         up: link.header.flags.contains(&LinkFlag::Up),
     }
+}
+
+fn matches_kind(actual: &LinkMessage, wanted: &str) -> bool {
+    let actual = kind(actual);
+    actual == wanted || (wanted == "ethernet" && ethernet_kind(&actual))
+}
+
+pub async fn discover(handle: &Handle, managed: &BTreeSet<String>) -> Result<Value> {
+    let mut inventory = Vec::new();
+    for link in links(handle).await? {
+        let p = parent(&link);
+        let mut prefixes = Vec::new();
+        for address in addresses(handle, p.index).await? {
+            let ip = address
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    AddressAttribute::Local(ip) => Some(*ip),
+                    _ => None,
+                })
+                .or_else(|| {
+                    address.attributes.iter().find_map(|a| match a {
+                        AddressAttribute::Address(ip) => Some(*ip),
+                        _ => None,
+                    })
+                });
+            if let Some(ip) = ip {
+                prefixes.push(format!("{ip}/{}", address.header.prefix_len));
+            }
+        }
+        prefixes.sort();
+        prefixes.dedup();
+        let ownership = if p.kind == "loopback" {
+            "loopback"
+        } else if managed.contains(&p.name) {
+            "managed"
+        } else {
+            "unmanaged"
+        };
+        inventory.push(json!({
+            "name":p.name,"kind":if ethernet_kind(&p.kind) { "ethernet" } else { &p.kind },
+            "index":p.index,"mac":p.mac,"mtu":p.mtu,"up":p.up,
+            "addresses":prefixes,"ownership":ownership
+        }));
+    }
+    inventory.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(json!(inventory))
+}
+
+pub async fn capture_ethernet(
+    handle: &Handle,
+    before: &Network,
+    after: &Network,
+) -> Result<BTreeMap<String, EthernetSnapshot>> {
+    let available = links(handle).await?;
+    let mut result = BTreeMap::new();
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let captured_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    for desired in before
+        .interfaces
+        .iter()
+        .chain(&after.interfaces)
+        .filter(|l| l.kind == "ethernet")
+    {
+        let link = available
+            .iter()
+            .find(|l| name(l) == desired.name)
+            .with_context(|| format!("Ethernet interface {} must already exist", desired.name))?;
+        let p = parent(link);
+        ensure!(
+            ethernet_kind(&p.kind) && p.mac.len() == 17,
+            "{} is not a physical Ethernet device or veth",
+            desired.name
+        );
+        let messages = addresses(handle, p.index).await?;
+        let addresses = messages
+            .iter()
+            .filter(|a| a.header.scope != AddressScope::Link)
+            .map(|a| {
+                let mut raw = vec![0; a.buffer_len()];
+                a.emit(&mut raw);
+                raw
+            })
+            .collect();
+        result.insert(
+            p.name.clone(),
+            EthernetSnapshot {
+                name: p.name,
+                kind: p.kind,
+                index: p.index,
+                mac: p.mac,
+                mtu: p.mtu,
+                up: p.up,
+                boot: boot.trim().into(),
+                captured_unix,
+                addresses,
+            },
+        );
+    }
+    Ok(result)
+}
+
+pub async fn check_ethernet(
+    handle: &Handle,
+    snapshots: &BTreeMap<String, EthernetSnapshot>,
+) -> Result<()> {
+    let available = links(handle).await?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    for snapshot in snapshots.values() {
+        let p = available
+            .iter()
+            .find(|l| name(l) == snapshot.name)
+            .map(parent)
+            .with_context(|| format!("captured Ethernet interface {} missing", snapshot.name))?;
+        crate::ensure_unchanged(
+            p.kind == snapshot.kind
+                && p.mac == snapshot.mac
+                && (boot.trim() != snapshot.boot || p.index == snapshot.index),
+            format!(
+                "captured Ethernet interface {} changed identity",
+                snapshot.name
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+pub async fn restore_ethernet(
+    handle: &Handle,
+    snapshots: &BTreeMap<String, EthernetSnapshot>,
+) -> Result<()> {
+    check_ethernet(handle, snapshots).await?;
+    let available = links(handle).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    for snapshot in snapshots.values() {
+        let index = available
+            .iter()
+            .find(|l| name(l) == snapshot.name)
+            .context("Ethernet disappeared")?
+            .header
+            .index;
+        let mut original = Vec::new();
+        for bytes in &snapshot.addresses {
+            let mut address = AddressMessage::parse(&AddressMessageBuffer::new_checked(bytes)?)?;
+            address.header.index = index;
+            let elapsed = now.checked_sub(snapshot.captured_unix);
+            let mut expired = false;
+            for attribute in &mut address.attributes {
+                if let AddressAttribute::CacheInfo(info) = attribute {
+                    for lifetime in [&mut info.ifa_preferred, &mut info.ifa_valid] {
+                        if *lifetime != u32::MAX {
+                            let elapsed = u32::try_from(elapsed.context("clock moved backward; cannot safely restore a finite address lifetime")?).unwrap_or(u32::MAX);
+                            *lifetime = lifetime.saturating_sub(elapsed);
+                        }
+                    }
+                    expired = info.ifa_valid == 0;
+                    info.cstamp = 0;
+                    info.tstamp = 0;
+                }
+            }
+            if !expired {
+                original.push(address);
+            }
+        }
+        for address in addresses(handle, index).await? {
+            if address.header.scope != AddressScope::Link
+                && !original.iter().any(|old| same_address(old, &address))
+            {
+                handle.address().del(address).execute().await?;
+            }
+        }
+        handle.link().set(index).mtu(snapshot.mtu).execute().await?;
+        let request = handle.link().set(index);
+        if snapshot.up {
+            request.up().execute().await?;
+        } else {
+            request.down().execute().await?;
+        }
+        for address in original {
+            let ip = address
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    AddressAttribute::Local(ip) | AddressAttribute::Address(ip) => Some(*ip),
+                    _ => None,
+                })
+                .context("captured address missing IP")?;
+            let mut request = handle
+                .address()
+                .add(index, ip, address.header.prefix_len)
+                .replace();
+            *request.message_mut() = address;
+            request.execute().await?;
+        }
+    }
+    Ok(())
+}
+
+fn same_address(a: &AddressMessage, b: &AddressMessage) -> bool {
+    a.header.family == b.header.family
+        && a.header.prefix_len == b.header.prefix_len
+        && a.attributes
+            .iter()
+            .filter(|a| matches!(a, AddressAttribute::Local(_) | AddressAttribute::Address(_)))
+            .eq(b
+                .attributes
+                .iter()
+                .filter(|a| matches!(a, AddressAttribute::Local(_) | AddressAttribute::Address(_))))
 }
 pub async fn adopt(handle: &Handle, names: &BTreeSet<String>) -> Result<BTreeMap<String, Parent>> {
     let available = links(handle).await?;
@@ -273,11 +489,9 @@ async fn owned_routes(handle: &Handle) -> Result<Vec<RouteMessage>> {
                     }
                 })
                 .unwrap_or(message.header.table as u32);
-            if (10000..=19999).contains(&table) {
-                crate::ensure_unchanged(
-                    message.header.protocol == RouteProtocol::Other(PROTOCOL),
-                    "foreign route in reserved managed table",
-                )?;
+            if (table == 254 || (10000..=19999).contains(&table))
+                && message.header.protocol == RouteProtocol::Other(PROTOCOL)
+            {
                 owned.push(message);
             }
         }
@@ -327,6 +541,159 @@ fn decode_route(message: &RouteMessage, names: &BTreeMap<u32, String>) -> Result
         metric,
     })
 }
+
+pub async fn preflight(handle: &Handle, before: &Network, after: &Network) -> Result<()> {
+    let available = links(handle).await?;
+    for desired in &after.interfaces {
+        let existing = available.iter().find(|l| name(l) == desired.name);
+        let previous = before.interfaces.iter().find(|l| l.name == desired.name);
+        if desired.kind == "ethernet" {
+            let existing = existing
+                .with_context(|| format!("Ethernet {} must already exist", desired.name))?;
+            ensure!(
+                ethernet_kind(&kind(existing)),
+                "{} is not Ethernet/veth",
+                desired.name
+            );
+            ensure!(
+                previous.is_none_or(|p| p.kind == "ethernet"),
+                "cannot adopt an owned virtual interface as Ethernet"
+            );
+        } else {
+            ensure!(
+                previous.is_none_or(|p| p.kind != "ethernet"),
+                "cannot replace Ethernet with a virtual interface"
+            );
+            ensure!(
+                existing.is_none() || previous.is_some(),
+                "interface {} already exists without managed ownership",
+                desired.name
+            );
+        }
+    }
+    for version in [IpVersion::V4, IpVersion::V6] {
+        let messages: Vec<RouteMessage> =
+            handle.route().get(version).execute().try_collect().await?;
+        for message in messages {
+            if message.header.protocol == RouteProtocol::Other(PROTOCOL) {
+                continue;
+            }
+            let table = message
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    RouteAttribute::Table(table) => Some(*table),
+                    _ => None,
+                })
+                .unwrap_or(message.header.table as u32);
+            let metric = message
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    RouteAttribute::Priority(metric) => Some(*metric),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let destination = message
+                .attributes
+                .iter()
+                .find_map(|a| match a {
+                    RouteAttribute::Destination(ip) => Some(route_ip(ip)),
+                    _ => None,
+                })
+                .transpose()?
+                .unwrap_or_else(|| {
+                    if message.header.address_family == AddressFamily::Inet {
+                        IpAddr::from([0; 4])
+                    } else {
+                        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+                    }
+                });
+            let prefix = format!("{destination}/{}", message.header.destination_prefix_length);
+            ensure!(
+                !after
+                    .routes
+                    .iter()
+                    .any(|r| r.table == table && r.metric == metric && r.destination == prefix),
+                "route {prefix} table {table} metric {metric} conflicts with an unowned kernel/DHCP/operator route"
+            );
+        }
+    }
+    Ok(())
+}
+pub async fn boot_snapshot(handle: &Handle, expected: &Network, keys: &Path) -> Result<Value> {
+    let available = links(handle).await?;
+    let names = available
+        .iter()
+        .map(|l| (l.header.index, name(l)))
+        .collect();
+    let mut actual = Vec::new();
+    for desired in &expected.interfaces {
+        let Some(link) = available.iter().find(|l| name(l) == desired.name) else {
+            ensure!(
+                desired.kind != "ethernet",
+                "configured Ethernet {} is missing after reboot",
+                desired.name
+            );
+            continue;
+        };
+        ensure!(
+            matches_kind(link, &desired.kind),
+            "owned interface {} has conflicting kind after reboot",
+            desired.name
+        );
+        if let Some(v) = &desired.vlan {
+            let parent = available
+                .iter()
+                .find(|p| name(p) == v.parent)
+                .context("reboot VLAN parent missing")?;
+            ensure!(
+                vlan(link)? == Some((parent.header.index, v.id)),
+                "owned VLAN identity changed after reboot"
+            );
+        }
+        if let Some(wg) = &desired.wireguard {
+            super::wireguard::verify(keys, &desired.name, wg)
+                .context("existing WireGuard state cannot be safely snapshotted after reboot")?;
+        }
+        let mut observed = desired.clone();
+        observed.mtu = mtu(link);
+        observed.up = link.header.flags.contains(&LinkFlag::Up);
+        observed.addresses = addresses(handle, link.header.index)
+            .await?
+            .iter()
+            .map(address_string)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        actual.push(observed);
+    }
+    let routes = owned_routes(handle)
+        .await?
+        .iter()
+        .map(|r| decode_route(r, &names))
+        .collect::<Result<Vec<_>>>()?;
+    let rules = owned_rules(handle)
+        .await?
+        .iter()
+        .map(decode_rule)
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        routes.iter().all(|r| expected.routes.contains(r)),
+        "unexpected protocol-242 route after reboot"
+    );
+    ensure!(
+        rules.iter().all(|r| expected.policy_rules.contains(r)),
+        "unexpected owned policy rule after reboot"
+    );
+    let mut value = serde_json::to_value(netcontrol_core::Config::empty())?;
+    value["interfaces"] = serde_json::to_value(actual)?;
+    value["routes"] = serde_json::to_value(routes)?;
+    value["policy_rules"] = serde_json::to_value(rules)?;
+    Ok(value)
+}
+
 async fn owned_rules(handle: &Handle) -> Result<Vec<RuleMessage>> {
     let mut owned = Vec::new();
     for version in [IpVersion::V4, IpVersion::V6] {
@@ -377,7 +744,7 @@ fn decode_rule(message: &RuleMessage) -> Result<Rule> {
         }
     }
     ensure!(
-        (10000..=19999).contains(&table),
+        table == 254 || (10000..=19999).contains(&table),
         "owned policy rule points outside managed tables"
     );
     Ok(Rule {
@@ -400,20 +767,12 @@ pub async fn verify(
         .map(|l| (l.header.index, name(l)))
         .collect();
     let by_name: BTreeMap<_, _> = available.iter().map(|l| (name(l), l)).collect();
-    let wanted: BTreeSet<_> = network.interfaces.iter().map(|v| v.name.clone()).collect();
-    for link in &available {
-        let name = name(link);
-        crate::ensure_unchanged(
-            name == "lo" || parents.contains_key(&name) || wanted.contains(&name),
-            format!("unexpected unmanaged interface {name} in isolated namespace"),
-        )?;
-    }
     for desired in &network.interfaces {
         let actual = by_name.get(&desired.name).ok_or_else(|| {
             netcontrol_core::BackendDrift(format!("managed interface {} missing", desired.name))
         })?;
         crate::ensure_unchanged(
-            kind(actual) == desired.kind
+            matches_kind(actual, &desired.kind)
                 && mtu(actual) == desired.mtu
                 && actual.header.flags.contains(&LinkFlag::Up) == desired.up,
             format!("interface {} kind/MTU/up drift", desired.name),
@@ -469,6 +828,7 @@ pub async fn reconcile(
     after: &Network,
     parents: &BTreeMap<String, Parent>,
     keys: &Path,
+    originals: &BTreeMap<String, EthernetSnapshot>,
 ) -> Result<()> {
     check_parents(handle, parents).await?;
     let allowed: BTreeSet<_> = before
@@ -478,13 +838,6 @@ pub async fn reconcile(
         .map(|l| l.name.clone())
         .collect();
     let mut available = links(handle).await?;
-    for link in &available {
-        let name = name(link);
-        ensure!(
-            name == "lo" || parents.contains_key(&name) || allowed.contains(&name),
-            "refusing unexpected interface {name} during reconcile/recovery"
-        );
-    }
     // Remove obsolete owned rules/routes before link changes. Retain matching entries
     // so an unrelated edit does not create an avoidable routing outage.
     let mut present_rules = BTreeSet::new();
@@ -500,9 +853,12 @@ pub async fn reconcile(
         .iter()
         .map(|l| (l.header.index, name(l)))
         .collect();
+    let mut present_routes = BTreeSet::new();
     for message in owned_routes(handle).await? {
         let route = decode_route(&message, &by_index)?;
-        if !after.routes.contains(&route) {
+        if after.routes.contains(&route) {
+            present_routes.insert(route);
+        } else {
             handle.route().del(message).execute().await?;
         }
     }
@@ -518,9 +874,29 @@ pub async fn reconcile(
         if !allowed.contains(&name) || parents.contains_key(&name) {
             continue;
         }
+        if before
+            .interfaces
+            .iter()
+            .chain(&after.interfaces)
+            .any(|l| l.name == name && l.kind == "ethernet")
+        {
+            ensure!(
+                ethernet_kind(&kind(link)),
+                "refusing to replace preexisting Ethernet {name}"
+            );
+            ensure!(
+                wanted.get(&name).is_none_or(|l| l.kind == "ethernet"),
+                "Ethernet cannot change kind"
+            );
+            continue;
+        }
+        ensure!(
+            !ethernet_kind(&kind(link)),
+            "refusing to delete or replace preexisting Ethernet link {name}"
+        );
         let replace = match wanted.get(&name) {
             None => true,
-            Some(wanted) if kind(link) != wanted.kind => true,
+            Some(wanted) if !matches_kind(link, &wanted.kind) => true,
             Some(wanted) => match &wanted.vlan {
                 Some(v) => {
                     let parent_index = available
@@ -540,12 +916,21 @@ pub async fn reconcile(
     loop {
         let old_len = remove.len();
         for link in &available {
-            if allowed.contains(&name(link))
-                && link
-                    .attributes
-                    .iter()
-                    .any(|a| matches!(a, LinkAttribute::Link(v) if remove.contains(v)))
+            if link
+                .attributes
+                .iter()
+                .any(|a| matches!(a, LinkAttribute::Link(v) if remove.contains(v)))
             {
+                ensure!(
+                    allowed.contains(&name(link)),
+                    "refusing parent deletion that would destroy unmanaged child {}",
+                    name(link)
+                );
+                ensure!(
+                    !ethernet_kind(&kind(link)),
+                    "refusing parent deletion that would destroy Ethernet {}",
+                    name(link)
+                );
                 remove.insert(link.header.index);
             }
         }
@@ -569,6 +954,18 @@ pub async fn reconcile(
         remove.remove(&index);
         available.retain(|l| l.header.index != index);
     }
+    let restored: BTreeMap<_, _> = originals
+        .iter()
+        .filter(|(name, _)| {
+            before
+                .interfaces
+                .iter()
+                .any(|l| l.name == **name && l.kind == "ethernet")
+                && !wanted.contains_key(*name)
+        })
+        .map(|(name, snapshot)| (name.clone(), snapshot.clone()))
+        .collect();
+    restore_ethernet(handle, &restored).await?;
     for desired in after.ordered_links()? {
         let index = if let Some(link) = available.iter().find(|l| name(l) == desired.name) {
             link.header.index
@@ -615,22 +1012,22 @@ pub async fn reconcile(
                 .index
         };
         handle.link().set(index).mtu(desired.mtu).execute().await?;
-        let mut current = BTreeSet::new();
+        let request = handle.link().set(index);
+        if desired.up {
+            request.up().execute().await?;
+        } else {
+            request.down().execute().await?;
+        }
         for address in addresses(handle, index).await? {
             if let Some(prefix) = address_string(&address)? {
                 if !desired.addresses.contains(&prefix) {
                     handle.address().del(address).execute().await?;
-                } else {
-                    current.insert(prefix);
                 }
             }
         }
         for prefix in &desired.addresses {
-            if current.contains(prefix) {
-                continue;
-            }
             let (ip, len) = parse_prefix(prefix, false)?;
-            let mut request = handle.address().add(index, ip, len);
+            let mut request = handle.address().add(index, ip, len).replace();
             request
                 .message_mut()
                 .attributes
@@ -642,15 +1039,12 @@ pub async fn reconcile(
                 super::wireguard::apply(keys, &desired.name, wg)?;
             }
         }
-        let request = handle.link().set(index);
-        if desired.up {
-            request.up().execute().await?;
-        } else {
-            request.down().execute().await?;
-        }
     }
     available = links(handle).await?;
     for route in &after.routes {
+        if present_routes.contains(route) {
+            continue;
+        }
         let index = available
             .iter()
             .find(|l| name(l) == route.interface)
@@ -670,8 +1064,7 @@ pub async fn reconcile(
             .priority(route.metric)
             .output_interface(index)
             .protocol(RouteProtocol::Other(PROTOCOL))
-            .scope(scope)
-            .replace();
+            .scope(scope);
         match destination {
             IpAddr::V4(ip) => {
                 let mut request = request.v4().destination_prefix(ip, length);

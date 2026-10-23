@@ -213,7 +213,7 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
-fn native_rejects_drift_and_preserves_adopted_parent() -> Result<()> {
+fn native_preserves_unmanaged_links_and_adopted_parent() -> Result<()> {
     let fixture = Fixture::new()?;
     let namespace = Arc::new(open_namespace(&fixture.namespace)?);
     session(namespace.clone(), |rt, handle| {
@@ -238,17 +238,10 @@ fn native_rejects_drift_and_preserves_adopted_parent() -> Result<()> {
             Ok(())
         })
     })?;
-    assert!(native.observe(&empty).is_err());
-    assert!(
-        native
-            .observe_for_repair(&empty)
-            .unwrap_err()
-            .downcast_ref::<netcontrol_core::BackendDrift>()
-            .is_some()
-    );
-    assert!(native.repair(&empty).is_err());
-    assert!(native.apply(&empty, &empty).is_err());
-    // Drift guard must leave both externally provisioned links untouched.
+    native.observe(&empty)?;
+    native.observe_for_repair(&empty)?;
+    native.repair(&empty)?;
+    native.apply(&empty, &empty)?;
     let names = session(namespace, |rt, handle| {
         rt.block_on(async {
             use futures_util::TryStreamExt;
@@ -316,6 +309,8 @@ fn native_durable_intent_restores_interrupted_network_changes() -> Result<()> {
         after: after.clone(),
         kernel_before: Kernel::default(),
         ownership_before: ownership.clone(),
+        ethernet_before: BTreeMap::new(),
+        ethernet_originals: BTreeMap::new(),
     };
     write_json(&native.state.join("intent.json"), &intent)?;
     let mut ownership_after = ownership;

@@ -471,6 +471,19 @@ async fn scoped_credentials_permissions_and_api_body_limit() {
     ));
     for (method, path, body, status) in [
         ("GET", "/api/v1/state", String::new(), 200),
+        ("GET", "/api/v1/interfaces/discovered", String::new(), 200),
+        (
+            "GET",
+            "/api/v1/interfaces/discovered?unexpected=1",
+            String::new(),
+            400,
+        ),
+        (
+            "POST",
+            "/api/v1/interfaces/discovered",
+            "{}".to_owned(),
+            405,
+        ),
         ("GET", "/api/v1/state", "x".repeat(1 << 20), 200),
         ("GET", "/api/v1/state", "x".repeat((1 << 20) + 1), 400),
         ("POST", "/api/v1/transactions", "{}".to_owned(), 403),

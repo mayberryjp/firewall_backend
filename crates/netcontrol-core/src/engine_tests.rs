@@ -299,6 +299,8 @@ struct Faults {
     traffic_response: Option<Value>,
     traffic_error: Option<String>,
     statistics_calls: Vec<(String, String)>,
+    discovery_error: bool,
+    discovery_calls: usize,
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
@@ -311,6 +313,15 @@ impl Backend for FaultBackend {
         ensure!(!f.worker_failed, "injected worker health error");
         Ok(f.state.clone())
     }
+    fn discover_interfaces(&mut self) -> Result<Value> {
+        let mut f = self.0.lock().unwrap();
+        f.discovery_calls += 1;
+        ensure!(!f.discovery_error, "injected discovery read failure");
+        Ok(json!([{
+            "name":"eth0","kind":"ethernet","index":2,"mac":"02:00:00:00:00:01",
+            "mtu":1500,"up":true,"addresses":["192.0.2.10/24"],"ownership":"unmanaged"
+        }]))
+    }
     fn observe_for_repair(&mut self, _: &Config) -> Result<Config> {
         let f = self.0.lock().unwrap();
         if f.typed_network_drift {
@@ -319,6 +330,7 @@ impl Backend for FaultBackend {
                     .context("verify repair ownership"),
             );
         }
+
         if f.fail_observe {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -363,6 +375,83 @@ impl Backend for FaultBackend {
         Ok(json!({}))
     }
 }
+#[test]
+fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    faults.lock().unwrap().fail_observe = true;
+    let reply = request(
+        &mut engine,
+        "GET",
+        "/api/v1/interfaces/discovered",
+        Value::Null,
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body[0]["name"], "eth0");
+    assert_eq!(reply.body[0]["ownership"], "unmanaged");
+    assert_eq!(faults.lock().unwrap().apply_count, 0);
+    assert_eq!(engine.state.revision, 0);
+    assert!(engine.state.desired.interfaces.is_empty());
+    let calls = faults.lock().unwrap().discovery_calls;
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/interfaces/discovered",
+                "",
+                "readonly",
+                &[],
+                &[]
+            )
+            .status,
+        403
+    );
+    assert_eq!(
+        engine
+            .request("GET", "/api/v1/interfaces/discovered", "", "", &all(), &[])
+            .status,
+        401
+    );
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/interfaces/discovered",
+                "unexpected=1",
+                "operator",
+                &all(),
+                &[]
+            )
+            .status,
+        400
+    );
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            "/api/v1/interfaces/discovered",
+            Value::Null
+        )
+        .status,
+        405
+    );
+    assert_eq!(faults.lock().unwrap().discovery_calls, calls);
+    faults.lock().unwrap().discovery_error = true;
+    let reply = request(
+        &mut engine,
+        "GET",
+        "/api/v1/interfaces/discovered",
+        Value::Null,
+    );
+    assert_eq!(reply.status, 503);
+    assert!(
+        reply.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("injected discovery read failure")
+    );
+}
+
 fn faulty(f: &Fixture) -> (Engine, Arc<Mutex<Faults>>) {
     let state = Arc::new(Mutex::new(Faults::default()));
     let e = Engine::open(&f.path(), Box::new(FaultBackend(state.clone()))).unwrap();

@@ -309,8 +309,9 @@ impl Config {
             }
             if i.dhcp_relay.enabled {
                 ensure!(
-                    i.up && ["dummy", "vlan"].contains(&i.kind.as_str()) && !servers.is_empty(),
-                    "relay requires up dummy/VLAN and upstream servers"
+                    i.up && ["ethernet", "dummy", "vlan"].contains(&i.kind.as_str())
+                        && !servers.is_empty(),
+                    "relay requires up Ethernet/dummy/VLAN and upstream servers"
                 );
                 ensure!(
                     ips.insert(i.relay_address()?),
@@ -385,7 +386,7 @@ impl Config {
                     && src.is_ipv4() == dst.is_ipv4()
                     && src != gw
                     && src != dst
-                    && (10000..=19999).contains(&m.routing_table),
+                    && (m.routing_table == 254 || (10000..=19999).contains(&m.routing_table)),
                 "invalid gateway family/source/table"
             );
             ensure!(
@@ -440,6 +441,20 @@ impl Config {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn ethernet_relay_and_main_table_gateway_are_supported() {
+        let mut value = json!({
+            "interfaces":[{"name":"nic0","kind":"ethernet","up":true,"addresses":["192.0.2.2/24"],"dhcp_relay":{"enabled":true,"servers":["198.51.100.10"]}}],
+            "gateway_monitors":[{"name":"wan","enabled":false,"interface":"nic0","source_address":"192.0.2.2","gateway":"192.0.2.1","target":"203.0.113.1","routing_table":254}]
+        });
+        assert!(Config::parse(&value).is_ok());
+        value["gateway_monitors"][0]["routing_table"] = json!(253);
+        assert!(Config::parse(&value).is_err());
+        value["gateway_monitors"][0]["routing_table"] = json!(254);
+        value["interfaces"][0]["up"] = json!(false);
+        assert!(Config::parse(&value).is_err());
+    }
+
     #[test]
     fn bounds_and_strict_service_fields() {
         assert!(Config::parse(&json!({})).is_ok());

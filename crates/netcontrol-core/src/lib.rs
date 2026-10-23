@@ -24,6 +24,9 @@ impl std::error::Error for BackendDrift {}
 pub trait Backend: Send {
     fn scope(&self) -> Result<String>;
     fn observe(&mut self, expected: &Config) -> Result<Config>;
+    fn discover_interfaces(&mut self) -> Result<Value> {
+        anyhow::bail!("interface discovery is not supported by this backend")
+    }
     fn observe_for_repair(&mut self, expected: &Config) -> Result<Config> {
         self.observe(expected)
     }

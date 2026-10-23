@@ -11,6 +11,11 @@ Construct `Services` on the host-network thread with an absolute, private
 `state_directory`. The constructor locks `services-v1.lock` and pins both the
 original host namespace and, when configured, the namespace file handle. Each
 worker explicitly enters its pinned network namespace; the caller is not moved.
+Here "host" means the daemon's original namespace, not PID 1's namespace. With
+native host mode, both host and managed workers use that same pinned namespace.
+Workers skip `setns` when already there; no `CAP_SYS_ADMIN` is required solely
+for same-namespace execution. Other-namespace entry and service-specific
+capabilities remain necessary where applicable.
 Host clock/logging/traffic collection requires `allow_host_services`; running
 managed workers without an isolated namespace requires that same opt-in. ICMP
 probing additionally requires `allow_gateway_monitoring`. Namespace switching
@@ -33,6 +38,7 @@ These are worker states, not external daemon states; there is no `pid` field.
 ## Implemented services and boundaries
 
 * **DHCPv4:** one exclusive UDP/67 socket with receive/send `IP_PKTINFO`,
+  supported on explicitly managed up Ethernet, dummy or VLAN interfaces;
   per-interface giaddr, up to 64 upstreams per interface, no downstream relay chaining,
   Ethernet/DHCP header/options/hops validation, transaction ID plus client-MAC
   correlation, trusted upstream/source-port checks, and bounded transaction
@@ -108,6 +114,7 @@ These are worker states, not external daemon states; there is no `pid` field.
   idle values fall back to general. Explicit protocol idle/maxlife zero disables
   that timeout; explicit `expint: 0` scans each bounded capture poll.
 * **Gateway monitoring:** native raw ICMPv4/v6, bound source and interface,
+  with explicit routing table 254 (main) or 10000–19999;
   effective rtnetlink table/interface/next-hop validation before each probe,
   nonce/id/sequence checks, rolling loss/RTT/stddev/percentiles/consecutive RTT
   variation, warmup, and failure/recovery holds. Missing/late/duplicate replies
@@ -308,7 +315,7 @@ approved baseline or release assigned.
 
 Portable tests: `cargo test -p netcontrol-services`.
 
-On Windows, all 32 portable protocol/lifecycle/persistence tests passed, as did
+On Windows, all 33 portable protocol/lifecycle/persistence tests passed, as did
 `cargo clippy -p netcontrol-services --all-targets -- -D warnings`. Linux musl source and ignored-test compilation passed with the default TLS
 feature using
 `cargo check -p netcontrol-services --target x86_64-unknown-linux-musl --tests`.

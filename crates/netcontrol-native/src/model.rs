@@ -8,6 +8,23 @@ use std::net::IpAddr;
 pub const PROTOCOL: u8 = 242;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EthernetSnapshot {
+    pub name: String,
+    pub kind: String,
+    pub index: u32,
+    pub mac: String,
+    pub mtu: u32,
+    pub up: bool,
+    pub boot: String,
+    pub captured_unix: u64,
+    pub addresses: Vec<Vec<u8>>,
+}
+
+pub fn ethernet_kind(kind: &str) -> bool {
+    matches!(kind, "device" | "veth")
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Link {
     pub name: String,
     pub kind: String,
@@ -99,9 +116,9 @@ impl Network {
             );
             ensure!((576..=65535).contains(&link.mtu), "invalid interface MTU");
             match link.kind.as_str() {
-                "dummy" => ensure!(
+                "dummy" | "ethernet" => ensure!(
                     link.vlan.is_none() && link.wireguard.is_none(),
-                    "dummy cannot have VLAN/WireGuard settings"
+                    "Ethernet/dummy cannot have VLAN/WireGuard settings"
                 ),
                 "vlan" => {
                     let vlan = link.vlan.as_ref().context("VLAN requires parent and ID")?;
@@ -157,8 +174,8 @@ impl Network {
         for route in &self.routes {
             let (destination, _) = parse_prefix(&route.destination, true)?;
             ensure!(
-                (10000..=19999).contains(&route.table),
-                "route table must be in owned range 10000..19999"
+                route.table == 254 || (10000..=19999).contains(&route.table),
+                "route table must be main (254) or in owned range 10000..19999"
             );
             ensure!(
                 names.contains(&route.interface) || parents.contains(&route.interface),
@@ -189,7 +206,8 @@ impl Network {
         for rule in &self.policy_rules {
             let (source, _) = parse_prefix(&rule.source, true)?;
             ensure!(
-                (10000..=19999).contains(&rule.table) && (10000..=19999).contains(&rule.priority),
+                (rule.table == 254 || (10000..=19999).contains(&rule.table))
+                    && (10000..=19999).contains(&rule.priority),
                 "policy rule table/priority outside owned range"
             );
             ensure!(
@@ -250,6 +268,64 @@ pub fn parse_prefix(value: &str, network: bool) -> Result<(IpAddr, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ethernet_vlan_and_main_routes_are_explicitly_supported() {
+        let mut value = serde_json::json!({
+            "interfaces":[
+                {"name":"nic0","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":["192.0.2.2/24","2001:db8::2/64"]},
+                {"name":"lan100","kind":"vlan","role":"lan","mtu":1400,"up":false,"addresses":[],"vlan":{"parent":"nic0","id":100}}
+            ],
+            "routes":[{"destination":"0.0.0.0/0","gateway":"192.0.2.1","interface":"nic0","table":254,"metric":100}],
+            "policy_rules":[{"source":"192.0.2.0/24","table":254,"priority":10000}],
+            "firewall":{}
+        });
+        Network::parse(&value)
+            .unwrap()
+            .validate(&BTreeSet::new())
+            .unwrap();
+        assert_eq!(
+            Network::parse(&value).unwrap().ordered_links().unwrap()[0].name,
+            "nic0"
+        );
+        value["routes"][0]["table"] = serde_json::json!(253);
+        assert!(
+            Network::parse(&value)
+                .unwrap()
+                .validate(&BTreeSet::new())
+                .is_err()
+        );
+        value["routes"][0]["table"] = serde_json::json!(254);
+        value["interfaces"][0]["vlan"] = serde_json::json!({"parent":"other0","id":1});
+        assert!(
+            Network::parse(&value)
+                .unwrap()
+                .validate(&BTreeSet::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ethernet_kind_and_durable_snapshot_are_lossless() {
+        assert!(ethernet_kind("device") && ethernet_kind("veth"));
+        for kind in ["dummy", "vlan", "wireguard", "bridge", "loopback"] {
+            assert!(!ethernet_kind(kind));
+        }
+        let snapshot = EthernetSnapshot {
+            name: "nic0".into(),
+            kind: "veth".into(),
+            index: 42,
+            mac: "02:00:00:00:00:42".into(),
+            mtu: 1500,
+            up: false,
+            boot: "synthetic-boot".into(),
+            captured_unix: 1234,
+            addresses: vec![vec![0, 1, 127, 128, 255]],
+        };
+        let decoded: EthernetSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert_eq!(decoded, snapshot);
+    }
+
     #[test]
     fn prefix_host_bits_and_families() {
         assert!(parse_prefix("192.0.2.4/24", false).is_ok());

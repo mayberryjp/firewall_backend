@@ -16,6 +16,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   show running-config                 Committed configuration, independent of observation
   show candidate-config / compare     Show the private candidate / its changes
   show state / runtime / interfaces / routes / policy-rules / firewall / kernel
+  show interfaces discovered          Read-only inventory, including unmanaged host NICs
   show transactions / transaction ID / revisions / revision NUMBER
   show statistics [interfaces|protocols|gateways|vnstat|vnstat/host|vnstat/managed]
   commit check                        Normalize and validate; no networking changes
@@ -26,7 +27,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   discard                             Discard only this session's candidate
   end / exit                          Leave mode / close session; never confirms
 Configuration commands:
-  interface NAME [dummy|vlan|wireguard] / no interface NAME
+  interface NAME [ethernet|dummy|vlan|wireguard] / no interface NAME
   ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
   ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
   no ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
@@ -351,11 +352,14 @@ impl CliSession {
                 edit_interface(interface, line, &words)
             })?;
         } else if let ["interface", name, rest @ ..] = words.as_slice() {
-            ensure!(rest.len() <= 1, "interface NAME [dummy|vlan|wireguard]");
+            ensure!(
+                rest.len() <= 1,
+                "interface NAME [ethernet|dummy|vlan|wireguard]"
+            );
             ensure!(valid_interface_name(name), "invalid interface name");
             let kind = rest.first().copied();
             ensure!(
-                kind.is_none_or(|k| matches!(k, "dummy" | "vlan" | "wireguard")),
+                kind.is_none_or(|k| matches!(k, "ethernet" | "dummy" | "vlan" | "wireguard")),
                 "unsupported interface kind"
             );
             self.edit(|config| {
@@ -479,6 +483,7 @@ impl CliSession {
             ["state"] => "/api/v1/state".to_owned(),
             ["runtime"] => "/api/v1/runtime".to_owned(),
             ["interfaces"] => "/api/v1/interfaces".to_owned(),
+            ["interfaces", "discovered"] => "/api/v1/interfaces/discovered".to_owned(),
             ["routes"] => "/api/v1/routes".to_owned(),
             ["policy-rules"] => "/api/v1/policy-rules".to_owned(),
             ["firewall"] => "/api/v1/firewall/rules".to_owned(),

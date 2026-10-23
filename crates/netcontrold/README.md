@@ -9,7 +9,8 @@ same process. There is no Go wrapper or external service supervision.
 netcontrold --backend simulator --listen 0.0.0.0:8080 --state state.json
 ```
 
-`--backend linux` requires a pre-created exclusive `--namespace`. Other current
+`--backend linux` manages the daemon's current host network namespace.
+`--namespace` optionally selects a pre-created lab namespace instead. Other current
 options are `--keys`, comma-separated `--adopt-parents`,
 `--allow-host-tunables`, `--allow-host-services`, `--gateway-monitoring`,
 `--services-state-dir`, `--credential-db`, `--auth-file`, and the paired
@@ -36,6 +37,12 @@ follow the actual listener. On Unix SIGTERM and Ctrl-C initiate graceful
 HTTP/SSH shutdown and durable engine shutdown. Pending transactions retain their
 confirmation deadline for restart recovery; expired deadlines roll back.
 Engine deadline ticks run every 250 ms; a tick failure stops both listeners.
+
+`GET /api/v1/interfaces/discovered` inventories live host interfaces independently
+of configured-state/worker observation, using `state.read`. Discovery is read-only;
+NICs are selected explicitly as `kind: "ethernet"` in full configuration
+transactions. `GET /api/v1/interfaces` remains managed configuration.
+Native mode inside Docker manages only the container's namespace.
 
 With host services enabled on Linux, structured daemon events are appended to
 `<services-state-dir>/backend.log` and stderr. The file is private and feeds the

@@ -46,6 +46,24 @@ impl Backend for Simulator {
     fn observe(&mut self, _expected: &Config) -> Result<Config> {
         Ok(self.state.clone())
     }
+    fn discover_interfaces(&mut self) -> Result<Value> {
+        Ok(json!(
+            self.state
+                .interfaces
+                .iter()
+                .map(|link| json!({
+                    "name": link.name,
+                    "kind": link.kind,
+                    "index": null,
+                    "mac": null,
+                    "mtu": link.mtu,
+                    "up": link.up,
+                    "addresses": link.addresses,
+                    "ownership": "managed"
+                }))
+                .collect::<Vec<_>>()
+        ))
+    }
     fn apply(&mut self, _before: &Config, after: &Config) -> Result<()> {
         after.validate()?;
         if let Some(p) = &after.firewall.policies {

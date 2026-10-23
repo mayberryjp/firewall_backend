@@ -2,7 +2,24 @@
 
 ## Unreleased
 
+### Fixed
+
+- Documented an Ubuntu amd64 source-install command that installs stable Rust
+  through rustup as well as native build dependencies, checks the checkout
+  directory, and selects the GNU target explicitly. Documentation only;
+  no runtime, signed-package or service-startup changes. Recommended bump: none.
+
 ### Added
+
+- Ubuntu amd64 `install.sh` source bootstrap: installs native build dependencies
+  and stable Rust, fetches a selectable GitHub ref and installs the daemon.
+  Does not configure networking, start services or change signed packaging.
+  Recommended feature bump: minor; no release baseline assigned.
+
+- Read-only `GET /api/v1/interfaces/discovered` and `show interfaces discovered`
+  for interface inventory, independent of configured state/worker health.
+  Ethernet configuration accepts existing host Ethernet/veth NICs; main routing
+  table `254` is supported alongside reserved tables.
 
 - Cisco-inspired configuration CLI over an optional in-process Rust SSH server,
   using existing API keys/permissions, private session candidates, complete-schema
@@ -58,6 +75,13 @@
   instructions.
 
 ### Changed
+
+- Native Linux networking now defaults to the daemon's host network namespace;
+  an explicit namespace is optional for isolated labs. Alpine package arguments
+  select native host mode; the bare daemon still defaults to the simulator.
+  Host-NIC onboarding is explicit rather than automatic takeover. Recommended
+  bump: major for native scope, deployment and physical-interface semantics;
+  no release baseline or version is assigned.
 
 - Replaced the Go implementation with Rust; there is no wrapper, dual runtime,
   compatibility endpoint or persisted-data importer. Incompatible/corrupt state

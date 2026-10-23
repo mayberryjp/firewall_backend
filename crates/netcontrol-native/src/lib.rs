@@ -1,4 +1,4 @@
-//! Direct Linux kernel networking in an explicitly selected, pre-created namespace.
+//! Direct Linux kernel networking in the daemon's namespace or an optional lab namespace.
 //! No external networking or service programs are launched.
 #[cfg(not(target_os = "linux"))]
 use anyhow::{Result, bail};
@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeOptions {
+    #[serde(default)]
     pub namespace: String,
     #[serde(default = "default_keys")]
     pub keys: PathBuf,
@@ -132,8 +133,13 @@ mod tests {
     }
 
     #[test]
-    fn namespace_is_never_defaulted() {
-        assert!(serde_json::from_str::<NativeOptions>("{}").is_err());
+    fn omitted_namespace_selects_current_daemon_namespace() {
+        assert_eq!(
+            serde_json::from_str::<NativeOptions>("{}")
+                .unwrap()
+                .namespace,
+            ""
+        );
         let options: NativeOptions = serde_json::from_str(r#"{"namespace":"lab"}"#).unwrap();
         assert_eq!(options.namespace, "lab");
         assert!(!options.allow_host_tunables);

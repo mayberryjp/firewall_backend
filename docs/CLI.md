@@ -19,8 +19,9 @@ netcontrold --backend simulator \
 
 For OpenRC, add the two SSH arguments to `netcontrold_args` in
 `/etc/conf.d/netcontrold`, preserving the other arguments. No new package payload
-or separate SSH service is required. The listener remains in the host management
-namespace, not the isolated managed namespace.
+or separate SSH service is required. Native mode manages the same host network
+namespace as the management listener unless an isolated lab namespace is
+explicitly selected. Changing a management NIC can interrupt API/SSH access.
 
 If `--ssh-host-key` is omitted, its path is `<state>.ssh-key`. The daemon creates
 an Ed25519 host key once and reuses it. Existing invalid/insecure host-key data
@@ -51,7 +52,7 @@ again before each command; scoped-file changes still require daemon restart.
 SSH encrypts its own connection even if the HTTP listener uses HTTP. It does not
 make HTTP key creation secure or restrict an all-interface listener to LAN.
 Operators still provide reachable addressing and management access controls.
-Enabling SSH does not provision interfaces, forwarding, or a native namespace.
+Enabling SSH does not provision interfaces or forwarding.
 
 ## Candidate, apply, and confirmation
 
@@ -117,7 +118,7 @@ provided.
 Global editors include:
 
 ```text
-interface NAME [dummy|vlan|wireguard]
+interface NAME [ethernet|dummy|vlan|wireguard]
 no interface NAME
 ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
@@ -169,8 +170,13 @@ no dhcp-relay server IPV4
 dhcp-relay enable|disable
 ```
 
-New interfaces start as administratively down, role LAN, MTU 1500; omitted kind
-is dummy. These are visible CLI creation defaults, not role-based network policy.
+New candidate entries start as administratively down, role LAN, MTU 1500;
+omitted kind is dummy. These are visible CLI creation defaults, not role-based
+network policy. Use `show interfaces discovered` before staging
+`interface eth0 ethernet` for an existing host NIC. Ethernet entries configure
+existing Ethernet/veth links; they do not create or delete hardware.
+Explicitly preserve needed management addresses in the candidate; discovery
+does not copy them into desired configuration or automatically assign roles.
 New VLAN/WireGuard interfaces require their specific settings before validation.
 Changing an existing interface's kind requires explicit removal/recreation or
 an explicit typed candidate edit. WireGuard accepts only preprovisioned key-file
@@ -187,6 +193,11 @@ Fields and bounds use the canonical backend contract, including reserved routing
 tables, explicit roles, supported capture filters, and operator host-service/
 kernel opt-ins. Semantic cross-resource validation is deferred to `commit check`
 and apply so a candidate can be built in several commands.
+
+For host routing, main table `254` is also supported. Forwarding remains an
+operator prerequisite: the CLI rejects forwarding sysctls because their
+collateral device/RA changes cannot currently be safely rolled back.
+Roles do not enable forwarding, acquire DHCP leases or create NAT automatically.
 
 ## Complete-schema JSON editing
 
@@ -224,6 +235,7 @@ compare
 show state
 show runtime
 show interfaces
+show interfaces discovered
 show routes
 show policy-rules
 show firewall
@@ -240,6 +252,9 @@ reconcile services ntp
 
 `show running-config` reads the committed revision archive without requiring
 healthy live observation. `show state`/resource views retain observation errors;
+`show interfaces discovered` reads actual namespace inventory independently of
+configured-state verification and worker health. In native host mode this
+includes unmanaged host NICs; in simulator mode it is simulated inventory only.
 `show runtime`, transaction reads and rollback are separate diagnostics/actions.
 Restore creates a new provisional transaction and requires confirmation.
 Discard a private candidate before restoring. Service repair acts on stored

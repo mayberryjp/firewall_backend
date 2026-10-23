@@ -1,5 +1,5 @@
 # Native Rust daemon; HTTP is reachable on every IPv4 interface.
-netcontrold_args="--backend simulator --listen 0.0.0.0:8080 \
+netcontrold_args="--backend linux --listen 0.0.0.0:8080 \
 	--state /var/lib/netcontrol/state.json \
 	--credential-db /var/lib/netcontrol/credentials.json \
 	--keys /etc/netcontrol/keys"

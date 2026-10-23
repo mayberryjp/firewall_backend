@@ -337,6 +337,9 @@ impl Engine {
         if method != "POST" {
             return Err(ApiError::new(405, "method not allowed"));
         }
+        if path == "/api/v1/interfaces/discovered" {
+            return Err(ApiError::new(405, "interface discovery is read-only"));
+        }
         if path == "/api/v1/statistics" || path.starts_with("/api/v1/statistics/") {
             return Err(ApiError::new(405, "statistics endpoints are read-only"));
         }
@@ -735,6 +738,18 @@ impl Engine {
         Ok(v)
     }
     fn get(&mut self, path: &str, query: &str) -> ApiResult<Value> {
+        if path == "/api/v1/interfaces/discovered" {
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "interface discovery does not accept query parameters",
+                ));
+            }
+            return self
+                .backend
+                .discover_interfaces()
+                .map_err(|e| service_error(format!("interface discovery failed: {e}")));
+        }
         if path == "/api/v1/transactions" {
             return value(&self.state.transactions);
         }

@@ -439,8 +439,8 @@ impl Config {
                 l.name
             );
             ensure!(
-                ["dummy", "wireguard", "vlan"].contains(&l.kind.as_str()),
-                "supported kinds are dummy, wireguard, and vlan"
+                ["ethernet", "dummy", "wireguard", "vlan"].contains(&l.kind.as_str()),
+                "supported kinds are ethernet, dummy, wireguard, and vlan"
             );
             ensure!((1280..=65535).contains(&l.mtu), "MTU must be 1280..65535");
             let mut addresses = BTreeSet::new();
@@ -522,9 +522,9 @@ impl Config {
             }
             if l.dhcp_relay.enabled {
                 ensure!(
-                    l.up && ["dummy", "vlan"].contains(&l.kind.as_str())
+                    l.up && ["ethernet", "dummy", "vlan"].contains(&l.kind.as_str())
                         && !l.dhcp_relay.servers.is_empty(),
-                    "enabled DHCP relay requires up dummy/VLAN and servers"
+                    "enabled DHCP relay requires up Ethernet/dummy/VLAN and servers"
                 );
                 let addr = l
                     .addresses
@@ -545,9 +545,9 @@ impl Config {
             let (a, _) = canonical_prefix(&r.destination, true)?;
             ensure!(
                 names.contains(&r.interface)
-                    && (10000..=19999).contains(&r.table)
+                    && (r.table == 254 || (10000..=19999).contains(&r.table))
                     && (1..=2147483647).contains(&r.metric),
-                "route requires managed interface, table 10000..19999, positive 32-bit metric"
+                "route requires managed interface, table 254 or 10000..19999, positive 32-bit metric"
             );
             if !r.gateway.is_empty() {
                 ensure!(
@@ -564,10 +564,10 @@ impl Config {
         for r in &self.policy_rules {
             canonical_prefix(&r.source, true)?;
             ensure!(
-                (10000..=19999).contains(&r.table)
+                (r.table == 254 || (10000..=19999).contains(&r.table))
                     && (10000..=19999).contains(&r.priority)
                     && priorities.insert(r.priority),
-                "policy rules require unique priorities and tables in 10000..19999"
+                "policy rules require unique priorities in 10000..19999 and table 254 or 10000..19999"
             );
         }
         ensure!(
@@ -697,7 +697,7 @@ impl Config {
                     && s.is_ipv4() == t.is_ipv4()
                     && s != g
                     && s != t
-                    && (10000..=19999).contains(&m.routing_table),
+                    && (m.routing_table == 254 || (10000..=19999).contains(&m.routing_table)),
                 "invalid gateway monitor addresses/table"
             );
             ensure!(
