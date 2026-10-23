@@ -47,13 +47,19 @@ does not install a cross-architecture linker.
 ## Incremental Ubuntu development upgrades
 
 [in-place-upgrade.sh](../in-place-upgrade.sh) builds the current checkout on an
-Ubuntu amd64 firewall and upgrades an already installed, active
-`netcontrold.service`. It discovers the installed executable from systemd's
+Ubuntu amd64 firewall and installs, starts or upgrades `netcontrold.service`.
+After a successful build and smoke check, it installs the supplied unit if
+systemd reports `LoadState=not-found`, creates the private state/key directories,
+and reloads systemd. No manual service-install commands are needed. A missing
+service uses `/usr/local/sbin/netcontrold`; existing loaded services retain
+their unit and executable path. The script discovers that path from systemd's
 effective `ExecStart` instead of assuming a fixed installation directory.
 Exactly one direct, absolute executable named `netcontrold` is required;
 wrappers, missing/ambiguous commands and symlink executables are rejected.
-The detected destination is printed before building. It does not use
-Docker, wait for CI, fetch code, install prerequisites, change the systemd unit,
+The destination may be absent on first installation. Masked/broken services,
+conflicting unit files and unmanaged running daemons cause explicit errors.
+The detected destination is printed before deployment. It does not use
+Docker, wait for CI, fetch code, install prerequisites, overwrite an existing unit,
 or explicitly modify credentials/configuration. This is a development path,
 not a signed-package installation or a substitute for full CI validation.
 
@@ -88,7 +94,7 @@ cd firewall_backend
 
 For each iteration, update the checkout deliberately, review the changes, and
 run the script as that same build account; it requests sudo only for service
-inspection and binary installation:
+setup and binary installation:
 
 ```sh
 git pull --ff-only
@@ -111,17 +117,26 @@ checks leave the running daemon untouched. A checkout-local lock rejects
 concurrent invocations; do not run other installers or upgrades, including
 from another checkout, at the same time.
 
-For deployment, the script stages the new binary beside the installed binary,
-saves `<installed-executable>.previous` (overwritten on each deployment),
+For deployment, the script stages the new binary beside the destination,
+saves `<installed-executable>.previous` if a binary exists (overwritten on each deployment),
 stops the service, atomically renames the staged binary and starts the service.
 It requires the unit to remain active across five one-second checks. Failed
-restart/checks or catchable interruption trigger best-effort binary restoration
-and restart. Restoration failure is reported explicitly. A power loss or
+restart/checks or catchable interruption trigger best-effort binary restoration.
+A previously active service is restarted; a previously inactive service stays
+stopped. With no previous binary, a failed first deployment removes the new
+binary. A newly installed unit/directories remain for inspection and retry;
+state and credentials are never deleted. Setup failures do not start the daemon.
+Boot enablement is unchanged, including on first installation. Restoration
+failure is reported explicitly. A power loss or
 `SIGKILL` cannot be recovered automatically by shell traps.
 
 Use a local console or the OS's independent SSH service, not netcontrold's
 configuration SSH listener, which restarts with the daemon. Expect interruption
-to managed networking/workers. Active systemd status is only a startup check:
+to managed networking/workers. The supplied unit runs native host mode, listens
+on all interfaces at HTTP port 8080, and uses state/credentials under
+`/var/lib/netcontrol`; restrict management access before deployment. If adopting
+an existing binary with nonstandard state paths, review the supplied unit first.
+Active systemd status is only a startup check:
 verify the management API, logs and actual network connectivity afterward.
 The new daemon can change persisted state during startup; binary restoration
 does not undo those changes or guarantee an older binary can load that state.

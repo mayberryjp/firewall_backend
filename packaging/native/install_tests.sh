@@ -72,10 +72,56 @@ root_command() { return 1; }
 if service_binary; then printf 'Failed systemd query accepted\n' >&2; exit 1; fi
 printf 'Service executable discovery tests passed (mocked systemd).\n'
 
-for scenario in success fail_stage fail_restart fail_health; do
+for scenario in missing loaded unmanaged conflicting masked install_failure reload_failure; do
+    destination="$temporary/setup-$scenario"
+    mkdir "$destination"
+    if [[ $scenario == conflicting ]]; then printf 'custom unit\n' > "$destination/unit"; fi
+    if UPGRADE_TEST_DIRECTORY="$destination" UPGRADE_TEST_SCENARIO="$scenario" bash -c '
+        set -euo pipefail
+        source ./in-place-upgrade.sh
+        root_command() {
+            printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"
+            case $1 in
+                pgrep) [[ $UPGRADE_TEST_SCENARIO == unmanaged ]] && return 0; return 1 ;;
+                install) [[ $UPGRADE_TEST_SCENARIO != install_failure ]] ;;
+                systemctl)
+                    case $* in
+                        *LoadState*)
+                            case $UPGRADE_TEST_SCENARIO in
+                                loaded) printf "loaded\n" ;;
+                                masked) printf "masked\n" ;;
+                                *) printf "not-found\n"; return 4 ;;
+                            esac ;;
+                        *ExecStart*) printf "{ path=/usr/local/sbin/netcontrold ; }\n" ;;
+                        *daemon-reload*) [[ $UPGRADE_TEST_SCENARIO != reload_failure ]] ;;
+                        *) return 1 ;;
+                    esac ;;
+                *) return 1 ;;
+            esac
+        }
+        service_target "$PWD" "$UPGRADE_TEST_DIRECTORY/unit"
+    '; then
+        [[ $scenario == missing || $scenario == loaded ]] || exit 1
+    else
+        [[ $scenario != missing && $scenario != loaded ]] || exit 1
+    fi
+    if [[ $scenario == missing ]]; then
+        grep -q 'install -d -m 0700 /var/lib/netcontrol' "$destination/commands"
+        grep -q 'install -m 0644 .*netcontrold.service' "$destination/commands"
+        grep -q 'systemctl daemon-reload' "$destination/commands"
+    elif [[ $scenario == loaded || $scenario == unmanaged || $scenario == conflicting || $scenario == masked ]]; then
+        ! grep -q '^install ' "$destination/commands"
+    fi
+    if [[ $scenario == conflicting ]]; then [[ $(< "$destination/unit") == 'custom unit' ]]; fi
+    ! grep -Eq 'systemctl (start|enable)' "$destination/commands"
+done
+printf 'Missing-service setup and refusal tests passed (mocked privileged commands).\n'
+
+for scenario in success fail_stage fail_restart fail_health first_install fail_first_start inactive_existing fail_inactive_start; do
     destination="$temporary/upgrade-$scenario"
     mkdir "$destination"
     printf 'old binary\n' > "$destination/netcontrold"
+    if [[ $scenario == first_install || $scenario == fail_first_start ]]; then rm "$destination/netcontrold"; fi
     printf 'new binary\n' > "$destination/new"
     if UPGRADE_TEST_DIRECTORY="$destination" UPGRADE_TEST_SCENARIO="$scenario" bash -c '
         set -euo pipefail
@@ -94,31 +140,46 @@ for scenario in success fail_stage fail_restart fail_health; do
                             if [[ ! -f $UPGRADE_TEST_DIRECTORY/started ]]; then
                                 touch "$UPGRADE_TEST_DIRECTORY/started"
                                 [[ $UPGRADE_TEST_SCENARIO != fail_restart ]] || return 1
+                                [[ $UPGRADE_TEST_SCENARIO != fail_first_start && $UPGRADE_TEST_SCENARIO != fail_inactive_start ]] || return 1
                             fi
                             ;;
                         is-active)
+                            case $UPGRADE_TEST_SCENARIO in
+                                first_install|fail_first_start|inactive_existing|fail_inactive_start)
+                                    [[ -f $UPGRADE_TEST_DIRECTORY/started ]] || return 1 ;;
+                            esac
                             [[ $UPGRADE_TEST_SCENARIO != fail_health || ! -f $UPGRADE_TEST_DIRECTORY/started ]] || return 1
                             ;;
+                        show) printf "inactive\n" ;;
                     esac
                     ;;
+                pgrep) return 1 ;;
                 *) command "$@" ;;
             esac
         }
         upgrade_binary "$UPGRADE_TEST_DIRECTORY/new" "$UPGRADE_TEST_DIRECTORY/netcontrold"
     '; then
-        [[ $scenario == success ]] || { printf 'Unexpected upgrade success: %s\n' "$scenario" >&2; exit 1; }
+        [[ $scenario == success || $scenario == first_install || $scenario == inactive_existing ]] || { printf 'Unexpected upgrade success: %s\n' "$scenario" >&2; exit 1; }
         cmp "$destination/new" "$destination/netcontrold"
     else
-        [[ $scenario != success ]] || { printf 'Valid upgrade failed\n' >&2; exit 1; }
-        [[ $(< "$destination/netcontrold") == 'old binary' ]]
+        [[ $scenario != success && $scenario != first_install && $scenario != inactive_existing ]] || { printf 'Valid upgrade failed\n' >&2; exit 1; }
+        if [[ $scenario == fail_first_start ]]; then
+            [[ ! -e $destination/netcontrold ]]
+        else
+            [[ $(< "$destination/netcontrold") == 'old binary' ]]
+        fi
         if [[ $scenario == fail_stage ]]; then
             ! grep -q 'systemctl stop' "$destination/commands"
         else
             [[ $(grep -c 'systemctl stop' "$destination/commands") -eq 2 ]]
-            [[ $(grep -c 'systemctl start' "$destination/commands") -eq 2 ]]
+            if [[ $scenario == fail_first_start || $scenario == fail_inactive_start ]]; then
+                [[ $(grep -c 'systemctl start' "$destination/commands") -eq 1 ]]
+            else
+                [[ $(grep -c 'systemctl start' "$destination/commands") -eq 2 ]]
+            fi
         fi
     fi
-    if [[ $scenario != fail_stage ]]; then
+    if [[ $scenario != fail_stage && $scenario != first_install && $scenario != fail_first_start ]]; then
         [[ $(< "$destination/netcontrold.previous") == 'old binary' ]]
     fi
     [[ -z $(find "$destination" -name 'netcontrold.upgrade.*' -print) ]]

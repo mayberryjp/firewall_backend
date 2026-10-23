@@ -56,9 +56,10 @@ Portable Windows tests and Linux cross-compilation do not establish native
 runtime correctness. Consult the [change journal](docs/journal/2026-10-19.md)
 for actual validation results and known limits of the rewrite.
 
-For fast development on an existing Ubuntu amd64 firewall, use
+For fast development on an Ubuntu amd64 firewall, use
 [in-place-upgrade.sh](in-place-upgrade.sh) to build incrementally and restart
-the installed daemon without Docker or waiting for CI. See the
+the daemon without Docker or waiting for CI. It installs the systemd unit and
+private directories automatically if missing. See the
 [setup and recovery limitations](docs/BUILD_AND_INSTALL.md#incremental-ubuntu-development-upgrades).
 
 ## Start and onboard

@@ -22,6 +22,13 @@
 
 ### Added
 
+- Incremental upgrader now installs a missing systemd unit/private directories
+  and starts the built daemon, including when no binary exists or the service
+  is inactive. Existing units are preserved, unmanaged daemons rejected, and
+  failed deployment recovers the previous binary/running state where possible.
+  Boot enablement remains operator-controlled. Recommended bump: minor;
+  aggregate Unreleased remains major, with no approved baseline.
+
 - Ubuntu amd64 incremental development upgrade script using a persistent Cargo
   cache and debug builds, with build-only mode, staged replacement of the active
   systemd daemon and best-effort previous-binary recovery. No Docker, Git fetch,
