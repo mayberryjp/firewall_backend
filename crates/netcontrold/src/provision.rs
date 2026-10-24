@@ -263,16 +263,7 @@ fn factory_candidate(saved: &Config, wan: &str, lan: &str, address: &str) -> Res
 }
 
 pub fn factory_reset(engine: &mut Engine, wan: &str, lan: &str, address: &str) -> Result<()> {
-    let state = checked(engine.request(
-        "GET",
-        "/api/v1/state",
-        "",
-        "local-factory-reset",
-        &["state.read".into()],
-        &[],
-    ))?;
-    let saved: Config = serde_json::from_value(state["desired"].clone())?;
-    let config = factory_candidate(&saved, wan, lan, address)?;
+    let config = factory_candidate(engine.saved_configuration(), wan, lan, address)?;
     engine.factory_reset(config)?;
     Ok(())
 }

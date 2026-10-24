@@ -542,6 +542,10 @@ impl Engine {
         }
         Ok(())
     }
+    pub fn saved_configuration(&self) -> &Config {
+        &self.state.desired
+    }
+
     pub fn factory_reset(&mut self, config: Config) -> Result<Transaction> {
         ensure!(!self.closed, "engine is shut down");
         let request = SubmitRequest {

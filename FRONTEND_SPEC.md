@@ -275,6 +275,10 @@ After backup and before native recovery, reset retires the temporary
 backup, ending temporary networkd Wi-Fi DHCP ownership. The file is not restored
 automatically on failure. Unrelated networkd files and native identity/ownership
 checks remain unchanged; reset does not forcibly disable all network managers.
+Explicit reset builds its candidate from saved desired configuration without a
+pre-reset live-address observation; drifted recovery addresses must not prevent
+reset preparation. Post-apply verification, transaction/identity/ownership checks
+and rollback remain. Normal observation-backed HTTP state behavior is unchanged.
 Frontend/operator guidance must distinguish upgrade, network reset and identity
 reset; after reconnect, refetch state/revision and discard or explicitly rebase
 stale drafts. Do not restart onboarding or expose a nonexistent HTTP reset API.

@@ -413,6 +413,13 @@ fn explicit_factory_reset_replaces_saved_configuration_without_pre_reset_repair(
         Engine::open_for_factory_reset(&fixture.path(), Box::new(FaultBackend(faults.clone())))
             .unwrap();
     assert_eq!(faults.lock().unwrap().repair_count, repairs);
+    faults.lock().unwrap().fail_observe = true;
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/state", Value::Null).status,
+        503
+    );
+    assert_eq!(engine.saved_configuration(), &config().normalized());
+    faults.lock().unwrap().fail_observe = false;
     let reset = engine.factory_reset(Config::empty()).unwrap();
     assert_eq!(reset.status, "committed");
     assert_eq!(reset.actor, "local-factory-reset");

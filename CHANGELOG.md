@@ -69,6 +69,12 @@
 
 ### Fixed
 
+- Local factory reset reads saved desired configuration directly rather than
+  calling observation-backed state retrieval, so pre-existing address drift no
+  longer blocks reset preparation with a provisioning 503. Post-apply verification,
+  rollback, identity/ownership checks and normal API behavior remain unchanged.
+  Recommended bump: patch; baseline unknown.
+
 - Factory reset moves the temporary networkd Wi-Fi recovery override into its
   private backup before native handover, so it no longer takes precedence over
   the managed-interface exclusion. Unrelated networkd configuration and normal

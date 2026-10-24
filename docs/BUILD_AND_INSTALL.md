@@ -648,6 +648,13 @@ networkd files are not disabled, and normal startup checks are unchanged.
 The recovery file stays in the backup even if reset subsequently fails; restore
 it manually only when intentionally returning Wi-Fi to networkd.
 
+Explicit reset constructs factory desired configuration directly from the saved
+plan, without reading the observation-backed state API first. Existing live
+addresses need not match saved addresses: do not remove the LAN recovery address
+to satisfy a pre-reset drift check. Native identity/ownership, active-transaction
+and rollback checks remain, and the applied factory configuration is verified
+before confirmation. Ordinary state/API observation checks are unchanged.
+
 To build a reset-capable binary without first restarting a broken service:
 
 ```sh
