@@ -100,6 +100,21 @@ pub fn fingerprint() -> Result<String> {
 }
 
 fn dump(message: u16, filter_table: bool) -> Result<Vec<Vec<u8>>> {
+    let mut attrs = Vec::new();
+    if filter_table {
+        attrs.extend(15u16.to_ne_bytes());
+        attrs.extend(1u16.to_ne_bytes());
+        attrs.extend(b"netcontrol\0");
+        attrs.push(0);
+    }
+    dump_messages(10, message, libc::NFPROTO_INET as u8, &attrs)
+}
+
+pub fn connections() -> Result<Vec<Vec<u8>>> {
+    dump_messages(1, 1, libc::AF_UNSPEC as u8, &[])
+}
+
+fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Result<Vec<Vec<u8>>> {
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -143,18 +158,13 @@ fn dump(message: u16, filter_table: bool) -> Result<Vec<Vec<u8>>> {
         "netfilter socket timeout"
     );
     let mut request = Vec::new();
-    request.extend((if filter_table { 36u32 } else { 20u32 }).to_ne_bytes());
-    request.extend(((10u16 << 8) | message).to_ne_bytes());
+    request.extend((20u32 + attrs.len() as u32).to_ne_bytes());
+    request.extend(((subsystem << 8) | message).to_ne_bytes());
     request.extend(0x301u16.to_ne_bytes()); // REQUEST | ROOT | MATCH
     request.extend(1u32.to_ne_bytes());
     request.extend(0u32.to_ne_bytes());
-    request.extend([libc::NFPROTO_INET as u8, 0, 0, 0]);
-    if filter_table {
-        request.extend(15u16.to_ne_bytes());
-        request.extend(1u16.to_ne_bytes());
-        request.extend(b"netcontrol\0");
-        request.push(0);
-    }
+    request.extend([family, 0, 0, 0]);
+    request.extend(attrs);
     ensure!(
         unsafe {
             libc::sendto(
@@ -166,27 +176,57 @@ fn dump(message: u16, filter_table: bool) -> Result<Vec<Vec<u8>>> {
                 std::mem::size_of_val(&address) as u32,
             )
         } == request.len() as isize,
-        "send nftables dump"
+        "send netfilter dump"
     );
     let mut result = Vec::new();
     let mut total = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .context("netfilter dump exceeded five-second collection budget")?;
+        let timeout = libc::timeval {
+            tv_sec: remaining.as_secs() as libc::time_t,
+            tv_usec: remaining.subsec_micros().max(1) as libc::suseconds_t,
+        };
+        ensure!(
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &timeout as *const _ as *const _,
+                    std::mem::size_of_val(&timeout) as u32,
+                )
+            } == 0,
+            "netfilter receive timeout"
+        );
         let mut buffer = vec![0u8; 1024 * 1024];
+        let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut sender_length = std::mem::size_of_val(&sender) as libc::socklen_t;
         let received = unsafe {
-            libc::recv(
+            libc::recvfrom(
                 fd.as_raw_fd(),
                 buffer.as_mut_ptr() as *mut _,
                 buffer.len(),
                 libc::MSG_TRUNC,
+                &mut sender as *mut _ as *mut libc::sockaddr,
+                &mut sender_length,
             )
         };
         ensure!(
             received > 0 && received as usize <= buffer.len(),
-            "receive nftables dump/truncated datagram: {}",
+            "receive netfilter dump/truncated datagram: {}",
             std::io::Error::last_os_error()
         );
+        ensure!(
+            sender_length as usize == std::mem::size_of_val(&sender)
+                && sender.nl_family == libc::AF_NETLINK as u16
+                && sender.nl_pid == 0,
+            "netfilter response did not originate from the kernel"
+        );
         total += received as usize;
-        ensure!(total <= 64 * 1024 * 1024, "oversized nftables inventory");
+        ensure!(total <= 64 * 1024 * 1024, "oversized netfilter inventory");
         let mut data = &buffer[..received as usize];
         while !data.is_empty() {
             ensure!(data.len() >= 16, "short netlink message");
@@ -200,7 +240,7 @@ fn dump(message: u16, filter_table: bool) -> Result<Vec<Vec<u8>>> {
             );
             ensure!(
                 flags & 0x10 == 0,
-                "nftables dump interrupted by concurrent mutation"
+                "netfilter dump interrupted by concurrent mutation"
             );
             let payload = &data[16..length];
             if kind == 2 {
@@ -208,19 +248,27 @@ fn dump(message: u16, filter_table: bool) -> Result<Vec<Vec<u8>>> {
                 let error = i32::from_ne_bytes(payload[..4].try_into()?);
                 ensure!(
                     error == 0,
-                    "nftables dump: {}",
+                    "netfilter dump: {}",
                     std::io::Error::from_raw_os_error(-error)
                 );
             } else if kind == 3 {
                 if payload.len() >= 4 {
                     ensure!(
                         i32::from_ne_bytes(payload[..4].try_into()?) == 0,
-                        "nftables dump failed"
+                        "netfilter dump failed"
                     );
                 }
                 return Ok(result);
             } else {
-                ensure!(kind >> 8 == 10, "unexpected netfilter message type");
+                ensure!(kind >> 8 == subsystem, "unexpected netfilter message type");
+                ensure!(
+                    subsystem != 1 || kind & 0xff == 0,
+                    "unexpected conntrack dump record"
+                );
+                ensure!(
+                    subsystem != 1 || result.len() < 100_000,
+                    "conntrack snapshot exceeds 100000 entries"
+                );
                 result.push(payload.to_vec());
             }
             let aligned = (length + 3) & !3;

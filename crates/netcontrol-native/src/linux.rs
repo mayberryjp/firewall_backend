@@ -1164,6 +1164,28 @@ impl Backend for Native {
     }
 
     fn statistics(&mut self, config: &Config, path: &str, query: &str) -> Result<Value> {
+        if path == "/api/v1/statistics/connections" {
+            let query = netcontrol_core::ConnectionQuery::parse(query)?;
+            self.check_scope()?;
+            let started_at = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)?;
+            let mut response = session(self.namespace.clone(), move |_, _| {
+                crate::conntrack::snapshot(&netfilter::connections()?, &query)
+            })?;
+            let collected_at = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)?;
+            let status = if response["summary"]["accounting_unavailable"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+            {
+                "partial"
+            } else {
+                "available"
+            };
+            response["sample"] = json!({"scope":self.identity,"started_at":started_at,"collected_at":collected_at,"status":status});
+            return Ok(response);
+        }
         ensure!(
             query.is_empty(),
             "statistics endpoints do not accept query parameters"

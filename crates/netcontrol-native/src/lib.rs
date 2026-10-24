@@ -31,6 +31,8 @@ fn default_services() -> PathBuf {
     PathBuf::from("/var/lib/netcontrol/services")
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod conntrack;
 #[cfg_attr(
     any(not(target_os = "linux"), not(feature = "nftables")),
     allow(dead_code)

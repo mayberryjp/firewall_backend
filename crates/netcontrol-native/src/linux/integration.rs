@@ -80,6 +80,64 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/conntrack modules"]
+fn native_connection_statistics_observe_udp_without_mutating_owned_state() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let mut desired = serde_json::to_value(&empty)?;
+    desired["firewall"]["input"] = json!({"policy":"accept","interfaces":[]});
+    let desired = config(desired)?;
+    native.apply(&empty, &desired)?;
+    let port = session(native.namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            let index = networking::links(handle)
+                .await?
+                .iter()
+                .find(|link| networking::name(link) == "lo")
+                .context("loopback missing")?
+                .header
+                .index;
+            handle.link().set(index).up().execute().await?;
+            let server = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let client = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            for socket in [&server, &client] {
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            }
+            client.send_to(b"request", server.local_addr()?)?;
+            let mut bytes = [0; 32];
+            let (_, source) = server.recv_from(&mut bytes)?;
+            server.send_to(b"reply", source)?;
+            client.recv_from(&mut bytes)?;
+            Ok(server.local_addr()?.port())
+        })
+    })?;
+    let ownership = fs::read(native.state.join("ownership.json"))?;
+    let fingerprint = session(native.namespace.clone(), |_, _| netfilter::fingerprint())?;
+    let result = native.statistics(
+        &desired,
+        "/api/v1/statistics/connections",
+        &format!("protocol=udp&port={port}"),
+    )?;
+    assert_eq!(result["schema"], "netcontrol-connections/v1");
+    assert_eq!(result["sample"]["scope"], native.identity);
+    assert_eq!(result["summary"]["matched"], 1);
+    assert_eq!(
+        result["connections"][0]["original"]["destination_port"],
+        port
+    );
+    assert_eq!(result["connections"][0]["original"]["source"], "127.0.0.1");
+    assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
+    assert_eq!(
+        session(native.namespace.clone(), |_, _| netfilter::fingerprint())?,
+        fingerprint
+    );
+    native.observe(&desired)?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
 fn native_dhcp_installs_connected_route_before_default_gateway() -> Result<()> {
     use futures_util::TryStreamExt;

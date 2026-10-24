@@ -50,6 +50,8 @@ Support:
 - Committed configuration history, comparison, export, and historical restore.
 - Read-only namespace interface counters and IP/TCP/UDP/ICMP protocol statistics,
   including explicit partial/unavailable and simulator states.
+- Read-only native conntrack connection snapshots with original/reply tuples,
+  protocol state, NAT status and nullable per-direction packet/byte accounting.
 - Read-only host NIC discovery and explicit Ethernet static configuration.
 - Initial physical-NIC inheritance on supported native host installations,
   in-process DHCPv4 clients and per-interface systemd-resolved configuration.
@@ -675,7 +677,9 @@ metrics. A failed observation is **Unknown/unavailable**, not zero resources.
 
 ### 6.1.1 Read-only networking statistics
 
-All statistics reads require `state.read` and accept no query parameters:
+All statistics reads require `state.read`. Only the connection snapshot endpoint
+accepts the bounded query parameters documented below; other statistics reads
+accept no query parameters:
 
 | GET endpoint | Response |
 | --- | --- |
@@ -683,6 +687,7 @@ All statistics reads require `state.read` and accept no query parameters:
 | `/api/v1/statistics/interfaces` | `{sample, interfaces}` |
 | `/api/v1/statistics/interfaces/{name}` | `{sample, interface}` |
 | `/api/v1/statistics/protocols` | `{sample, protocols}` |
+| `/api/v1/statistics/connections` | Connection snapshot with filters/paging; `netcontrol-connections/v1` |
 | `/api/v1/statistics/gateways` | `{sample, monitors}` |
 | `/api/v1/statistics/gateways/{name}` | `{sample, monitor}` |
 
@@ -732,8 +737,136 @@ gauges/constants or sum parents/VLANs/veths/loopback into a misleading total.
 Keep statistics in separate ephemeral monitoring state. Polling must not dirty,
 replace, or rebase a configuration draft, alter pending transactions, or imply
 counter history can be restored with a revision. Statistics remain independent
-of full configuration observation errors. No per-flow, driver-specific,
-host-global softnet/sockstat, WireGuard peer, or streaming API is implied.
+of full configuration observation errors. Connection state is available only
+through the explicit endpoint below; interface/protocol statistics do not imply
+driver-specific, host-global softnet/sockstat, WireGuard peer, or streaming APIs.
+
+#### Conntrack connection snapshots
+
+`GET /api/v1/statistics/connections` is an API-key Bearer-authenticated,
+`state.read` action. It reads Linux conntrack directly through netfilter netlink
+in the daemon's network namespace (host by default, optional lab namespace).
+It includes tracked connections involving unmanaged links, loopback, local
+services and other firewall owners, not just managed forwarded traffic. Treat
+remote/local endpoint visibility as sensitive operational data; do not log or
+persist complete snapshots in browser storage or export them automatically.
+Collection is independent of configuration observation and protocol-worker
+health, and is not included in aggregate `GET /api/v1/statistics` polling.
+
+Query parameters use normal URL encoding. Unknown/duplicate parameters, empty
+values, malformed/out-of-range values and queries over 4096 bytes return `400`.
+Numbers are canonical unsigned decimal without leading zeroes except `0`.
+
+| Parameter | Type/default and validation |
+| --- | --- |
+| `limit` | Integer 1..1000, default 100 |
+| `offset` | Integer 0..1000000, default 0 |
+| `family` | Omit for both; `ipv4` or `ipv6` |
+| `protocol` | Omit for all; `tcp`, `udp`, `icmp`, `icmpv6`, `sctp`, or numeric IP protocol 0..255 |
+| `address` | Canonical IPv4/IPv6 literal, no hostname/CIDR/zone; matches either endpoint in either tuple; must agree with `family` when both supplied |
+| `port` | Integer 0..65535; matches either source/destination port in either tuple |
+| `zone` | Integer 0..65535; matches the top-level conntrack zone |
+
+Example: `GET /api/v1/statistics/connections?protocol=tcp&port=443&limit=100`.
+Filtering is AND across parameters, applied after the namespace-wide dump. It
+does not reduce kernel dump cost. A successful native response has:
+
+- `schema`: literal `netcontrol-connections/v1`.
+- `sample`: normal `scope`, RFC3339 `started_at`/`collected_at`, and `status`.
+  Status is `partial` when any matched connection lacks counters in either
+  direction; otherwise `available`. An empty successful snapshot does not prove
+  connection accounting is enabled. The window is not an atomic kernel snapshot.
+- `summary`: nonnegative integer `total` (all dumped entries), `matched` (after
+  filters), `returned` (this page), `accounting_unavailable` (matched entries
+  missing either directional counter object). These are counts, not counter
+  strings. Accounting-unavailable counts apply to all matches, not only this page.
+- `limit`, `offset`: effective numeric values; `next_offset`: integer or `null`.
+  Offset beyond available matches returns an empty page and null next offset.
+- `connections`: array ordered by zone/available ID and tuple identity. Every
+  page is a new live dump; connections can arrive/expire between pages, so pages
+  may overlap/skip entries. No retained snapshot, cursor or historical store.
+
+Each connection contains these non-optional fields (nullable where specified):
+
+| Fields | Types and meaning |
+| --- | --- |
+| `id` | Decimal string or null, kernel conntrack ID; not a durable/global identity |
+| `zone` | Integer 0..65535; zero when the kernel omits the default zone |
+| `family` | `ipv4` or `ipv6` |
+| `protocol`, `protocol_name` | Numeric IP protocol and `tcp`/`udp`/`icmp`/`icmpv6`/`sctp`/`other` |
+| `state`, `tcp_state` | State string and nullable numeric TCP conntrack state; raw unknown TCP states are retained with `state: "UNKNOWN"` |
+| `status` | Raw unsigned 32-bit kernel conntrack status bitmask |
+| `seen_reply`, `assured`, `source_nat`, `destination_nat` | Booleans derived from kernel status, not rule evaluation |
+| `mark` | Unsigned 32-bit connection mark; zero when omitted by the kernel |
+| `timeout_seconds` | Remaining kernel timeout in seconds, or null |
+| `original`, `reply` | Tuple objects in each kernel direction, not frontend-local TX/RX |
+| `original_counters`, `reply_counters` | `{packets: string, bytes: string}` or null; exact unsigned decimal strings |
+
+Tuple fields are non-null IP strings `source`, `destination`; nullable integer
+`source_port`, `destination_port`, `icmp_id` (0..65535), `icmp_type`, `icmp_code`
+(0..255); and nullable tuple `zone` (0..65535). No invented ports for ICMP or
+unknown protocols. Original/reply tuples expose NAT translations without
+asserting which rule caused them. TCP state strings are `NONE`, `SYN_SENT`,
+`SYN_RECV`, `ESTABLISHED`, `FIN_WAIT`, `CLOSE_WAIT`, `LAST_ACK`, `TIME_WAIT`,
+`CLOSE`, `LISTEN`, `SYN_SENT2`, or `UNKNOWN`; without a TCP state the coarse status
+is `ASSURED`, `SEEN_REPLY`, or `UNREPLIED`. These are conntrack states, not
+application connection status or current firewall allow/drop verdicts.
+
+Synthetic example with unavailable kernel accounting:
+
+```json
+{
+  "schema": "netcontrol-connections/v1",
+  "sample": {"scope":"synthetic:namespace","started_at":"2026-10-24T12:00:00Z","collected_at":"2026-10-24T12:00:00.010Z","status":"partial"},
+  "summary": {"total":1,"matched":1,"returned":1,"accounting_unavailable":1},
+  "limit": 100,
+  "offset": 0,
+  "next_offset": null,
+  "connections": [{
+    "id":"42","zone":0,"family":"ipv4","protocol":6,"protocol_name":"tcp",
+    "state":"ESTABLISHED","tcp_state":3,"status":22,"seen_reply":true,"assured":true,
+    "source_nat":true,"destination_nat":false,"mark":0,"timeout_seconds":120,
+    "original":{"source":"192.0.2.10","destination":"198.51.100.20","source_port":40000,"destination_port":443,"icmp_id":null,"icmp_type":null,"icmp_code":null,"zone":null},
+    "reply":{"source":"198.51.100.20","destination":"203.0.113.10","source_port":443,"destination_port":50000,"icmp_id":null,"icmp_type":null,"icmp_code":null,"zone":null},
+    "original_counters":null,"reply_counters":null
+  }]
+}
+```
+
+Counter values are kernel per-connection accounting, not interface/L2 throughput,
+application payload, or cumulative per-rule hits. Null is unavailable, not zero.
+Kernel accounting generally requires `net.netfilter.nf_conntrack_acct=1` in the
+same namespace when the connection is created; enabling it is an explicit
+operator action, is not retroactive for existing entries, and is not performed
+by this read API. Never flush connections to obtain counters. Rates require
+matching scope, ID/zone and full tuple identity, exact integer deltas and actual
+sample time; reset on counter decrease, identity change, disappearance or error.
+Do not invent a rate from a first sample, null/simulated counters or a page change.
+
+Kernel dump limits are 100000 entries, 64 MiB received, a five-second receive
+collection budget and a 1 MiB maximum datagram. Missing kernel support/modules,
+insufficient netfilter privileges, interrupted/malformed/over-limit dumps and
+read errors are `503`, not an empty available response. The existing raw
+netfilter reader validates kernel sender/sequence and rejects interrupted dumps;
+its framing checks also continue to protect native nftables drift inspection.
+The kernel read budget does not include all decoding/serialization overhead.
+Invalid/missing key is `401`, insufficient permission `403`, unsupported method
+`405`, unknown endpoint suffix `404`; errors use `{error, transaction: null}`.
+
+Simulator returns `200` with `sample.status: "simulated"`, an empty array,
+`summary.total`, `matched`, `accounting_unavailable` null, `returned: 0`, and null
+`next_offset`. It does not fabricate native activity or measured zero totals.
+
+Frontend tasks: add a read-only Connections view with server-side filters,
+original/reply/NAT details, state/remaining timeout, directional counters,
+freshness and unavailable accounting messages. Poll only while visible, do not
+overlap requests, back off on `503`, reset offset on filter change and preserve
+drafts. Keep only ephemeral monitoring state; no close/delete/flush action is
+provided. Prefer ID plus zone/tuple identity over array position for row keys.
+Existing `GET /api/v1/firewall/rules` and desired firewall configuration remain
+the rule-definition sources. This feature does not add per-rule counters,
+rule-to-connection attribution, packet logs, guaranteed visibility of rejected
+or NOTRACK traffic, historical connections, or automatic policy changes.
 
 ### 6.1.2 Gateway health and RTT variation
 
@@ -997,6 +1130,33 @@ configuration kind `ethernet`. Explicitly choose role, desired MTU/up state and
 static addresses before submitting the full candidate; do not infer WAN/LAN.
 Discovery addresses may not satisfy candidate validation, so never blindly copy
 them into a transaction.
+
+The main interface overview must also show live inventory, not only the managed
+configuration list. Default to **All interfaces**, including down, unmanaged,
+loopback and unsupported links; kind/ownership filters must be explicit user
+choices, not an implicit supported-kind whitelist. Linux loopback is normally
+named `lo`; preserve the actual backend name rather than inventing a `lo0` alias.
+Loopback is visible/read-only, not eligible for adoption, deletion or submission
+as a configurable Ethernet interface.
+
+Join discovered rows with managed configuration by technical `name`. Display
+`DiscoveredInterface.addresses` as **Active addresses**, including DHCP IPv4,
+static IPv4, global/link-local IPv6 and loopback addresses. Keep configured static
+addresses in a separate field/column or detail section. An empty configured
+address list must not render as no active IP when discovery contains one. Do not
+discard kernel addresses just because they are absent from desired state or
+from Netcontrol's DHCP lease map: an external manager may have assigned them.
+Lease records from `GET /api/v1/runtime` enrich matching rows with server/expiry/
+errors; they do not replace kernel inventory or prove a recorded address is
+currently applied. Discovery alone does not identify DHCP versus static origin.
+Never copy these active addresses into configuration drafts.
+
+Fetch inventory independently of managed-state observation and runtime polling.
+If those other reads fail, keep successful inventory rows/addresses visible and
+mark unavailable configuration/lease details separately. If inventory fails,
+show unavailable/stale state rather than an empty successful table. Preserve
+missing configured links as clearly absent/read-only diagnostic rows, without
+fabricating live addresses from desired state or a cached lease.
 
 Changing host networking may sever API/SSH management. Keep the user's draft,
 show the exact removals/additions and provisional deadline, require independent

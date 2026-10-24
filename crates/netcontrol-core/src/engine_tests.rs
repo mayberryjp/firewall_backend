@@ -386,7 +386,10 @@ impl Backend for FaultBackend {
         ensure!(!f.discovery_error, "injected discovery read failure");
         Ok(json!([{
             "name":"eth0","kind":"ethernet","index":2,"mac":"02:00:00:00:00:01",
-            "mtu":1500,"up":true,"addresses":["192.0.2.10/24"],"ownership":"unmanaged"
+            "mtu":1500,"up":true,"addresses":["192.0.2.10/24","fe80::1/64"],"ownership":"unmanaged"
+        }, {
+            "name":"lo","kind":"loopback","index":1,"mac":"00:00:00:00:00:00",
+            "mtu":65536,"up":true,"addresses":["127.0.0.1/8","::1/128"],"ownership":"loopback"
         }]))
     }
     fn observe_for_repair(&mut self, _: &Config) -> Result<Config> {
@@ -655,8 +658,20 @@ fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
         Value::Null,
     );
     assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body.as_array().unwrap().len(), 2);
     assert_eq!(reply.body[0]["name"], "eth0");
     assert_eq!(reply.body[0]["ownership"], "unmanaged");
+    assert_eq!(
+        reply.body[0]["addresses"],
+        json!(["192.0.2.10/24", "fe80::1/64"])
+    );
+    assert_eq!(reply.body[1]["name"], "lo");
+    assert_eq!(reply.body[1]["kind"], "loopback");
+    assert_eq!(reply.body[1]["ownership"], "loopback");
+    assert_eq!(
+        reply.body[1]["addresses"],
+        json!(["127.0.0.1/8", "::1/128"])
+    );
     assert_eq!(faults.lock().unwrap().apply_count, 0);
     assert_eq!(engine.state.revision, 0);
     assert!(engine.state.desired.interfaces.is_empty());
@@ -1471,6 +1486,80 @@ fn simulator_traffic_history_never_fabricates_measured_counters() {
         );
         assert!(unavailable.body.get("scopes").is_none());
     }
+}
+
+#[test]
+fn connection_statistics_are_authorized_filtered_and_readonly() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let expected = json!({"schema":"netcontrol-connections/v1","sample":{"status":"partial"},"connections":[],"summary":{"total":0}});
+    backend.lock().unwrap().traffic_response = Some(expected.clone());
+    backend.lock().unwrap().fail_observe = true;
+    let before = fs::read(fixture.path()).unwrap();
+    let path = "/api/v1/statistics/connections";
+    let query = "family=ipv4&protocol=tcp&port=443&limit=20&offset=0";
+    assert_eq!(
+        engine
+            .request("GET", path, query, "reader", &[], &[])
+            .status,
+        403
+    );
+    assert_eq!(
+        engine.request("GET", path, query, "", &all(), &[]).status,
+        401
+    );
+    for query in [
+        "unknown=1",
+        "limit=0",
+        "limit=1001",
+        "port=65536",
+        "offset=-1",
+        "protocol=tcp&protocol=udp",
+    ] {
+        assert_eq!(
+            engine
+                .request("GET", path, query, "reader", &["state.read".into()], &[])
+                .status,
+            400
+        );
+    }
+    assert_eq!(request(&mut engine, "POST", path, Value::Null).status, 405);
+    assert!(backend.lock().unwrap().statistics_calls.is_empty());
+    let reply = engine.request("GET", path, query, "reader", &["state.read".into()], &[]);
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body, expected);
+    assert_eq!(
+        backend.lock().unwrap().statistics_calls,
+        [(path.into(), query.into())]
+    );
+    backend.lock().unwrap().traffic_error = Some("conntrack unavailable".into());
+    assert_eq!(
+        engine
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .status,
+        503
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    assert_eq!(backend.lock().unwrap().apply_count, 0);
+}
+
+#[test]
+fn simulator_connection_statistics_do_not_fabricate_live_sessions_or_totals() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let reply = engine.request(
+        "GET",
+        "/api/v1/statistics/connections",
+        "limit=10",
+        "reader",
+        &["state.read".into()],
+        &[],
+    );
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["sample"]["status"], "simulated");
+    assert!(reply.body["summary"]["total"].is_null());
+    assert_eq!(reply.body["connections"], json!([]));
+    assert_eq!(reply.body["limit"], 10);
 }
 
 #[test]

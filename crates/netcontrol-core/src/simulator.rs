@@ -140,6 +140,15 @@ impl Backend for Simulator {
         )
     }
     fn statistics(&mut self, config: &Config, path: &str, query: &str) -> Result<Value> {
+        if path == "/api/v1/statistics/connections" {
+            let query = crate::ConnectionQuery::parse(query)?;
+            return Ok(json!({
+                "schema":"netcontrol-connections/v1",
+                "sample":{"scope":"simulator","started_at":Utc::now(),"collected_at":Utc::now(),"status":"simulated"},
+                "connections":[],"summary":{"total":null,"matched":null,"returned":0,"accounting_unavailable":null},
+                "limit":query.limit,"offset":query.offset,"next_offset":null
+            }));
+        }
         ensure!(
             query.is_empty(),
             "statistics endpoints do not accept query parameters"

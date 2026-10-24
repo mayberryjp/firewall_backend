@@ -53,6 +53,39 @@ without the C/header toolchain: TLS requests then fail explicitly and
 `Native::open` always fails because nftables is essential. It is **not** a
 functional networking build or a permissive firewall fallback.
 
+## Conntrack connection snapshots
+
+`GET /api/v1/statistics/connections` reads namespace-wide Linux conntrack state
+using `NETLINK_NETFILTER`, not the `conntrack` executable or a supervised helper.
+The HTTP API requires `state.read`; the daemon needs kernel conntrack support
+and native netfilter read privileges in its configured namespace. Host mode
+includes connections involving unmanaged devices and other firewall owners;
+lab mode reads only that namespace. It does not require healthy service workers
+or a successful configured-state observation, and does not mutate ownership,
+firewall rules, connections, sysctls or desired configuration.
+
+Original/reply tuples expose NAT addresses/ports, with protocol/TCP state,
+status flags, mark, zone, nullable timeout/ID, and per-direction packet/byte
+counts. Counts are exact decimal strings or null when accounting is absent.
+This is neither a per-rule counter nor evidence of a current allow/drop verdict.
+No rule association, connection deletion/flush, packet capture or history API.
+
+An operator may explicitly enable `net.netfilter.nf_conntrack_acct=1` in the same
+network namespace before new connections are created. The endpoint never enables
+it and does not retrofit counters onto existing entries. No conntrack table flush
+is required or recommended. Counter bytes are kernel connection accounting, not
+application-payload or interface byte totals. See the
+[canonical query/schema and frontend contract](../../FRONTEND_SPEC.md#conntrack-connection-snapshots).
+
+Dump collection is capped at five seconds, 64 MiB and 100000 entries; individual
+datagrams are capped at 1 MiB. Decode/serialization adds overhead. Filters run
+after the full dump, so do not bypass those collection limits. Interrupted,
+truncated, unsupported and permission-denied reads fail explicitly. Pagination
+is over fresh live snapshots, not a consistent retained cursor. The daemon does
+not explicitly load kernel modules, restart services or change accounting
+configuration in this read path. Privileged Linux acceptance remains outstanding in this task's
+[journal](../../docs/journal/2026-10-24.md#conntrack-connection-statistics-api).
+
 ## Ownership and reconciliation
 
 Host mode requires a valid stable `/etc/machine-id`. Its scope combines that ID

@@ -20,6 +20,9 @@ impl std::fmt::Display for BackendDrift {
 }
 impl std::error::Error for BackendDrift {}
 
+mod connections;
+pub use connections::ConnectionQuery;
+
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
     fn scope(&self) -> Result<String>;

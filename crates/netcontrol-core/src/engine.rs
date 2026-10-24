@@ -1193,6 +1193,10 @@ fn form_decode(s: &str) -> ApiResult<String> {
     String::from_utf8(result).map_err(|_| ApiError::new(400, "query must be UTF-8"))
 }
 fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
+    if path == "/api/v1/statistics/connections" {
+        crate::ConnectionQuery::parse(query).map_err(|error| ApiError::new(400, error))?;
+        return Ok(());
+    }
     if !query.is_empty() {
         return Err(ApiError::new(
             400,

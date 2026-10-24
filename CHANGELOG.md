@@ -4,6 +4,16 @@
 
 ### Added
 
+- Read-only `GET /api/v1/statistics/connections` conntrack snapshots using
+  `state.read`: original/reply NAT tuples, protocol state/status, zone/mark,
+  nullable remaining timeout/ID and exact nullable per-direction packet/byte
+  counters. Strict family/protocol/address/port/zone filters and bounded live
+  paging; no per-rule attribution, writes/flush, history or silent accounting
+  enablement. Simulator explicitly reports unmeasured data. Raw netfilter reads
+  validate kernel origin and use bounded collection; existing nftables ownership
+  checks remain. Recommended bump: minor; baseline unknown. Linux acceptance is
+  unverified; see [handoff 2026-10-24-05](docs/frontend-handoffs/2026-10-24.md#2026-10-24-05-read-only-conntrack-connection-statistics).
+
 - Authenticated `POST /api/v1/interfaces/{name}/dhcp/retry` runtime action using
   `interfaces.write`, without changing configuration/revisions or restarting
   other clients. Native retry joins the selected worker before fresh discovery,
@@ -69,6 +79,14 @@
   user direction. Linux compilation and runtime acceptance remain outstanding.
 
 ### Changed
+
+- Frontend contract clarification: the interface overview must use live inventory
+  for active addresses, show DHCP-assigned IPv4 even when configured static
+  addresses are empty, and include loopback/unmanaged/unsupported links by
+  default. Backend API/runtime behavior is unchanged; rendering remains pending
+  in the separate frontend. Release impact: none for this backend documentation/
+  regression change; recommend a frontend patch when implemented. See
+  [handoff 2026-10-24-04](docs/frontend-handoffs/2026-10-24.md#2026-10-24-04-live-interface-addresses-and-loopback-visibility).
 
 - Factory reset now prompts for confirmation with `sudo bash reset.sh`; `--yes`
   is optional for unattended use. Blank, declined/invalid input and EOF cancel
