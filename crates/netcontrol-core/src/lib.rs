@@ -34,6 +34,9 @@ pub trait Backend: Send {
         self.observe(expected)
     }
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()>;
+    fn factory_reset(&mut self, _before: &Config, _after: &Config) -> Result<()> {
+        anyhow::bail!("factory reset is not supported by this backend")
+    }
     fn runtime(&mut self, config: &Config) -> Result<Value>;
     fn statistics(&mut self, config: &Config, path: &str, query: &str) -> Result<Value>;
     fn repair(&mut self, config: &Config) -> Result<Value>;

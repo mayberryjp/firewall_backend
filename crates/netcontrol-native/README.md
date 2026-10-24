@@ -82,7 +82,7 @@ addresses are not resurrected, and backward wall-clock changes cause an error
 instead of extending a finite lease. External DHCP/network managers must not
 race changes to selected interfaces.
 
-Initial host startup now inherits physical NICs into an otherwise unused core
+Explicit initial provisioning inherits physical NICs into an otherwise unused core
 journal with role `unassigned`; it does not recapture configured state. Handover
 currently requires networkd/resolved and live finite DHCPv4 leases, preserving
 client identity rather than persisting a lease as static configuration. The
@@ -105,7 +105,16 @@ exclusions are recreated; conflicting files still fail explicitly. This prevents
 resolved's `LinkBusy` failure after networkd has reclaimed an interface. Explicit
 lab configurations and interfaces no longer managed are not handed over through
 this restart path. It does not change saved addresses, DHCP settings or roles,
-and it does not bypass address drift or discard recovery intents.
+and it does not discard recovery intents.
+
+Ordinary startup reads the core journal without initial inheritance. If an
+already-owned host interface differs from the saved desired configuration,
+startup reconciles it to that saved configuration after identity and ownership
+checks. Live snapshots are captured only for rollback, never promoted to desired
+configuration. Transaction observation/drift checks remain strict, and changed
+foreign firewall tables, conflicting routes and unsupported kernel state still
+fail explicitly. Explicit factory reset uses the same snapshot/intent machinery
+to apply a replacement configuration selected by the local operator.
 
 Top-level `dhcp_clients` and `dns` maps participate in core transactions and
 interface authorization. DHCP addresses and routes are separate live lease

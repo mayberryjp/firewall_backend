@@ -4,6 +4,13 @@
 
 ### Added
 
+- Explicit Ubuntu `reset.sh --yes` for factory network configuration, with
+  optional port/LAN-prefix selection and a reset-capable binary override. Private
+  backup precedes a journaled local reset; credentials, keys and revision history
+  are retained. Factory LAN is committed without waiting for WAN DHCP. No HTTP
+  reset endpoint. Initial installation shares the same clean factory builder.
+  See [handoff 2026-10-23-04](docs/frontend-handoffs/2026-10-23.md#2026-10-23-04-saved-configuration-upgrades-and-explicit-factory-reset).
+
 - Fresh Ubuntu appliance provisioning: first/second naturally ordered physical
   Ethernet ports default to DHCPv4 WAN/LAN, with optional paired overrides and
   static LAN `192.168.0.1/24`. LAN allows all input/forwarding; unsolicited WAN
@@ -34,6 +41,13 @@
   user direction. Linux compilation and runtime acceptance remain outstanding.
 
 ### Changed
+
+- Native daemon startup and `upgrade.sh` now require saved configuration and do
+  not initialize desired state from live NIC settings. Missing installed services
+  are upgrade errors instead of implicit installations. Owned host interfaces are
+  reconciled to the saved plan on startup drift; live snapshots remain rollback
+  data only. Explicit first-install provisioning remains separate. Recommended
+  bump: major for the changed startup/deployment contract; baseline unknown.
 
 - Interface roles accept `unassigned` in addition to `wan`/`lan`. First native
   host startup now takes supported physical NIC IP/DHCP ownership instead of

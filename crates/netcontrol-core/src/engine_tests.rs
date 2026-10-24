@@ -289,6 +289,7 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 #[derive(Default)]
 struct Faults {
     state: Config,
+    initial_count: usize,
     fail_applies: usize,
     apply_count: usize,
     fail_observe: bool,
@@ -306,6 +307,10 @@ struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
     fn scope(&self) -> Result<String> {
         Ok("fault-test".into())
+    }
+    fn initial_configuration(&mut self) -> Result<Config> {
+        self.0.lock().unwrap().initial_count += 1;
+        Ok(Config::empty())
     }
     fn observe(&mut self, _: &Config) -> Result<Config> {
         let f = self.0.lock().unwrap();
@@ -353,6 +358,9 @@ impl Backend for FaultBackend {
         }
         Ok(())
     }
+    fn factory_reset(&mut self, before: &Config, after: &Config) -> Result<()> {
+        self.apply(before, after)
+    }
     fn runtime(&mut self, _: &Config) -> Result<Value> {
         Ok(json!({}))
     }
@@ -375,6 +383,65 @@ impl Backend for FaultBackend {
         Ok(json!({}))
     }
 }
+#[test]
+fn saved_startup_never_initializes_or_recaptures_an_empty_journal() {
+    let fixture = Fixture::new();
+    assert!(Engine::open_saved(&fixture.path(), Box::new(Simulator::new())).is_err());
+    assert!(!fixture.path().exists());
+    let (engine, faults) = faulty(&fixture);
+    let initial_count = faults.lock().unwrap().initial_count;
+    drop(engine);
+    let engine =
+        Engine::open_saved(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    assert_eq!(faults.lock().unwrap().initial_count, initial_count);
+    assert_eq!(engine.state.desired, Config::empty());
+}
+
+#[test]
+fn explicit_factory_reset_replaces_saved_configuration_without_pre_reset_repair() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    let transaction = submit(&mut engine, config());
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let repairs = faults.lock().unwrap().repair_count;
+    faults.lock().unwrap().state = Config::empty();
+    let mut engine =
+        Engine::open_for_factory_reset(&fixture.path(), Box::new(FaultBackend(faults.clone())))
+            .unwrap();
+    assert_eq!(faults.lock().unwrap().repair_count, repairs);
+    let reset = engine.factory_reset(Config::empty()).unwrap();
+    assert_eq!(reset.status, "committed");
+    assert_eq!(reset.actor, "local-factory-reset");
+    assert_eq!(engine.state.desired, Config::empty());
+    assert_eq!(engine.state.revision, 2);
+    assert!(engine.state.active_transaction.is_none());
+    assert_eq!(engine.state.transactions.len(), 2);
+    engine.shutdown().unwrap();
+    assert!(engine.factory_reset(Config::empty()).is_err());
+}
+
+#[test]
+fn failed_factory_reset_rolls_back_and_active_transactions_block_reset() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    let transaction = submit(&mut engine, config());
+    assert!(engine.factory_reset(Config::empty()).is_err());
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    faults.lock().unwrap().fail_applies = 1;
+    assert!(engine.factory_reset(Config::empty()).is_err());
+    assert_eq!(engine.state.desired, config().normalized());
+    assert_eq!(engine.state.revision, 1);
+    assert!(engine.state.active_transaction.is_none());
+    assert_eq!(faults.lock().unwrap().state, config().normalized());
+}
+
 #[test]
 fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
     let fixture = Fixture::new();

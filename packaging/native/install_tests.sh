@@ -167,21 +167,15 @@ for scenario in missing loaded unmanaged conflicting masked install_failure relo
         }
         service_target "$PWD" "$UPGRADE_TEST_DIRECTORY/unit"
     '; then
-        [[ $scenario == missing || $scenario == loaded ]] || exit 1
+        [[ $scenario == loaded ]] || exit 1
     else
-        [[ $scenario != missing && $scenario != loaded ]] || exit 1
+        [[ $scenario != loaded ]] || exit 1
     fi
-    if [[ $scenario == missing ]]; then
-        grep -q 'install -d -m 0700 /var/lib/netcontrol' "$destination/commands"
-        grep -q 'install -m 0644 .*netcontrold.service' "$destination/commands"
-        grep -q 'systemctl daemon-reload' "$destination/commands"
-    elif [[ $scenario == loaded || $scenario == unmanaged || $scenario == conflicting || $scenario == masked ]]; then
-        ! grep -q '^install ' "$destination/commands"
-    fi
+    ! grep -q '^install ' "$destination/commands"
     if [[ $scenario == conflicting ]]; then [[ $(< "$destination/unit") == 'custom unit' ]]; fi
     ! grep -Eq 'systemctl (start|enable)' "$destination/commands"
 done
-printf 'Missing-service setup and refusal tests passed (mocked privileged commands).\n'
+printf 'Upgrade refuses missing services without provisioning or interface changes (mocked privileged commands).\n'
 
 for scenario in success fail_stage fail_restart fail_health first_install fail_first_start inactive_existing fail_inactive_start; do
     destination="$temporary/upgrade-$scenario"
@@ -251,3 +245,49 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
     [[ -z $(find "$destination" -name 'netcontrold.upgrade.*' -print) ]]
 done
 printf 'Incremental upgrade replacement and recovery tests passed (mocked service commands).\n'
+
+for reset_scenario in success config_failure env_failure reload_failure start_failure http_failure; do
+    reset_directory="$temporary/reset-$reset_scenario"
+    mkdir "$reset_directory"
+    if (
+        source ./reset.sh
+        reset_fixture() {
+            printf 'reset %s\n' "$*" >> "$reset_directory/commands"
+            [[ $reset_scenario != config_failure ]]
+        }
+        install() {
+            printf 'environment\n' >> "$reset_directory/commands"
+            command cat > "$reset_directory/environment"
+            [[ $reset_scenario != env_failure ]]
+        }
+        systemctl() {
+            printf 'systemctl %s\n' "$*" >> "$reset_directory/commands"
+            [[ $* != daemon-reload || $reset_scenario != reload_failure ]] || return 1
+            [[ $* != 'enable --now netcontrold.service' || $reset_scenario != start_failure ]]
+        }
+        curl() {
+            printf 'http %s\n' "$*" >> "$reset_directory/commands"
+            [[ $reset_scenario != http_failure ]]
+        }
+        reset_appliance reset_fixture eno1 enp3s0 192.168.0.1/24
+    ); then
+        [[ $reset_scenario == success ]] || exit 1
+    else
+        [[ $reset_scenario != success ]] || exit 1
+    fi
+    grep -q -- '--factory-reset' "$reset_directory/commands"
+    grep -q -- '--provision-wan eno1 --provision-lan enp3s0 --provision-lan-address 192.168.0.1/24' "$reset_directory/commands"
+    case $reset_scenario in
+        config_failure) ! grep -Eq '^environment|^systemctl|^http' "$reset_directory/commands" ;;
+        env_failure) ! grep -Eq '^systemctl|^http' "$reset_directory/commands" ;;
+        reload_failure) ! grep -Eq 'enable --now|^http' "$reset_directory/commands" ;;
+        start_failure) ! grep -q '^http' "$reset_directory/commands" ;;
+        success) [[ $(< "$reset_directory/environment") == 'NETCONTROL_LISTEN=192.168.0.1:8080' ]] ;;
+    esac
+done
+(
+    source ./reset.sh
+    if main; then printf 'Reset accepted without explicit confirmation.\n' >&2; exit 1; fi
+    if main --unknown; then printf 'Reset accepted unknown options.\n' >&2; exit 1; fi
+)
+printf 'Explicit factory reset and prerequisite-failure ordering tests passed (mocked host commands).\n'

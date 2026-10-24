@@ -248,6 +248,29 @@ denial with reply/DHCP exceptions, LAN-subnet WAN NAT, and starts/enables the
 service with `--appliance`. It binds HTTP to the selected LAN address using
 `/etc/netcontrol/appliance.env`; there is no new HTTP provisioning endpoint.
 LAN clients need static addressing/gateway; no DHCP/DNS server is provisioned.
+Ordinary native startup and `upgrade.sh` require a saved journal and apply that
+desired configuration; they never initialize desired state from current NIC
+settings. Managed-interface drift is reconciled to the saved plan, subject to
+native identity, ownership and foreign-resource checks. Live snapshots are used
+only for rollback, not as a new desired configuration.
+
+Initial installation and explicit reset share the same clean factory configuration
+builder; inherited OS settings are handover/rollback data, not factory defaults.
+The operator-only `reset.sh --yes` replaces current networking with factory
+WAN/LAN defaults using a locally authorized transaction. This is not an HTTP
+endpoint or identity reset. It preserves account/API credentials, key files and
+revision history; revision increments rather than returning to zero. Other saved
+Ethernet interfaces become unassigned with MTU 1500, up, without configured
+addresses/DNS/DHCP; custom virtual interfaces/routes/policies/service settings
+are removed from current desired configuration. Wi-Fi association remains with
+the supplicant. Factory reset does not wait for WAN DHCP before committing the
+LAN recovery configuration. It requires console access, an existing valid saved
+configuration and no active core transaction; native recovery intents are not
+discarded. It reinstalls the appliance service and LAN HTTP binding, starts and
+enables the service, and defaults to `http://192.168.0.1:8080/` afterward.
+Frontend/operator guidance must distinguish upgrade, network reset and identity
+reset; after reconnect, refetch state/revision and discard or explicitly rebase
+stale drafts. Do not restart onboarding or expose a nonexistent HTTP reset API.
 Changing the management IP requires operator coordination of that environment
 file and service restart; an API interface-address edit alone does not rebind
 the listener. The persisted input policy enforces WAN denial; binding alone is

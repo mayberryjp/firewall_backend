@@ -259,6 +259,37 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     native.observe(&desired)?;
     assert_eq!(native.scope()?, scope);
 
+    for rollback in [false, true] {
+        session(namespace.clone(), |rt, handle| {
+            rt.block_on(async {
+                let links = networking::links(handle).await?;
+                let index = links
+                    .iter()
+                    .find(|link| networking::name(link) == "nic0")
+                    .context("fixture NIC missing")?
+                    .header
+                    .index;
+                handle
+                    .address()
+                    .add(index, "198.51.100.250".parse()?, 32)
+                    .execute()
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+        })?;
+        assert!(native.observe(&desired).is_err());
+        if rollback {
+            native.apply(&desired, &desired)?;
+        } else {
+            native.repair(&desired)?;
+        }
+        native.observe(&desired)?;
+        assert_eq!(
+            native.ownership()?.committed_config,
+            Some(serde_json::to_value(&desired)?)
+        );
+    }
+
     // Core expires pending transactions before startup repair; do not replay the expired candidate.
     let mut ownership = native.ownership()?;
     ownership.boot = "synthetic-previous-boot".into();

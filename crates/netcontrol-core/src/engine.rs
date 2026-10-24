@@ -196,7 +196,24 @@ pub struct Engine {
     now: Option<DateTime<Utc>>,
 }
 impl Engine {
-    pub fn open(path: &Path, mut backend: Box<dyn Backend>) -> Result<Self> {
+    pub fn open(path: &Path, backend: Box<dyn Backend>) -> Result<Self> {
+        Self::open_inner(path, backend, true, true)
+    }
+
+    pub fn open_saved(path: &Path, backend: Box<dyn Backend>) -> Result<Self> {
+        Self::open_inner(path, backend, false, true)
+    }
+
+    pub fn open_for_factory_reset(path: &Path, backend: Box<dyn Backend>) -> Result<Self> {
+        Self::open_inner(path, backend, false, false)
+    }
+
+    fn open_inner(
+        path: &Path,
+        mut backend: Box<dyn Backend>,
+        initialize: bool,
+        reconcile: bool,
+    ) -> Result<Self> {
         let store = Store::open(path)?;
         let scope = backend.scope().context("backend scope")?;
         ensure!(!scope.is_empty(), "backend scope must not be empty");
@@ -207,7 +224,11 @@ impl Engine {
                     "state belongs to a different backend scope"
                 );
                 validate_state(&s)?;
-                if s.revision == 0 && s.transactions.is_empty() && s.desired == Config::empty() {
+                if initialize
+                    && s.revision == 0
+                    && s.transactions.is_empty()
+                    && s.desired == Config::empty()
+                {
                     let initial = backend.initial_configuration()?.normalized();
                     initial.validate()?;
                     s.desired = initial;
@@ -218,6 +239,10 @@ impl Engine {
                 s
             }
             None => {
+                ensure!(
+                    initialize,
+                    "no saved configuration; initial provisioning is required"
+                );
                 let initial = backend
                     .initial_configuration()
                     .context("capture initial backend configuration")?
@@ -252,6 +277,13 @@ impl Engine {
             #[cfg(test)]
             now: None,
         };
+        if !reconcile {
+            ensure!(
+                e.state.active_transaction.is_none(),
+                "factory reset requires completing the active transaction recovery first"
+            );
+            return Ok(e);
+        }
         if let Some(id) = e.state.active_transaction.clone() {
             let t = e
                 .state
@@ -510,11 +542,36 @@ impl Engine {
         }
         Ok(())
     }
+    pub fn factory_reset(&mut self, config: Config) -> Result<Transaction> {
+        ensure!(!self.closed, "engine is shut down");
+        let request = SubmitRequest {
+            base_revision: self.state.revision,
+            confirm_timeout_seconds: 300,
+            config,
+            description: "Explicit local factory configuration reset".into(),
+        };
+        let transaction = self
+            .submit_inner("local-factory-reset", request, None, true)
+            .map_err(|error| anyhow::anyhow!(error.error))?;
+        self.confirm(&transaction.id, "local-factory-reset")
+            .map_err(|error| anyhow::anyhow!(error.error))
+    }
+
     fn submit(
+        &mut self,
+        actor: &str,
+        r: SubmitRequest,
+        restored: Option<u64>,
+    ) -> ApiResult<Transaction> {
+        self.submit_inner(actor, r, restored, false)
+    }
+
+    fn submit_inner(
         &mut self,
         actor: &str,
         mut r: SubmitRequest,
         restored: Option<u64>,
+        factory_reset: bool,
     ) -> ApiResult<Transaction> {
         r.config.normalize();
         r.description = r.description.trim().into();
@@ -532,12 +589,14 @@ impl Engine {
         if self.active().is_some() {
             return Err(ApiError::new(409, "configuration conflict"));
         }
-        let observed = self
-            .backend
-            .observe(&self.state.desired)
-            .map_err(internal_error)?;
-        if observed.normalized() != self.state.desired.normalized() {
-            return Err(ApiError::new(409, "managed state has drifted"));
+        if !factory_reset {
+            let observed = self
+                .backend
+                .observe(&self.state.desired)
+                .map_err(internal_error)?;
+            if observed.normalized() != self.state.desired.normalized() {
+                return Err(ApiError::new(409, "managed state has drifted"));
+            }
         }
         for before in &self.state.desired.interfaces {
             if let Some(after) = r.config.interfaces.iter().find(|l| l.name == before.name) {
@@ -578,7 +637,11 @@ impl Engine {
         self.persist(next)
             .map_err(|e| internal_error(format!("persist intent: {e}")))?;
         let applied = (|| -> Result<()> {
-            self.backend.apply(&t.previous, &t.candidate)?;
+            if factory_reset {
+                self.backend.factory_reset(&t.previous, &t.candidate)?;
+            } else {
+                self.backend.apply(&t.previous, &t.candidate)?;
+            }
             let actual = self.backend.observe(&t.candidate)?;
             ensure!(
                 actual.normalized() == t.candidate.normalized(),

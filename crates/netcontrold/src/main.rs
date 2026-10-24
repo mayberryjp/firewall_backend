@@ -32,6 +32,8 @@ struct Options {
         help = "One-time appliance LAN interface"
     )]
     provision_lan: Option<String>,
+    #[arg(long, requires_all = ["appliance", "provision_wan", "provision_lan"], help = "Explicitly replace saved networking with factory configuration and exit")]
+    factory_reset: bool,
     #[arg(long, default_value = "192.168.0.1/24")]
     provision_lan_address: String,
     #[arg(long, default_value = "0.0.0.0:8080")]
@@ -255,6 +257,14 @@ async fn run(options: Options) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("initialize daemon logging"))?;
         Ok(())
     }
+    let saved_native_startup = options.backend == "linux"
+        && options.namespace.is_empty()
+        && options.provision_wan.is_none();
+    if saved_native_startup && !options.state.try_exists()? {
+        bail!(
+            "no saved native configuration; run install.sh for initial provisioning instead of upgrading an unconfigured device"
+        );
+    }
     let backend: Box<dyn Backend> = match options.backend.as_str() {
         "linux" => Box::new(Native::open(NativeOptions {
             namespace: options.namespace,
@@ -267,9 +277,20 @@ async fn run(options: Options) -> Result<()> {
         })?),
         _ => Box::new(Simulator::new()),
     };
-    let mut engine = Engine::open(&options.state, backend)?;
+    let mut engine = if options.factory_reset {
+        Engine::open_for_factory_reset(&options.state, backend)?
+    } else if saved_native_startup {
+        Engine::open_saved(&options.state, backend)?
+    } else {
+        Engine::open(&options.state, backend)?
+    };
     if let (Some(wan), Some(lan)) = (&options.provision_wan, &options.provision_lan) {
-        provision::apply(&mut engine, wan, lan, &options.provision_lan_address).await?;
+        if options.factory_reset {
+            provision::factory_reset(&mut engine, wan, lan, &options.provision_lan_address)?;
+            provision::enable_forwarding(&mut engine)?;
+        } else {
+            provision::apply(&mut engine, wan, lan, &options.provision_lan_address).await?;
+        }
         engine.shutdown()?;
         tracing::info!(
             wan,
@@ -436,6 +457,21 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(appliance.provision_lan_address, "192.168.0.1/24");
+        assert!(!appliance.factory_reset);
+        assert!(Options::try_parse_from(["netcontrold", "--factory-reset"]).is_err());
+        let reset = Options::try_parse_from([
+            "netcontrold",
+            "--backend",
+            "linux",
+            "--appliance",
+            "--factory-reset",
+            "--provision-wan",
+            "wan0",
+            "--provision-lan",
+            "lan0",
+        ])
+        .unwrap();
+        assert!(reset.factory_reset);
         assert!(options.credential_db.is_none());
         assert!(options.ssh_listen.is_none());
         assert!(options.ssh_host_key.is_none());

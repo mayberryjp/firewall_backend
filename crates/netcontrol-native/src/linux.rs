@@ -975,8 +975,6 @@ impl Backend for Native {
             return self.reconcile_after_boot(&after, ownership, Some(&before));
         }
         if let Err(drift) = self.verify(&before) {
-            // Core recovery may retry rollback after this backend already restored its WAL.
-            // Accept only a fully verified target; this does not mutate or excuse drift.
             let after_names: BTreeSet<_> = Network::parse(&after)?
                 .interfaces
                 .into_iter()
@@ -985,12 +983,22 @@ impl Backend for Native {
             let recorded_target = ownership.committed_config.as_ref() == Some(&after)
                 || (ownership.committed_config.is_none()
                     && after == serde_json::to_value(Config::empty())?);
-            if recorded_target
-                && ownership.managed_interfaces == after_names
-                && self.verify(&after).is_ok()
-            {
-                self.services.repair(&after)?;
-                return Ok(());
+            if recorded_target && ownership.managed_interfaces == after_names {
+                match self.verify(&after) {
+                    Ok(()) => {
+                        self.services.repair(&after)?;
+                        return Ok(());
+                    }
+                    Err(error)
+                        if self.options.namespace.is_empty()
+                            && error
+                                .downcast_ref::<netcontrol_core::BackendDrift>()
+                                .is_some() =>
+                    {
+                        return self.reconcile_after_boot(&after, ownership, None);
+                    }
+                    Err(_) => {}
+                }
             }
             return Err(
                 drift.context("native drift guard: committed configuration differs from kernel")
@@ -1081,6 +1089,17 @@ impl Backend for Native {
             };
         }
         Ok(())
+    }
+
+    fn factory_reset(&mut self, before: &Config, after: &Config) -> Result<()> {
+        ensure!(
+            self.options.namespace.is_empty(),
+            "factory reset requires host mode"
+        );
+        self.recover()?;
+        let before = serde_json::to_value(before)?;
+        let after = serde_json::to_value(after)?;
+        self.reconcile_after_boot(&after, self.ownership()?, Some(&before))
     }
 
     fn runtime(&mut self, config: &Config) -> Result<Value> {
@@ -1176,7 +1195,18 @@ impl Backend for Native {
             self.reconcile_after_boot(&value, ownership, None)?;
         }
         self.preflight(&value)?;
-        self.verify(&value)?;
+        if let Err(error) = self.verify(&value) {
+            if self.options.namespace.is_empty()
+                && error
+                    .downcast_ref::<netcontrol_core::BackendDrift>()
+                    .is_some()
+            {
+                self.reconcile_after_boot(&value, self.ownership()?, None)?;
+                self.verify(&value)?;
+            } else {
+                return Err(error);
+            }
+        }
         // Empty initial state has no owned nftables table yet. Bootstrap only the verified
         // current firewall; never overwrite a foreign table or repair unrelated drift.
         let mut ownership = self.ownership()?;

@@ -186,7 +186,7 @@ pub async fn apply(engine: &mut Engine, wan: &str, lan: &str, address: &str) -> 
                 .all(|interface| interface.role == "unassigned"),
         "appliance provisioning refuses existing role or firewall configuration"
     );
-    let config = candidate(baseline, wan, lan, address)?;
+    let config = factory_candidate(&baseline, wan, lan, address)?;
     let request = serde_json::to_vec(&json!({"base_revision": 0, "confirm_timeout_seconds": 60,
         "description": "Initial LAN/WAN appliance provisioning", "config": config}))?;
     let transaction = checked(engine.request(
@@ -248,6 +248,35 @@ pub async fn apply(engine: &mut Engine, wan: &str, lan: &str, address: &str) -> 
     Ok(())
 }
 
+fn factory_candidate(saved: &Config, wan: &str, lan: &str, address: &str) -> Result<Config> {
+    let interfaces = saved
+        .interfaces
+        .iter()
+        .filter(|interface| interface.kind == "ethernet")
+        .map(|interface| {
+            json!({"name": interface.name, "kind": "ethernet", "role": "unassigned",
+            "mtu": 1500, "up": true, "addresses": []})
+        })
+        .collect::<Vec<_>>();
+    let baseline = serde_json::from_value(json!({"interfaces": interfaces}))?;
+    candidate(baseline, wan, lan, address)
+}
+
+pub fn factory_reset(engine: &mut Engine, wan: &str, lan: &str, address: &str) -> Result<()> {
+    let state = checked(engine.request(
+        "GET",
+        "/api/v1/state",
+        "",
+        "local-factory-reset",
+        &["state.read".into()],
+        &[],
+    ))?;
+    let saved: Config = serde_json::from_value(state["desired"].clone())?;
+    let config = factory_candidate(&saved, wan, lan, address)?;
+    engine.factory_reset(config)?;
+    Ok(())
+}
+
 pub fn enable_forwarding(engine: &mut Engine) -> Result<()> {
     let permissions = vec!["state.read".to_owned()];
     let state = checked(engine.request(
@@ -293,6 +322,58 @@ mod tests {
             {"name":"lan0","kind":"ethernet","role":"unassigned","mtu":1500,"up":false,"addresses":[]}
         ],"routes":[{"destination":"0.0.0.0/0","gateway":"198.51.100.1","interface":"wan0","table":254,"metric":100}]})).unwrap()
     }
+    #[test]
+    fn factory_reset_discards_custom_network_configuration() {
+        let mut saved = initial();
+        saved.dhcp_clients.insert("lan0".into(), Default::default());
+        saved.interfaces.push(
+            serde_json::from_value(json!({"name":"wifi0", "kind":"ethernet",
+            "role":"wan", "mtu":1400, "up":true, "addresses":[]}))
+            .unwrap(),
+        );
+        saved.interfaces.push(
+            serde_json::from_value(json!({"name":"extra0", "kind":"dummy",
+            "role":"lan", "mtu":1400, "up":true, "addresses":["192.0.2.1/24"]}))
+            .unwrap(),
+        );
+        saved
+            .dhcp_clients
+            .insert("wifi0".into(), Default::default());
+        saved.dns.insert(
+            "wan0".into(),
+            serde_json::from_value(json!({"servers":["192.0.2.53"]})).unwrap(),
+        );
+        let factory = factory_candidate(&saved, "wan0", "lan0", "192.168.0.1/24").unwrap();
+        assert_eq!(
+            factory.dhcp_clients.keys().cloned().collect::<Vec<_>>(),
+            ["wan0"]
+        );
+        assert!(factory.dns.is_empty());
+        assert!(factory.routes.is_empty());
+        assert!(
+            !factory
+                .interfaces
+                .iter()
+                .any(|interface| interface.name == "extra0")
+        );
+        let wifi = factory
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "wifi0")
+            .unwrap();
+        assert_eq!(wifi.role, "unassigned");
+        assert_eq!(wifi.mtu, 1500);
+        assert!(wifi.addresses.is_empty());
+        let lan = factory
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "lan0")
+            .unwrap();
+        assert_eq!(lan.role, "lan");
+        assert_eq!(lan.addresses, ["192.168.0.1/24"]);
+        assert_eq!(factory.firewall.nat.masquerade[0].source, "192.168.0.0/24");
+    }
+
     #[test]
     fn appliance_defaults_and_invalid_topologies() {
         let config = candidate(initial(), "wan0", "lan0", "192.168.0.1/24").unwrap();

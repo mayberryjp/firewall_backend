@@ -58,8 +58,8 @@ for actual validation results and known limits of the rewrite.
 
 For fast development on an Ubuntu amd64 firewall, use
 [upgrade.sh](upgrade.sh) to build incrementally and restart
-the daemon without Docker or waiting for CI. It installs the systemd unit and
-private directories automatically if missing. See the
+the daemon without Docker or waiting for CI. An installed service and saved
+configuration are required; upgrades never provision from live interfaces. See the
 [setup and recovery limitations](docs/BUILD_AND_INSTALL.md#incremental-ubuntu-development-upgrades).
 
 ## Start and onboard
@@ -133,12 +133,23 @@ a static LAN address, LAN-to-WAN forwarding, and IPv4 masquerade. Installed
 appliance mode enables host IPv4 forwarding after native policy reconciliation
 on every startup; changing roles through the API does not regenerate policy.
 
-On first native host startup, a new or untouched empty revision-zero journal
-inherits physical NICs, their static addresses/routes, MTU, administrative state,
-DHCPv4 client identity and resolver configuration. Imported roles are `unassigned`.
+During explicit first-install provisioning, a new or untouched empty revision-zero
+journal captures physical NICs, addresses/routes, MTU, administrative state,
+DHCPv4 identity and resolver configuration for handover and rollback. Initial
+installation then applies the same clean factory plan as explicit reset: selected
+WAN/LAN, other saved Ethernet interfaces unassigned without IP/DHCP configuration.
 Netcontrold takes per-NIC IP/DHCP ownership from systemd-networkd; it does not
 guess WAN/LAN, reset configured journals, or copy DHCP addresses as static ones.
-The installer still does not start the service; `upgrade.sh` starts it by default.
+The installer provisions and starts the appliance. Ordinary native startup and
+`upgrade.sh` use the saved configuration; they do not inherit live settings.
+Startup reconciles managed interfaces to that saved plan. Temporary recovery
+addresses are not saved configuration and can be removed during reconciliation.
+
+Use `sudo bash reset.sh --yes` from a local console to replace current networking
+with factory WAN/LAN defaults. Optional paired `--wan`/`--lan` overrides select
+ports. Reset backs up state and preserves credentials, keys and revision history;
+it does not delete journals or reconstruct desired settings from the live NICs.
+See [factory reset](docs/BUILD_AND_INSTALL.md#factory-configuration-reset).
 
 This implementation targets systemd-networkd/systemd-resolved hosts. A DHCP NIC
 needs an active finite lease for identity/lifetime inheritance. NetworkManager,

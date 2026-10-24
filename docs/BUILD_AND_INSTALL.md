@@ -47,12 +47,9 @@ does not install a cross-architecture linker.
 ## Incremental Ubuntu development upgrades
 
 [upgrade.sh](../upgrade.sh) builds the current checkout on an
-Ubuntu amd64 firewall and installs, starts or upgrades `netcontrold.service`.
-After a successful build and smoke check, it installs the supplied unit if
-systemd reports `LoadState=not-found`, creates the private state/key directories,
-and reloads systemd. No manual service-install commands are needed. A missing
-service uses `/usr/local/sbin/netcontrold`; existing loaded services retain
-their unit and executable path. The script discovers that path from systemd's
+Ubuntu amd64 firewall and replaces/restarts an installed `netcontrold.service`.
+A missing service is an explicit error; use the fresh installer for provisioning.
+Loaded services retain their unit and executable path. The script discovers that path from systemd's
 effective `ExecStart` instead of assuming a fixed installation directory.
 Exactly one direct, absolute executable named `netcontrold` is required;
 wrappers, missing/ambiguous commands and symlink executables are rejected.
@@ -60,7 +57,11 @@ The destination may be absent on first installation. Masked/broken services,
 conflicting unit files and unmanaged running daemons cause explicit errors.
 The detected destination is printed before deployment. It does not use
 Docker, wait for CI, fetch code, install prerequisites, overwrite an existing unit,
-or explicitly modify credentials/configuration. This is a development path,
+or explicitly modify credentials/configuration. The daemon loads and applies
+its saved desired configuration, not the live NIC configuration. Missing native
+journals are errors, not permission to inherit the host during upgrade. Live
+snapshots are rollback evidence only; temporary recovery addresses may be removed
+when saved configuration is applied. This is a development path,
 not a signed-package installation or a substitute for full CI validation.
 
 Install build prerequisites once:
@@ -93,8 +94,8 @@ cd firewall_backend
 ```
 
 For each iteration, update the checkout deliberately, review the changes, and
-run the script as that same build account; it requests sudo only for service
-setup and binary installation:
+run the script as that same build account; it requests sudo for service control
+and binary installation:
 
 ```sh
 git pull --ff-only
@@ -316,9 +317,10 @@ new credential store.
 The installed Ubuntu listener is unencrypted HTTP on the provisioned LAN address,
 not the WAN address. Bare-daemon and Alpine defaults are separate contracts.
 Keep console access and leave Ubuntu's Wi-Fi authentication under its existing
-supplicant. First startup now attempts automatic physical NIC inheritance and
-exclusive IP/DHCP ownership as described below; this is a connectivity-changing
-operation, not only an HTTP service start.
+supplicant. Explicit first-install provisioning performs physical NIC inheritance
+and ownership handover. Subsequent native host startup requires its saved journal
+and applies that known configuration, not current interface settings. Startup can
+change connectivity; it is not only an HTTP service start.
 
 ```sh
 sudo systemctl start netcontrold
@@ -554,7 +556,7 @@ This unreleased implementation needs Linux build and console-assisted runtime
 acceptance before deployment. No runtime acceptance is claimed by local Rust
 syntax checks. Build first with `bash upgrade.sh --build-only` on Ubuntu amd64.
 
-First native host startup seeds only a new journal, or an empty revision-zero
+Explicit first-install provisioning seeds only a new journal, or an empty revision-zero
 journal with no transaction history. Existing configurations are never reset or
 recaptured. Lab namespaces and explicitly read-only adopted parents do not
 participate. Physical detection requires a sysfs device, excluding loopback,
@@ -594,7 +596,59 @@ start, static and DHCP NICs, renew/rebind/NAK/expiry, daemon restart/reboot,
 transaction confirmation/timeout rollback, foreign-route protection and an
 interrupted handover. Confirm a second startup does not recapture the host.
 Do not run the runtime checks over the sole management connection without a
-console. No test code was added for this task at the user's request.
+console. Regression tests now cover saved-only startup and explicit reset;
+privileged Linux acceptance remains required.
+
+## Factory Configuration Reset
+
+Use the local console: factory reset may immediately disconnect SSH and change
+management addressing. It requires an installed Ubuntu amd64 service and a valid
+saved core/native configuration containing the selected ports and native
+ownership. It is not an identity reset or a repair tool
+for corrupt journals. An active core transaction must be recovered or rolled
+back before reset; native recovery intents remain authoritative and are replayed.
+
+```sh
+sudo bash reset.sh --yes --wan eno1 --lan enp3s0
+```
+
+Omit both port arguments for the install defaults: first and second naturally
+ordered physical Ethernet ports, excluding Wi-Fi/virtual links. LAN defaults to
+`192.168.0.1/24`; `--lan-address` can explicitly select another valid private host
+prefix. WAN becomes DHCPv4. The factory input/forwarding/NAT policy is the same
+as installation. Other saved Ethernet interfaces are up, MTU 1500, unassigned,
+without configured IPs, DNS or DHCP clients. VLAN/WireGuard, custom routes,
+policy, service settings and tunable overrides are removed from current desired
+configuration. Supplicant credentials/association definitions are not rewritten.
+Re-enable Wi-Fi DHCP through a subsequent confirmed configuration if required.
+Initial installation uses the same clean factory configuration builder; inherited
+OS settings serve only as handover/rollback data before the initial transaction.
+
+The script requires `--yes`, stops the daemon and writes a private backup under
+`/var/lib/netcontrol/factory-reset.XXXXXX` before changing configuration. It uses
+the installed binary by default, reinstalls the canonical appliance unit/binary,
+sets the LAN HTTP environment, and starts/enables the service. Credentials,
+API keys, WireGuard/SSH key files and transaction history are retained; the
+current configuration is replaced through a locally authorized journaled reset,
+not by deleting core/native state. Revision increments normally. Reset commits
+once native verification succeeds; it does not wait for a WAN lease/default
+route. An unplugged WAN must not undo the factory LAN recovery address.
+
+To build a reset-capable binary without first restarting a broken service:
+
+```sh
+bash upgrade.sh --build-only
+sudo bash reset.sh --yes --wan eno1 --lan enp3s0 \
+  --binary target/in-place-upgrade/x86_64-unknown-linux-gnu/debug/netcontrold
+```
+
+Failed reset applies use existing transaction/native rollback. A failure after
+the reset transaction commits (for example, service/environment setup) retains
+the committed factory configuration. The script leaves
+the daemon stopped on failure and prints the backup location; it does not copy
+backup journals over recovery evidence. Do not run reset/upgrade concurrently.
+After success, reconnect at `192.168.0.1`, use the retained credentials, and
+refetch desired state/revision before submitting any saved frontend draft.
 
 ## Optional configuration SSH server
 

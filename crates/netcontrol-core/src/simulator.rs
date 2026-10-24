@@ -112,6 +112,9 @@ impl Backend for Simulator {
         self.state = after.normalized();
         Ok(())
     }
+    fn factory_reset(&mut self, before: &Config, after: &Config) -> Result<()> {
+        self.apply(before, after)
+    }
     fn runtime(&mut self, config: &Config) -> Result<Value> {
         let mut appliance = vec![];
         for (name, scope, enabled) in [

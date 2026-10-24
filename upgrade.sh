@@ -15,21 +15,15 @@ no_unmanaged_daemon() {
 }
 
 service_target() {
-    local repository=$1 unit=${2:-/etc/systemd/system/netcontrold.service} load_state
+    local load_state
     if ! load_state=$(root_command systemctl show netcontrold.service --property=LoadState --value); then
         [[ $load_state == not-found ]] || return 1
     fi
     case $load_state in
         loaded) service_binary ;;
         not-found)
-            no_unmanaged_daemon || return 1
-            [[ ! -e $unit && ! -L $unit ]] || { printf 'Refusing to overwrite existing service unit: %s\n' "$unit" >&2; return 1; }
-            printf 'Installing the appliance systemd service and private directories. A provisioned LAN/WAN configuration is required; default management is 192.168.0.1:8080.\n' >&2
-            root_command install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys >&2 || return 1
-            root_command install -d -m 0755 /usr/local/sbin >&2 || return 1
-            root_command install -m 0644 "$repository/packaging/native/netcontrold.service" "$unit" >&2 || return 1
-            root_command systemctl daemon-reload >&2 || return 1
-            service_binary
+            printf 'No installed netcontrold service; use install.sh for initial provisioning. Upgrade does not initialize networking.\n' >&2
+            return 1
             ;;
         *) printf 'Unsupported service load state: %s. No unit overwritten.\n' "$load_state" >&2; return 1 ;;
     esac
@@ -130,7 +124,7 @@ upgrade_binary() (
 
 main() {
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash upgrade.sh [--build-only]\nIncrementally builds the current checkout on Ubuntu amd64, installs the systemd service if missing, and starts or upgrades netcontrold. No git pull, prerequisite installation or boot enablement.\n'
+        printf 'Usage: bash upgrade.sh [--build-only]\nBuilds the current checkout on Ubuntu amd64 and replaces/restarts an installed netcontrold service. The daemon applies its saved configuration, not live interface settings. No initial provisioning, factory reset, git pull, prerequisite installation or boot enablement.\n'
         return
     fi
     [[ $# -eq 0 || $# -eq 1 && $1 == --build-only ]] || { printf 'Use --help for usage.\n' >&2; return 1; }
@@ -157,7 +151,7 @@ main() {
     "$binary" --help >/dev/null
     printf 'Built %s\n' "$binary"
     if [[ $# -eq 0 ]]; then
-        destination=$(service_target "$repository") || return 1
+        destination=$(service_target) || return 1
         printf 'Service executable: %s\n' "$destination"
         printf 'Restarting the firewall daemon; use a local console or independent OS SSH session.\n'
         upgrade_binary "$binary" "$destination"
