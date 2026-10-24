@@ -80,6 +80,65 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_dhcp_installs_connected_route_before_default_gateway() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use netlink_packet_route::{
+        address::AddressAttribute,
+        route::{RouteAttribute, RouteProtocol},
+    };
+    use rtnetlink::IpVersion;
+
+    let fixture = Fixture::new()?;
+    let namespace = Arc::new(File::open(&fixture.namespace)?);
+    session(namespace, |rt, handle| {
+        rt.block_on(async {
+            handle.link().add().dummy("dhcp0".into()).execute().await?;
+            let index = networking::links(handle).await?.iter()
+                .find(|link| networking::name(link) == "dhcp0")
+                .context("test DHCP interface missing")?.header.index;
+            handle.link().set(index).up().execute().await?;
+            let lease: dhcp_client::Lease = serde_json::from_value(json!({
+                "client": {}, "address": "192.0.2.10/24", "server": "192.0.2.1",
+                "acquired_at": dhcp_client::now()?, "lifetime": 3600,
+                "renewal": 1800, "rebinding": 3150,
+                "routes": [
+                    {"destination": "0.0.0.0/0", "gateway": "192.0.2.1", "interface": "dhcp0", "table": 254, "metric": 0},
+                    {"destination": "192.0.2.0/24", "gateway": "", "interface": "dhcp0", "table": 254, "metric": 0}
+                ], "dns": [], "domain": "", "mtu": null
+            }))?;
+            let addressing = dhcp_client::Addressing { mtu: 1500, ..Default::default() };
+            networking::dhcp_lease(handle, "dhcp0", None, Some(&lease), &addressing, false).await?;
+            let addresses: Vec<_> = handle.address().get().set_link_index_filter(index)
+                .execute().try_collect().await?;
+            let leased_ip = "192.0.2.10".parse::<std::net::IpAddr>()?;
+            assert!(addresses.iter().any(|address| address.attributes.iter().any(
+                |attribute| matches!(attribute, AddressAttribute::Local(value) if *value == leased_ip)
+            )));
+            let routes: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let owned: Vec<_> = routes.iter().filter(|route| route.header.protocol == RouteProtocol::Other(dhcp_client::PROTOCOL)
+                && route.attributes.iter().any(|attribute| matches!(attribute, RouteAttribute::Oif(value) if *value == index))).collect();
+            assert_eq!(owned.len(), 2);
+            assert!(owned.iter().any(|route| route.header.destination_prefix_length == 0));
+            assert!(owned.iter().any(|route| route.header.destination_prefix_length == 24));
+
+            let mut renewed = lease.clone();
+            renewed.lifetime = 7200;
+            networking::dhcp_lease(handle, "dhcp0", Some(&lease), Some(&renewed), &addressing, false).await?;
+            networking::dhcp_lease(handle, "dhcp0", Some(&renewed), None, &addressing, false).await?;
+            let addresses: Vec<_> = handle.address().get().set_link_index_filter(index)
+                .execute().try_collect().await?;
+            assert!(!addresses.iter().any(|address| address.attributes.iter().any(
+                |attribute| matches!(attribute, AddressAttribute::Local(value) if *value == leased_ip)
+            )));
+            let routes: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            assert!(!routes.iter().any(|route| route.header.protocol == RouteProtocol::Other(dhcp_client::PROTOCOL)));
+            Ok(())
+        })
+    })
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
 fn native_vnstat_statistics_delegates_live_history_and_scope() -> Result<()> {
     let fixture = Fixture::new()?;

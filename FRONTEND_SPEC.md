@@ -57,6 +57,8 @@ Support:
   service-managed host IPv4 forwarding after native policy reconciliation.
 - Persisted host-input default policy and managed-ingress rules, with implicit
   loopback and established/related acceptance when input filtering is configured.
+- Persisted descriptive display names and notes on configurable resource records,
+  separate from technical identities and references.
 
 Do not present as supported:
 
@@ -107,7 +109,7 @@ zero values and subsequently failing semantic validation. Required fields:
 | Firewall host | `id`, `name`, `addresses`, `policy` |
 | Ingress policy | `interface` |
 | Syslog destination | `host`, `port`, `transport` |
-| Flow exporter | All configuration fields except `capture_filter`, `timeouts` |
+| Flow exporter | All configuration fields except `capture_filter`, `timeouts`, `metadata` |
 | Gateway monitor | Identity/enabled/interface/address/table fields; timing fields remain defaultable |
 
 `firewall.allow_all_icmp` defaults to true only when omitted; explicit null is
@@ -148,6 +150,82 @@ runtime-directory, `--backend-log-file`, and `--syslog-ca-file` settings are
 removed. The backend log source is `<services-state-dir>/backend.log`; syslog TLS
 uses system CA trust. See the [daemon contract](crates/netcontrold/README.md)
 and [installation guide](docs/BUILD_AND_INSTALL.md) for current deployment flags.
+
+### 1.4 Descriptive Object Metadata
+
+The following resource objects accept optional `metadata` containing optional
+string `display_name` and `description` fields. This is part of the full desired
+configuration, not a separate annotation endpoint.
+
+| Resource | Metadata location |
+| --- | --- |
+| Ethernet, dummy, VLAN, WireGuard interface | `interfaces[].metadata` |
+| WireGuard peer | `interfaces[].wireguard.peers[].metadata` |
+| DHCP relay | `interfaces[].dhcp_relay.metadata` |
+| DHCP client | `dhcp_clients[interface].metadata` |
+| DNS settings / domain | `dns[interface].metadata`, `dns[interface].domains[].metadata` |
+| Route / source-policy rule | `routes[].metadata`, `policy_rules[].metadata` |
+| Ordered firewall rule / masquerade rule | `firewall.rules[].metadata`, `firewall.nat.masquerade[].metadata` |
+| Firewall host / outbound host rule | `firewall.policies.hosts[].metadata`, `firewall.policies.hosts[].rules[].metadata` |
+| Interface policy / rule | `firewall.policies.interfaces[].metadata`, `firewall.policies.interfaces[].rules[].metadata` |
+| Input interface policy / rule | `firewall.input.interfaces[].metadata`, `firewall.input.interfaces[].rules[].metadata` |
+| NTP / syslog / vnStat settings | `ntp.metadata`, `syslog.metadata`, `vnstat.metadata` |
+| Syslog destination | `syslog.servers[].metadata` |
+| Flow exporter / gateway monitor | `softflowd[].metadata`, `gateway_monitors[].metadata` |
+
+VLAN and WireGuard interface labels belong on the containing interface, not on
+the nested VLAN tag/key-settings objects. Container objects (`config`, `firewall`,
+`nat`, `kernel`, policy collections) and scalar address/server lists do not gain
+their own metadata fields.
+
+Valid interface example (technical identity is still `eno1`):
+
+```json
+{
+  "name": "eno1",
+  "kind": "ethernet",
+  "role": "wan",
+  "mtu": 1500,
+  "up": true,
+  "metadata": {"display_name": "Internet uplink", "description": "Primary ISP handoff"}
+}
+```
+
+- Omitted metadata/strings default to empty strings. Empty metadata is omitted
+  from serialized responses; a nonempty object serializes both string fields,
+  including an empty companion field. `{}` clears both fields in the submitted
+  complete configuration. Explicit null, wrong types and unknown metadata fields
+  are `400`, not defaults.
+- `display_name`: empty or up to 128 Unicode scalar values, no control characters;
+  a nonempty whitespace-only value is invalid. `description`: up to 2048 Unicode
+  scalar values, with newline/tab allowed but other control characters rejected.
+  Semantic violations return `422`. Text is preserved, not lowercased or trimmed.
+  Count Unicode scalar values rather than UTF-8 bytes or UTF-16 code units.
+- Display names need not be unique. They never rename a kernel link, change VLAN
+  identity, peer key, route/policy identity, exporter/monitor name, host ID/name,
+  references, worker identity or firewall matching. Existing identifier validation
+  remains authoritative.
+- Use existing full-package transaction/confirmation/rollback/history/restore
+  workflows. Metadata-only edits require `transactions.write` and the same
+  resource write permissions as functional changes: `interfaces.write` for
+  interface/relay/client/DNS metadata; `wireguard.write` for peer metadata;
+  `routes.write`, `policy.write`, `nat.write`, `firewall.write`, `ntp.write`,
+  `syslog.write`, `vnstat.write`, `softflowd.write`, `gateway_monitors.write`
+  for the corresponding objects. No new permission or HTTP method/path is added.
+- Native operational configuration excludes these annotations. Metadata-only
+  applies verify the existing configuration but do not take the native network
+  mutation/worker-restart path. Saved state, transaction candidates/previous
+  configs and revision details retain annotations. Normal drift checks remain.
+  Observed resource metadata is configuration-derived, not evidence that Linux
+  or a remote peer reports that display name. Discovery/runtime identifiers
+  remain technical; join them with desired configuration for labels.
+- Required frontend work: add optional display-name/description controls on all
+  listed editors, include metadata in shared drafts/import/export/review/restore,
+  and preserve it when changing unrelated fields. Display a friendly label with
+  the technical identity still available; selectors submit technical keys, not
+  labels. Blank labels fall back to the existing name/ID/prefix/key. Sort/search
+  may include labels without changing backend object identity or rule ordering.
+  Render all annotation text as text, never raw HTML.
 
 ## 2. Product and interaction principles
 
@@ -290,6 +368,21 @@ Package arguments select native Linux host mode; the bare daemon defaults to sim
 Package installation must not be presented as proof of native networking readiness.
 The embedded website requires no separate frontend build.
 
+Optional Ubuntu OS footprint reduction is a separate console operator workflow:
+`sudo bash hardening.sh` previews only; `--apply` stops/disables explicit printing,
+mDNS discovery and crash-reporting units and purges only explicit installed
+profile packages. Dependency removals outside that list are refused; there is no
+autoremove. Network, Wi-Fi, SSH, time/security updates and build tools are not
+targeted. It is not automatically run during installation/upgrade/reset and adds
+no HTTP endpoint, browser action, permissions or schema fields. mDNS discovery
+may disappear, so operator instructions should use the appliance IP.
+AppArmor remains enabled by default. `--disable-apparmor` explicitly opts out of
+that protection, with `--apply`, via a GRUB `apparmor=0` boot drop-in and disabled
+service. GRUB is required, packages are retained, and kernel enforcement changes
+only after a manual reboot. Do not present the opt-out as a security improvement
+or as verified immediately from a service stop. Private state records are not a
+full package/configuration rollback. See [scope/recovery](docs/BUILD_AND_INSTALL.md#ubuntu-os-footprint-reduction).
+
 **Operator prerequisite:** Use operator-configured, reachable frontend/API origins.
 Direct onboarding is available at `http://<appliance-LAN-IP>:8080/` with no SSH
 tunnel or certificate. HTTP is permitted on non-loopback listeners. TLS is
@@ -424,7 +517,8 @@ revoke it; use device key management (or operator edits/restart in legacy mode).
 
 ### 4.3 Authorization
 
-All reads require `state.read`. All POST actions require `transactions.write`.
+All reads require `state.read`. POST actions require `transactions.write`, except
+the per-interface DHCP retry action, which requires only `interfaces.write`.
 Configuration changes additionally require permissions for every changed area:
 
 | Change | Additional permission |
@@ -945,7 +1039,8 @@ Shared service-repair POSTs also require `interfaces.write` whenever either map
 is configured, in addition to permissions for all enabled services. Structural
 errors use 400, semantic schema errors 422, missing permissions 403; existing
 transaction conflicts, apply/recovery failures and observation 503 behavior
-remain. No new standalone DHCP/DNS HTTP method/path is introduced.
+remain. Configuration changes still use transactions, not standalone DHCP/DNS
+configuration endpoints. The runtime-only retry action below is separate.
 
 Native `GET /api/v1/runtime` adds `dhcp_clients: { leases, errors }`. Both are
 objects keyed by NIC name. A lease contains the configured `client`, IPv4 CIDR
@@ -962,6 +1057,50 @@ mode, active address/expiry/server, dynamic routes and resolver data separately.
 Poll runtime using existing cadence and preserve expired/unavailable/error
 distinctions. Renewal does not create a new configuration revision. Never
 auto-confirm a transaction because a lease exists or the HTTP process is active.
+
+**Manual DHCPv4 retry:** `POST /api/v1/interfaces/{name}/dhcp/retry` requires an
+API-key Bearer token with `interfaces.write`; `transactions.write` and
+`state.read` are not required for the action itself. Polling runtime separately
+requires `state.read`. Accept no body or exactly an empty JSON object `{}`;
+reject query parameters, unknown fields, null, arrays and malformed JSON with
+`400`. Names use the configured interface-name syntax (1..15 ASCII bytes;
+letters, digits, `_`, `-`, `.`; not `lo`, `.` or `..`). No name aliases or
+display names. A synthetic accepted response is:
+
+```json
+{"interface":"wan0","status":"retrying"}
+```
+
+`202` means the selected replacement worker initialized, not that a lease or
+default route was obtained. Native Linux stops/joins only that client's worker
+before replacement, starts fresh DHCP discovery without DHCPRELEASE, and keeps
+a still-valid lease/address/routes/resolver state until replacement, expiry or
+a DHCP rejection. Other DHCP clients and protocol workers are not restarted.
+Existing lease-update intents are recovered using the normal committed-lease
+rollback path. Stop has a 15-second deadline and startup acknowledgment a
+10-second wait; native reads/recovery can add time. A stop timeout retains
+ownership and prevents a second client. Do not automatically repeat a timed-out
+HTTP request; inspect runtime first. This action does not create a transaction,
+change configuration/revision/history, or require confirmation.
+
+Errors: `401` invalid/missing API key; `403` missing permission; `404` valid name
+not in committed configuration; `409` any active/recovering transaction,
+interface administratively down in committed configuration, DHCP not configured,
+native ownership mismatch/identity drift, or pending native configuration
+recovery intent; `405` other methods; `503` unsupported backend (including
+simulator), native I/O/startup/shutdown failure or engine unavailable. Errors use
+the ordinary `{error, transaction}` envelope (`transaction: null`). Worker
+health/lease-acquisition failure alone does not prevent attempting retry.
+
+Offer an explicit retry action for configured, up DHCP interfaces using committed
+state, not the draft. Disable duplicate clicks while the request is pending;
+handle conflicts and errors without clearing drafts. Poll
+`GET /api/v1/runtime` at the existing cadence and render
+`dhcp_clients.leases[name]` and `dhcp_clients.errors[name]`. A previously valid
+lease can remain visible during retry; its mere presence is not proof of a new
+acquisition. Compare `acquired_at`/expiry and show an unconfirmed outcome if no
+update is observed, rather than claiming success from `202`. No attempt ID,
+completion event, forced release, DHCPv6 retry or automatic retry is provided.
 
 Deployment: takeover currently requires systemd-networkd/systemd-resolved and a
 live finite lease for each DHCPv4 NIC. Physical sysfs NICs only, not veth/loopback;
@@ -1524,6 +1663,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/interfaces` | Observed `Interface[]` |
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
 | GET | `/interfaces/{name}` | One observed `Interface` |
+| POST | `/interfaces/{name}/dhcp/retry` | No body or `{}` -> `202 {interface, status: "retrying"}`; `interfaces.write`, runtime only |
 | GET | `/vlans` | Observed VLAN `Interface[]` |
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |
 | GET | `/routes` | Observed `Route[]` |

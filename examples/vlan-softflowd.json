@@ -6,6 +6,7 @@
     "interfaces": [
       {
         "name": "uplink.100",
+        "metadata": {"display_name": "Office LAN", "description": "Staff devices on VLAN 100"},
         "kind": "vlan",
         "role": "lan",
         "mtu": 1500,
@@ -15,7 +16,7 @@
       }
     ],
     "routes": [
-      {"destination": "198.51.100.50/32", "gateway": "192.0.2.1", "interface": "uplink.100", "table": 10000, "metric": 100}
+      {"metadata": {"display_name": "Flow collector route"}, "destination": "198.51.100.50/32", "gateway": "192.0.2.1", "interface": "uplink.100", "table": 10000, "metric": 100}
     ],
     "policy_rules": [
       {"priority": 10000, "source": "0.0.0.0/0", "table": 10000}
@@ -24,6 +25,7 @@
     "softflowd": [
       {
         "name": "office",
+        "metadata": {"display_name": "Office traffic export", "description": "Sampled IPFIX collector"},
         "enabled": true,
         "interface": "uplink.100",
         "collector": "198.51.100.50:4739",

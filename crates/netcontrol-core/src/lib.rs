@@ -34,6 +34,9 @@ pub trait Backend: Send {
         self.observe(expected)
     }
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()>;
+    fn retry_dhcp(&mut self, _config: &Config, _interface: &str) -> Result<()> {
+        anyhow::bail!("DHCP retry is not supported by this backend")
+    }
     fn factory_reset(&mut self, _before: &Config, _after: &Config) -> Result<()> {
         anyhow::bail!("factory reset is not supported by this backend")
     }

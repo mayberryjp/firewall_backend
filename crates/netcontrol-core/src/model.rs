@@ -32,9 +32,43 @@ pub struct Config {
     pub kernel: KernelConfig,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectMetadata {
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+impl ObjectMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.display_name.is_empty() && self.description.is_empty()
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.display_name.chars().count() <= 128
+                && !self.display_name.chars().any(char::is_control)
+                && (self.display_name.is_empty() || !self.display_name.trim().is_empty()),
+            "display_name must be empty or 1..128 characters without control characters or only whitespace"
+        );
+        ensure!(
+            self.description.chars().count() <= 2048
+                && !self.description.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\t')
+                }),
+            "description must be at most 2048 characters without control characters other than newline/tab"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Interface {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub name: String,
     pub kind: String,
     pub role: String,
@@ -61,6 +95,8 @@ pub struct WireGuard {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub public_key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint: String,
@@ -78,6 +114,8 @@ pub struct VLAN {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct DHCPRelayConfig {
+    #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub enabled: bool,
     pub servers: Vec<String>,
 }
@@ -85,6 +123,8 @@ pub struct DHCPRelayConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DHCPClientConfig {
+    #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub client_id: String,
     pub hostname: String,
     pub route_metric: u32,
@@ -94,6 +134,7 @@ pub struct DHCPClientConfig {
 impl Default for DHCPClientConfig {
     fn default() -> Self {
         Self {
+            metadata: ObjectMetadata::default(),
             client_id: String::new(),
             hostname: String::new(),
             route_metric: 0,
@@ -106,6 +147,8 @@ impl Default for DHCPClientConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DNSConfig {
+    #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub servers: Vec<String>,
     pub domains: Vec<DNSDomain>,
 }
@@ -113,12 +156,16 @@ pub struct DNSConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DNSDomain {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub name: String,
     pub route_only: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub destination: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gateway: String,
@@ -129,6 +176,8 @@ pub struct Route {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub priority: i64,
     pub source: String,
     pub table: i64,
@@ -167,6 +216,8 @@ pub struct NAT {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MasqueradeRule {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub family: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
@@ -175,6 +226,8 @@ pub struct MasqueradeRule {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirewallRule {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -190,6 +243,8 @@ pub struct FirewallPolicies {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirewallHost {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub id: String,
     pub name: String,
     pub addresses: Vec<String>,
@@ -200,6 +255,8 @@ pub struct FirewallHost {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterfacePolicy {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub interface: String,
     #[serde(default)]
     pub rules: Vec<HostPolicyRule>,
@@ -214,6 +271,8 @@ pub struct InputFirewall {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostPolicyRule {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub out_interface: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -229,18 +288,24 @@ pub struct HostPolicyRule {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct NTPConfig {
+    #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub enabled: bool,
     pub servers: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyslogConfig {
+    #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub enabled: bool,
     pub servers: Vec<SyslogServer>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyslogServer {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub host: String,
     pub port: i64,
     pub transport: String,
@@ -248,11 +313,15 @@ pub struct SyslogServer {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct VNStatConfig {
+    #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub enabled: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoftflowdConfig {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub name: String,
     pub enabled: bool,
     pub interface: String,
@@ -276,6 +345,8 @@ pub struct KernelConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayMonitor {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
     pub name: String,
     pub enabled: bool,
     pub interface: String,
@@ -399,6 +470,88 @@ fn action(s: &str) -> bool {
 }
 
 impl Config {
+    fn metadata_values(&self) -> Vec<&ObjectMetadata> {
+        let mut values = vec![
+            &self.ntp.metadata,
+            &self.syslog.metadata,
+            &self.vnstat.metadata,
+        ];
+        for server in &self.syslog.servers {
+            values.push(&server.metadata);
+        }
+        for interface in &self.interfaces {
+            values.extend([&interface.metadata, &interface.dhcp_relay.metadata]);
+            if let Some(wireguard) = &interface.wireguard {
+                values.extend(wireguard.peers.iter().map(|peer| &peer.metadata));
+            }
+        }
+        values.extend(self.dhcp_clients.values().map(|client| &client.metadata));
+        for dns in self.dns.values() {
+            values.push(&dns.metadata);
+            values.extend(dns.domains.iter().map(|domain| &domain.metadata));
+        }
+        values.extend(self.routes.iter().map(|route| &route.metadata));
+        values.extend(self.policy_rules.iter().map(|rule| &rule.metadata));
+        values.extend(self.firewall.rules.iter().map(|rule| &rule.metadata));
+        values.extend(
+            self.firewall
+                .nat
+                .masquerade
+                .iter()
+                .map(|rule| &rule.metadata),
+        );
+        if let Some(policies) = &self.firewall.policies {
+            for host in &policies.hosts {
+                values.push(&host.metadata);
+                values.extend(host.rules.iter().map(|rule| &rule.metadata));
+            }
+            for interface in &policies.interfaces {
+                values.push(&interface.metadata);
+                values.extend(interface.rules.iter().map(|rule| &rule.metadata));
+            }
+        }
+        if let Some(input) = &self.firewall.input {
+            for interface in &input.interfaces {
+                values.push(&interface.metadata);
+                values.extend(interface.rules.iter().map(|rule| &rule.metadata));
+            }
+        }
+        values.extend(self.softflowd.iter().map(|exporter| &exporter.metadata));
+        values.extend(
+            self.gateway_monitors
+                .iter()
+                .map(|monitor| &monitor.metadata),
+        );
+        values
+    }
+
+    pub fn operational_value(&self) -> Result<serde_json::Value> {
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if object.get("metadata").is_some_and(|metadata| {
+                        metadata.get("display_name").is_some()
+                            && metadata.get("description").is_some()
+                    }) {
+                        object.remove("metadata");
+                    }
+                    for child in object.values_mut() {
+                        strip(child);
+                    }
+                }
+                serde_json::Value::Array(array) => {
+                    for child in array {
+                        strip(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(self)?;
+        strip(&mut value);
+        Ok(value)
+    }
+
     pub fn empty() -> Self {
         Self::default()
     }
@@ -462,6 +615,9 @@ impl Config {
         c
     }
     pub fn validate(&self) -> Result<()> {
+        for metadata in self.metadata_values() {
+            metadata.validate()?;
+        }
         ensure!(
             self.ntp.servers.len() <= 8 && (!self.ntp.enabled || !self.ntp.servers.is_empty()),
             "NTP requires 1..8 servers when enabled"

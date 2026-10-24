@@ -350,6 +350,7 @@ pub async fn capture(
                 })
                 .unwrap_or_else(|| "no".into());
             let dns = DNSConfig {
+                metadata: Default::default(),
                 servers: settings
                     .get("Network", "DNS")
                     .unwrap_or_default()
@@ -361,6 +362,7 @@ pub async fn capture(
                     .unwrap_or_default()
                     .split_whitespace()
                     .map(|domain| DNSDomain {
+                        metadata: Default::default(),
                         name: domain.trim_start_matches('~').into(),
                         route_only: domain.starts_with('~'),
                     })
@@ -468,6 +470,7 @@ pub async fn capture(
         }
         names.insert(parent.index, parent.name.clone());
         config.interfaces.push(Interface {
+            metadata: Default::default(),
             name: parent.name,
             kind: "ethernet".into(),
             role: "unassigned".into(),

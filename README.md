@@ -62,6 +62,12 @@ the daemon without Docker or waiting for CI. An installed service and saved
 configuration are required; upgrades never provision from live interfaces. See the
 [setup and recovery limitations](docs/BUILD_AND_INSTALL.md#incremental-ubuntu-development-upgrades).
 
+For optional Ubuntu OS footprint reduction, start with `sudo bash hardening.sh`
+to preview the explicit service/package profile. Nothing changes without
+`--apply`. AppArmor remains enabled unless `--disable-apparmor` is explicitly
+selected; that protection opt-out requires GRUB and a later manual reboot.
+See [scope and recovery](docs/BUILD_AND_INSTALL.md#ubuntu-os-footprint-reduction).
+
 ## Start and onboard
 
 For a development simulator:
@@ -113,6 +119,14 @@ cookies are Secure. CORS does not bypass mixed-content, certificate,
 private-network, or network-reachability restrictions.
 
 ## Configuration workflow
+
+Configuration resources support optional `metadata.display_name` and
+`metadata.description`, including Ethernet/VLAN/WireGuard interfaces, peers,
+routes, policies, firewall/NAT rules, DHCP/DNS settings and service instances.
+These annotations are persisted with the normal transaction/revision workflow;
+they never replace technical identifiers or interface references. See the
+[metadata contract](FRONTEND_SPEC.md#14-descriptive-object-metadata) and
+[labelled VLAN example](examples/vlan-softflowd.json).
 
 Networking changes use a full configuration package, not independent resource
 edits:

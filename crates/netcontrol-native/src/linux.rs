@@ -901,12 +901,11 @@ impl Backend for Native {
             ownership.scope = self.identity.clone();
             ownership.ethernet_originals = receipt.originals.clone();
             ownership.managed_interfaces = receipt.originals.keys().cloned().collect();
-            ownership.committed_config = Some(serde_json::to_value(&receipt.config)?);
+            ownership.committed_config = Some(receipt.config.operational_value()?);
             ownership.boot = self.boot.clone();
             self.save_ownership(&ownership)?;
-            self.dhcp
-                .configure(&serde_json::to_value(&receipt.config)?)?;
-            let network = Network::parse(&serde_json::to_value(&receipt.config)?)?;
+            self.dhcp.configure(&receipt.config.operational_value()?)?;
+            let network = Network::parse(&receipt.config.operational_value()?)?;
             let leases = self
                 .dhcp
                 .state
@@ -950,21 +949,21 @@ impl Backend for Native {
     }
 
     fn observe(&mut self, expected: &Config) -> Result<Config> {
-        let config = serde_json::to_value(expected)?;
+        let config = expected.operational_value()?;
         self.verify(&config)?;
         self.verify_services(&config)?;
         Ok(expected.clone())
     }
 
     fn observe_for_repair(&mut self, expected: &Config) -> Result<Config> {
-        self.verify(&serde_json::to_value(expected)?)?;
+        self.verify(&expected.operational_value()?)?;
         Ok(expected.clone())
     }
 
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()> {
         self.recover()?;
-        let before = serde_json::to_value(before)?;
-        let after = serde_json::to_value(after)?;
+        let before = before.operational_value()?;
+        let after = after.operational_value()?;
         self.preflight(&before)?;
         self.preflight(&after)?;
         let mut ownership = self.ownership()?;
@@ -1003,6 +1002,10 @@ impl Backend for Native {
             return Err(
                 drift.context("native drift guard: committed configuration differs from kernel")
             );
+        }
+        if before == after {
+            self.verify_services(&after)?;
+            return Ok(());
         }
         let before_network = Network::parse(&before)?;
         let after_network = Network::parse(&after)?;
@@ -1091,14 +1094,35 @@ impl Backend for Native {
         Ok(())
     }
 
+    fn retry_dhcp(&mut self, config: &Config, interface: &str) -> Result<()> {
+        self.check_scope()?;
+        let value = config.operational_value()?;
+        let ownership = self.ownership()?;
+        crate::ensure_unchanged(
+            !self.state.join("intent.json").try_exists()?
+                && ownership.committed_config.as_ref() == Some(&value)
+                && ownership.managed_interfaces.contains(interface),
+            "DHCP retry requires committed native ownership with no pending recovery intent",
+        )?;
+        let originals = ownership
+            .ethernet_originals
+            .into_iter()
+            .filter(|(name, _)| name == interface)
+            .collect();
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::check_ethernet(handle, &originals))
+        })?;
+        self.dhcp.retry(&value, interface)
+    }
+
     fn factory_reset(&mut self, before: &Config, after: &Config) -> Result<()> {
         ensure!(
             self.options.namespace.is_empty(),
             "factory reset requires host mode"
         );
         self.recover()?;
-        let before = serde_json::to_value(before)?;
-        let after = serde_json::to_value(after)?;
+        let before = before.operational_value()?;
+        let after = after.operational_value()?;
         self.reconcile_after_boot(&after, self.ownership()?, Some(&before))
     }
 
@@ -1115,14 +1139,14 @@ impl Backend for Native {
         value["parents"] = parent_status;
         value["dhcp_clients"] = self.dhcp.status()?;
         value["scope"] = json!(self.identity);
-        let desired = Network::parse(&serde_json::to_value(config)?)?.kernel;
+        let desired = Network::parse(&config.operational_value()?)?.kernel;
         let baseline = self.ownership()?.kernel_baseline;
         let mut effective = baseline.clone();
         effective.namespace.extend(desired.namespace.clone());
         effective.host.extend(desired.host.clone());
         let observed = self.read_kernel(&effective)?;
         value["kernel_tunables"] = json!({"desired":desired,"configured":desired,"effective":effective,"observed":observed,"captured_original":baseline,"drift":effective != observed});
-        let names: Vec<_> = Network::parse(&serde_json::to_value(config)?)?
+        let names: Vec<_> = Network::parse(&config.operational_value()?)?
             .interfaces
             .into_iter()
             .filter(|l| l.kind == "wireguard")
@@ -1156,7 +1180,7 @@ impl Backend for Native {
                 &self.identity,
             );
         }
-        let config = serde_json::to_value(config)?;
+        let config = config.operational_value()?;
         let parents = self.parents.clone();
         let path = path.to_string();
         let query = query.to_string();
@@ -1181,7 +1205,7 @@ impl Backend for Native {
 
     fn repair(&mut self, config: &Config) -> Result<Value> {
         self.recover()?;
-        let value = serde_json::to_value(config)?;
+        let value = config.operational_value()?;
         let originals = self.ownership()?.ethernet_originals;
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::check_ethernet(handle, &originals))

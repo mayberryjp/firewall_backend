@@ -290,6 +290,17 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
         );
     }
 
+    let ownership_before = fs::read(native.state.join("ownership.json"))?;
+    let mut described = desired.clone();
+    described.interfaces[0].metadata.display_name = "Office LAN".into();
+    native.apply(&desired, &described)?;
+    assert_eq!(native.observe(&described)?, described);
+    assert_eq!(
+        fs::read(native.state.join("ownership.json"))?,
+        ownership_before
+    );
+    assert!(!native.state.join("intent.json").exists());
+
     // Core expires pending transactions before startup repair; do not replay the expired candidate.
     let mut ownership = native.ownership()?;
     ownership.boot = "synthetic-previous-boot".into();

@@ -1343,7 +1343,9 @@ pub async fn dhcp_lease(
         }
     }
     if let Some(lease) = next {
-        for route in &lease.routes {
+        let mut routes: Vec<_> = lease.routes.iter().collect();
+        routes.sort_by_key(|route| !route.gateway.is_empty());
+        for route in routes {
             let (destination, length) = parse_prefix(&route.destination, true)?;
             let IpAddr::V4(destination) = destination else {
                 bail!("DHCPv4 supplied an IPv6 route")

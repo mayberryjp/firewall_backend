@@ -11,10 +11,63 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn interface_metadata_is_descriptive_not_an_identity() {
+    let mut config = candidate();
+    config.interfaces[0].metadata = ObjectMetadata {
+        display_name: "Office LAN".into(),
+        description: "Staff network".into(),
+    };
+    config.validate().unwrap();
+    let decoded: Config = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+    assert_eq!(decoded, config);
+    assert_eq!(decoded.interfaces[0].name, "lan0");
+    config.interfaces[0].metadata.display_name = "x".repeat(129);
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn metadata_defaults_types_limits_and_operational_projection() {
+    let mut config = candidate();
+    assert!(config.interfaces[0].metadata.is_empty());
+    let baseline = config.operational_value().unwrap();
+    for display_name in [" ".into(), "bad\nname".into(), "x".repeat(129)] {
+        config.interfaces[0].metadata.display_name = display_name;
+        assert!(config.validate().is_err());
+    }
+    config.interfaces[0].metadata.display_name = "\u{00e9}".repeat(128);
+    config.interfaces[0].metadata.description = "Details\nwith\ttabs".into();
+    config.validate().unwrap();
+    assert_eq!(config.operational_value().unwrap(), baseline);
+    config.interfaces[0].metadata.description = "x".repeat(2049);
+    assert!(config.validate().is_err());
+    config.interfaces[0].metadata.description = "bad\u{0000}text".into();
+    assert!(config.validate().is_err());
+    for invalid in [
+        json!(null),
+        json!("name"),
+        json!({"unknown": "value"}),
+        json!({"display_name": null}),
+    ] {
+        let mut value = baseline.clone();
+        value["interfaces"][0]["metadata"] = invalid;
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
+    let mut config = Config::empty();
+    config
+        .dhcp_clients
+        .insert("metadata".into(), Default::default());
+    config.dns.insert("metadata".into(), Default::default());
+    let value = config.operational_value().unwrap();
+    assert!(value["dhcp_clients"].get("metadata").is_some());
+    assert!(value["dns"].get("metadata").is_some());
+}
+
+#[test]
 fn host_ethernet_and_main_table_routes_validate_without_relaxing_reserved_values() {
     let mut config = candidate();
     config.interfaces[0].kind = "ethernet".into();
     config.interfaces[0].dhcp_relay = DHCPRelayConfig {
+        metadata: Default::default(),
         enabled: true,
         servers: vec!["192.0.2.2".into()],
     };
@@ -68,6 +121,7 @@ fn masquerade_supports_dynamic_wan_but_not_missing_family_or_interface() {
         .dhcp_clients
         .insert("wan0".into(), DHCPClientConfig::default());
     config.firewall.nat.masquerade.push(MasqueradeRule {
+        metadata: Default::default(),
         family: "ipv4".into(),
         source: "192.0.2.0/24".into(),
         out_interface: "wan0".into(),
@@ -158,6 +212,7 @@ fn normalization_preserves_ordered_policy_semantics() {
     other.interfaces[0].addresses.reverse();
     assert_eq!(c, other.normalized());
     c.firewall.rules.push(FirewallRule {
+        metadata: Default::default(),
         source: String::new(),
         destination: String::new(),
         action: "drop".into(),
@@ -216,6 +271,7 @@ fn interface_route_rule_and_nat_validation_edges() {
     assert!(c.validate().is_err());
     let mut c = candidate();
     c.firewall.nat.masquerade.push(MasqueradeRule {
+        metadata: Default::default(),
         family: "ipv6".into(),
         source: "".into(),
         out_interface: "lan0".into(),
@@ -273,6 +329,7 @@ fn appliance_hostname_and_destination_validation() {
     assert!(c.validate().is_err());
     let mut c = Config::empty();
     c.syslog.servers.push(SyslogServer {
+        metadata: Default::default(),
         host: "logs.example.invalid".into(),
         port: 6514,
         transport: "tls".into(),
@@ -285,6 +342,7 @@ fn appliance_hostname_and_destination_validation() {
 fn vlan_cycles_identity_and_mtu_are_rejected() {
     let mut c = candidate();
     let child = Interface {
+        metadata: Default::default(),
         name: "vlan0".into(),
         kind: "vlan".into(),
         role: "lan".into(),
@@ -326,6 +384,7 @@ fn wireguard_keys_endpoints_and_allowed_ips() {
         key_ref: "lab-key".into(),
         listen_port: 51820,
         peers: vec![Peer {
+            metadata: Default::default(),
             public_key: base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
             endpoint: "[2001:db8::1]:51820".into(),
             allowed_ips: vec!["198.51.100.0/24".into()],
@@ -400,11 +459,13 @@ fn policy_references_ports_expansion_and_family() {
     c.firewall.policies = Some(FirewallPolicies {
         hosts: vec![
             FirewallHost {
+                metadata: Default::default(),
                 id: "client".into(),
                 name: "Client".into(),
                 addresses: vec!["192.0.2.10".into()],
                 policy: "drop".into(),
                 rules: vec![HostPolicyRule {
+                    metadata: Default::default(),
                     out_interface: "".into(),
                     destination_host: "server".into(),
                     destination: "".into(),
@@ -414,6 +475,7 @@ fn policy_references_ports_expansion_and_family() {
                 }],
             },
             FirewallHost {
+                metadata: Default::default(),
                 id: "server".into(),
                 name: "Server".into(),
                 addresses: vec!["198.51.100.10".into()],
@@ -438,6 +500,7 @@ fn policy_references_ports_expansion_and_family() {
     assert!(bad.validate().is_err());
     let mut bad = c;
     bad.firewall.rules.push(FirewallRule {
+        metadata: Default::default(),
         source: "".into(),
         destination: "".into(),
         action: "drop".into(),
@@ -446,6 +509,40 @@ fn policy_references_ports_expansion_and_family() {
 }
 #[test]
 fn all_current_example_feature_schemas_validate() {
+    fn annotate(value: &mut Value, path: &str, paths: &mut Vec<String>) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object.iter_mut() {
+                    annotate(child, &format!("{path}/{key}"), paths);
+                }
+                if [
+                    "kind",
+                    "action",
+                    "enabled",
+                    "public_key",
+                    "priority",
+                    "family",
+                    "interface",
+                    "name",
+                    "host",
+                    "hostname",
+                    "domains",
+                ]
+                .iter()
+                .any(|key| object.contains_key(*key))
+                {
+                    object.insert("metadata".into(), json!({"display_name": "Descriptive name", "description": "Operator notes"}));
+                    paths.push(format!("{path}/metadata"));
+                }
+            }
+            Value::Array(array) => {
+                for (index, child) in array.iter_mut().enumerate() {
+                    annotate(child, &format!("{path}/{index}"), paths);
+                }
+            }
+            _ => {}
+        }
+    }
     for raw in [
         include_str!("../../../examples/appliance-services.json"),
         include_str!("../../../examples/dhcp-relay.json"),
@@ -461,6 +558,30 @@ fn all_current_example_feature_schemas_validate() {
         c.validate().unwrap();
         let roundtrip: Config = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
         assert_eq!(c, roundtrip);
+        let mut annotated = serde_json::to_value(&c).unwrap();
+        let mut paths = vec![];
+        annotate(&mut annotated, "", &mut paths);
+        assert!(!paths.is_empty());
+        let described: Config = serde_json::from_value(annotated.clone()).unwrap();
+        described.validate().unwrap();
+        assert_eq!(
+            described.operational_value().unwrap(),
+            c.operational_value().unwrap()
+        );
+        let roundtrip: Config =
+            serde_json::from_value(serde_json::to_value(&described).unwrap()).unwrap();
+        assert_eq!(described, roundtrip);
+        for path in paths {
+            let mut invalid = annotated.clone();
+            invalid.pointer_mut(&path).unwrap()["display_name"] = json!("x".repeat(129));
+            assert!(
+                serde_json::from_value::<Config>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{path}"
+            );
+        }
     }
 }
 #[test]
@@ -468,6 +589,7 @@ fn policy_expansion_accepts_exact_limit_and_rejects_one_extra() {
     let mut p = FirewallPolicies::default();
     for i in 0..2 {
         let mut h = FirewallHost {
+            metadata: Default::default(),
             id: format!("host{i}"),
             name: format!("Host {i}"),
             addresses: vec![format!("192.0.2.{}", i + 1)],
@@ -477,6 +599,7 @@ fn policy_expansion_accepts_exact_limit_and_rejects_one_extra() {
         for j in 0..64 {
             let count = if i == 1 && j == 63 { 29 } else { 32 };
             h.rules.push(HostPolicyRule {
+                metadata: Default::default(),
                 out_interface: "".into(),
                 destination_host: "".into(),
                 destination: "".into(),

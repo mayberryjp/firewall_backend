@@ -65,6 +65,57 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
 }
 
 #[test]
+fn descriptive_metadata_requires_resource_permission_and_survives_reopen() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let initial = submit(&mut engine, config());
+    assert_eq!(
+        confirm(&mut engine, initial.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let mut described = engine.saved_configuration().clone();
+    described.interfaces[0].metadata.display_name = "Office LAN".into();
+    described.interfaces[0].metadata.description = "Operator notes".into();
+    let body = serde_json::to_vec(
+        &json!({"base_revision": 1, "confirm_timeout_seconds": 30, "config": described}),
+    )
+    .unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "restricted",
+                &["transactions.write".into()],
+                &body
+            )
+            .status,
+        403
+    );
+    let transaction = submit(&mut engine, described.clone());
+    assert_eq!(transaction.status, 202);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    engine.shutdown().unwrap();
+    drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(engine.saved_configuration(), &described.normalized());
+    let state = request(&mut engine, "GET", "/api/v1/state", Value::Null);
+    assert_eq!(state.status, 200);
+    assert_eq!(
+        state.body["desired"]["interfaces"][0]["metadata"]["display_name"],
+        "Office LAN"
+    );
+    assert_eq!(
+        state.body["observed"]["interfaces"][0]["metadata"]["display_name"],
+        "Office LAN"
+    );
+}
+
+#[test]
 fn every_example_json_is_a_valid_current_transaction_request() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -288,6 +339,8 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    dhcp_retries: Vec<String>,
+    fail_dhcp_retry: bool,
     state: Config,
     initial_count: usize,
     fail_applies: usize,
@@ -305,6 +358,15 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn retry_dhcp(&mut self, _: &Config, interface: &str) -> Result<()> {
+        let mut faults = self.0.lock().unwrap();
+        faults.dhcp_retries.push(interface.into());
+        if faults.typed_network_drift {
+            return Err(crate::BackendDrift("injected DHCP ownership drift".into()).into());
+        }
+        ensure!(!faults.fail_dhcp_retry, "injected DHCP retry failure");
+        Ok(())
+    }
     fn scope(&self) -> Result<String> {
         Ok("fault-test".into())
     }
@@ -383,6 +445,138 @@ impl Backend for FaultBackend {
         Ok(json!({}))
     }
 }
+#[test]
+fn dhcp_retry_is_authorized_scoped_and_does_not_change_configuration() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    let mut desired = config();
+    desired.interfaces[0].kind = "ethernet".into();
+    desired.interfaces[0].addresses.clear();
+    desired
+        .dhcp_clients
+        .insert("lan0".into(), Default::default());
+    let pending = submit(&mut engine, desired.clone());
+    let path = "/api/v1/interfaces/lan0/dhcp/retry";
+    assert_eq!(request(&mut engine, "POST", path, json!({})).status, 409);
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let before = fs::read(fixture.path()).unwrap();
+    let permission = vec!["interfaces.write".into()];
+    assert_eq!(
+        engine
+            .request("POST", path, "", "operator", &["state.read".into()], &[])
+            .status,
+        403
+    );
+    assert_eq!(
+        engine
+            .request("POST", path, "", "", &permission, &[])
+            .status,
+        401
+    );
+    assert_eq!(
+        engine
+            .request("GET", path, "", "operator", &permission, &[])
+            .status,
+        405
+    );
+    assert_eq!(
+        engine
+            .request("POST", path, "unexpected=1", "operator", &permission, &[])
+            .status,
+        400
+    );
+    for body in [b"null".as_slice(), b"[]", b"{\"unknown\":true}"] {
+        assert_eq!(
+            engine
+                .request("POST", path, "", "operator", &permission, body)
+                .status,
+            400
+        );
+    }
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            "/api/v1/interfaces/missing0/dhcp/retry",
+            json!({})
+        )
+        .status,
+        404
+    );
+    assert!(faults.lock().unwrap().dhcp_retries.is_empty());
+    faults.lock().unwrap().fail_observe = true;
+    let reply = engine.request("POST", path, "", "operator", &permission, &[]);
+    assert_eq!(reply.status, 202);
+    assert_eq!(
+        reply.body,
+        json!({"interface": "lan0", "status": "retrying"})
+    );
+    assert_eq!(faults.lock().unwrap().dhcp_retries, ["lan0"]);
+    faults.lock().unwrap().fail_dhcp_retry = true;
+    assert_eq!(
+        engine
+            .request("POST", path, "", "operator", &permission, b"{}")
+            .status,
+        503
+    );
+    faults.lock().unwrap().fail_dhcp_retry = false;
+    faults.lock().unwrap().typed_network_drift = true;
+    assert_eq!(
+        engine
+            .request("POST", path, "", "operator", &permission, &[])
+            .status,
+        409
+    );
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            "/api/v1/interfaces/../dhcp/retry",
+            json!({})
+        )
+        .status,
+        400
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    assert_eq!(engine.saved_configuration(), &desired.normalized());
+}
+
+#[test]
+fn dhcp_retry_rejects_down_or_unconfigured_interfaces() {
+    for configured in [false, true] {
+        let fixture = Fixture::new();
+        let (mut engine, faults) = faulty(&fixture);
+        let mut desired = config();
+        desired.interfaces[0].kind = "ethernet".into();
+        if configured {
+            desired.interfaces[0].addresses.clear();
+            desired.interfaces[0].up = false;
+            desired
+                .dhcp_clients
+                .insert("lan0".into(), Default::default());
+        }
+        let pending = submit(&mut engine, desired);
+        assert_eq!(
+            confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+            200
+        );
+        assert_eq!(
+            request(
+                &mut engine,
+                "POST",
+                "/api/v1/interfaces/lan0/dhcp/retry",
+                json!({})
+            )
+            .status,
+            409
+        );
+        assert!(faults.lock().unwrap().dhcp_retries.is_empty());
+    }
+}
+
 #[test]
 fn saved_startup_never_initializes_or_recaptures_an_empty_journal() {
     let fixture = Fixture::new();

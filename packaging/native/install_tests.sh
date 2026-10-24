@@ -319,3 +319,114 @@ done
     [[ ! -e $temporary/unexpected-reset-host-check ]]
 )
 printf 'Explicit factory reset and prerequisite-failure ordering tests passed (mocked host commands).\n'
+
+(
+    source ./hardening.sh
+    hardening_check_host() { :; }
+    hardening_check_apparmor() { :; }
+    hardening_unit_candidates=(cups.service)
+    hardening_package_candidates=(cups)
+    hardening_test_plan='Purg cups [1.0]'
+    hardening_test_protected=false
+    systemctl() {
+        [[ $1 == show ]] || { printf 'Unexpected service mutation.\n' >&2; return 1; }
+        printf 'loaded\n'
+    }
+    dpkg-query() {
+        if [[ $hardening_test_protected == true ]]; then printf 'installed yes\n'; else printf 'installed\n'; fi
+    }
+    apt-get() {
+        [[ $1 == --simulate ]] || { printf 'Unexpected package mutation.\n' >&2; return 1; }
+        printf '%s\n' "$hardening_test_plan"
+    }
+    install() { printf 'Unexpected filesystem mutation.\n' >&2; return 1; }
+    preview=$(main)
+    [[ $preview == *'Preview only; nothing changed.'* ]]
+    preview=$(main --disable-apparmor)
+    [[ $preview == *'WARNING: disabling AppArmor'* && $preview == *'Preview only; nothing changed.'* ]]
+    hardening_packages=(cups)
+    for hardening_test_plan in 'Remv openssh-server [1.0]' 'Purg cups [1.0]
+Remv systemd-networkd [1.0]' 'Inst unexpected [1.0]' 'unrecognized plan'; do
+        if hardening_check_purge; then printf 'Unsafe hardening plan accepted.\n' >&2; exit 1; fi
+    done
+    hardening_test_plan='Purg cups:amd64 [1.0]'
+    hardening_check_purge
+    hardening_test_protected=true
+    if hardening_plan; then printf 'Protected package accepted.\n' >&2; exit 1; fi
+    if main --unknown; then exit 1; fi
+)
+
+for hardening_test_scenario in success simulation_failure service_failure purge_failure; do
+    (
+        source ./hardening.sh
+        hardening_units=(cups.service)
+        hardening_packages=(cups)
+        hardening_test_backup="$temporary/hardening-$hardening_test_scenario"
+        mkdir "$hardening_test_backup"
+        systemctl() {
+            printf 'service %s\n' "$*" >> "$hardening_test_backup/commands"
+            [[ $1 != disable || $hardening_test_scenario != service_failure ]]
+        }
+        dpkg-query() { printf 'cups\t1.0\n'; }
+        apt-get() {
+            printf 'apt %s\n' "$*" >> "$hardening_test_backup/commands"
+            if [[ $1 == --simulate ]]; then
+                [[ $hardening_test_scenario != simulation_failure ]] || return 1
+                printf 'Purg cups [1.0]\n'
+            else
+                [[ $hardening_test_scenario != purge_failure ]]
+            fi
+        }
+        if hardening_apply_plan "$hardening_test_backup" false; then
+            [[ $hardening_test_scenario == success ]] || exit 1
+        else
+            [[ $hardening_test_scenario != success ]] || exit 1
+        fi
+        case $hardening_test_scenario in
+            simulation_failure) ! grep -q '^service' "$hardening_test_backup/commands" ;;
+            service_failure) ! grep -q '^apt --assume-yes' "$hardening_test_backup/commands" ;;
+            success)
+                grep -q '^apt --assume-yes purge -- cups$' "$hardening_test_backup/commands"
+                hardening_disable_apparmor() { printf 'apparmor\n' >> "$hardening_test_backup/commands"; }
+                ! grep -q '^apparmor$' "$hardening_test_backup/commands"
+                hardening_apply_plan "$hardening_test_backup" true
+                grep -q '^apparmor$' "$hardening_test_backup/commands" ;;
+        esac
+    )
+done
+
+for hardening_test_scenario in success grub_failure first_grub_failure; do
+    (
+        source ./hardening.sh
+        hardening_test_directory="$temporary/grub-$hardening_test_scenario"
+        hardening_test_backup="$temporary/grub-backup-$hardening_test_scenario"
+        mkdir "$hardening_test_directory" "$hardening_test_backup"
+        if [[ $hardening_test_scenario != first_grub_failure ]]; then
+            printf 'previous configuration\n' > "$hardening_test_directory/99-netcontrol-apparmor.cfg"
+        fi
+        install() {
+            if [[ $1 == -d ]]; then return 0; fi
+            command cat > "${@: -1}"
+        }
+        update-grub() { [[ $hardening_test_scenario == success ]]; }
+        systemctl() {
+            printf '%s\n' "$*" >> "$hardening_test_backup/commands"
+            if [[ $1 == show ]]; then printf 'loaded\n'; fi
+        }
+        if hardening_disable_apparmor "$hardening_test_backup" "$hardening_test_directory"; then
+            [[ $hardening_test_scenario == success ]] || exit 1
+            grep -Fq 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} apparmor=0"' "$hardening_test_directory/99-netcontrol-apparmor.cfg"
+            grep -q '^disable apparmor.service$' "$hardening_test_backup/commands"
+            ! grep -Eq -- '--now|stop' "$hardening_test_backup/commands"
+        else
+            [[ $hardening_test_scenario != success ]] || exit 1
+            if [[ $hardening_test_scenario == grub_failure ]]; then
+                [[ $(< "$hardening_test_directory/99-netcontrol-apparmor.cfg") == 'previous configuration' ]]
+            else
+                [[ ! -e $hardening_test_directory/99-netcontrol-apparmor.cfg ]]
+            fi
+            ! grep -q '^disable' "$hardening_test_backup/commands"
+        fi
+    )
+done
+printf 'OS footprint preview, dependency guards, failure ordering and AppArmor boot-option tests passed (mocked host commands).\n'

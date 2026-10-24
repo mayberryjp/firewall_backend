@@ -211,6 +211,42 @@ impl Manager {
     }
 
     pub fn configure(&mut self, value: &Value) -> Result<()> {
+        self.configure_selected(value, None)
+    }
+
+    fn stop_worker(&mut self, name: &str, deadline: Instant) -> Result<()> {
+        if let Some(worker) = self.workers.get(name) {
+            worker.stop.store(true, Ordering::Release);
+            worker.wait(deadline)?;
+            let worker = self.workers.remove(name).context("DHCP worker missing")?;
+            worker
+                .join
+                .join()
+                .map_err(|_| anyhow::anyhow!("DHCP worker panicked"))?;
+        }
+        Ok(())
+    }
+
+    pub fn retry(&mut self, value: &Value, name: &str) -> Result<()> {
+        let config: Config = serde_json::from_value(value.clone())?;
+        ensure!(
+            config.dhcp_clients.contains_key(name)
+                && config
+                    .interfaces
+                    .iter()
+                    .any(|interface| interface.name == name && interface.up),
+            "DHCP retry requires an up interface with DHCP configured"
+        );
+        self.stop_worker(name, Instant::now() + Duration::from_secs(15))?;
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?
+            .errors
+            .remove(name);
+        self.configure_selected(value, Some(name))
+    }
+
+    fn configure_selected(&mut self, value: &Value, only: Option<&str>) -> Result<()> {
         let config: Config = serde_json::from_value(value.clone())?;
         let addressing: BTreeMap<_, _> = config
             .interfaces
@@ -247,21 +283,15 @@ impl Manager {
             .workers
             .iter()
             .filter(|(name, worker)| {
-                wanted.get(*name) != Some(&worker.client)
-                    || worker.join.is_finished()
-                    || failed.contains(*name)
+                only.is_none_or(|selected| selected == name.as_str())
+                    && (wanted.get(*name) != Some(&worker.client)
+                        || worker.join.is_finished()
+                        || failed.contains(*name))
             })
             .map(|(name, _)| name.clone())
             .collect();
         for name in removed {
-            let worker = self.workers.get(&name).context("DHCP worker missing")?;
-            worker.stop.store(true, Ordering::Release);
-            worker.wait(Instant::now() + Duration::from_secs(15))?;
-            let worker = self.workers.remove(&name).context("DHCP worker missing")?;
-            worker
-                .join
-                .join()
-                .map_err(|_| anyhow::anyhow!("DHCP worker panicked"))?;
+            self.stop_worker(&name, Instant::now() + Duration::from_secs(15))?;
             let mut state = self
                 .state
                 .lock()
@@ -284,56 +314,65 @@ impl Manager {
             .map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?
             .addressing = addressing.clone();
         for (name, client) in wanted {
+            if only.is_some_and(|selected| selected != name.as_str()) {
+                continue;
+            }
             if self.workers.contains_key(&name) {
                 continue;
             }
             let path = self.directory.join(format!("dhcp-{name}.json"));
             let intent_path = path.with_extension("intent");
-            if intent_path.try_exists()? {
-                let intent: LeaseIntent = read_json(&intent_path)?;
-                let committed = if path.try_exists()? {
+            let seed = if only.is_none() || intent_path.try_exists()? {
+                if intent_path.try_exists()? {
+                    let intent: LeaseIntent = read_json(&intent_path)?;
+                    let committed = if path.try_exists()? {
+                        Some(read_json::<Lease>(&path)?)
+                    } else {
+                        None
+                    };
+                    let target = committed.filter(|lease| lease.client == client && lease.valid());
+                    change_lease(
+                        self.namespace.clone(),
+                        self.publish_dns,
+                        name.clone(),
+                        Some(intent.after),
+                        target,
+                        addressing
+                            .get(&name)
+                            .cloned()
+                            .context("DHCP addressing missing")?,
+                    )?;
+                    super::remove_durable(&intent_path)?;
+                }
+                let seed = if path.try_exists()? {
                     Some(read_json::<Lease>(&path)?)
                 } else {
                     None
                 };
-                let target = committed.filter(|lease| lease.client == client && lease.valid());
-                change_lease(
-                    self.namespace.clone(),
-                    self.publish_dns,
-                    name.clone(),
-                    Some(intent.after),
-                    target,
-                    addressing
-                        .get(&name)
-                        .cloned()
-                        .context("DHCP addressing missing")?,
-                )?;
-                super::remove_durable(&intent_path)?;
-            }
-            let seed = if path.try_exists()? {
-                Some(read_json::<Lease>(&path)?)
+                let seed = seed.filter(|lease| lease.client == client && lease.valid());
+                if let Some(lease) = &seed {
+                    change_lease(
+                        self.namespace.clone(),
+                        self.publish_dns,
+                        name.clone(),
+                        None,
+                        Some(lease.clone()),
+                        addressing
+                            .get(&name)
+                            .cloned()
+                            .context("DHCP interface addressing missing")?,
+                    )?;
+                    self.state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?
+                        .leases
+                        .insert(name.clone(), lease.clone());
+                }
+                seed
             } else {
                 None
             };
-            let seed = seed.filter(|lease| lease.client == client && lease.valid());
-            if let Some(lease) = &seed {
-                change_lease(
-                    self.namespace.clone(),
-                    self.publish_dns,
-                    name.clone(),
-                    None,
-                    Some(lease.clone()),
-                    addressing
-                        .get(&name)
-                        .cloned()
-                        .context("DHCP interface addressing missing")?,
-                )?;
-                self.state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?
-                    .leases
-                    .insert(name.clone(), lease.clone());
-            }
+            let seed = if only.is_some() { None } else { seed };
             let namespace = self.namespace.clone();
             let shared = self.state.clone();
             let stop = Arc::new(AtomicBool::new(false));
@@ -598,4 +637,94 @@ fn run(task: ClientTask) -> Result<()> {
             } else { client.clean_up(); }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocked_worker() -> (Worker, mpsc::Sender<()>) {
+        let (release, waiting) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _ = waiting.recv();
+        });
+        (
+            Worker {
+                client: DHCPClientConfig::default(),
+                stop: Arc::new(AtomicBool::new(false)),
+                join,
+            },
+            release,
+        )
+    }
+
+    fn manager() -> Manager {
+        Manager::new(
+            Arc::new(File::open("/proc/thread-self/ns/net").unwrap()),
+            PathBuf::new(),
+            false,
+        )
+    }
+
+    #[test]
+    fn dhcp_retry_stop_timeout_retains_ownership_and_other_workers() {
+        let mut manager = manager();
+        let (selected, selected_release) = blocked_worker();
+        let (other, other_release) = blocked_worker();
+        let other_stop = other.stop.clone();
+        manager.workers.insert("wan0".into(), selected);
+        manager.workers.insert("other0".into(), other);
+        manager.state.lock().unwrap().leases.insert(
+            "wan0".into(),
+            Lease {
+                client: DHCPClientConfig::default(),
+                address: "192.0.2.10/24".into(),
+                server: "192.0.2.1".parse().unwrap(),
+                acquired_at: now().unwrap(),
+                lifetime: 3600,
+                renewal: 1800,
+                rebinding: 3150,
+                routes: vec![],
+                dns: vec![],
+                domain: String::new(),
+                mtu: None,
+            },
+        );
+        let before = manager.status().unwrap();
+        let error = manager.stop_worker("wan0", Instant::now()).unwrap_err();
+        let retained = manager.workers.contains_key("wan0");
+        let isolated = !other_stop.load(Ordering::Acquire);
+        selected_release.send(()).unwrap();
+        other_release.send(()).unwrap();
+        manager.shutdown().unwrap();
+        assert_eq!(manager.status().unwrap(), before);
+        assert!(error.to_string().contains("ownership retained"));
+        assert!(retained);
+        assert!(isolated);
+    }
+
+    #[test]
+    fn dhcp_retry_selection_leaves_unrelated_failed_clients_alone() {
+        let mut manager = manager();
+        let (worker, release) = blocked_worker();
+        let stop = worker.stop.clone();
+        manager.workers.insert("other0".into(), worker);
+        manager
+            .state
+            .lock()
+            .unwrap()
+            .errors
+            .insert("other0".into(), "injected failure".into());
+        let result = manager.configure_selected(&json!({
+            "interfaces": [{"name": "other0", "kind": "dummy", "role": "wan", "mtu": 1500, "up": true}],
+            "dhcp_clients": {"other0": {}}
+        }), Some("wan0"));
+        let isolated = !stop.load(Ordering::Acquire)
+            && manager.workers.contains_key("other0")
+            && manager.state.lock().unwrap().errors.contains_key("other0");
+        release.send(()).unwrap();
+        manager.shutdown().unwrap();
+        result.unwrap();
+        assert!(isolated);
+    }
 }

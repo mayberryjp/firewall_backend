@@ -1,4 +1,4 @@
-use crate::{Backend, Config, KernelConfig, kernel_catalog, store::Store};
+use crate::{Backend, Config, KernelConfig, kernel_catalog, store::Store, valid_interface_name};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use rand::RngCore;
@@ -383,6 +383,62 @@ impl Engine {
     ) -> ApiResult<Reply> {
         if actor.trim().is_empty() {
             return Err(ApiError::new(401, "valid API key required"));
+        }
+        if let Some(name) = path
+            .strip_prefix("/api/v1/interfaces/")
+            .and_then(|rest| rest.strip_suffix("/dhcp/retry"))
+        {
+            if method != "POST" {
+                return Err(ApiError::new(405, "method not allowed"));
+            }
+            require(permissions, "interfaces.write")?;
+            if !valid_interface_name(name) || !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "invalid interface name or query parameters",
+                ));
+            }
+            if !body.is_empty() {
+                let request: Value = parse(body)?;
+                if !request.as_object().is_some_and(|fields| fields.is_empty()) {
+                    return Err(ApiError::new(
+                        400,
+                        "DHCP retry accepts only an empty object or no body",
+                    ));
+                }
+            }
+            if self.active().is_some() {
+                return Err(ApiError::new(
+                    409,
+                    "DHCP retry requires no active transaction",
+                ));
+            }
+            let interface = self
+                .state
+                .desired
+                .interfaces
+                .iter()
+                .find(|interface| interface.name == name)
+                .ok_or_else(|| ApiError::new(404, "interface not found"))?;
+            if !interface.up || !self.state.desired.dhcp_clients.contains_key(name) {
+                return Err(ApiError::new(
+                    409,
+                    "interface must be up with DHCP configured",
+                ));
+            }
+            self.backend
+                .retry_dhcp(&self.state.desired, name)
+                .map_err(|error| {
+                    if error.downcast_ref::<crate::BackendDrift>().is_some() {
+                        ApiError::new(409, error)
+                    } else {
+                        service_error(error)
+                    }
+                })?;
+            return Ok(Reply::value(
+                202,
+                json!({"interface": name, "status": "retrying"}),
+            ));
         }
         if method == "GET" {
             require(permissions, "state.read")?;

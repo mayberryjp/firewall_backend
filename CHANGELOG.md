@@ -4,6 +4,34 @@
 
 ### Added
 
+- Authenticated `POST /api/v1/interfaces/{name}/dhcp/retry` runtime action using
+  `interfaces.write`, without changing configuration/revisions or restarting
+  other clients. Native retry joins the selected worker before fresh discovery,
+  retaining a valid lease until replacement, expiry or rejection; `202` confirms
+  worker startup, not lease acquisition. Conflicts block active transactions,
+  down/unconfigured interfaces and native ownership/recovery mismatches.
+  Recommended bump: minor; baseline unknown. Linux validation remains pending;
+  see [handoff 2026-10-24-03](docs/frontend-handoffs/2026-10-24.md#2026-10-24-03-per-interface-dhcpv4-retry).
+
+- Optional descriptive `metadata.display_name`/`metadata.description` on interfaces
+  (including VLAN/WireGuard), peers, routes/policies, firewall/NAT records,
+  DHCP/DNS settings and service/monitor/exporter records. Bounded Unicode text is
+  persisted and authorized through existing transactions/revisions without
+  changing identifiers. Native metadata-only edits avoid network mutation and
+  worker restarts. Recommended bump: minor; baseline unknown. Frontend types,
+  forms and draft preservation are required; see
+  [handoff 2026-10-24-02](docs/frontend-handoffs/2026-10-24.md#2026-10-24-02-descriptive-object-metadata).
+
+- Preview-first Ubuntu `hardening.sh` footprint profile for explicit printing,
+  mDNS discovery and crash-reporting service/package removal. `--apply` is
+  required; dependency removal outside the allowlist and package installations
+  are refused, with no autoremove. Optional `--disable-apparmor` schedules a
+  GRUB-based protection opt-out on a manual reboot; default preserves AppArmor.
+  Includes private pre-change state records and mocked regression coverage.
+  Recommended bump: minor for new operator functionality; baseline unknown.
+  Live Ubuntu/APT/GRUB/reboot acceptance remains unverified. See
+  [handoff 2026-10-24-01](docs/frontend-handoffs/2026-10-24.md#2026-10-24-01-optional-ubuntu-footprint-reduction).
+
 - Explicit Ubuntu `reset.sh` for factory network configuration, with
   optional port/LAN-prefix selection and a reset-capable binary override. Private
   backup precedes a journaled local reset; credentials, keys and revision history
@@ -68,6 +96,14 @@
   release baseline.
 
 ### Fixed
+
+- Native DHCP lease application installs direct/connected routes before routes
+  through a gateway. Previously canonical route sorting put the default route
+  first while the leased address used `NOPREFIXROUTE`, so a fresh lease could
+  fail with an unreachable gateway and roll its address back despite a DHCP ACK.
+  Added isolated Linux lease application/renewal/removal regression coverage;
+  privileged execution remains unverified. No API/schema change. Recommended
+  bump: patch; baseline unknown.
 
 - Local factory reset reads saved desired configuration directly rather than
   calling observation-backed state retrieval, so pre-existing address drift no

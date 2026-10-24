@@ -287,7 +287,8 @@ DHCP server, DNS proxy, IPv6 router advertisements or IPv6 NAT is provisioned.
 Complete onboarding from LAN immediately. HTTP is unencrypted; LAN clients are
 trusted by the initial allow-all policy. WAN protection is provided by the input
 policy, not merely the listener binding. No SSH authentication hardening or
-broader OS-hardening/eBPF profile is installed.
+eBPF profile is installed. The optional OS footprint script is a separate
+operator action, not part of installation or upgrade.
 
 For a source build, use `bash upgrade.sh --build-only`, install its binary/unit
 as documented below, then run the same one-time provisioning invocation locally
@@ -670,6 +671,97 @@ the daemon stopped on failure and prints the backup location; it does not copy
 backup journals over recovery evidence. Do not run reset/upgrade concurrently.
 After success, reconnect at `192.168.0.1`, use the retained credentials, and
 refetch desired state/revision before submitting any saved frontend draft.
+
+## Ubuntu OS Footprint Reduction
+
+[hardening.sh](../hardening.sh) starts a conservative Ubuntu amd64/systemd
+appliance footprint profile. It is not a complete security-hardening baseline.
+Default invocation only reads unit/package state and simulates APT removal:
+
+```sh
+sudo bash hardening.sh
+```
+
+Review the output, take a device snapshot and use a local console to apply:
+
+```sh
+sudo bash hardening.sh --apply
+```
+
+The service list is `cups.service`, `cups.socket`, `cups.path`,
+`cups-browsed.service`, `avahi-daemon.service`, `avahi-daemon.socket`,
+`apport.service` and `whoopsie.service`. Loaded matching units are stopped and
+disabled; absent or masked units are skipped. This removes printing, mDNS
+discovery and crash-reporting functions, so do not use it on a host needing them.
+Use the appliance IP instead of relying on its `.local` discovery name.
+
+Only installed packages from this list are requested for purge: `cups`,
+`cups-browsed`, `cups-daemon`, `cups-client`, `avahi-daemon`, `avahi-utils`,
+`apport`, `apport-gtk`, `whoopsie`, `popularity-contest`, `ubuntu-report`.
+Essential/protected packages are refused. The English-language APT simulation
+must contain recognized removals and may neither install packages nor remove
+anything outside that exact selected list. Desktop/metapackage dependency chains
+can therefore cause a refusal; the script does not override that guard. It never
+runs autoremove, update, upgrade, cache cleanup or broad wildcard purges.
+
+Networkd/resolved, Wi-Fi supplicants, SSH, time synchronization, security updates,
+firmware, kernels, boot tools, logging, cloud-init, NetworkManager, Bluetooth and
+the Rust/build/download toolchain are not targeted. No addresses, routes,
+firewall rules, Netcontrol journals/credentials/keys or network configuration are
+rewritten. No new protocol worker or external service is installed. This initial
+profile deliberately does not strip every package or kernel module.
+
+### Optional AppArmor Protection Opt-Out
+
+Disabling AppArmor removes mandatory access-control protection; it is not itself
+a security improvement. For the requested opt-out, preview and then apply:
+
+```sh
+sudo bash hardening.sh --disable-apparmor
+sudo bash hardening.sh --apply --disable-apparmor
+```
+
+This requires an existing GRUB installation with `update-grub`, a regular
+`/etc/default/grub` and `/boot/grub/grub.cfg`; unsupported boot layouts fail
+preflight before any service/package changes. It writes the root-owned `0644`
+`/etc/default/grub.d/99-netcontrol-apparmor.cfg` drop-in, appending `apparmor=0`
+to `GRUB_CMDLINE_LINUX`, runs `update-grub`, and disables `apparmor.service`
+without stopping it. AppArmor packages are retained. Existing kernel enforcement
+is not claimed to be disabled until the next boot; no automatic reboot occurs.
+Other applications relying on AppArmor confinement lose that protection too.
+After a deliberate console-maintenance reboot, inspect `/proc/cmdline` and
+`/sys/module/apparmor/parameters/enabled` to verify the actual boot state.
+
+### State Records and Recovery
+
+Apply stores root-only pre-change records under
+`/var/lib/netcontrol/os-hardening.XXXXXX`: selected service active/enablement
+states, selected package versions, and, for the AppArmor option, its service
+state and any previous script drop-in. The state record is not a filesystem
+snapshot: package payloads and purged application configuration are not backed
+up, and reinstalling packages may require network access. APT maintainer scripts
+still run; real-device boot and management continuity require separate testing.
+
+Failures stop subsequent steps but earlier service/package changes may remain.
+There is no automatic package rollback. Reinstall only the removed packages you
+actually need and restore service enablement/activation according to the records;
+do not blindly start every recorded unit. Shared dependencies are left alone.
+If GRUB generation fails, the previous drop-in is restored (or a newly created
+one removed); generated GRUB output may still need repair. Regenerate/inspect
+the boot configuration before rebooting, rather than assuming full boot rollback.
+
+To undo the AppArmor option, restore `apparmor-grub.cfg` from the selected backup
+if it exists; otherwise remove only the script's
+`/etc/default/grub.d/99-netcontrol-apparmor.cfg`. Run `sudo update-grub`, restore
+the prior `apparmor.service` enablement (normally `sudo systemctl enable
+apparmor.service`), and reboot manually when console recovery is available.
+Verify kernel state afterward; stopping/starting the service alone cannot undo
+the `apparmor=0` boot parameter.
+
+Do not run hardening concurrently with install, upgrade, reset or APT/dpkg jobs.
+The script serializes its own apply runs, not other package managers. It is not
+automatically invoked by any deployment script. Preview and mocked tests do not
+prove the live Ubuntu package plan, bootloader or post-reboot connectivity.
 
 ## Optional configuration SSH server
 
