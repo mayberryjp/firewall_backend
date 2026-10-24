@@ -605,6 +605,10 @@ fn override_contents(name: &str) -> String {
 }
 
 pub fn handover(receipt: &Receipt) -> Result<()> {
+    handover_interfaces(&receipt.originals)
+}
+
+pub fn handover_interfaces(originals: &BTreeMap<String, EthernetSnapshot>) -> Result<()> {
     let directory = Path::new("/etc/systemd/network");
     fs::DirBuilder::new()
         .recursive(true)
@@ -615,7 +619,7 @@ pub fn handover(receipt: &Receipt) -> Result<()> {
         metadata.is_dir() && metadata.uid() == 0 && metadata.permissions().mode() & 0o022 == 0,
         "networkd configuration directory must be root-owned, non-symlink and not group/other writable"
     );
-    for interface in &receipt.config.interfaces {
+    for interface in originals.values() {
         let path = override_path(&interface.name);
         let contents = override_contents(&interface.name);
         if path.try_exists()? {
@@ -654,9 +658,9 @@ pub fn handover(receipt: &Receipt) -> Result<()> {
             fs::File::open(path.parent().context("handover directory missing")?)?.sync_all()?;
         }
     }
-    let indices = current_indices(receipt)?;
+    let indices = current_indices(originals)?;
     networkd(indices.clone())?;
-    for (snapshot, index) in receipt.originals.values().zip(indices) {
+    for (snapshot, index) in originals.values().zip(indices) {
         let state = fields(Path::new(&format!("/run/systemd/netif/links/{}", index)))?;
         let admin_state = state
             .get("default", "ADMIN_STATE")
@@ -746,12 +750,11 @@ pub fn release(receipt: &Receipt) -> Result<()> {
             super::remove_durable(&path)?;
         }
     }
-    networkd(current_indices(receipt)?)
+    networkd(current_indices(&receipt.originals)?)
 }
 
-fn current_indices(receipt: &Receipt) -> Result<Vec<u32>> {
-    receipt
-        .originals
+fn current_indices(originals: &BTreeMap<String, EthernetSnapshot>) -> Result<Vec<u32>> {
+    originals
         .values()
         .map(|snapshot| {
             fs::read_to_string(format!("/sys/class/net/{}/ifindex", snapshot.name))?

@@ -98,6 +98,15 @@ receipt files receive the same readable mode on retry. This does not relax
 private receipt/lease permissions. An unsuccessful ownership check includes the
 observed administrative state, selected network file and expected override.
 
+On restart, inherited host interfaces that remain in durable native ownership
+have their identities checked and their networkd exclusions reasserted before
+interrupted-operation recovery, DHCP startup or resolver publication. Missing
+exclusions are recreated; conflicting files still fail explicitly. This prevents
+resolved's `LinkBusy` failure after networkd has reclaimed an interface. Explicit
+lab configurations and interfaces no longer managed are not handed over through
+this restart path. It does not change saved addresses, DHCP settings or roles,
+and it does not bypass address drift or discard recovery intents.
+
 Top-level `dhcp_clients` and `dns` maps participate in core transactions and
 interface authorization. DHCP addresses and routes are separate live lease
 state, guarded by a shared lock during native verify/reconcile. DHCP routes use
@@ -105,8 +114,9 @@ protocol 243; static routes remain protocol 242. A lease-update intent protects
 address/route/persistence convergence. Renewal, rebind, NAK, expiry, bounded worker
 shutdown and restart are implemented using a locally patched Apache-2.0 mozim
 engine; its optional second netlink implementation is disabled.
-This work is not yet Linux build/runtime validated. No first-party test code was
-added at the user's request; original vendored unit tests remain upstream code.
+This work is not yet Linux build/runtime validated. Restart handover-selection
+regression tests cover owned/released interfaces and the lab/non-inherited
+boundary; real networkd/resolved reboot and recovery acceptance remains required.
 
 Removal from desired configuration restores the original NIC snapshot but does
 not remove its persistent networkd exclusion or restart an OS DHCP client.

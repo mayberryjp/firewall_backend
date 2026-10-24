@@ -50,6 +50,15 @@
 
 ### Fixed
 
+- Inherited host startup reasserts networkd ownership exclusions for still-managed
+  physical NICs before retained-intent recovery, DHCP startup and resolver writes.
+  Prevents resolved `LinkBusy` failures when networkd reclaimed a NIC after reboot
+  or console recovery. Identity and conflicting-file checks remain enforced;
+  lab/non-inherited configurations and released interfaces are not taken over.
+  No state reset, address-drift bypass or API/schema change. Recommended bump:
+  patch; aggregate Unreleased remains major. Linux compilation/runtime validation
+  remains outstanding.
+
 - Physical-NIC handover publishes non-secret networkd exclusion files as `0644`
   so the unprivileged networkd service can read them; matching prepared-receipt
   files receive the same mode on retry. Failures now report the observed

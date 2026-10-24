@@ -84,6 +84,23 @@ struct Ownership {
     committed_config: Option<Value>,
 }
 
+impl Ownership {
+    fn handover_originals(
+        &self,
+        host_mode: bool,
+        inherited: bool,
+    ) -> BTreeMap<String, EthernetSnapshot> {
+        if !host_mode || !inherited {
+            return BTreeMap::new();
+        }
+        self.ethernet_originals
+            .iter()
+            .filter(|(name, _)| self.managed_interfaces.contains(*name))
+            .map(|(name, snapshot)| (name.clone(), snapshot.clone()))
+            .collect()
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Intent {
@@ -291,6 +308,18 @@ impl Native {
             ownership.kernel_baseline.host.is_empty() || native.host_namespace.is_some(),
             "host tunable ownership requires explicit allow_host_tunables for recovery"
         );
+        let originals = ownership.handover_originals(
+            host_mode,
+            host_mode && native.state.join("adoption.json").try_exists()?,
+        );
+        if !originals.is_empty() {
+            let snapshots = originals.clone();
+            session(native.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::check_ethernet(handle, &snapshots))
+            })?;
+            adoption::handover_interfaces(&originals)
+                .context("restore managed-interface networkd handover before native recovery")?;
+        }
         native.recover()?;
         Ok(native)
     }
@@ -1374,4 +1403,61 @@ fn remove_durable(path: &Path) -> Result<()> {
     fs::remove_file(path)?;
     File::open(path.parent().context("state parent")?)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn inherited_ownership() -> Ownership {
+        let mut ownership = Ownership::default();
+        for name in ["owned0", "released0"] {
+            ownership.ethernet_originals.insert(
+                name.into(),
+                EthernetSnapshot {
+                    name: name.into(),
+                    kind: "device".into(),
+                    index: 2,
+                    mac: "02:00:00:00:00:01".into(),
+                    mtu: 1500,
+                    up: true,
+                    boot: "fixture".into(),
+                    captured_unix: 0,
+                    addresses: Vec::new(),
+                },
+            );
+        }
+        ownership.managed_interfaces.insert("owned0".into());
+        ownership
+    }
+
+    #[test]
+    fn handover_restores_only_still_managed_interfaces() {
+        let ownership = inherited_ownership();
+        let selected = ownership.handover_originals(true, true);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected["owned0"], ownership.ethernet_originals["owned0"]);
+        assert!(!selected.contains_key("released0"));
+    }
+
+    #[test]
+    fn handover_skips_labs_and_non_inherited_configurations() {
+        let ownership = inherited_ownership();
+        for (host_mode, inherited) in [(false, false), (false, true), (true, false)] {
+            assert!(
+                ownership
+                    .handover_originals(host_mode, inherited)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn handover_does_not_discover_new_interfaces() {
+        assert!(
+            Ownership::default()
+                .handover_originals(true, true)
+                .is_empty()
+        );
+    }
 }
