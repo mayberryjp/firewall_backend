@@ -145,8 +145,9 @@ The installer provisions and starts the appliance. Ordinary native startup and
 Startup reconciles managed interfaces to that saved plan. Temporary recovery
 addresses are not saved configuration and can be removed during reconciliation.
 
-Use `sudo bash reset.sh --yes` from a local console to replace current networking
-with factory WAN/LAN defaults. Optional paired `--wan`/`--lan` overrides select
+Use `sudo bash reset.sh` from a local console and confirm the prompt to replace
+current networking with factory WAN/LAN defaults. `--yes` skips confirmation for
+unattended use. Optional paired `--wan`/`--lan` overrides select
 ports. Reset backs up state and preserves credentials, keys and revision history;
 it does not delete journals or reconstruct desired settings from the live NICs.
 See [factory reset](docs/BUILD_AND_INSTALL.md#factory-configuration-reset).

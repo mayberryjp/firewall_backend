@@ -256,7 +256,9 @@ only for rollback, not as a new desired configuration.
 
 Initial installation and explicit reset share the same clean factory configuration
 builder; inherited OS settings are handover/rollback data, not factory defaults.
-The operator-only `reset.sh --yes` replaces current networking with factory
+The operator-only `sudo bash reset.sh` asks for default-No confirmation before
+any host checks or changes; `--yes` skips the prompt for unattended use. Blank,
+declined/invalid input or EOF cancels. It replaces current networking with factory
 WAN/LAN defaults using a locally authorized transaction. This is not an HTTP
 endpoint or identity reset. It preserves account/API credentials, key files and
 revision history; revision increments rather than returning to zero. Other saved
@@ -268,6 +270,11 @@ LAN recovery configuration. It requires console access, an existing valid saved
 configuration and no active core transaction; native recovery intents are not
 discarded. It reinstalls the appliance service and LAN HTTP binding, starts and
 enables the service, and defaults to `http://192.168.0.1:8080/` afterward.
+After backup and before native recovery, reset retires the temporary
+`/run/systemd/network/00-00-wifi-recovery.network` override into its private
+backup, ending temporary networkd Wi-Fi DHCP ownership. The file is not restored
+automatically on failure. Unrelated networkd files and native identity/ownership
+checks remain unchanged; reset does not forcibly disable all network managers.
 Frontend/operator guidance must distinguish upgrade, network reset and identity
 reset; after reconnect, refetch state/revision and discard or explicitly rebase
 stale drafts. Do not restart onboarding or expose a nonexistent HTTP reset API.

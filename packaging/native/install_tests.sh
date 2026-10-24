@@ -246,6 +246,23 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
 done
 printf 'Incremental upgrade replacement and recovery tests passed (mocked service commands).\n'
 
+(
+    source ./reset.sh
+    recovery_directory="$temporary/wifi-recovery"
+    recovery_backup="$temporary/wifi-recovery-backup"
+    mkdir "$recovery_directory" "$recovery_backup"
+    retire_wifi_recovery "$recovery_directory" "$recovery_backup"
+    printf 'temporary DHCP configuration\n' > "$recovery_directory/00-00-wifi-recovery.network"
+    printf 'operator configuration\n' > "$recovery_directory/10-operator.network"
+    retire_wifi_recovery "$recovery_directory" "$recovery_backup"
+    [[ ! -e $recovery_directory/00-00-wifi-recovery.network ]]
+    [[ $(< "$recovery_backup/wifi-recovery.network") == 'temporary DHCP configuration' ]]
+    [[ $(< "$recovery_directory/10-operator.network") == 'operator configuration' ]]
+    mkdir "$recovery_directory/00-00-wifi-recovery.network"
+    if retire_wifi_recovery "$recovery_directory" "$recovery_backup"; then exit 1; fi
+    rmdir "$recovery_directory/00-00-wifi-recovery.network"
+)
+
 for reset_scenario in success config_failure env_failure reload_failure start_failure http_failure; do
     reset_directory="$temporary/reset-$reset_scenario"
     mkdir "$reset_directory"
@@ -287,7 +304,18 @@ for reset_scenario in success config_failure env_failure reload_failure start_fa
 done
 (
     source ./reset.sh
-    if main; then printf 'Reset accepted without explicit confirmation.\n' >&2; exit 1; fi
+    uname() { touch "$temporary/unexpected-reset-host-check"; return 1; }
+    for answer in '' n no invalid; do
+        if confirm_reset false <<< "$answer"; then printf 'Reset accepted a declined confirmation.\n' >&2; exit 1; fi
+        if main <<< "$answer"; then printf 'Reset continued without confirmation.\n' >&2; exit 1; fi
+    done
+    if confirm_reset false </dev/null; then printf 'Reset accepted EOF.\n' >&2; exit 1; fi
+    if main </dev/null; then printf 'Reset continued after EOF.\n' >&2; exit 1; fi
+    for answer in y Y yes YES Yes; do
+        confirm_reset false <<< "$answer" || exit 1
+    done
+    confirm_reset true </dev/null || exit 1
     if main --unknown; then printf 'Reset accepted unknown options.\n' >&2; exit 1; fi
+    [[ ! -e $temporary/unexpected-reset-host-check ]]
 )
 printf 'Explicit factory reset and prerequisite-failure ordering tests passed (mocked host commands).\n'

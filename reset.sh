@@ -5,6 +5,30 @@ reset_repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$reset_repository/install.sh"
 source "$reset_repository/upgrade.sh"
 
+confirm_reset() {
+    [[ $1 == true ]] && return 0
+    local answer
+    printf 'Factory reset replaces networking and may disconnect SSH. Use a local console. Credentials and keys are retained.\n' >&2
+    if read -r -p 'Restore factory network settings? [y/N] ' answer; then
+        case $answer in
+            [yY]|[yY][eE][sS]) return 0 ;;
+        esac
+    fi
+    printf 'Factory reset cancelled; nothing changed.\n' >&2
+    return 1
+}
+
+retire_wifi_recovery() {
+    local recovery="$1/00-00-wifi-recovery.network" backup=$2
+    [[ -e $recovery || -L $recovery ]] || return 0
+    [[ -f $recovery && ! -L $recovery ]] || {
+        printf 'Refusing a symlink or non-regular Wi-Fi recovery override: %s\n' "$recovery" >&2
+        return 1
+    }
+    mv -- "$recovery" "$backup/wifi-recovery.network" || return 1
+    printf 'Temporary Wi-Fi networkd override moved into reset backup.\n'
+}
+
 reset_appliance() {
     local binary=$1 wan=$2 lan=$3 address=$4
     "$binary" --backend linux --appliance --factory-reset \
@@ -25,7 +49,7 @@ reset_appliance() {
 main() {
     local confirmed=false wan='' lan='' address=192.168.0.1/24 binary='' installed ports backup path
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: sudo bash reset.sh --yes [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24] [--binary PATH]\nExplicitly replaces saved networking with factory defaults, reinstalls the appliance service and starts/enables it. Default first/second physical Ethernet ports are WAN/LAN. Requires an existing saved configuration and local console access. Preserves credentials, keys and transaction history. No WAN lease is required to finish reset.\n'
+        printf 'Usage: sudo bash reset.sh\nAsks for confirmation before restoring factory networking. Use --yes to skip the prompt for unattended use.\nOptional overrides: [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24] [--binary PATH]\nExplicitly replaces saved networking with factory defaults, reinstalls the appliance service and starts/enables it. Default first/second physical Ethernet ports are WAN/LAN. Requires an existing saved configuration and local console access. Preserves credentials, keys and transaction history. No WAN lease is required to finish reset.\n'
         return
     fi
     while [[ $# -gt 0 ]]; do
@@ -43,7 +67,7 @@ main() {
             *) printf 'Unknown reset option: %s\n' "$1" >&2; return 1 ;;
         esac
     done
-    [[ $confirmed == true ]] || { printf 'Factory reset changes networking and may disconnect SSH. Use a local console and pass --yes.\n' >&2; return 1; }
+    confirm_reset "$confirmed" || return 1
     [[ $EUID -eq 0 && $(uname -s) == Linux && -d /run/systemd/system ]] || {
         printf 'Run reset.sh as root on Ubuntu with systemd.\n' >&2; return 1;
     }
@@ -84,6 +108,7 @@ main() {
     done
     cp -a -- "$installed" "$backup/netcontrold" || return 1
     printf 'Private pre-reset backup: %s\n' "$backup"
+    retire_wifi_recovery /run/systemd/network "$backup" || return 1
     install -d -m 0755 /usr/local/sbin || return 1
     if [[ $binary != /usr/local/sbin/netcontrold ]]; then
         install -o root -g root -m 0755 -- "$binary" /usr/local/sbin/netcontrold || return 1

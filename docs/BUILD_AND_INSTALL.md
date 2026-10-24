@@ -609,9 +609,12 @@ for corrupt journals. An active core transaction must be recovered or rolled
 back before reset; native recovery intents remain authoritative and are replayed.
 
 ```sh
-sudo bash reset.sh --yes --wan eno1 --lan enp3s0
+sudo bash reset.sh
 ```
 
+Confirm with `y` or `yes` when prompted. Empty input, any other answer or EOF
+cancels before host checks or changes. Use `--yes` only to skip confirmation for
+unattended use. Optional paired `--wan`/`--lan` overrides select specific ports.
 Omit both port arguments for the install defaults: first and second naturally
 ordered physical Ethernet ports, excluding Wi-Fi/virtual links. LAN defaults to
 `192.168.0.1/24`; `--lan-address` can explicitly select another valid private host
@@ -624,7 +627,7 @@ Re-enable Wi-Fi DHCP through a subsequent confirmed configuration if required.
 Initial installation uses the same clean factory configuration builder; inherited
 OS settings serve only as handover/rollback data before the initial transaction.
 
-The script requires `--yes`, stops the daemon and writes a private backup under
+After confirmation, the script stops the daemon and writes a private backup under
 `/var/lib/netcontrol/factory-reset.XXXXXX` before changing configuration. It uses
 the installed binary by default, reinstalls the canonical appliance unit/binary,
 sets the LAN HTTP environment, and starts/enables the service. Credentials,
@@ -633,6 +636,17 @@ current configuration is replaced through a locally authorized journaled reset,
 not by deleting core/native state. Revision increments normally. Reset commits
 once native verification succeeds; it does not wait for a WAN lease/default
 route. An unplugged WAN must not undo the factory LAN recovery address.
+
+Before invoking native recovery, reset moves the temporary Wi-Fi recovery file
+`/run/systemd/network/00-00-wifi-recovery.network`, when present, into that private
+backup as `wifi-recovery.network`. Otherwise its earlier filename can override
+Netcontrol's networkd exclusion and prevent handover. Native handover reloads
+networkd and reconfigures its owned links before checking that networkd has
+relinquished them. This explicitly ends temporary networkd Wi-Fi DHCP ownership;
+use the console. Symlink/non-regular recovery files are refused. Unrelated
+networkd files are not disabled, and normal startup checks are unchanged.
+The recovery file stays in the backup even if reset subsequently fails; restore
+it manually only when intentionally returning Wi-Fi to networkd.
 
 To build a reset-capable binary without first restarting a broken service:
 

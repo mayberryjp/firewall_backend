@@ -4,7 +4,7 @@
 
 ### Added
 
-- Explicit Ubuntu `reset.sh --yes` for factory network configuration, with
+- Explicit Ubuntu `reset.sh` for factory network configuration, with
   optional port/LAN-prefix selection and a reset-capable binary override. Private
   backup precedes a journaled local reset; credentials, keys and revision history
   are retained. Factory LAN is committed without waiting for WAN DHCP. No HTTP
@@ -42,6 +42,11 @@
 
 ### Changed
 
+- Factory reset now prompts for confirmation with `sudo bash reset.sh`; `--yes`
+  is optional for unattended use. Blank, declined/invalid input and EOF cancel
+  before host checks or changes. Recommended bump: patch for CLI usability;
+  baseline unknown, no release assigned.
+
 - Native daemon startup and `upgrade.sh` now require saved configuration and do
   not initialize desired state from live NIC settings. Missing installed services
   are upgrade errors instead of implicit installations. Owned host interfaces are
@@ -63,6 +68,11 @@
   release baseline.
 
 ### Fixed
+
+- Factory reset moves the temporary networkd Wi-Fi recovery override into its
+  private backup before native handover, so it no longer takes precedence over
+  the managed-interface exclusion. Unrelated networkd configuration and normal
+  startup checks remain unchanged. Recommended bump: patch; baseline unknown.
 
 - Inherited host startup reasserts networkd ownership exclusions for still-managed
   physical NICs before retained-intent recovery, DHCP startup and resolver writes.
