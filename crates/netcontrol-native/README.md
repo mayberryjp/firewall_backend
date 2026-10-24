@@ -237,12 +237,22 @@ therefore remain repairable without weakening networking drift protection.
 - WireGuard `listen_port=0` is explicitly rejected. A stable nonzero port is
   required for exact committed/effective comparison. DNS endpoints, userspace
   WireGuard, PSKs and fwmarks are not part of this contract.
-- Kernel forwarding toggles, module loading, namespace provisioning,
+- Transactional kernel forwarding toggles, module loading, namespace provisioning,
   unsupported netlink features, protocol-counter rate history,
   and arbitrary statistics query options are not implemented or silently enabled.
-  Provision routing forwarding externally where required: `ip_forward` can reset
-  IPv4 devconf defaults and IPv6 forwarding has per-device/RA side effects;
-  named-value sysctl snapshots alone cannot promise safe rollback for these.
+  Ubuntu installation now automatically assigns the first/second naturally
+  ordered physical Ethernet ports as DHCPv4 WAN/LAN, uses `192.168.0.1/24` on
+  LAN, permits all LAN input/forwarding, denies unsolicited WAN input, and
+  masquerades LAN-subnet traffic exiting WAN. Explicit port/subnet overrides
+  remain available. The persisted `firewall.input` uses the same owned table
+  and atomic batch as forwarding/NAT, including loopback/stateful/DHCP exceptions.
+  Daemon `--appliance`
+  mode enables host IPv4 forwarding after native policy reconciliation on each
+  startup. This is a deployment prerequisite, not an API tunable or a
+  transactionally rolled-back setting. `ip_forward` can reset IPv4 devconf
+  defaults; configure any required per-device hardening after that transition.
+  IPv6 forwarding is not enabled; it has additional per-device/RA side effects.
+  Named-value sysctl snapshots alone cannot promise safe rollback for these.
 - Privileged Linux integration tests have **not** been executed. Cross compilation is not
   evidence of packet forwarding, firewall/NAT semantics, host tuning, crash/power
   loss behavior, or real service interoperability. In particular, the current

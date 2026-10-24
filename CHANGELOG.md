@@ -4,6 +4,25 @@
 
 ### Added
 
+- Fresh Ubuntu appliance provisioning: first/second naturally ordered physical
+  Ethernet ports default to DHCPv4 WAN/LAN, with optional paired overrides and
+  static LAN `192.168.0.1/24`. LAN allows all input/forwarding; unsolicited WAN
+  input and other new forwarded traffic are denied, with loopback/stateful/DHCP
+  input exceptions. WAN lease/default-route acquisition is bounded to 30 seconds
+  before confirmation, with transaction rollback on failure. LAN-subnet WAN IPv4
+  masquerade committed through the transaction engine, LAN-address management
+  binding and automatic service start/boot enablement. `--appliance` enables
+  host IPv4 forwarding after native policy reconciliation on every startup.
+  Host/interface policy rules support optional managed `out_interface` matches;
+  IPv4 masquerade accepts DHCP-client WANs without static address copies.
+  Recommended bump: major for the changed installer/service deployment contract;
+  baseline unknown, no release assigned. Linux build/packet-path acceptance is
+  outstanding; no LAN DHCP/DNS server or IPv6 forwarding is provisioned. See
+  [handoff 2026-10-23-03](docs/frontend-handoffs/2026-10-23.md#2026-10-23-03-automatic-ports-dhcp-wan-and-input-filtering).
+- Optional persisted `firewall.input` default and managed-ingress policies,
+  validated with existing host-rule limits and `firewall.write` authorization.
+  Input filtering is installed atomically with forwarding/NAT in the owned
+  nftables table; removing it explicitly removes that input protection.
 - Automatic first-start inheritance of physical NICs for an unused native host
   journal, with `unassigned` roles, networkd per-NIC ownership handover,
   original snapshot/route recovery and explicit unsupported-host errors.

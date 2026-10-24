@@ -36,7 +36,8 @@ Support:
 - Unicast routes and source-policy routing.
 - Ordered forward-chain source/destination accept/drop rules and default policy.
 - Named IP-based outbound host policies, ingress-interface rule overrides,
-  TCP/UDP destination ports, and automatic established/related return traffic.
+  optional managed egress-interface matches, TCP/UDP destination ports, and
+  automatic established/related return traffic.
 - IPv4/IPv6 masquerading.
 - WireGuard key references, peers, endpoints, allowed networks, and keepalive.
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
@@ -52,6 +53,10 @@ Support:
 - Read-only host NIC discovery and explicit Ethernet static configuration.
 - Initial physical-NIC inheritance on supported native host installations,
   in-process DHCPv4 clients and per-interface systemd-resolved configuration.
+- Ubuntu install-time LAN/WAN provisioning, IPv4 LAN-to-WAN masquerade and
+  service-managed host IPv4 forwarding after native policy reconciliation.
+- Persisted host-input default policy and managed-ingress rules, with implicit
+  loopback and established/related acceptance when input filtering is configured.
 
 Do not present as supported:
 
@@ -70,8 +75,9 @@ Do not present as supported:
   a tamper-evident audit log, or multi-device coordination. Single-device setup
   and named API-key creation/revocation are provided by the embedded website.
 
-Label the product **Isolated lab control plane**. Do not market it as a production
-host-network manager or describe a package apply as an atomic kernel transaction.
+Label the product **Firewall appliance**. Production readiness still requires
+Linux packet-path, reboot and recovery acceptance; do not describe a package
+apply as an atomic kernel transaction.
 
 ### 1.3 Rust request and persistence contract
 
@@ -231,8 +237,22 @@ write outcome, pending confirmation, unavailable/stale state, modeled drift.
 
 Custom signed native package/OpenRC installation and automatic build artifacts are documented in
 the [build and installation specification](docs/BUILD_AND_INSTALL.md).
-Packages and the daemon default to HTTP on `0.0.0.0:8080`. Package arguments select
-native Linux host mode; the bare daemon defaults to simulator development mode.
+Alpine packages and the bare daemon default to HTTP on `0.0.0.0:8080`.
+Ubuntu's fresh appliance installer selects the first physical Ethernet NIC in
+natural name order as WAN and the second as LAN (Wi-Fi/virtual NICs excluded).
+Both NICs may be explicitly overridden. LAN defaults to `192.168.0.1/24`; WAN
+is configured as DHCPv4, with static WAN address/route/DNS removed and an
+upstream lease/default route required within 30 seconds of provisional apply.
+The installer commits LAN allow-all forwarding/input, WAN unsolicited-input
+denial with reply/DHCP exceptions, LAN-subnet WAN NAT, and starts/enables the
+service with `--appliance`. It binds HTTP to the selected LAN address using
+`/etc/netcontrol/appliance.env`; there is no new HTTP provisioning endpoint.
+LAN clients need static addressing/gateway; no DHCP/DNS server is provisioned.
+Changing the management IP requires operator coordination of that environment
+file and service restart; an API interface-address edit alone does not rebind
+the listener. The persisted input policy enforces WAN denial; binding alone is
+not an ingress ACL. Removing the input policy removes that protection.
+Package arguments select native Linux host mode; the bare daemon defaults to simulator development mode.
 Package installation must not be presented as proof of native networking readiness.
 The embedded website requires no separate frontend build.
 
@@ -920,7 +940,11 @@ neither operation automatically restores OS DHCP ownership. Require console
 access for first-start, recovery and hand-back. This unreleased work still needs
 Linux compilation and runtime acceptance; it is not proof of production safety.
 
-Forwarding remains an operator prerequisite, never inferred from WAN/LAN roles.
+Installed Ubuntu appliance mode enables host IPv4 forwarding after native
+policy reconciliation on each startup. The installer explicitly commits the
+initial LAN/WAN roles, static LAN address, DHCPv4 WAN, forward/input drop defaults,
+LAN allow-all rules and LAN-subnet WAN masquerade. Role edits alone do not regenerate policy.
+IPv6 forwarding and non-appliance deployments remain operator responsibilities.
 The API deliberately rejects IPv4/IPv6 forwarding sysctls: changing them can
 change other kernel device/RA settings that are not currently captured for
 transaction rollback. Do not render a supported forwarding toggle or claim
@@ -1017,9 +1041,10 @@ future interfaces, without generating editable per-interface policy entries.
 It covers all IPv4 ICMP types/codes, not just echo, and does not cover ICMPv6
 (protocol 58). Other nftables tables may still drop traffic.
 
-Disabling removes the exception and owned input/output chains, not a blanket
-ICMP block. Other local traffic remains unchanged because those chains use
-accept defaults. Forwarding rules/defaults still apply when disabled.
+Disabling removes the exception and the owned output chain, not a blanket
+ICMP block. The input chain remains if `firewall.input` is configured and its
+rules/default continue to apply. Without that policy, the ICMP-only input chain
+is removed. Forwarding rules/defaults still apply when disabled.
 Show this exception prominently in both policy modes and in the review diff.
 Warn that an older client omitting the field re-enables it. Older durable
 configurations and historical snapshots without the setting default to enabled;
@@ -1034,6 +1059,11 @@ authenticated identity and does not track DHCP/MAC changes automatically.
 
 Rules: destination Any, another host by ID, or a canonical network; protocol Any,
 TCP, or UDP; optional explicit destination ports for TCP/UDP; Accept/Drop.
+Host and interface rules also accept optional `out_interface`: an empty/omitted
+string matches any egress; otherwise it must name a managed draft interface
+(maximum 15 characters, using the interface-name validation). Null is invalid.
+An interface rule with this field requires both the ingress and egress matches.
+Preserve this field in drafts, imports, exports, history and full-package writes.
 Changing a host address updates all destination-host references in the package.
 Deletion must first remove or replace references; never silently broaden them.
 Offer add/edit/delete and keyboard-accessible reordering.
@@ -1052,8 +1082,9 @@ The destination host's own outbound policy is not evaluated. Interface allows
 override host drops as well as interface drops overriding host allows. Warn about
 interface catch-alls that shadow all host policies. Existing connections can
 survive a newly applied block until conntrack expires; no connection-flush action
-exists. Host/interface rules apply only to forwarded traffic, not management
-input or local device output; the global ICMP exception also covers input/output.
+exists. `firewall.policies` host/interface rules apply only to forwarded traffic,
+not management input or local device output. `firewall.input` is a separate
+host-input policy; the global ICMP exception also covers input/output.
 NAT remains separate.
 
 Include explicit **Legacy ordered rules** mode for existing configurations:
@@ -1065,16 +1096,51 @@ must show the full difference and require acknowledgement, not silently translat
 or discard rules. Host-only, interface-only, and combined configurations are valid.
 
 Never sort rules before sending. Host inventory and port lists may be sorted.
-Require review acknowledgement for drop defaults and catch-all drops. Do not add
-egress matches, arbitrary protocol choices, port ranges, logging, or configurable
+Require review acknowledgement for drop defaults and catch-all drops. Provide
+managed egress selection, but do not add arbitrary protocol choices, port ranges, logging, or configurable
 conntrack controls: these are not implemented.
+
+### 6.6.1 Host input filtering
+
+`config.firewall.input` is optional/nullable. Omitted/null means no explicit
+input filter (apart from the global ICMP exception); normalized reads omit it
+when absent. A configured object requires `policy: "accept" | "drop"` and
+accepts `interfaces` (omitted defaults to an empty array). Each ingress policy
+requires a managed `interface` and ordered `rules` (omitted defaults empty).
+Input rules reuse destination prefix, TCP/UDP protocol, destination-port list
+and action from host policy rules; nonempty `out_interface` and
+`destination_host` are rejected. Input does not support host identity matches.
+Types/null-in-nonnullable-fields/unknown-field errors are 400; invalid policy,
+unmanaged ingress, invalid ports/prefixes or forbidden nonempty matches are 422.
+Changes require `firewall.write` and `transactions.write`, not a new permission.
+
+Configured-input precedence is global IPv4 ICMP acceptance if enabled, then
+implicit loopback acceptance, implicit established/related acceptance, ordered
+ingress rules, and finally the input default. Local output is not filtered.
+Input and forwarding are distinct views; neither input defaults nor rules
+authorize forwarded traffic. Preserve both through full-package edits/history.
+The existing policy limits apply: at most 32 unique managed ingress entries,
+64 ordered rules each, 32 explicit TCP/UDP destination ports per rule,
+64 KiB policy metadata and 4096 expanded entries including established/related,
+plus the implicit loopback entry. Rule order is semantic; port lists and unique
+ingress entries are normalized by sorting.
+
+Fresh Ubuntu provisioning creates input default-drop, LAN allow-all, and WAN
+IPv4 UDP destination-port 68 acceptance for DHCP. Loopback and replies remain
+implicit. The forwarding policy has a LAN allow-all rule without egress matching,
+default-drop for other new traffic, and stateful returns. NAT remains restricted
+to LAN-subnet IPv4 traffic exiting WAN. Show the DHCP exception and implicit
+rules clearly; deleting the DHCP/LAN allowances can affect reachability/renewal.
+Enabling the global ICMP exception also allows WAN ICMP before input drops.
+Warn before removing the input policy: doing so removes WAN host protection.
 
 ### 6.7 NAT masquerading
 
 Ordered table/editor: position, family (`ipv4`/`ipv6`), optional source network or
 Any, managed egress interface. Provide move up/down as well as add/edit/delete.
 
-Filter egress choices to draft interfaces with an address of the selected family.
+Filter IPv4 egress choices to draft interfaces with a static IPv4 address or
+a configured DHCPv4 client. IPv6 still requires a static IPv6 address.
 Explain missing options and link to interface editing. Switching family must
 revalidate source and egress rather than silently rewriting values.
 
@@ -1358,7 +1424,7 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Policy expansion | <=64 KiB serialized policy metadata and <=4096 generated forwarding rules, counting stateful and host defaults; backend authoritative |
 | Masquerade family | Exactly `ipv4` or `ipv6` |
 | Masquerade source | Optional canonical network matching explicit family |
-| Masquerade egress | Managed draft interface with at least one configured address of matching family |
+| Masquerade egress | Managed draft interface with an address of matching family, or a DHCPv4 client for IPv4 |
 | Description | Optional, trimmed; maximum 1024 UTF-8 bytes after trimming |
 | Confirmation window | 10..300 seconds |
 
@@ -1685,6 +1751,15 @@ interface Firewall {
   rules: Array<{ source?: string; destination?: string; action: "accept" | "drop" }>;
   nat: { masquerade: MasqueradeRule[] };
   policies?: { hosts: FirewallHost[]; interfaces: InterfacePolicy[] } | null;
+  input?: InputFirewall | null;
+}
+
+interface InputFirewall {
+  policy: "accept" | "drop";
+  interfaces: Array<{
+    interface: string;
+    rules: Array<Omit<HostPolicyRule, "out_interface" | "destination_host">>;
+  }>;
 }
 
 interface FirewallHost {
@@ -1701,6 +1776,7 @@ interface InterfacePolicy {
 }
 
 interface HostPolicyRule {
+  out_interface?: string;
   destination_host?: string;
   destination?: string;
   protocol?: "tcp" | "udp";
@@ -1975,7 +2051,7 @@ the initial frontend release.
 | No history pruning/server transaction pagination | Client pagination; document scaling limitation |
 | No persisted rollback actor/time fields | Display reason/raw error, avoid fabricated metadata |
 | Revisions/cursors emitted as JSON numbers | Lossless parsing/serialization; statistics values are already decimal strings |
-| Linux namespace/parents/forwarding/capability setup | Operator-owned provisioning outside application |
+| Linux namespace/parents/capability setup | Operator-owned; Ubuntu installer provisions IPv4 LAN/WAN forwarding/NAT, not IPv6 |
 
 Future enhancements such as capabilities, structured error codes, idempotency
 keys, paginated transaction summaries, and explicit server clock can be proposed
@@ -2055,7 +2131,7 @@ networking or real softflowd delivery.
 | A22 | Protected parent missing/replaced | Read-only diagnostic retained; no API recreate/edit control |
 | A23 | Interface kind or VLAN parent/ID change | Locked for existing interface; replacement workflow explained |
 | A24 | Delete referenced interface | Dependency impact visible; no silent cascade; invalid references block apply |
-| A25 | Masquerade egress missing family address | Local error; family-correct managed options only |
+| A25 | Masquerade egress missing family address/client | Local error unless IPv4 has a DHCPv4 client; IPv6 still requires its family address |
 | A26 | WireGuard field/key/allowed-IP validation | Constraints enforced; no private-key input or unsupported tunnel-health claims |
 | A27 | softflowd limits and disabled entries | 16-instance limit, full disabled-entry validation, timeout/filter byte boundaries |
 | A28 | Running/error/stopped/disabled/simulated worker | Correct labels; no fabricated PID or delivery claim |

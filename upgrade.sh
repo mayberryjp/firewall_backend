@@ -24,7 +24,7 @@ service_target() {
         not-found)
             no_unmanaged_daemon || return 1
             [[ ! -e $unit && ! -L $unit ]] || { printf 'Refusing to overwrite existing service unit: %s\n' "$unit" >&2; return 1; }
-            printf 'Installing the missing systemd service and private directories. HTTP listens on all interfaces, port 8080; restrict management access.\n' >&2
+            printf 'Installing the appliance systemd service and private directories. A provisioned LAN/WAN configuration is required; default management is 192.168.0.1:8080.\n' >&2
             root_command install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys >&2 || return 1
             root_command install -d -m 0755 /usr/local/sbin >&2 || return 1
             root_command install -m 0644 "$repository/packaging/native/netcontrold.service" "$unit" >&2 || return 1

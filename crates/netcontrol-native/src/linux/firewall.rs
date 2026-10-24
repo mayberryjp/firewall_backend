@@ -11,6 +11,7 @@ use serde_json::Value;
 const TABLE: &str = "netcontrol";
 pub fn validate(value: &Value) -> Result<()> {
     crate::firewall_plan::compile(value)?;
+    crate::firewall_plan::compile_input(value)?;
     Ok(())
 }
 
@@ -35,7 +36,8 @@ pub fn verify(value: &Value, recorded: &Option<Value>, fingerprint: Option<&str>
                     && value["nat"]["masquerade"]
                         .as_array()
                         .is_some_and(Vec::is_empty)
-                    && value.get("policies").is_none_or(Value::is_null),
+                    && value.get("policies").is_none_or(Value::is_null)
+                    && value.get("input").is_none_or(Value::is_null),
                 "nonempty firewall has no durable owned state",
             )?;
         }
@@ -65,6 +67,9 @@ fn matching(chain: &Chain, plan: &crate::firewall_plan::Match) -> Result<Rule> {
     }
     if !plan.ingress.is_empty() {
         rule = rule.iiface(&plan.ingress)?;
+    }
+    if !plan.egress.is_empty() {
+        rule = rule.oiface(&plan.egress)?;
     }
     if !plan.protocol.is_empty() {
         let protocol = if plan.protocol == "tcp" {
@@ -109,6 +114,7 @@ pub fn remove_owned(expected: &str) -> Result<()> {
 
 pub fn apply(value: &Value) -> Result<()> {
     let plans = crate::firewall_plan::compile(value)?;
+    let input_plans = crate::firewall_plan::compile_input(value)?;
     let table = Table::new(ProtocolFamily::Inet)
         .with_name(TABLE)
         .with_userdata(b"netcontrol-native-v1".to_vec());
@@ -130,14 +136,30 @@ pub fn apply(value: &Value) -> Result<()> {
         .add_to_batch(&mut batch);
     if value["allow_all_icmp"] == true {
         icmp(&forward)?.add_to_batch(&mut batch);
-        for (name, hook) in [("input", HookClass::In), ("output", HookClass::Out)] {
-            let chain = Chain::new(&table)
-                .with_name(name)
-                .with_type(ChainType::Filter)
-                .with_hook(Hook::new(hook, 0))
-                .with_policy(ChainPolicy::Accept)
-                .add_to_batch(&mut batch);
-            icmp(&chain)?.add_to_batch(&mut batch);
+        let output = Chain::new(&table)
+            .with_name("output")
+            .with_type(ChainType::Filter)
+            .with_hook(Hook::new(HookClass::Out, 0))
+            .with_policy(ChainPolicy::Accept)
+            .add_to_batch(&mut batch);
+        icmp(&output)?.add_to_batch(&mut batch);
+    }
+    if !input_plans.is_empty() || value["allow_all_icmp"] == true {
+        let input = Chain::new(&table)
+            .with_name("input")
+            .with_type(ChainType::Filter)
+            .with_hook(Hook::new(HookClass::In, 0))
+            .with_policy(if value["input"]["policy"] == "drop" {
+                ChainPolicy::Drop
+            } else {
+                ChainPolicy::Accept
+            })
+            .add_to_batch(&mut batch);
+        if value["allow_all_icmp"] == true {
+            icmp(&input)?.add_to_batch(&mut batch);
+        }
+        for plan in &input_plans {
+            matching(&input, plan)?.add_to_batch(&mut batch);
         }
     }
     for plan in &plans {

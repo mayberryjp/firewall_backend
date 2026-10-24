@@ -56,6 +56,30 @@ fn empty_and_icmp_defaults_are_explicit() {
     assert_ne!(empty, other);
 }
 #[test]
+fn masquerade_supports_dynamic_wan_but_not_missing_family_or_interface() {
+    let mut config = candidate();
+    let mut wan = config.interfaces[0].clone();
+    wan.name = "wan0".into();
+    wan.kind = "ethernet".into();
+    wan.role = "wan".into();
+    wan.addresses.clear();
+    config.interfaces.push(wan);
+    config
+        .dhcp_clients
+        .insert("wan0".into(), DHCPClientConfig::default());
+    config.firewall.nat.masquerade.push(MasqueradeRule {
+        family: "ipv4".into(),
+        source: "192.0.2.0/24".into(),
+        out_interface: "wan0".into(),
+    });
+    config.validate().unwrap();
+    config.firewall.nat.masquerade[0].family = "ipv6".into();
+    assert!(config.validate().is_err());
+    config.firewall.nat.masquerade[0].family = "ipv4".into();
+    config.dhcp_clients.clear();
+    assert!(config.validate().is_err());
+}
+#[test]
 fn unknown_fields_rejected_at_every_feature_boundary() {
     let c = serde_json::to_value(candidate()).unwrap();
     for path in [
@@ -83,6 +107,47 @@ fn unknown_fields_rejected_at_every_feature_boundary() {
     let mut c = c;
     c["interfaces"][0].as_object_mut().unwrap().remove("role");
     assert!(serde_json::from_value::<Config>(c).is_err());
+}
+#[test]
+fn policy_egress_requires_a_managed_interface() {
+    let mut config = candidate();
+    config.firewall.rules.clear();
+    config.firewall.policies = Some(serde_json::from_value(json!({
+        "hosts": [],
+        "interfaces": [{"interface": "lan0", "rules": [{"out_interface": "lan0", "action": "accept"}]}]
+    })).unwrap());
+    config.validate().unwrap();
+    config.firewall.policies.as_mut().unwrap().interfaces[0].rules[0].out_interface =
+        "missing0".into();
+    assert!(config.validate().is_err());
+}
+#[test]
+fn input_policy_requires_managed_ingress_and_input_appropriate_rules() {
+    let mut config = candidate();
+    config.firewall.input = Some(
+        serde_json::from_value(json!({
+            "policy": "drop", "interfaces": [{"interface": "lan0", "rules": [{"action": "accept"}]}]
+        }))
+        .unwrap(),
+    );
+    config.validate().unwrap();
+    let baseline = config.clone();
+    config.firewall.input.as_mut().unwrap().interfaces[0].interface = "missing0".into();
+    assert!(config.validate().is_err());
+    for invalid in [
+        json!({"out_interface": "lan0", "action": "accept"}),
+        json!({"destination_host": "client", "action": "accept"}),
+        json!({"destination_ports": [68], "action": "accept"}),
+    ] {
+        let mut config = baseline.clone();
+        config.firewall.input.as_mut().unwrap().interfaces[0].rules[0] =
+            serde_json::from_value(invalid).unwrap();
+        assert!(config.validate().is_err());
+    }
+    assert!(
+        serde_json::from_value::<InputFirewall>(json!({"policy": "drop", "surprise": true}))
+            .is_err()
+    );
 }
 #[test]
 fn normalization_preserves_ordered_policy_semantics() {
@@ -340,6 +405,7 @@ fn policy_references_ports_expansion_and_family() {
                 addresses: vec!["192.0.2.10".into()],
                 policy: "drop".into(),
                 rules: vec![HostPolicyRule {
+                    out_interface: "".into(),
                     destination_host: "server".into(),
                     destination: "".into(),
                     protocol: "tcp".into(),
@@ -411,6 +477,7 @@ fn policy_expansion_accepts_exact_limit_and_rejects_one_extra() {
         for j in 0..64 {
             let count = if i == 1 && j == 63 { 29 } else { 32 };
             h.rules.push(HostPolicyRule {
+                out_interface: "".into(),
                 destination_host: "".into(),
                 destination: "".into(),
                 protocol: "tcp".into(),

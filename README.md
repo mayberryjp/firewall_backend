@@ -128,7 +128,10 @@ edits:
 Do not treat `202 Accepted` as a committed revision. An uncertain HTTP write
 must be reconciled through transaction reads, not blindly retried.
 Interfaces require an explicit `wan`, `lan`, or `unassigned` role; roles do not automatically
-configure firewall policy, bind management to LAN, or enable forwarding.
+rewrite policy. The Ubuntu appliance installer explicitly provisions those roles,
+a static LAN address, LAN-to-WAN forwarding, and IPv4 masquerade. Installed
+appliance mode enables host IPv4 forwarding after native policy reconciliation
+on every startup; changing roles through the API does not regenerate policy.
 
 On first native host startup, a new or untouched empty revision-zero journal
 inherits physical NICs, their static addresses/routes, MTU, administrative state,
@@ -163,8 +166,25 @@ from a successful manually dispatched GitHub Actions run. No Rust/compiler
 installation is needed on the firewall. GitHub authentication and an approved
 artifact-producing workflow run are required; there is no public release yet.
 See the [download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-prebuilt-installation-amd64).
-It installs a systemd unit and private directories, but does not configure
-networking or start/enable the service. See the
+It automatically provisions a fresh appliance:
+
+```sh
+sudo bash install.sh --run-id 123456789
+```
+
+Use the actual approved workflow run ID. The first physical Ethernet interface
+in natural name order (`eno1`, `eno2`, ...; Wi-Fi/virtual links excluded) is WAN;
+the second is LAN. Override with both `--wan` and `--lan` when needed. LAN
+defaults to `192.168.0.1/24` (`--lan-address` overrides it); WAN is configured
+for DHCPv4, not retained as static. The installer waits up to 30 seconds for an
+upstream lease/default route and rolls back its transaction on failure.
+It enables/starts the service, binds HTTP management to the LAN address,
+installs LAN allow-all forwarding and input rules, drops unsolicited inbound
+WAN traffic, permits replies and WAN DHCP, and masquerades the LAN subnet on WAN.
+Existing appliance state is not reset.
+LAN clients currently need static addresses and the appliance as their gateway;
+no LAN DHCP or DNS server is installed. IPv6 forwarding is not enabled.
+Use console access during provisioning. See the
 [service commands](docs/BUILD_AND_INSTALL.md#ubuntu-systemd-service). The GitHub
 download command requires the installer to be pushed and the reviewed artifacts
 to be built and uploaded first.

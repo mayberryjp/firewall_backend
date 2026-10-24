@@ -7,6 +7,7 @@ pub struct Match {
     pub source: String,
     pub destination: String,
     pub ingress: String,
+    pub egress: String,
     pub protocol: String,
     pub port: u16,
     pub action: String,
@@ -138,6 +139,36 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
     Ok(output)
 }
 
+pub fn compile_input(firewall: &Value) -> Result<Vec<Match>> {
+    let Some(input) = firewall.get("input").filter(|value| !value.is_null()) else {
+        return Ok(vec![]);
+    };
+    action(string(input, "policy"))?;
+    for interface in array(input, "interfaces")? {
+        for rule in array(interface, "rules")? {
+            ensure!(
+                string(rule, "out_interface").is_empty()
+                    && string(rule, "destination_host").is_empty(),
+                "input rules cannot match egress interfaces or destination hosts"
+            );
+        }
+    }
+    let mut plans = compile(&serde_json::json!({
+        "policy": string(input, "policy"), "allow_all_icmp": false, "rules": [],
+        "nat": {"masquerade": []},
+        "policies": {"hosts": [], "interfaces": input["interfaces"]}
+    }))?;
+    plans.insert(
+        0,
+        Match {
+            ingress: "lo".into(),
+            action: "accept".into(),
+            ..Match::default()
+        },
+    );
+    Ok(plans)
+}
+
 fn expand(
     output: &mut Vec<Match>,
     rule: &Value,
@@ -146,6 +177,11 @@ fn expand(
     hosts: &BTreeMap<&str, &Value>,
 ) -> Result<()> {
     action(string(rule, "action"))?;
+    let egress = string(rule, "out_interface");
+    ensure!(
+        egress.is_empty() || crate::safe_name(egress, 15),
+        "invalid firewall outgoing interface"
+    );
     let protocol = string(rule, "protocol");
     ensure!(
         matches!(protocol, "" | "tcp" | "udp"),
@@ -198,6 +234,7 @@ fn expand(
                     source: source.clone(),
                     destination: destination.clone(),
                     ingress: ingress.into(),
+                    egress: egress.into(),
                     protocol: protocol.into(),
                     port: *port,
                     action: string(rule, "action").into(),
@@ -217,6 +254,26 @@ fn expand(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn appliance_input_allows_loopback_replies_lan_and_dhcp_only() {
+        let mut firewall = json!({"input": {"policy": "drop", "interfaces": [
+            {"interface": "eno2", "rules": [{"action": "accept"}]},
+            {"interface": "eno1", "rules": [{"destination": "0.0.0.0/0", "protocol": "udp", "destination_ports": [68], "action": "accept"}]}
+        ]}});
+        let plans = compile_input(&firewall).unwrap();
+        assert_eq!(plans.len(), 4);
+        assert_eq!(plans[0].ingress, "lo");
+        assert!(plans[1].established_related);
+        assert_eq!(plans[2].ingress, "eno2");
+        assert!(plans[2].protocol.is_empty());
+        assert_eq!(plans[3].ingress, "eno1");
+        assert_eq!(plans[3].protocol, "udp");
+        assert_eq!(plans[3].port, 68);
+        assert_eq!(plans[3].destination, "0.0.0.0/0");
+        firewall["input"]["interfaces"][0]["rules"][0]["out_interface"] = json!("eno1");
+        assert!(compile_input(&firewall).is_err());
+        assert!(compile_input(&json!({})).unwrap().is_empty());
+    }
     #[test]
     fn ordered_rules_are_not_sorted_by_action() {
         let f = json!({"policy":"drop","allow_all_icmp":true,"rules":[{"action":"drop","source":"192.0.2.0/24"},{"action":"accept"}],"nat":{"masquerade":[]}});
@@ -238,5 +295,16 @@ mod tests {
     fn family_mismatch_and_rule_expansion_rejected() {
         let f = json!({"policy":"accept","allow_all_icmp":false,"rules":[{"source":"192.0.2.0/24","destination":"2001:db8::/32","action":"accept"}],"nat":{"masquerade":[]}});
         assert!(compile(&f).is_err());
+    }
+    #[test]
+    fn appliance_policy_matches_both_ports() {
+        let mut firewall = json!({"policy":"drop","allow_all_icmp":false,"rules":[],"nat":{"masquerade":[]},"policies":{"hosts":[],"interfaces":[{"interface":"lan0","rules":[{"out_interface":"wan0","action":"accept"}]}]}});
+        let rules = compile(&firewall).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].established_related);
+        assert_eq!(rules[1].ingress, "lan0");
+        assert_eq!(rules[1].egress, "wan0");
+        firewall["policies"]["interfaces"][0]["rules"][0]["out_interface"] = json!("bad/name");
+        assert!(compile(&firewall).is_err());
     }
 }

@@ -2,12 +2,31 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
-source <(sed '$d' install.sh)
+source ./install.sh
 temporary=$(mktemp -d)
 printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
 fixture_commit=0123456789abcdef0123456789abcdef01234567
 scenario=valid
+
+ports_fixture="$temporary/ports"
+mkdir -p "$ports_fixture"
+for port_fixture_name in eno10 eno2 eno1 wlan0 lo tun0; do
+    mkdir -p "$ports_fixture/$port_fixture_name"
+    printf '1\n' > "$ports_fixture/$port_fixture_name/type"
+done
+for port_fixture_name in eno10 eno2 eno1 wlan0; do mkdir "$ports_fixture/$port_fixture_name/device"; done
+mkdir "$ports_fixture/wlan0/wireless"
+[[ $(select_appliance_ports '' '' "$ports_fixture") == 'eno1 eno2' ]]
+[[ $(select_appliance_ports eno10 eno1 "$ports_fixture") == 'eno10 eno1' ]]
+for port_fixture_pair in 'eno1 eno1' 'eno1 missing' 'wlan0 eno1' 'eno1'; do
+    read -r fixture_wan fixture_lan <<< "$port_fixture_pair"
+    if select_appliance_ports "$fixture_wan" "$fixture_lan" "$ports_fixture"; then exit 1; fi
+done
+mkdir "$temporary/one-port"
+mv "$ports_fixture/eno1" "$temporary/one-port/"
+if select_appliance_ports '' '' "$temporary/one-port"; then exit 1; fi
+printf 'Automatic Ethernet port selection and override validation passed.\n'
 
 gh() {
     case $1 in
@@ -58,6 +77,53 @@ check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
 printf 'Prebuilt download verification and service-installation tests passed (mocked GitHub/system commands).\n'
+
+for provision_scenario in success config_failure env_failure reload_failure start_failure http_failure forwarding_failure; do
+    provision_directory="$temporary/provision-$provision_scenario"
+    mkdir "$provision_directory"
+    if (
+        provision_fixture() {
+            printf 'configure %s\n' "$*" >> "$provision_directory/commands"
+            [[ $provision_scenario != config_failure ]]
+        }
+        install() {
+            printf 'install %s\n' "$*" >> "$provision_directory/commands"
+            command cat > "$provision_directory/environment"
+            [[ $provision_scenario != env_failure ]]
+        }
+        systemctl() {
+            printf 'systemctl %s\n' "$*" >> "$provision_directory/commands"
+            [[ $provision_scenario != reload_failure || $1 != daemon-reload ]] || return 1
+            [[ $provision_scenario != start_failure || $1 != enable ]]
+        }
+        curl() {
+            printf 'curl %s\n' "$*" >> "$provision_directory/commands"
+            [[ $provision_scenario != http_failure ]]
+        }
+        sysctl() {
+            if [[ $provision_scenario == forwarding_failure ]]; then printf '0\n'; else printf '1\n'; fi
+        }
+        provision_appliance provision_fixture wan0 lan0 192.168.50.1/24
+    ); then
+        [[ $provision_scenario == success ]] || exit 1
+    else
+        [[ $provision_scenario != success ]] || exit 1
+    fi
+    grep -q -- '--provision-wan wan0 --provision-lan lan0 --provision-lan-address 192.168.50.1/24' "$provision_directory/commands"
+    if [[ $provision_scenario == config_failure ]]; then
+        ! grep -Eq '^(install|systemctl|curl) ' "$provision_directory/commands"
+    else
+        [[ $(< "$provision_directory/environment") == NETCONTROL_LISTEN=192.168.50.1:8080 ]]
+    fi
+    if [[ $provision_scenario == env_failure || $provision_scenario == reload_failure ]]; then
+        ! grep -q '^systemctl enable' "$provision_directory/commands"
+    fi
+    if [[ $provision_scenario == success ]]; then
+        grep -q '^systemctl enable --now netcontrold.service' "$provision_directory/commands"
+        grep -q 'http://192.168.50.1:8080/' "$provision_directory/commands"
+    fi
+done
+printf 'Appliance provisioning and prerequisite-failure ordering tests passed (mocked host commands).\n'
 
 source ./upgrade.sh
 for executable_path in /usr/local/sbin/netcontrold /usr/sbin/netcontrold /opt/netcontrol/netcontrold; do

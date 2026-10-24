@@ -144,6 +144,8 @@ pub struct Firewall {
     pub nat: NAT,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policies: Option<FirewallPolicies>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<InputFirewall>,
 }
 impl Default for Firewall {
     fn default() -> Self {
@@ -153,6 +155,7 @@ impl Default for Firewall {
             rules: vec![],
             nat: NAT::default(),
             policies: None,
+            input: None,
         }
     }
 }
@@ -203,7 +206,16 @@ pub struct InterfacePolicy {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct InputFirewall {
+    pub policy: String,
+    #[serde(default)]
+    pub interfaces: Vec<InterfacePolicy>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostPolicyRule {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub out_interface: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub destination_host: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -430,6 +442,16 @@ impl Config {
             for i in &mut p.interfaces {
                 for r in &mut i.rules {
                     r.destination_ports.sort();
+                }
+            }
+        }
+        if let Some(input) = &mut self.firewall.input {
+            input
+                .interfaces
+                .sort_by(|first, second| first.interface.cmp(&second.interface));
+            for interface in &mut input.interfaces {
+                for rule in &mut interface.rules {
+                    rule.destination_ports.sort();
                 }
             }
         }
@@ -701,6 +723,39 @@ impl Config {
                 "firewall rules cannot be mixed with host/interface policies"
             );
             p.validate()?;
+            for rule in p
+                .interfaces
+                .iter()
+                .flat_map(|policy| &policy.rules)
+                .chain(p.hosts.iter().flat_map(|host| &host.rules))
+            {
+                ensure!(
+                    rule.out_interface.is_empty() || names.contains(&rule.out_interface),
+                    "policy outgoing interface must be managed"
+                );
+            }
+        }
+        if let Some(input) = &self.firewall.input {
+            ensure!(action(&input.policy), "input policy must be accept or drop");
+            FirewallPolicies {
+                hosts: vec![],
+                interfaces: input.interfaces.clone(),
+            }
+            .validate()?;
+            for interface in &input.interfaces {
+                ensure!(
+                    names.contains(&interface.interface),
+                    "input policy interface must be managed"
+                );
+                ensure!(
+                    interface
+                        .rules
+                        .iter()
+                        .all(|rule| rule.out_interface.is_empty()
+                            && rule.destination_host.is_empty()),
+                    "input rules cannot match egress interfaces or destination hosts"
+                );
+            }
         }
         for r in &self.firewall.nat.masquerade {
             ensure!(
@@ -714,10 +769,11 @@ impl Config {
                 );
             }
             ensure!(
-                self.interfaces.iter().any(|l| l.name == r.out_interface
-                    && l.addresses.iter().any(|a| canonical_prefix(a, false)
-                        .is_ok_and(|p| p.0.is_ipv4() == (r.family == "ipv4")))),
-                "masquerade egress requires an address of its family"
+                (r.family == "ipv4" && self.dhcp_clients.contains_key(&r.out_interface))
+                    || self.interfaces.iter().any(|l| l.name == r.out_interface
+                        && l.addresses.iter().any(|a| canonical_prefix(a, false)
+                            .is_ok_and(|p| p.0.is_ipv4() == (r.family == "ipv4")))),
+                "masquerade egress requires an address of its family or an IPv4 DHCP client"
             );
         }
         self.validate_softflowd()?;
@@ -1012,6 +1068,10 @@ impl FirewallPolicies {
             ensure!(rules.len() <= 64, "at most 64 rules per host/interface");
             let mut count = 0usize;
             for r in rules {
+                ensure!(
+                    r.out_interface.is_empty() || valid_interface_name(&r.out_interface),
+                    "invalid policy outgoing interface"
+                );
                 ensure!(
                     action(&r.action) && ["", "tcp", "udp"].contains(&r.protocol.as_str()),
                     "invalid policy action/protocol"

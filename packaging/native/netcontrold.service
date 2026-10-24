@@ -8,9 +8,12 @@ Type=simple
 User=root
 UMask=0077
 WorkingDirectory=/var/lib/netcontrol
+Environment=NETCONTROL_LISTEN=192.168.0.1:8080
+EnvironmentFile=-/etc/netcontrol/appliance.env
 ExecStart=/usr/local/sbin/netcontrold \
     --backend linux \
-    --listen 0.0.0.0:8080 \
+    --appliance \
+    --listen ${NETCONTROL_LISTEN} \
     --state /var/lib/netcontrol/native-state.json \
     --credential-db /var/lib/netcontrol/credentials.json \
     --keys /etc/netcontrol/keys \

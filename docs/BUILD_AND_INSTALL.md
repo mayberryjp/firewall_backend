@@ -198,11 +198,20 @@ pinned installer replace `main` in its URL with the reviewed source commit.
 Public raw access is required for that command; private repositories require
 an authenticated download without credentials embedded in the URL.
 
-The installer installs only `ca-certificates`, `gh` and `procps` through APT,
+The installer installs only `ca-certificates`, `gh`, `procps` and `curl` through APT,
 checks the successful workflow's repository/path/event/commit, downloads
 `netcontrol-ubuntu-amd64-<commit>`, verifies SHA-256 for the exact daemon and
-unit files and installs `/usr/local/sbin/netcontrold`. `--run-id` is required;
-there is no source-build fallback or `--ref` option. No checkout is needed.
+unit files and installs `/usr/local/sbin/netcontrold`. Only `--run-id` is required.
+The first physical Ethernet interface in natural name order is WAN and the
+second is LAN (`eno1`, `eno2`, ...; `eno2` precedes `eno10`). Loopback, virtual
+and Wi-Fi interfaces are excluded. At least two physical Ethernet ports are
+required. Both `--wan WAN_NIC --lan LAN_NIC` may override selection; a partial
+override is rejected. Selection does not depend on current addresses or the
+current default route. Extra ports retain `unassigned` roles.
+`--lan-address` defaults to `192.168.0.1/24` and must describe a usable host
+inside an RFC1918 subnet with prefix length 8..30, entirely within private
+space and not overlapping another interface or active DHCP lease. There is no
+source-build fallback or `--ref` option. No checkout is needed.
 Checksums detect corruption; authenticity relies on the reviewed source and
 authenticated GitHub workflow/artifact channel, not an independently trusted
 publisher signature. This is not a signed `.ncpkg` installation.
@@ -212,10 +221,77 @@ The workflow's manual upload input is an operator approval gate, not proof that
 licensing has been resolved. No release version is inferred from a run ID.
 An already running daemon causes an explicit stop-and-retry error; the script
 does not stop it for you. It installs the systemd unit and private directories
-described below and reloads systemd, but never starts/enables the service,
-configures networking, or removes runtime state. Existing compiler/toolchain
+described below, provisions the appliance and starts/enables it. Existing
+appliance journals, journal locks and appliance environment files cause explicit
+refusal; they are never removed to force a reinstall. Existing compiler/toolchain
 packages from prior source installs are not automatically removed.
 The host must be running systemd, not merely have `systemctl` installed.
+
+### Initial appliance provisioning
+
+Use a local console and connect the selected WAN to an upstream network before
+installation. Ubuntu must already provide supported networkd/resolved state;
+the installer explicitly configures WAN as DHCPv4 even if Ubuntu initially used
+a static WAN. A previously inherited DHCP identity is retained when available.
+An upstream DHCP server must supply an IPv4 address and default route within
+30 seconds after provisional application. NetworkManager and unsupported initial network
+settings still fail explicitly; the installer does not convert OS managers.
+
+The install-time root-only daemon invocation uses `--backend linux --appliance
+--provision-wan WAN_NIC --provision-lan LAN_NIC --provision-lan-address LAN_CIDR`
+with the installed state paths. It captures the initial physical NIC baseline,
+then provisionally applies a normal durable configuration transaction. It
+waits for WAN DHCP/address/default-route readiness and checks subnet overlap,
+then confirms locally without waiting for remote confirmation. Failure attempts
+an explicit transaction rollback; rollback errors remain explicit. This local
+installer confirmation is deliberate; it is
+not independent connectivity verification. The command exits after committing.
+Configured roles/firewall, nonzero revisions and active transactions are refused.
+Failures can leave durable handover/state evidence; inspect it from the console,
+do not delete it or rerun installation as an assumed rollback.
+
+The resulting configuration assigns WAN/LAN roles, replaces the LAN's addresses
+with the selected static IPv4 address, removes LAN DHCP-client/DNS/static routes,
+clears static WAN addressing/routes/DNS and configures a WAN DHCPv4 client.
+The forward default is drop, with an unrestricted LAN-ingress allow-all rule
+(no egress restriction), established/related return acceptance and no global
+ICMP bypass. LAN-subnet IPv4 traffic exiting WAN is masqueraded. WAN DHCP
+addresses/routes remain runtime state, not static copies. Competing default
+routes on additional ports are rejected.
+
+An explicit host-input policy defaults to drop for both IP families. It accepts
+loopback, established/related replies, all traffic entering LAN, and WAN IPv4
+UDP destination port 68 for DHCP. New WAN connections to the appliance,
+including system SSH and packets addressed to its LAN IP, are denied. Local
+output is unrestricted. These are Netcontrol-owned nftables rules, installed
+atomically with forwarding/NAT and persisted in configuration, not a second
+UFW ruleset. The policy is editable through configuration transactions;
+removing it removes that input protection.
+
+Installation writes root-only `/etc/netcontrol/appliance.env` with
+`NETCONTROL_LISTEN=<LAN-IP>:8080`, then enables/starts the systemd service.
+Appliance startup reconciles native policy first, then writes and verifies
+`net.ipv4.ip_forward=1`. The unit selects this mode on every boot; no separate
+sysctl file enables routing before the daemon has reconciled policy. Unprovisioned
+LAN/WAN roles fail appliance startup. IPv4 forwarding remains enabled on daemon
+stop; the owned kernel firewall/routes remain, while DHCP workers stop. This
+is not a fail-closed supervisor or automatic forwarding-drift repair mechanism.
+Changing IPv4 forwarding can reset kernel per-interface defaults; apply future
+host-hardening settings after that transition. IPv6 forwarding is unchanged.
+
+Installation checks HTTP readiness on the LAN address and IPv4 forwarding; it
+does not establish end-to-end forwarding, upstream reachability or reboot safety.
+LAN clients need static subnet addresses and the appliance as gateway. No LAN
+DHCP server, DNS proxy, IPv6 router advertisements or IPv6 NAT is provisioned.
+Complete onboarding from LAN immediately. HTTP is unencrypted; LAN clients are
+trusted by the initial allow-all policy. WAN protection is provided by the input
+policy, not merely the listener binding. No SSH authentication hardening or
+broader OS-hardening/eBPF profile is installed.
+
+For a source build, use `bash upgrade.sh --build-only`, install its binary/unit
+as documented below, then run the same one-time provisioning invocation locally
+with the full installed state paths before starting the appliance service.
+The development upgrader is not a fresh-device provisioner.
 
 ### Ubuntu systemd service
 
@@ -225,7 +301,9 @@ at `/etc/systemd/system/netcontrold.service`. It creates root-only directories
 The unit runs as root in native host mode, with private file creation (`0077`),
 journald logging, restart on failure and a 60-second shutdown allowance.
 It does not isolate the network namespace: native operations must reach the
-host networking. Host services, tunables, gateway monitoring and configuration
+host networking. The unit selects `--appliance` and the LAN-address management
+listener from `/etc/netcontrol/appliance.env` (default `192.168.0.1:8080`).
+Host services, API tunables, gateway monitoring and configuration
 SSH remain disabled unless explicitly added to `ExecStart`.
 
 Persistent paths match the manual Ubuntu startup command:
@@ -235,8 +313,8 @@ imported from another state path. If you used different paths, retain them in
 a reviewed systemd override before startup; do not accidentally onboard into a
 new credential store.
 
-The default listener is unencrypted HTTP on **`0.0.0.0:8080`**, including reachable
-WAN interfaces. Restrict management access before starting an unclaimed device.
+The installed Ubuntu listener is unencrypted HTTP on the provisioned LAN address,
+not the WAN address. Bare-daemon and Alpine defaults are separate contracts.
 Keep console access and leave Ubuntu's Wi-Fi authentication under its existing
 supplicant. First startup now attempts automatic physical NIC inheritance and
 exclusive IP/DHCP ownership as described below; this is a connectivity-changing
@@ -248,8 +326,8 @@ sudo systemctl status netcontrold --no-pager
 sudo journalctl -u netcontrold -f
 ```
 
-Complete onboarding at `http://<management-IP>:8080/`. Only after connectivity,
-shutdown/restart and configuration recovery are verified, opt into boot startup:
+Complete onboarding at `http://<LAN-IP>:8080/`. The appliance installer already
+enables boot startup; for a manual/source installation, enable it after provisioning:
 
 ```sh
 sudo systemctl enable netcontrold
@@ -260,7 +338,10 @@ clear `ExecStart=` and supply the complete replacement command under `[Service]`
 then reload systemd and explicitly restart during a safe maintenance window.
 The installer accepts an identical existing unit but refuses differing units
 or symlinks rather than overwriting operator changes. Drop-ins are preserved.
-It does not restart or change the boot-enabled state of an existing service.
+The fresh appliance installer starts/enables the service after provisioning;
+it is not an existing-appliance upgrade mechanism. If changing the LAN management
+IP later, coordinate `/etc/netcontrol/appliance.env` and a service restart from
+the console. API address changes do not rewrite the process listener binding.
 
 For a previously installed binary without a unit, no rebuild is needed. After
 the unit is pushed to GitHub, run the following only when no unit exists at the

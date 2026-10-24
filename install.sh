@@ -17,6 +17,51 @@ install_systemd_service() {
     systemctl daemon-reload
 }
 
+select_appliance_ports() {
+    local wan=${1:-} lan=${2:-} directory=${3:-/sys/class/net} path name
+    local -a interfaces=()
+    mapfile -t interfaces < <(
+        for path in "$directory"/*; do
+            name=${path##*/}
+            [[ $name != lo && -d $path/device && -r $path/type && $(< "$path/type") == 1 &&
+               ! -d $path/wireless && ! -e $path/phy80211 ]] || continue
+            printf '%s\n' "$name"
+        done | LC_ALL=C sort -V
+    )
+    if [[ -z $wan && -z $lan ]]; then
+        [[ ${#interfaces[@]} -ge 2 ]] || { printf 'At least two physical Ethernet interfaces are required.\n' >&2; return 1; }
+        wan=${interfaces[0]}
+        lan=${interfaces[1]}
+    fi
+    [[ -n $wan && -n $lan && $wan != "$lan" && " ${interfaces[*]} " == *" $wan "* &&
+       " ${interfaces[*]} " == *" $lan "* ]] || {
+        printf 'Provide both --wan and --lan with distinct physical Ethernet ports, or omit both for automatic selection.\n' >&2
+        return 1
+    }
+    printf '%s %s\n' "$wan" "$lan"
+}
+
+provision_appliance() {
+    local binary=$1 wan=$2 lan=$3 address=$4
+    "$binary" --backend linux --appliance \
+        --state /var/lib/netcontrol/native-state.json \
+        --credential-db /var/lib/netcontrol/credentials.json \
+        --keys /etc/netcontrol/keys \
+        --services-state-dir /var/lib/netcontrol/services \
+        --provision-wan "$wan" --provision-lan "$lan" --provision-lan-address "$address" || return 1
+    printf 'NETCONTROL_LISTEN=%s:8080\n' "${address%/*}" |
+        install -o root -g root -m 0600 /dev/stdin /etc/netcontrol/appliance.env || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable --now netcontrold.service || return 1
+    curl --noproxy '*' --silent --show-error --fail --retry 15 \
+        --retry-connrefused --retry-all-errors --retry-delay 1 --max-time 2 \
+        "http://${address%/*}:8080/" >/dev/null || return 1
+    [[ $(sysctl -n net.ipv4.ip_forward) == 1 ]] || {
+        printf 'Appliance startup did not enable IPv4 forwarding. Inspect the service journal.\n' >&2
+        return 1
+    }
+}
+
 download_prebuilt() {
     local run_id=$1 destination=$2 commit
     gh auth status || {
@@ -44,16 +89,28 @@ download_prebuilt() {
 }
 
 main() {
-    local run_id
+    local run_id='' wan='' lan='' lan_address=192.168.0.1/24 path ports
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash install.sh --run-id SUCCESSFUL_BUILD_RUN_ID\nInstalls verified prebuilt netcontrold artifacts on Ubuntu amd64; requires GitHub CLI authentication and does not start services.\n'
+        printf 'Usage: bash install.sh --run-id SUCCESSFUL_BUILD_RUN_ID [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24]\nDefaults: first physical Ethernet port (natural name order) is DHCP WAN, second is LAN; LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
         return
     fi
-    if [[ $# -ne 2 || $1 != --run-id || ! $2 =~ ^[0-9]+$ ]]; then
-        printf 'Usage: bash install.sh --run-id SUCCESSFUL_BUILD_RUN_ID\n' >&2
+    while [[ $# -gt 0 ]]; do
+        [[ $# -ge 2 ]] || { printf 'Missing option value; use --help.\n' >&2; return 1; }
+        case $1 in
+            --run-id) [[ -z $run_id ]] || return 1; run_id=$2 ;;
+            --wan) [[ -z $wan ]] || return 1; wan=$2 ;;
+            --lan) [[ -z $lan ]] || return 1; lan=$2 ;;
+            --lan-address) lan_address=$2 ;;
+            *) printf 'Unknown option: %s. Use --help.\n' "$1" >&2; return 1 ;;
+        esac
+        shift 2
+    done
+        if [[ ! $run_id =~ ^[0-9]+$ || ( -n $wan && ! $wan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
+            ( -n $lan && ! $lan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
+          ! $lan_address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+        printf 'Specify a run ID, an IPv4 LAN prefix and optionally both --wan/--lan; use --help.\n' >&2
         return 1
     fi
-    run_id=$2
     if [[ $(uname -s) != Linux || ! -r /etc/os-release ]]; then
         printf 'This prebuilt installer requires Ubuntu Linux amd64.\n' >&2
         return 1
@@ -73,8 +130,16 @@ main() {
         return 1
     fi
 
+    for path in /var/lib/netcontrol/native-state.json /var/lib/netcontrol/native-state.json.lock /etc/netcontrol/appliance.env; do
+        [[ ! -e $path && ! -L $path ]] || { printf 'Fresh appliance installation required; refusing existing %s. Do not delete appliance state to reinstall.\n' "$path" >&2; return 1; }
+    done
+    ports=$(select_appliance_ports "$wan" "$lan") || return 1
+    read -r wan lan <<< "$ports"
+    printf 'Selected WAN: %s (DHCP); LAN: %s (%s).\n' "$wan" "$lan" "$lan_address"
+    systemctl is-active --quiet systemd-networkd.service || return 1
+    systemctl is-active --quiet systemd-resolved.service || return 1
     apt-get update
-    apt-get install --no-install-recommends -y ca-certificates gh procps
+    apt-get install --no-install-recommends -y ca-certificates gh procps curl
     if pgrep -x netcontrold >/dev/null; then
         printf 'Stop the running netcontrold before installing; networking will not be stopped automatically.\n' >&2
         return 1
@@ -85,11 +150,17 @@ main() {
     trap "$cleanup" EXIT
     download_prebuilt "$run_id" "$work"
     cd "$work"
+    chmod 0755 netcontrold
+    ./netcontrold --help | grep -- --provision-wan >/dev/null || {
+        printf 'Artifact lacks appliance provisioning. Build the reviewed current source; no older-contract fallback is provided.\n' >&2
+        return 1
+    }
     check_systemd_unit
     install -d -m 0755 /usr/local/sbin
     install -m 0755 netcontrold /usr/local/sbin/netcontrold
     install_systemd_service
-    printf 'Installed netcontrold and its systemd unit. No services started or enabled; no network configuration changed.\nReview management access, then run: systemctl start netcontrold\nEnable at boot only after testing: systemctl enable netcontrold\nLogs: journalctl -u netcontrold -f\n'
+    provision_appliance /usr/local/sbin/netcontrold "$wan" "$lan" "$lan_address"
+    printf 'Provisioned IPv4 firewall: LAN %s (%s), WAN %s, LAN-to-WAN forwarding and masquerade. Service enabled at boot.\nManagement: http://%s:8080/ (complete onboarding from LAN). LAN clients need addresses in this subnet and this appliance as gateway; no DHCP/DNS server was installed.\nLogs: journalctl -u netcontrold -f\n' "$lan" "$lan_address" "$wan" "${lan_address%/*}"
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

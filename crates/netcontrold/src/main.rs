@@ -12,11 +12,28 @@ use std::{
     time::Duration,
 };
 
+mod provision;
+
 #[derive(Parser)]
 #[command(name = "netcontrold", about = "Native Rust network control daemon")]
 struct Options {
     #[arg(long, default_value = "simulator", value_parser = ["simulator", "linux"])]
     backend: String,
+    #[arg(
+        long,
+        help = "Enable IPv4 forwarding after native firewall reconciliation"
+    )]
+    appliance: bool,
+    #[arg(long, requires_all = ["appliance", "provision_lan"], help = "One-time appliance WAN interface; provision and exit")]
+    provision_wan: Option<String>,
+    #[arg(
+        long,
+        requires = "provision_wan",
+        help = "One-time appliance LAN interface"
+    )]
+    provision_lan: Option<String>,
+    #[arg(long, default_value = "192.168.0.1/24")]
+    provision_lan_address: String,
     #[arg(long, default_value = "0.0.0.0:8080")]
     listen: String,
     #[arg(long, default_value = "state.json")]
@@ -111,6 +128,9 @@ fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
 }
 async fn run(options: Options) -> Result<()> {
     configure_logging(&options)?;
+    if options.appliance && (options.backend != "linux" || !options.namespace.is_empty()) {
+        bail!("appliance provisioning and forwarding require the Linux host backend");
+    }
     let listen = tokio::net::lookup_host(&options.listen)
         .await
         .context("resolve management listener")?
@@ -247,7 +267,21 @@ async fn run(options: Options) -> Result<()> {
         })?),
         _ => Box::new(Simulator::new()),
     };
-    let engine = Arc::new(Mutex::new(Engine::open(&options.state, backend)?));
+    let mut engine = Engine::open(&options.state, backend)?;
+    if let (Some(wan), Some(lan)) = (&options.provision_wan, &options.provision_lan) {
+        provision::apply(&mut engine, wan, lan, &options.provision_lan_address).await?;
+        engine.shutdown()?;
+        tracing::info!(
+            wan,
+            lan,
+            "appliance provisioned; IPv4 forwarding enables on service startup"
+        );
+        return Ok(());
+    }
+    if options.appliance {
+        provision::enable_forwarding(&mut engine)?;
+    }
+    let engine = Arc::new(Mutex::new(engine));
     let app = App::new(engine.clone(), auth, tls.is_some());
     let handle = axum_server::Handle::new();
     let (ssh_stop_tx, ssh_stop_rx) = tokio::sync::watch::channel(false);
@@ -375,6 +409,33 @@ mod tests {
         let options = Options::try_parse_from(["netcontrold"]).unwrap();
         assert_eq!(options.listen, "0.0.0.0:8080");
         assert_eq!(options.backend, "simulator");
+        assert!(!options.appliance);
+        assert!(
+            Options::try_parse_from([
+                "netcontrold",
+                "--provision-wan",
+                "wan0",
+                "--provision-lan",
+                "lan0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Options::try_parse_from(["netcontrold", "--appliance", "--provision-wan", "wan0"])
+                .is_err()
+        );
+        let appliance = Options::try_parse_from([
+            "netcontrold",
+            "--backend",
+            "linux",
+            "--appliance",
+            "--provision-wan",
+            "wan0",
+            "--provision-lan",
+            "lan0",
+        ])
+        .unwrap();
+        assert_eq!(appliance.provision_lan_address, "192.168.0.1/24");
         assert!(options.credential_db.is_none());
         assert!(options.ssh_listen.is_none());
         assert!(options.ssh_host_key.is_none());
