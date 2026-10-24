@@ -70,10 +70,14 @@ counts. Counts are exact decimal strings or null when accounting is absent.
 This is neither a per-rule counter nor evidence of a current allow/drop verdict.
 No rule association, connection deletion/flush, packet capture or history API.
 
-An operator may explicitly enable `net.netfilter.nf_conntrack_acct=1` in the same
-network namespace before new connections are created. The endpoint never enables
-it and does not retrofit counters onto existing entries. No conntrack table flush
-is required or recommended. Counter bytes are kernel connection accounting, not
+Ubuntu installation and full development upgrades load `nf_conntrack`, enable
+and persist `net.netfilter.nf_conntrack_acct=1` and
+`net.netfilter.nf_conntrack_checksum=1` in the host namespace. Other deployment
+paths/namespaces require explicit operator setup before new connections are
+created. See [host prerequisites and limitations](../../docs/BUILD_AND_INSTALL.md#conntrack-host-prerequisites).
+The endpoint never enables accounting itself and does not retrofit counters onto
+existing entries. No conntrack table flush is required or recommended.
+Counter bytes are kernel connection accounting, not
 application-payload or interface byte totals. See the
 [canonical query/schema and frontend contract](../../FRONTEND_SPEC.md#conntrack-connection-snapshots).
 

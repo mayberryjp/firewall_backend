@@ -61,6 +61,9 @@ For fast development on an Ubuntu amd64 firewall, use
 the daemon without Docker or waiting for CI. An installed service and saved
 configuration are required; upgrades never provision from live interfaces. See the
 [setup and recovery limitations](docs/BUILD_AND_INSTALL.md#incremental-ubuntu-development-upgrades).
+Ubuntu installation and full upgrades also enable and persist conntrack accounting
+and checksum validation; existing flows may retain null counters. See
+[conntrack host prerequisites](docs/BUILD_AND_INSTALL.md#conntrack-host-prerequisites).
 
 For optional Ubuntu OS footprint reduction, start with `sudo bash hardening.sh`
 to preview the explicit service/package profile. Nothing changes without

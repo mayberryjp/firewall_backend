@@ -70,7 +70,7 @@ Install build prerequisites once:
 sudo apt-get update
 sudo apt-get install --no-install-recommends -y \
   build-essential pkg-config libclang-dev linux-libc-dev util-linux \
-  git curl ca-certificates sudo
+  git curl ca-certificates sudo procps kmod
 ```
 
 If rustup is not installed, download and review the official installer, then
@@ -118,6 +118,13 @@ checks leave the running daemon untouched. A checkout-local lock rejects
 concurrent invocations; do not run other installers or upgrades, including
 from another checkout, at the same time.
 
+Full deployment runs the installer's shared conntrack setup as root after the
+build and service-path check, before staging/replacing/stopping the daemon.
+Keep `install.sh` beside `upgrade.sh` from the same reviewed checkout.
+`--build-only` performs no conntrack setup or host changes. See
+[conntrack host prerequisites](#conntrack-host-prerequisites) for persistence,
+failure limitations and accounting behavior.
+
 For deployment, the script stages the new binary beside the destination,
 saves `<installed-executable>.previous` if a binary exists (overwritten on each deployment),
 stops the service, atomically renames the staged binary and starts the service.
@@ -162,6 +169,55 @@ sudo systemctl start netcontrold.service
 sudo journalctl -u netcontrold.service -n 50 --no-pager
 ```
 
+## Conntrack host prerequisites
+
+The Ubuntu fresh installer and full development upgrade load `nf_conntrack`,
+apply and read back these host-network-namespace settings before provisioning
+or replacing the daemon, and persist them across boot:
+
+| Setting | Value | Purpose |
+| --- | --- | --- |
+| `net.netfilter.nf_conntrack_acct` | `1` | Per-direction packet/byte accounting for new connections |
+| `net.netfilter.nf_conntrack_checksum` | `1` | Validate incoming checksums during connection tracking |
+
+Root-owned, mode `0644` files are installed at
+`/etc/sysctl.d/90-netcontrol-conntrack.conf` (the two settings) and
+`/etc/modules-load.d/netcontrol-conntrack.conf` (`nf_conntrack`), so systemd can
+load the module before boot-time sysctls. These Netcontrol-owned files are
+replaced on each install/full upgrade; symlinks and non-regular destinations
+are refused. Unrelated configuration files are not rewritten. Later-sorted
+operator sysctl files can override these settings at boot; resolve conflicts
+deliberately and check the effective values after reboot.
+
+`kmod` supplies `modprobe`; `procps` supplies `sysctl`. Fresh installation installs
+both. Existing installations need both available before a full upgrade; the
+upgrade does not install packages. Missing commands/module/kernel support,
+failed writes/readback or persistence errors abort before daemon replacement or
+fresh provisioning. Host changes are not a multi-file/kernel transaction: a
+failed setup can leave already-applied settings or a configuration file, and
+later deployment failure does not undo these prerequisites. Inspect the error
+and retry after correcting it. Do not unload conntrack or flush connections as
+recovery. Saved desired configuration, credentials and revision history are not
+reset by this setup.
+
+Accounting is not retroactive. Existing entries can retain null counters until
+they expire naturally; generate new traffic to verify counters. It adds
+per-connection memory overhead. No table flush or reboot is needed for new
+connections to receive accounting after successful setup. Verify on the host:
+
+```sh
+sysctl net.netfilter.nf_conntrack_acct net.netfilter.nf_conntrack_checksum
+```
+
+The profile leaves table capacity/hash sizing, timeouts, TCP loose/liberal
+tracking policy, automatic helpers, event delivery and timestamp extensions
+unchanged. Capacity/timeouts require workload and RAM sizing; events/timestamps
+are not needed by the current dump-based API. It never enables automatic
+helpers or relaxes TCP validation. Other deployment paths and isolated network
+namespaces require explicit operator setup in the appropriate namespace; the
+read-only connections API never changes these settings itself. No package,
+daemon-startup, factory-reset or browser hook is added by this shell setup.
+
 ## Ubuntu prebuilt installation (amd64)
 
 The repository provides [install.sh](../install.sh) for an internet-connected
@@ -199,7 +255,7 @@ pinned installer replace `main` in its URL with the reviewed source commit.
 Public raw access is required for that command; private repositories require
 an authenticated download without credentials embedded in the URL.
 
-The installer installs only `ca-certificates`, `gh`, `procps` and `curl` through APT,
+The installer installs only `ca-certificates`, `gh`, `procps`, `kmod` and `curl` through APT,
 checks the successful workflow's repository/path/event/commit, downloads
 `netcontrol-ubuntu-amd64-<commit>`, verifies SHA-256 for the exact daemon and
 unit files and installs `/usr/local/sbin/netcontrold`. Only `--run-id` is required.
@@ -227,6 +283,9 @@ appliance journals, journal locks and appliance environment files cause explicit
 refusal; they are never removed to force a reinstall. Existing compiler/toolchain
 packages from prior source installs are not automatically removed.
 The host must be running systemd, not merely have `systemctl` installed.
+Before provisioning, it applies the persistent
+[conntrack host prerequisites](#conntrack-host-prerequisites). The downloaded
+installer remains self-contained; no checkout or extra helper download is needed.
 
 ### Initial appliance provisioning
 

@@ -80,6 +80,15 @@
 
 ### Changed
 
+- Ubuntu fresh installation and full development upgrades now load/persist
+  `nf_conntrack`, enable packet/byte accounting and checksum validation, and
+  verify live settings before provisioning or replacing the daemon. Installer
+  adds `kmod`; existing upgrade hosts need `kmod`/`procps`. Build-only and HTTP
+  reads remain non-mutating. Existing flows can retain null counters; no flush,
+  reset or arbitrary capacity/timeout tuning. Recommended bump: patch for
+  missing appliance accounting prerequisites; baseline unknown. Linux reboot
+  acceptance remains pending. See [handoff 2026-10-24-06](docs/frontend-handoffs/2026-10-24.md#2026-10-24-06-conntrack-installation-prerequisites).
+
 - Frontend contract clarification: the interface overview must use live inventory
   for active addresses, show DHCP-assigned IPv4 even when configured static
   addresses are empty, and include loopback/unmanaged/unsupported links by

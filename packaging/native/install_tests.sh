@@ -9,6 +9,76 @@ trap "$cleanup" EXIT
 fixture_commit=0123456789abcdef0123456789abcdef01234567
 scenario=valid
 
+for conntrack_scenario in success repeat module_failure write_failure read_failure verify_failure checksum_failure persist_failure symlink_sysctl symlink_modules; do
+    conntrack_directory="$temporary/conntrack-$conntrack_scenario"
+    mkdir -p "$conntrack_directory/sysctl.d" "$conntrack_directory/modules-load.d"
+    printf 'unrelated configuration\n' > "$conntrack_directory/sysctl.d/10-unrelated.conf"
+    if [[ $conntrack_scenario == symlink_sysctl ]]; then
+        ln -s 10-unrelated.conf "$conntrack_directory/sysctl.d/90-netcontrol-conntrack.conf"
+        if [[ ! -L $conntrack_directory/sysctl.d/90-netcontrol-conntrack.conf ]]; then
+            printf 'Skipped sysctl symlink refusal: filesystem did not create a symlink.\n'
+            continue
+        fi
+    elif [[ $conntrack_scenario == symlink_modules ]]; then
+        ln -s ../sysctl.d/10-unrelated.conf "$conntrack_directory/modules-load.d/netcontrol-conntrack.conf"
+        if [[ ! -L $conntrack_directory/modules-load.d/netcontrol-conntrack.conf ]]; then
+            printf 'Skipped modules symlink refusal: filesystem did not create a symlink.\n'
+            continue
+        fi
+    fi
+    if (
+        modprobe() {
+            printf 'modprobe %s\n' "$*" >> "$conntrack_directory/commands"
+            [[ $* == nf_conntrack ]] || return 1
+            [[ $conntrack_scenario != module_failure ]]
+        }
+        sysctl() {
+            printf 'sysctl %s\n' "$*" >> "$conntrack_directory/commands"
+            if [[ $1 == -w ]]; then
+                [[ $* == '-w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_checksum=1' ]] || return 1
+                [[ $conntrack_scenario != write_failure ]]
+            elif [[ $conntrack_scenario == verify_failure ||
+                ( $conntrack_scenario == checksum_failure && $2 == net.netfilter.nf_conntrack_checksum ) ]]; then
+                printf '0\n'
+            else
+                printf '1\n'
+                [[ $conntrack_scenario != read_failure ]]
+            fi
+        }
+        install() {
+            [[ $conntrack_scenario != persist_failure ]] || return 1
+            local -a arguments=()
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    -o|-g) shift 2 ;;
+                    *) arguments+=("$1"); shift ;;
+                esac
+            done
+            command install "${arguments[@]}"
+        }
+        configure_conntrack "$conntrack_directory/sysctl.d" "$conntrack_directory/modules-load.d" || exit 1
+        if [[ $conntrack_scenario == repeat ]]; then
+            configure_conntrack "$conntrack_directory/sysctl.d" "$conntrack_directory/modules-load.d" || exit 1
+        fi
+    ); then
+        [[ $conntrack_scenario == success || $conntrack_scenario == repeat ]] || exit 1
+        [[ $(< "$conntrack_directory/sysctl.d/90-netcontrol-conntrack.conf") == $'net.netfilter.nf_conntrack_acct = 1\nnet.netfilter.nf_conntrack_checksum = 1' ]]
+        [[ $(< "$conntrack_directory/modules-load.d/netcontrol-conntrack.conf") == nf_conntrack ]]
+        grep -q '^modprobe nf_conntrack$' "$conntrack_directory/commands"
+        grep -q '^sysctl -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_checksum=1$' "$conntrack_directory/commands"
+    else
+        [[ $conntrack_scenario != success ]] || exit 1
+        [[ ! -f $conntrack_directory/modules-load.d/netcontrol-conntrack.conf || -L $conntrack_directory/modules-load.d/netcontrol-conntrack.conf ]]
+        if [[ $conntrack_scenario == symlink_* ]]; then
+            [[ ! -e $conntrack_directory/commands ]]
+        elif [[ $conntrack_scenario == module_failure ]]; then
+            ! grep -q '^sysctl ' "$conntrack_directory/commands"
+        fi
+    fi
+    [[ $(< "$conntrack_directory/sysctl.d/10-unrelated.conf") == 'unrelated configuration' ]]
+done
+printf 'Conntrack live settings, boot persistence and prerequisite-failure tests passed (mocked kernel commands).\n'
+
 ports_fixture="$temporary/ports"
 mkdir -p "$ports_fixture"
 for port_fixture_name in eno10 eno2 eno1 wlan0 lo tun0; do
@@ -138,6 +208,34 @@ root_command() { return 1; }
 if service_binary; then printf 'Failed systemd query accepted\n' >&2; exit 1; fi
 printf 'Service executable discovery tests passed (mocked systemd).\n'
 
+for deployment_scenario in success setup_failure deploy_failure; do
+    (
+        deployment_trace=''
+        root_command() {
+            [[ $# -eq 5 && $1 == bash && $2 == -c &&
+                $3 == 'source "$1"; configure_conntrack' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
+            deployment_trace+='setup;'
+            [[ $deployment_scenario != setup_failure ]]
+        }
+        upgrade_binary() {
+            [[ $1 == new-binary && $2 == installed-binary ]] || return 1
+            deployment_trace+='deploy;'
+            [[ $deployment_scenario != deploy_failure ]]
+        }
+        if deploy_upgrade new-binary installed-binary "$PWD/install.sh"; then
+            [[ $deployment_scenario == success ]] || exit 1
+        else
+            [[ $deployment_scenario != success ]] || exit 1
+        fi
+        if [[ $deployment_scenario == setup_failure ]]; then
+            [[ $deployment_trace == 'setup;' ]]
+        else
+            [[ $deployment_trace == 'setup;deploy;' ]]
+        fi
+    )
+done
+printf 'Upgrade configures conntrack before replacement and aborts on setup failure (mocked commands).\n'
+
 for scenario in missing loaded unmanaged conflicting masked install_failure reload_failure; do
     destination="$temporary/setup-$scenario"
     mkdir "$destination"
@@ -190,6 +288,7 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
         root_command() {
             printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"
             case $1 in
+                bash) [[ $3 == '\''source "$1"; configure_conntrack'\'' ]] ;;
                 install)
                     [[ $UPGRADE_TEST_SCENARIO != fail_stage ]] || return 1
                     command cp -- "${@: -2}"
@@ -217,7 +316,7 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
                 *) command "$@" ;;
             esac
         }
-        upgrade_binary "$UPGRADE_TEST_DIRECTORY/new" "$UPGRADE_TEST_DIRECTORY/netcontrold"
+        deploy_upgrade "$UPGRADE_TEST_DIRECTORY/new" "$UPGRADE_TEST_DIRECTORY/netcontrold" "$PWD/install.sh"
     '; then
         [[ $scenario == success || $scenario == first_install || $scenario == inactive_existing ]] || { printf 'Unexpected upgrade success: %s\n' "$scenario" >&2; exit 1; }
         cmp "$destination/new" "$destination/netcontrold"

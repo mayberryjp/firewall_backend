@@ -1,6 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+configure_conntrack() (
+    set -euo pipefail
+    local sysctl_directory=${1:-/etc/sysctl.d} modules_directory=${2:-/etc/modules-load.d}
+    local sysctl_file="$sysctl_directory/90-netcontrol-conntrack.conf"
+    local modules_file="$modules_directory/netcontrol-conntrack.conf"
+    local executable path work actual
+    for executable in modprobe sysctl install; do
+        command -v "$executable" >/dev/null || {
+            printf 'Missing %s; install kmod and procps before configuring conntrack.\n' "$executable" >&2
+            exit 1
+        }
+    done
+    for path in "$sysctl_file" "$modules_file"; do
+        [[ ! -L $path && ( ! -e $path || -f $path ) ]] || {
+            printf 'Refusing non-regular conntrack configuration: %s\n' "$path" >&2
+            exit 1
+        }
+    done
+    modprobe nf_conntrack || exit 1
+    sysctl -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_checksum=1 || exit 1
+    for path in net.netfilter.nf_conntrack_acct net.netfilter.nf_conntrack_checksum; do
+        actual=$(sysctl -n "$path") || exit 1
+        [[ $actual == 1 ]] || {
+            printf 'Conntrack prerequisite did not take effect: %s\n' "$path" >&2
+            exit 1
+        }
+    done
+    work=$(mktemp -d) || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    printf 'net.netfilter.nf_conntrack_acct = 1\nnet.netfilter.nf_conntrack_checksum = 1\n' > "$work/sysctl" || exit 1
+    printf 'nf_conntrack\n' > "$work/modules" || exit 1
+    install -d -m 0755 "$sysctl_directory" "$modules_directory" || exit 1
+    install -o root -g root -m 0644 "$work/sysctl" "$sysctl_file" || exit 1
+    install -o root -g root -m 0644 "$work/modules" "$modules_file" || exit 1
+    printf 'Conntrack accounting and checksum validation enabled and configured for boot. Existing connections may still lack counters.\n'
+)
+
 check_systemd_unit() {
     local unit=netcontrold.service
     local destination=/etc/systemd/system/netcontrold.service
@@ -139,7 +176,7 @@ main() {
     systemctl is-active --quiet systemd-networkd.service || return 1
     systemctl is-active --quiet systemd-resolved.service || return 1
     apt-get update
-    apt-get install --no-install-recommends -y ca-certificates gh procps curl
+    apt-get install --no-install-recommends -y ca-certificates gh procps kmod curl
     if pgrep -x netcontrold >/dev/null; then
         printf 'Stop the running netcontrold before installing; networking will not be stopped automatically.\n' >&2
         return 1
@@ -156,6 +193,7 @@ main() {
         return 1
     }
     check_systemd_unit
+    configure_conntrack || return 1
     install -d -m 0755 /usr/local/sbin
     install -m 0755 netcontrold /usr/local/sbin/netcontrold
     install_systemd_service

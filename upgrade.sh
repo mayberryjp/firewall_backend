@@ -122,6 +122,13 @@ upgrade_binary() (
     if [[ $had_binary == true ]]; then printf 'Previous binary: %s\n' "$backup"; fi
 )
 
+deploy_upgrade() {
+    local binary=$1 destination=$2 installer=$3
+    root_command bash -c 'source "$1"; configure_conntrack' bash "$installer" || return 1
+    printf 'Restarting the firewall daemon; use a local console or independent OS SSH session.\n'
+    upgrade_binary "$binary" "$destination"
+}
+
 main() {
     if [[ ${1:-} == --help ]]; then
         printf 'Usage: bash upgrade.sh [--build-only]\nBuilds the current checkout on Ubuntu amd64 and replaces/restarts an installed netcontrold service. The daemon applies its saved configuration, not live interface settings. No initial provisioning, factory reset, git pull, prerequisite installation or boot enablement.\n'
@@ -153,8 +160,7 @@ main() {
     if [[ $# -eq 0 ]]; then
         destination=$(service_target) || return 1
         printf 'Service executable: %s\n' "$destination"
-        printf 'Restarting the firewall daemon; use a local console or independent OS SSH session.\n'
-        upgrade_binary "$binary" "$destination"
+        deploy_upgrade "$binary" "$destination" "$repository/install.sh"
     fi
 }
 

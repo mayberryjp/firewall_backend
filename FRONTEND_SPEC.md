@@ -334,6 +334,17 @@ settings. Managed-interface drift is reconciled to the saved plan, subject to
 native identity, ownership and foreign-resource checks. Live snapshots are used
 only for rollback, not as a new desired configuration.
 
+Ubuntu fresh installation and full `upgrade.sh` deployment now load
+`nf_conntrack` and enable/persist host `net.netfilter.nf_conntrack_acct=1` and
+`net.netfilter.nf_conntrack_checksum=1` before provisioning/daemon replacement.
+The installer supplies `procps`/`kmod`; existing upgrade hosts must already have
+them. Setup failure aborts before daemon replacement; partially applied host
+prerequisites are not rolled back. `--build-only`, factory reset, signed-package
+installation and the HTTP read API do not run this setup. Other network
+namespaces still need explicit operator configuration. Existing connections
+can retain null counters; no table flush, state reset or browser setup action
+is added. See [host persistence and limitations](docs/BUILD_AND_INSTALL.md#conntrack-host-prerequisites).
+
 Initial installation and explicit reset share the same clean factory configuration
 builder; inherited OS settings are handover/rollback data, not factory defaults.
 The operator-only `sudo bash reset.sh` asks for default-No confirmation before
@@ -837,8 +848,11 @@ Counter values are kernel per-connection accounting, not interface/L2 throughput
 application payload, or cumulative per-rule hits. Null is unavailable, not zero.
 Kernel accounting generally requires `net.netfilter.nf_conntrack_acct=1` in the
 same namespace when the connection is created; enabling it is an explicit
-operator action, is not retroactive for existing entries, and is not performed
-by this read API. Never flush connections to obtain counters. Rates require
+operator deployment action, is not retroactive for existing entries, and is not
+performed by this read API. Ubuntu installation/full upgrade now configure it
+automatically as part of that operator workflow (section 4.1); other deployment
+paths/namespaces require explicit setup. Null counters and partial samples must
+still be supported after installation/upgrade. Never flush connections to obtain counters. Rates require
 matching scope, ID/zone and full tuple identity, exact integer deltas and actual
 sample time; reset on counter decrease, identity change, disappearance or error.
 Do not invent a rate from a first sample, null/simulated counters or a page change.
