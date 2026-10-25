@@ -22,8 +22,9 @@ process or simulator result is not evidence that real networking works.
 
 There is no Go executable, Go wrapper, dual backend, or Go-state migration path.
 Protocol services run in Rust rather than supervising dnsmasq, chronyd,
-softflowd, syslog-ng, or vnstatd. The operating system's OpenRC service starts
-the single daemon; it is not a protocol implementation.
+softflowd, syslog-ng, or vnstatd. The operating system's service manager starts
+the single daemon; it is not a protocol implementation. Native syslog requires
+systemd/journald socket activation; it is unavailable under OpenRC.
 
 Backward compatibility is not a constraint. Invalid or unsupported
 configuration must produce explicit errors rather than permissive defaults or
@@ -64,6 +65,11 @@ configuration are required; upgrades never provision from live interfaces. See t
 Ubuntu installation and full upgrades also enable and persist conntrack accounting
 and checksum validation; existing flows may retain null counters. See
 [conntrack host prerequisites](docs/BUILD_AND_INSTALL.md#conntrack-host-prerequisites).
+These scripts also configure journald forwarding and a systemd-owned native
+syslog receiver at `/run/systemd/journal/syslog`, stopping/masking competing
+syslog receivers. Journald keeps `/dev/log`, kernel capture and the local journal.
+Review [logging ownership and recovery](docs/BUILD_AND_INSTALL.md#host-logging-ownership);
+saved syslog settings are not enabled automatically.
 
 Optional Ubuntu amd64 self-upgrade uses `POST /api/v1/system/upgrade` with a
 specific SemVer version and `GET` on the same path for durable job status.
@@ -239,6 +245,26 @@ are immutable and retained for revisions; limit 256 passwords. There is no pruni
 or deletion API: do not remove files referenced by configuration/history. Missing
 or corrupt private state requires operator recovery, not an identity reset.
 See the [exact contract](FRONTEND_SPEC.md#614-home-assistant-mqtt-streaming).
+
+## Host name and time zone
+
+`config.system` holds an optional `hostname` and an optional IANA `timezone`; empty
+means unmanaged (the default). Changes use the ordinary confirmed transaction flow
+with `transactions.write` plus `system.write`, but the daemon applies them itself
+after confirmation, like MQTT: the network is not touched and a rolled-back
+transaction never changes the host. Linux host mode sets the kernel hostname and
+`/etc/hostname` and replaces `/etc/localtime` with a link to the zone file (the host
+must have its timezone database, normally the `tzdata` package; nothing is installed).
+Values are enforced, so a change by another agent is set again within seconds, and
+failures are retried. Clearing a value stops managing it and does not revert the
+host. `/etc/hosts` is not edited, and processes started earlier may keep the old time
+zone until restarted. The simulator and namespace lab perform no host changes.
+
+`GET /api/v1/system/status` and `GET /api/v1/system/timezones` (`state.read`) report
+the confirmed values, what the host reports and the valid zone names. CLI:
+`hostname NAME`, `timezone ZONE`, `no hostname`, `no timezone`. DNS resolvers are not
+part of this section: use the per-interface `dns` settings. See the
+[exact contract](FRONTEND_SPEC.md#616-host-name-and-time-zone).
 
 ## Configuration workflow
 

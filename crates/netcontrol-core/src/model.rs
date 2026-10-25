@@ -22,6 +22,7 @@ pub struct Config {
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
     pub mqtt: MQTTConfig,
+    pub system: SystemConfig,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dynamic_dns: Vec<crate::DynamicDNSConfig>,
     pub gateway_monitors: Vec<GatewayMonitor>,
@@ -46,6 +47,7 @@ impl Default for Config {
             syslog: Default::default(),
             vnstat: Default::default(),
             mqtt: Default::default(),
+            system: Default::default(),
             dynamic_dns: Vec::new(),
             gateway_monitors: Vec::new(),
             interfaces: Vec::new(),
@@ -89,6 +91,48 @@ impl BlackholeConfig {
     pub fn targets(&self, interface: &str) -> bool {
         self.configured() && self.name == interface
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SystemConfig {
+    pub hostname: String,
+    pub timezone: String,
+}
+
+impl SystemConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.hostname.is_empty() || valid_hostname(&self.hostname),
+            "hostname must be empty (unmanaged) or a lowercase RFC 1123 label of 1..63 letters, digits and hyphens that neither starts nor ends with a hyphen"
+        );
+        ensure!(
+            self.timezone.is_empty() || valid_timezone_name(&self.timezone),
+            "timezone must be empty (unmanaged) or an IANA zone name such as UTC or America/New_York"
+        );
+        Ok(())
+    }
+}
+
+pub fn valid_hostname(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Shape only: whether the zone exists on the host is checked by the host system manager.
+pub fn valid_timezone_name(name: &str) -> bool {
+    name.len() <= 64
+        && name.split('/').count() <= 3
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+' | b'-'))
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -678,6 +722,7 @@ impl Config {
         }
         let mut value = serde_json::to_value(self)?;
         value.as_object_mut().unwrap().remove("mqtt");
+        value.as_object_mut().unwrap().remove("system");
         value.as_object_mut().unwrap().remove("dynamic_dns");
         strip(&mut value);
         if let Some(routes) = value["routes"].as_array_mut() {
@@ -761,6 +806,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         crate::dynamic_dns::validate(self)?;
+        self.system.validate()?;
         let mqtt = &self.mqtt;
         ensure!(
             (10..=3600).contains(&mqtt.interval_seconds)

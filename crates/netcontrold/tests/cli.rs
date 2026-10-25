@@ -178,6 +178,46 @@ fn blackhole_routes_are_staged_with_ip_route_and_checked_against_the_named_secti
 }
 
 #[test]
+fn hostname_and_timezone_are_staged_checked_committed_and_cleared() {
+    let f = Fixture::new(PERMISSIONS);
+    f.app
+        .engine
+        .lock()
+        .unwrap()
+        .configure_system(Some(Arc::new(|zone| zone == "UTC")));
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "hostname Fw-1");
+    f.fail(&mut cli, "commit check", "hostname");
+    f.ok(&mut cli, "hostname fw-1");
+    f.ok(&mut cli, "timezone Mars/Base");
+    // Shape is checked offline; host availability is checked when the transaction is submitted.
+    f.ok(&mut cli, "commit check");
+    f.fail(&mut cli, "commit confirmed 30 Unknown zone", "timezone");
+    f.ok(&mut cli, "timezone UTC");
+    f.ok(&mut cli, "commit check");
+    assert_eq!(
+        f.request("/api/v1/state")["desired"]["system"],
+        json!({"hostname":"","timezone":""})
+    );
+    f.ok(&mut cli, "commit confirmed 30 Name the appliance");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/state")["desired"]["system"],
+        json!({"hostname":"fw-1","timezone":"UTC"})
+    );
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "no hostname");
+    f.ok(&mut cli, "no timezone");
+    f.ok(&mut cli, "commit confirmed 30 Release host settings");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/state")["desired"]["system"],
+        json!({"hostname":"","timezone":""})
+    );
+}
+
+#[test]
 fn global_ipv6_cli_stages_checks_commits_and_rolls_back() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

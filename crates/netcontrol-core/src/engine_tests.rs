@@ -1,5 +1,5 @@
 use super::*;
-use crate::Simulator;
+use crate::{Simulator, SystemConfig};
 use std::{
     fs,
     path::PathBuf,
@@ -1513,6 +1513,47 @@ fn fine_grained_permissions_cover_confirmation_and_restore() {
     );
 }
 #[test]
+fn host_system_settings_need_backend_support_and_only_changed_values_are_checked() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut candidate = config();
+    candidate.system.hostname = "fw-1".into();
+    assert_eq!(submit(&mut engine, candidate.clone()).status, 422);
+    engine.configure_system(Some(Arc::new(|zone| zone == "UTC")));
+    candidate.system.timezone = "Mars/Base".into();
+    assert_eq!(submit(&mut engine, candidate.clone()).status, 422);
+    candidate.system.timezone = "UTC".into();
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    assert_eq!(engine.saved_configuration().system, SystemConfig::default());
+    let id = pending.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(confirm(&mut engine, &id).status, 200);
+    assert_eq!(engine.saved_configuration().system.hostname, "fw-1");
+    assert_eq!(engine.saved_configuration().system.timezone, "UTC");
+
+    // A zone that disappears from the host only blocks changing the zone itself.
+    engine.configure_system(Some(Arc::new(|_| false)));
+    candidate.interfaces[0].mtu = 1400;
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    let id = pending.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(confirm(&mut engine, &id).status, 200);
+    candidate.system.timezone = "America/Chicago".into();
+    assert_eq!(submit(&mut engine, candidate.clone()).status, 422);
+
+    // Clearing is always allowed, and unchanged values survive a backend without support.
+    engine.configure_system(None);
+    candidate.system.timezone = "UTC".into();
+    candidate.interfaces[0].mtu = 1300;
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    let id = pending.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(confirm(&mut engine, &id).status, 200);
+    candidate.system = SystemConfig::default();
+    assert_eq!(submit(&mut engine, candidate).status, 202);
+}
+
+#[test]
 fn all_domain_permissions_are_independently_required() {
     let before = Config::empty();
     let cases = [
@@ -1526,6 +1567,8 @@ fn all_domain_permissions_are_independently_required() {
         ),
         ("vnstat.write", json!({"vnstat":{"enabled":true}})),
         ("mqtt.write", json!({"mqtt":{"interval_seconds":120}})),
+        ("system.write", json!({"system":{"hostname":"fw-1"}})),
+        ("system.write", json!({"system":{"timezone":"UTC"}})),
         (
             "firewall.write",
             json!({"firewall":{"allow_all_icmp":false}}),

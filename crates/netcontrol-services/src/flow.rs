@@ -498,7 +498,7 @@ impl CaptureBatch {
                 fd,
                 messages.as_mut_ptr(),
                 CAPTURE_BATCH as u32,
-                libc::MSG_DONTWAIT,
+                libc::MSG_DONTWAIT as _,
                 std::ptr::null_mut(),
             )
         };

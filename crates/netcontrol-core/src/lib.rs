@@ -6,7 +6,7 @@ mod simulator;
 mod store;
 
 pub use dynamic_dns::{DynamicDNSAddressSource, DynamicDNSConfig};
-pub use engine::{Engine, PERMISSIONS, Reply, Transaction, validate_offline_state};
+pub use engine::{Engine, PERMISSIONS, Reply, TimezoneCheck, Transaction, validate_offline_state};
 pub use model::*;
 pub use simulator::Simulator;
 

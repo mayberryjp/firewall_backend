@@ -9,6 +9,8 @@ subprocess. The Ubuntu prebuilt installer below is a separate deployment path.
 Alpine Linux remains a deployment target, using static musl executables and
 OpenRC to start the single Rust daemon. No dnsmasq, chronyd, softflowd,
 syslog-ng, or vnstatd service is installed or supervised.
+Native syslog is the exception to OpenRC support: it requires systemd/journald
+socket activation. Keep `syslog.enabled=false` on non-systemd deployments.
 
 Supported package targets:
 
@@ -55,6 +57,7 @@ Full installation/upgrade also enables native host services and gateway probes
 through the managed systemd environment drop-in described
 [below](#enabling-gateway-monitoring-on-an-installed-appliance), without rewriting
 the base unit or custom startup arguments. Build-only runs do not change it.
+They also [configure journald forwarding](#host-logging-ownership) for native syslog.
 Exactly one direct, absolute executable named `netcontrold` is required;
 wrappers, missing/ambiguous commands and symlink executables are rejected.
 The destination may be absent on first installation. Masked/broken services,
@@ -923,6 +926,30 @@ are not part of the configuration journal or its exports, so back up the key
 directory separately and keep the backup private. The WireGuard/SSH key files are
 retained by factory reset.
 
+### Host Name and Time Zone Prerequisites
+
+The optional `system.hostname` and `system.timezone` settings are applied by the
+daemon on the host after a transaction is confirmed (see the
+[contract](../FRONTEND_SPEC.md#616-host-name-and-time-zone)). They need Linux host
+mode, a daemon running as root (`CAP_SYS_ADMIN` sets the hostname), and the host's
+timezone database at `/usr/share/zoneinfo`, normally the `tzdata` package. The
+installer and daemon never install packages. Check it with:
+
+```sh
+test -f /usr/share/zoneinfo/UTC && echo "timezone database present"
+```
+
+Without the database `GET /api/v1/system/timezones` is empty and a timezone change is
+rejected with a clear error. Install `tzdata` with the operating system's package
+manager if you want to manage the time zone.
+
+The daemon treats managed values as authoritative and sets them again if they
+drift. If another agent also writes the hostname they will fight; on Ubuntu images
+that use cloud-init, set `preserve_hostname: true` in a file under
+`/etc/cloud/cloud.cfg.d/` before managing the hostname, and do not combine it with a
+DHCP-provided hostname. The daemon writes `/etc/hostname` and the kernel name only;
+it does not edit `/etc/hosts`. Clearing a managed value leaves the host as it is.
+
 ### Enabling Gateway Monitoring on an Installed Appliance
 
 The current `install.sh` and full `upgrade.sh` automatically enable both required
@@ -931,7 +958,12 @@ the managed file
 `/etc/systemd/system/netcontrold.service.d/50-netcontrol-appliance-services.conf`:
 
 ```ini
+[Unit]
+Requires=netcontrol-syslog.socket
+After=netcontrol-syslog.socket systemd-journald.service
+
 [Service]
+Sockets=netcontrol-syslog.socket
 Environment=NETCONTROL_ALLOW_HOST_SERVICES=true
 Environment=NETCONTROL_GATEWAY_MONITORING=true
 ```
@@ -950,6 +982,83 @@ Like conntrack prerequisites, this managed permission configuration persists
 if a subsequent binary deployment fails; binary recovery does not undo it.
 Explicit operator environment overrides can still change the effective settings.
 `--build-only` does not install the drop-in, reload systemd or restart anything.
+
+### Host Logging Ownership
+
+The Ubuntu [installer](../install.sh) and full [source upgrade](../upgrade.sh)
+configure **journald forwarding**, not `/dev/log` takeover:
+
+```text
+Applications -> /dev/log -> journald -> /run/systemd/journal/syslog -> Netcontrol
+Kernel + daemon stdout/stderr -> journald -------------------------------^
+```
+
+Journald keeps `/dev/log`, kernel capture and its local journal even when native
+syslog is disabled. Netcontrol neither binds/unlinks `/dev/log`, reads
+`/dev/kmsg`, nor tails `backend.log`; this avoids duplicate kernel/backend
+forwarding. `backend.log` remains a private daemon audit file. Messages from
+journald are wrapped as RFC5424 records with APP-NAME `journald`; original
+forwarded headers stay in message text, not structured journal fields.
+
+The scripts atomically publish these root-owned mode `0644` managed files:
+
+- `/etc/systemd/journald.conf.d/90-netcontrol-syslog.conf`:
+  `[Journal]`, `ForwardToSyslog=yes`, `MaxLevelSyslog=debug`, `ReadKMsg=yes`.
+- `/etc/systemd/system/netcontrol-syslog.socket`: a mode `0600` Unix datagram
+  receiver at `/run/systemd/journal/syslog`, `Service=netcontrold.service`,
+  `FileDescriptorName=netcontrol-syslog`, `RemoveOnStop=yes`,
+  `PartOf=netcontrold.service`. Systemd creates and passes the receiver.
+- The appliance service drop-in shown above requires/receives that socket.
+  `PartOf` propagates service stop/restart to the socket in the same systemd
+  transaction, including source upgrades, signed API upgrades and factory reset.
+  It prevents forwarding traffic from reactivating the daemon during maintenance.
+  The socket is not independently enabled or started before initial provisioning.
+
+Unrelated files/custom arguments are preserved; unsafe managed paths are refused.
+Configuration publication is atomic per file, not a multi-file transaction.
+The scripts reload units, stop/persistently mask installed `rsyslog.service`,
+`syslog-ng.service`, `syslog.service`, `syslogd.service`, `busybox-syslogd.service`
+and the competing vendor `syslog.socket`. They **start/preserve**
+`systemd-journald-dev-log.socket` and restart journald to apply forwarding.
+No journald input is masked and no arbitrary process/socket is killed/unlinked.
+Custom receivers must release the forwarding path explicitly. Systemd retains
+its normal socket creation/error handling; the Rust worker never steals paths.
+After stopping known receivers, setup rejects symlinks/non-sockets and checks
+`/proc/net/unix` before removing only a stale unbound forwarding socket. Still-bound
+custom receivers and failed ownership inspection abort without removing the path.
+Neither setup nor the worker removes `/dev/log`.
+
+During source upgrade, files/reload are prepared before stopping Netcontrol;
+competing receivers and journald forwarding are configured after it stops and
+before binary replacement. Setup/restart failure aborts deployment and uses
+existing binary recovery. Managed configuration and masks persist on failure.
+Build-only changes none of this. Later operator drop-ins may override the managed
+journald settings; verify the effective configuration and end-to-end capture.
+
+Native syslog requires a systemd launch passing exactly one descriptor named
+`netcontrol-syslog`, bound to the forwarding path, with matching `LISTEN_PID`.
+Bad activation metadata or socket descriptors fail startup explicitly. Without
+activation, enabling syslog fails service preflight; other disabled-syslog
+deployments remain possible. There is **no direct/OpenRC fallback**. Direct/manual
+systemd deployments must provide the equivalent units/journald settings.
+Signed API/package upgrades update binaries, not this deployment setup; provision
+it before deploying code with enabled native syslog. Use console/independent OS SSH.
+
+Saved syslog stays opt-in: disabled means no native remote forwarding, while
+journald still captures locally. The socket queue is bounded, not durable:
+messages may be buffered while disabled and forwarded on later enable, or lost
+to overflow/rate limits. Daemon stop/restart discards the managed socket queue.
+No journal replay/cursor, exact coverage or remote acknowledgment is provided.
+
+Verify `systemctl status netcontrold netcontrol-syslog.socket systemd-journald`
+and effective `systemd-analyze cat-config systemd/journald.conf`, then use a
+synthetic `logger` message and remote collector to verify capture once per input.
+Confirm journald retains the record and repeat after reboot. Returning to an OS
+syslog receiver requires stopping Netcontrol/socket first and deliberately
+removing/replacing the managed receiver/service dependencies before unmasking
+the appropriate original units. Never run competing receivers at the same path.
+An already blocked transaction/failed rollback still needs explicit operator
+recovery; these scripts do not clear it.
 
 Host-service permission also permits other native services **when enabled in
 saved configuration**. It does not turn on NTP/syslog/traffic workers, add

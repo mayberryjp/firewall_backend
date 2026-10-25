@@ -121,6 +121,10 @@ Global editors include:
 interface NAME [ethernet|dummy|vlan|wireguard]
 no interface NAME
 ipv6 enable|disable
+hostname NAME
+no hostname
+timezone ZONE
+no timezone
 ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 no ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
@@ -159,6 +163,15 @@ same candidate; use IPv4 management and independently verify connectivity before
 confirmation. It affects loopback/unmanaged interfaces in the managed namespace,
 not only addresses configured through the CLI. See the
 [global IPv6 contract](../FRONTEND_SPEC.md#global-ipv6-policy).
+
+`hostname NAME` and `timezone ZONE` stage `system.hostname` and `system.timezone`;
+the `no` forms stage the empty (unmanaged) value, which stops management without
+restoring the previous value. They require `system.write` when applied. `commit
+check` validates only the syntax (lowercase RFC 1123 label; IANA zone shape); a
+timezone that is missing from the host database is rejected when the transaction is
+submitted. The daemon applies confirmed values itself after confirmation; see the
+[host name and time zone contract](../FRONTEND_SPEC.md#616-host-name-and-time-zone).
+There is no `show system`; read `GET /api/v1/system/status` over HTTP.
 
 Source-policy routing is not user-configurable: `policy-rule`, `no policy-rule`
 and `show policy-rules` are unsupported. JSON candidate imports must omit

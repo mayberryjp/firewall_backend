@@ -122,7 +122,7 @@ for service_scenario in success repeat directory_failure chmod_failure publish_f
         fi
     ); then
         [[ $service_scenario == success || $service_scenario == repeat ]] || exit 1
-        [[ $(< "$service_target") == $'[Service]\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true' ]]
+        [[ $(< "$service_target") == $'[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\n\n[Service]\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true' ]]
     else
         [[ $service_scenario != success && $service_scenario != repeat ]] || exit 1
         if [[ $service_scenario == *_failure ]]; then
@@ -136,6 +136,91 @@ for service_scenario in success repeat directory_failure chmod_failure publish_f
     fi
 done
 printf 'Appliance service opt-ins, repeat setup, custom-setting preservation and publication failure tests passed.\n'
+
+for logging_setup in success repeat symlink_file symlink_directory publish_failure; do
+    logging_root="$temporary/logging-setup-$logging_setup"
+    mkdir -p "$logging_root/systemd/system" "$logging_root/systemd/journald.conf.d"
+    printf 'operator config\n' > "$logging_root/systemd/journald.conf.d/99-operator.conf"
+    case $logging_setup in
+        symlink_file) ln -s 99-operator.conf "$logging_root/systemd/journald.conf.d/90-netcontrol-syslog.conf" ;;
+        symlink_directory)
+            mv "$logging_root/systemd/journald.conf.d" "$logging_root/original"
+            ln -s ../original "$logging_root/systemd/journald.conf.d" ;;
+    esac
+    if (
+        mv() { [[ $logging_setup != publish_failure ]] && command mv "$@"; }
+        configure_logging_units "$logging_root" || exit 1
+        if [[ $logging_setup == repeat ]]; then configure_logging_units "$logging_root" || exit 1; fi
+    ); then
+        [[ $logging_setup == success || $logging_setup == repeat ]] || exit 1
+        [[ $(< "$logging_root/systemd/journald.conf.d/90-netcontrol-syslog.conf") == $'[Journal]\nForwardToSyslog=yes\nMaxLevelSyslog=debug\nReadKMsg=yes' ]]
+        for directive in PartOf=netcontrold.service ListenDatagram=/run/systemd/journal/syslog SocketMode=0600 Service=netcontrold.service FileDescriptorName=netcontrol-syslog RemoveOnStop=yes; do
+            grep -Fxq "$directive" "$logging_root/systemd/system/netcontrol-syslog.socket"
+        done
+    else
+        [[ $logging_setup != success && $logging_setup != repeat ]] || exit 1
+    fi
+    [[ $(< "$logging_root/systemd/journald.conf.d/99-operator.conf") == 'operator config' ]]
+    [[ -z $(find "$logging_root" -name '.netcontrol-logging.*' -print) ]]
+done
+printf 'Managed journald forwarding and socket-unit persistence, idempotency and safe publication tests passed.\n'
+
+for logging_scenario in stopped repeat missing query_failure mask_failure active_failure still_active unknown_state input_failure restart_failure regular symlink; do
+    logging_directory="$temporary/logging-$logging_scenario"
+    mkdir "$logging_directory"
+    printf 'preserve\n' > "$logging_directory/operator"
+    if [[ $logging_scenario == regular ]]; then
+        printf 'not a socket\n' > "$logging_directory/log"
+    elif [[ $logging_scenario == symlink ]]; then
+        ln -s operator "$logging_directory/log"
+    fi
+    if (
+        systemctl() {
+            printf '%s\n' "$*" >> "$logging_directory/commands"
+            case $1 in
+                show)
+                    if [[ $* == *LoadState* ]]; then
+                        case $logging_scenario in
+                            missing) printf 'not-found\n'; return 4 ;;
+                            query_failure) return 1 ;;
+                            unknown_state) printf 'error\n' ;;
+                            repeat) printf 'masked\n' ;;
+                            *) printf 'loaded\n' ;;
+                        esac
+                    else
+                        case $logging_scenario in
+                            active_failure) return 1 ;;
+                            still_active) printf 'active\n' ;;
+                            *) printf 'inactive\n' ;;
+                        esac
+                    fi ;;
+                mask) [[ $logging_scenario != mask_failure ]] ;;
+                start) [[ $* == 'start systemd-journald-dev-log.socket' && $logging_scenario != input_failure ]] ;;
+                restart) [[ $* == 'restart systemd-journald.service' && $logging_scenario != restart_failure ]] ;;
+                *) return 1 ;;
+            esac
+        }
+        configure_host_logging "$logging_directory/log" "$logging_directory/unix"
+    ); then
+        case $logging_scenario in stopped|repeat|missing) ;; *) exit 1 ;; esac
+        grep -Fxq 'start systemd-journald-dev-log.socket' "$logging_directory/commands"
+        grep -Fxq 'restart systemd-journald.service' "$logging_directory/commands"
+    else
+        case $logging_scenario in stopped|repeat|missing) exit 1 ;; esac
+    fi
+    ! grep -Eq '^(mask|stop).*systemd-journald' "$logging_directory/commands"
+    [[ $(< "$logging_directory/operator") == preserve ]]
+    if [[ $logging_scenario == regular || $logging_scenario == symlink ]]; then
+        [[ -e $logging_directory/log ]]
+        ! grep -q '^restart ' "$logging_directory/commands"
+    fi
+    if [[ $logging_scenario == stopped || $logging_scenario == repeat ]]; then
+        for logging_unit in rsyslog.service syslog-ng.service syslog.service syslogd.service busybox-syslogd.service syslog.socket; do
+            grep -Fxq "mask --now $logging_unit" "$logging_directory/commands"
+        done
+    fi
+done
+printf 'Competing receiver masking, journald input preservation/restart and failure tests passed (mocked systemd).\n'
 
 ports_fixture="$temporary/ports"
 mkdir -p "$ports_fixture"
@@ -197,24 +282,29 @@ check_systemd_unit() { return 0; }
 install() { trace="$trace install $*;"; }
 systemctl() { trace="$trace systemctl $*;"; }
 configure_appliance_services() { trace+=' appliance-services;'; }
+configure_logging_units() { trace+=' logging-units;'; }
+configure_host_logging() { trace+=' host-logging;'; }
 install_systemd_service
 [[ $trace == *'install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys;'* ]]
 [[ $trace == *'install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service;'* ]]
 [[ $trace == *'systemctl daemon-reload;'* ]]
-[[ $trace == *'appliance-services; systemctl daemon-reload;'* ]]
+[[ $trace == *'appliance-services; logging-units; systemctl daemon-reload;'* ]]
+[[ $trace == *'systemctl daemon-reload; host-logging;'* ]]
 [[ $trace != *'systemctl start'* && $trace != *'systemctl enable'* ]]
 trace=''
 check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
-for failure_stage in service_setup reload; do
+for failure_stage in service_setup logging_units reload logging; do
     trace=''
     check_systemd_unit() { return 0; }
     configure_appliance_services() { trace+=' appliance-services;'; [[ $failure_stage != service_setup ]]; }
-    systemctl() { trace+=" systemctl $*;"; return 1; }
+    configure_logging_units() { trace+=' logging-units;'; [[ $failure_stage != logging_units ]]; }
+    systemctl() { trace+=" systemctl $*;"; [[ $failure_stage != reload ]]; }
+    configure_host_logging() { trace+=' host-logging;'; return 1; }
     if install_systemd_service; then exit 1; fi
     [[ $trace == *'appliance-services;'* ]]
-    if [[ $failure_stage == service_setup ]]; then
+    if [[ $failure_stage == service_setup || $failure_stage == logging_units ]]; then
         [[ $trace != *'systemctl daemon-reload;'* ]]
     else
         [[ $trace == *'systemctl daemon-reload;'* ]]
@@ -288,12 +378,12 @@ for deployment_scenario in success setup_failure deploy_failure; do
         deployment_trace=''
         root_command() {
             [[ $# -eq 5 && $1 == bash && $2 == -c &&
-                $3 == 'source "$1"; configure_conntrack && configure_appliance_services && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
+                $3 == 'source "$1"; configure_conntrack && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
             deployment_trace+='setup;'
             [[ $deployment_scenario != setup_failure ]]
         }
         upgrade_binary() {
-            [[ $1 == new-binary && $2 == installed-binary ]] || return 1
+            [[ $1 == new-binary && $2 == installed-binary && $3 == "$PWD/install.sh" ]] || return 1
             deployment_trace+='deploy;'
             [[ $deployment_scenario != deploy_failure ]]
         }
@@ -320,13 +410,17 @@ configure_appliance_services() {
     printf 'services\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != services_failure ]]
 }
+configure_logging_units() {
+    printf 'logging-units\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != logging_units_failure ]]
+}
 systemctl() {
     [[ $* == daemon-reload ]] || return 1
     printf 'reload\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != reload_failure ]]
 }
 EOF
-for setup_scenario in success conntrack_failure services_failure reload_failure; do
+for setup_scenario in success conntrack_failure services_failure logging_units_failure reload_failure; do
     (
         export SETUP_SCENARIO=$setup_scenario SETUP_TRACE="$temporary/setup-$setup_scenario.trace"
         root_command() { "$@"; }
@@ -337,10 +431,11 @@ for setup_scenario in success conntrack_failure services_failure reload_failure;
             [[ $setup_scenario != success ]] || exit 1
         fi
         case $setup_scenario in
-            success) expected=$'conntrack\nservices\nreload\ndeploy' ;;
+            success) expected=$'conntrack\nservices\nlogging-units\nreload\ndeploy' ;;
             conntrack_failure) expected=conntrack ;;
             services_failure) expected=$'conntrack\nservices' ;;
-            reload_failure) expected=$'conntrack\nservices\nreload' ;;
+            logging_units_failure) expected=$'conntrack\nservices\nlogging-units' ;;
+            reload_failure) expected=$'conntrack\nservices\nlogging-units\nreload' ;;
         esac
         [[ $(< "$SETUP_TRACE") == "$expected" ]]
     )
@@ -386,7 +481,7 @@ for scenario in missing loaded unmanaged conflicting masked install_failure relo
 done
 printf 'Upgrade refuses missing services without provisioning or interface changes (mocked privileged commands).\n'
 
-for scenario in success fail_stage fail_restart fail_health first_install fail_first_start inactive_existing fail_inactive_start; do
+for scenario in success fail_stage fail_logging fail_restart fail_health first_install fail_first_start inactive_existing fail_inactive_start; do
     destination="$temporary/upgrade-$scenario"
     mkdir "$destination"
     printf 'old binary\n' > "$destination/netcontrold"
@@ -399,7 +494,13 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
         root_command() {
             printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"
             case $1 in
-                bash) [[ $3 == '\''source "$1"; configure_conntrack && configure_appliance_services && systemctl daemon-reload'\'' ]] ;;
+                bash)
+                    if [[ $3 == '\''source "$1"; configure_host_logging'\'' ]]; then
+                        grep -q "^systemctl stop netcontrold.service$" "$UPGRADE_TEST_DIRECTORY/commands" || return 1
+                        [[ $UPGRADE_TEST_SCENARIO != fail_logging ]]
+                    else
+                        [[ $3 == '\''source "$1"; configure_conntrack && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
+                    fi ;;
                 install)
                     [[ $UPGRADE_TEST_SCENARIO != fail_stage ]] || return 1
                     command cp -- "${@: -2}"
@@ -442,7 +543,7 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
             ! grep -q 'systemctl stop' "$destination/commands"
         else
             [[ $(grep -c 'systemctl stop' "$destination/commands") -eq 2 ]]
-            if [[ $scenario == fail_first_start || $scenario == fail_inactive_start ]]; then
+            if [[ $scenario == fail_first_start || $scenario == fail_inactive_start || $scenario == fail_logging ]]; then
                 [[ $(grep -c 'systemctl start' "$destination/commands") -eq 1 ]]
             else
                 [[ $(grep -c 'systemctl start' "$destination/commands") -eq 2 ]]

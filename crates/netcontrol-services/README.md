@@ -58,24 +58,39 @@ These are worker states, not external daemon states; there is no `pid` field.
   causing failure. The kernel applies corrections gradually; no clock step
   or immediate synchronization is claimed. Requires CAP_SYS_TIME
   and explicit operator ownership of clock discipline; no automatic takeover
-  of another clock manager. Missing samples are visibly unavailable; three
-  failed polling rounds stop the worker in error. No NTP serving, NTS, drift
+  of another clock manager. Missing/invalid samples remain visibly unavailable
+  with a row-local error while the worker keeps running and polling, even after
+  three failed rounds. A valid sample clears the warning automatically.
+  This condition does not fail configuration observation or confirmation;
+  startup, socket I/O and clock-adjustment failures remain fatal errors.
+  No NTP serving, NTS, drift
   estimator, server consensus/falseticker algorithm, or chrony command API.
 * **Syslog:** RFC5424 output over UDP and RFC6587 octet-counted TCP/TLS.
   TLS verifies server identity/IP against system CA roots. The default-enabled
   `tls` Cargo feature uses rustls/ring and needs a C compiler when building its
   cryptographic dependency; builds without this feature reject TLS forwarding
-  explicitly, never downgrade it. Hosts must have an
-  available `/dev/log` socket path and readable `/dev/kmsg`; conflicting logger
-  ownership is rejected rather than stolen. Owns/removes only its socket inode.
-  Sources include host datagrams, kernel messages, and new complete lines from
-  `<state_directory>/backend.log`; the daemon must write backend events there.
-  The backend file is initially tailed at EOF, follows inode rotation, and
-  rejects truncation/overlong lines. A local RFC5424 copy is appended to
-  `syslog-host.log`. Messages are bounded to 65,000 bytes. Failed connections,
-  writes, source loss, or ownership loss become errors; no delivery
-  acknowledgment, durable forwarding queue, journald-native ingestion,
-  automatic log rotation, or automatic reconnect is claimed.
+  explicitly, never downgrade it. **Requires systemd/journald** with
+  `ForwardToSyslog=yes` and a single inherited datagram descriptor named
+  `netcontrol-syslog`, bound to `/run/systemd/journal/syslog`. Validates the
+  activation PID/count/name, socket type/address and socket-path identity.
+  Missing activation rejects enabled syslog before worker shutdown/apply.
+  OpenRC/direct launches cannot enable native syslog; no direct-capture fallback.
+  Ubuntu install/full source-upgrade scripts configure the socket/journald and
+  stop/mask competing receivers, not journald's `/dev/log` input; see
+  [host logging ownership](../../docs/BUILD_AND_INSTALL.md#host-logging-ownership).
+  Journald captures host/kernel messages and daemon stdout/stderr. Netcontrol
+  only receives forwarded datagrams; it never binds/unlinks `/dev/log`, opens
+  `/dev/kmsg`, or tails `backend.log`, avoiding duplicate kernel/backend capture.
+  Journald's forwarded message text is wrapped in bounded RFC5424 output with
+  APP-NAME `journald`; this is not a journal cursor reader or metadata-preserving
+  journal export. A local copy is appended to `syslog-host.log`.
+  Messages are bounded to 65,000 bytes. Failed connections, writes or socket-path
+  loss become errors. Systemd owns socket lifetime; worker repair/rollback
+  reuses the inherited receiver and never unlinks it. While disabled/stopped,
+  the bounded socket queue may retain messages for later forwarding or overflow;
+  daemon stop/restart closes the managed socket and its queue. Journald capture,
+  rate limits and forwarding settings determine coverage. No complete delivery,
+  acknowledgment, durable forwarding queue/replay, rotation or reconnect is claimed.
 * **Traffic counters:** host and managed workers sample all `/proc/thread-self/net/dev`
   interfaces, including loopback, every five seconds. Captures byte/packet
   baselines, accumulates observed deltas, and records boot/namespace/interface/reset
@@ -225,8 +240,10 @@ Common enabled appliance row:
   offsets may require prolonged slewing. A previous successful sample remains labeled with its original
   `collected_at` when a later polling round fails; `sample_status: unavailable`
   and `error` indicate staleness, not a current successful correction.
-* Syslog adds `backend_source`, `host_source`, `kernel_source` path strings,
-  then `forwarded_records` nonnegative integer. The latter counts complete
+* Syslog adds `source: "journald"` and
+  `host_source: "/run/systemd/journal/syslog"`; the former `backend_source` and
+  `kernel_source` fields are removed. `forwarded_records` is a nonnegative
+  integer, reset per worker start. It counts complete
   records written to every configured destination, not acknowledgments.
 * Each `vnstat-host`/`vnstat-managed` row adds
   `schema: "netcontrol-services/counters/v1"`, `database_directory` path,

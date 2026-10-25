@@ -25,7 +25,7 @@ Specifically removed: `--softflowd-binary`, `--softflowd-runtime-dir`,
 `--dhcp-relay-runtime-dir`, `--dhcp-relay-uid`, `--dhcp-relay-gid`,
 `--ntp-binary`, `--syslog-binary`, `--vnstatd-binary`, `--vnstat-binary`,
 and `--services-runtime-dir`. `--backend-log-file` is replaced by the fixed
-`<services-state-dir>/backend.log` source; `--syslog-ca-file` is replaced by
+`<services-state-dir>/backend.log` audit file; `--syslog-ca-file` is replaced by
 the native service's system-trust TLS policy. The WireGuard key-directory
 default is now `/etc/netcontrol/keys`.
 
@@ -45,8 +45,11 @@ transactions. `GET /api/v1/interfaces` remains managed configuration.
 Native mode inside Docker manages only the container's namespace.
 
 With host services enabled on Linux, structured daemon events are appended to
-`<services-state-dir>/backend.log` and stderr. The file is private and feeds the
-native syslog backend source. Request bodies, raw URLs, cookies, passwords,
+`<services-state-dir>/backend.log` and stderr. The file is private; native syslog
+receives the stderr copy through journald forwarding, not by tailing the file.
+Native syslog requires systemd socket activation from `netcontrol-syslog.socket`
+and journald `ForwardToSyslog=yes`; OpenRC/direct launches cannot enable it.
+Request bodies, raw URLs, cookies, passwords,
 Authorization headers, and API-key tokens are never logged.
 
 ## Configuration SSH

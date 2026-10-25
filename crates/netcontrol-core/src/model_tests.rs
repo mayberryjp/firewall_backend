@@ -100,6 +100,75 @@ fn mqtt_settings_do_not_change_native_operational_configuration() {
 }
 
 #[test]
+fn system_settings_default_unmanaged_validate_and_stay_out_of_native_configuration() {
+    let before = candidate();
+    assert_eq!(before.system, SystemConfig::default());
+    assert_eq!(
+        serde_json::to_value(&before).unwrap()["system"],
+        json!({"hostname":"","timezone":""})
+    );
+    let mut after = before.clone();
+    after.system.hostname = "fw-1".into();
+    after.system.timezone = "America/Argentina/Buenos_Aires".into();
+    after.validate().unwrap();
+    assert!(after.operational_value().unwrap().get("system").is_none());
+    assert_eq!(
+        before.operational_value().unwrap(),
+        after.operational_value().unwrap()
+    );
+    let (long_name, too_long_name) = ("a".repeat(63), "a".repeat(64));
+    for hostname in ["a", "0", "fw-1", long_name.as_str()] {
+        assert!(valid_hostname(hostname), "{hostname}");
+    }
+    for hostname in [
+        "",
+        "-fw",
+        "fw-",
+        "FW",
+        "fw_1",
+        "fw.example",
+        "fw 1",
+        "ünï",
+        too_long_name.as_str(),
+    ] {
+        assert!(!valid_hostname(hostname), "{hostname:?}");
+        if !hostname.is_empty() {
+            let mut invalid = before.clone();
+            invalid.system.hostname = hostname.into();
+            assert!(invalid.validate().is_err(), "{hostname:?}");
+        }
+    }
+    for zone in [
+        "UTC",
+        "America/New_York",
+        "Etc/GMT+5",
+        "America/Indiana/Indianapolis",
+    ] {
+        assert!(valid_timezone_name(zone), "{zone}");
+    }
+    let too_long_zone = "A".repeat(65);
+    for zone in [
+        "/UTC",
+        "UTC/",
+        "../etc/passwd",
+        "America//New_York",
+        "a/b/c/d",
+        "UTC\0",
+        "New York",
+        "zone.tab",
+        too_long_zone.as_str(),
+    ] {
+        assert!(!valid_timezone_name(zone), "{zone:?}");
+        let mut invalid = before.clone();
+        invalid.system.timezone = zone.into();
+        assert!(invalid.validate().is_err(), "{zone:?}");
+    }
+    let mut unknown = serde_json::to_value(&after).unwrap();
+    unknown["system"]["domain"] = json!("example.test");
+    assert!(serde_json::from_value::<Config>(unknown).is_err());
+}
+
+#[test]
 fn mqtt_configuration_defaults_validation_and_no_inline_password() {
     let mut config = candidate();
     assert!(!config.mqtt.enabled);
@@ -855,7 +924,7 @@ fn policy_references_ports_expansion_and_family() {
 #[test]
 fn all_current_example_feature_schemas_validate() {
     fn annotate(value: &mut Value, path: &str, paths: &mut Vec<String>) {
-        if path == "/mqtt" {
+        if path == "/mqtt" || path == "/system" {
             return;
         }
         match value {
@@ -912,6 +981,7 @@ fn all_current_example_feature_schemas_validate() {
         assert!(!paths.is_empty());
         assert!(annotated["kernel"].get("metadata").is_none());
         assert!(annotated["mqtt"].get("metadata").is_none());
+        assert!(annotated["system"].get("metadata").is_none());
         let described: Config = serde_json::from_value(annotated.clone()).unwrap();
         described.validate().unwrap();
         assert_eq!(

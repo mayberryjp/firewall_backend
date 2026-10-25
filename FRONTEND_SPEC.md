@@ -152,7 +152,8 @@ No old identity, network-state, or vnStat database importer/reset is provided.
 
 CLI options use `--long-options`. External executable, child UID/GID,
 runtime-directory, `--backend-log-file`, and `--syslog-ca-file` settings are
-removed. The backend log source is `<services-state-dir>/backend.log`; syslog TLS
+removed. The backend audit file is `<services-state-dir>/backend.log`; native syslog
+receives journald-forwarded messages via systemd socket activation, and syslog TLS
 uses system CA trust. See the [daemon contract](crates/netcontrold/README.md)
 and [installation guide](docs/BUILD_AND_INSTALL.md) for current deployment flags.
 
@@ -587,6 +588,7 @@ Configuration changes additionally require permissions for every changed area:
 | Whole-appliance syslog/remote destinations | `syslog.write` |
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
 | MQTT streaming configuration | `mqtt.write` |
+| Host name and time zone (`system`) | `system.write` |
 | Azure Dynamic DNS configuration and secret upload | `dynamic_dns.write` |
 
 Creating/removing a WireGuard interface typically needs both interface and
@@ -1352,7 +1354,11 @@ servers and preserving the actual complete network configuration.
   enabling requires at least one. Explicit `udp`/`tcp`/`tls`, integer port
   1..65535, canonical IP or lowercase DNS host. TLS uses verified operator trust;
   no insecure fallback. Warn that UDP/TCP are unencrypted and UDP can lose logs.
-  Fan-out includes system/kernel/backend logs; backend JSON remains message text.
+  Fan-out receives journald-forwarded host/kernel/daemon stderr messages; backend
+  JSON remains message text. Native syslog requires systemd/journald and the
+  inherited `netcontrol-syslog` datagram socket at `/run/systemd/journal/syslog`.
+  Journald retains `/dev/log`. No direct kernel reader/backend file tail remains,
+  avoiding duplicate capture. OpenRC/direct launches cannot enable native syslog.
   The Rust worker does not start/stop a system syslog daemon. Describe its actual
   captured sources and unavailable sources explicitly; do not imply complete
   system/kernel/backend delivery merely because a worker is running.
@@ -1385,6 +1391,15 @@ milliseconds; delay is nonnegative. Requested slew is bounded to +/-500 ms.
 Uncorrected offset is sample offset minus the requested correction, not proof
 that the asynchronous adjustment completed. Preserve sample timestamps on stale
 samples; no synchronization or remote-delivery acknowledgment is provided.
+Missing or invalid NTP samples do not stop the worker, including after three
+failed polling rounds. While `state: "running"` and `sample_status: "unavailable"`,
+render the row's `error` as a non-blocking time-sync warning, not a failed
+configuration read or a global editing lock. Keep configured servers visible
+from `GET /api/v1/services/ntp`; an unavailable sample is not an empty server list.
+Continue status polling; the next accepted sample clears the warning. Other
+configuration reads, staging and confirmation remain available when no genuine
+backend error exists. Startup, socket I/O and clock-adjustment failures remain
+errors; existing drift, authorization and transaction recovery guards still apply.
 Poll visible status at the existing non-overlapping 2-5 second cadence.
 Failures do not rewrite desired enabled settings or create drift by themselves.
 
@@ -1396,9 +1411,26 @@ Preserve drafts on 403/409/422/500; expose validation/runtime errors. Existing
 
 Operator prerequisites are not API settings: `--allow-host-services` or
 `NETCONTROL_ALLOW_HOST_SERVICES=true` (set by current install/full upgrade scripts),
-namespace/host capabilities, exclusive host-service ownership, an arranged backend log source, trust bundle,
+namespace/host capabilities, exclusive host-service ownership, journald forwarding for syslog, trust bundle,
 host DNS/routing, and stopping competing clock/logging services. No packages,
 arbitrary commands, OpenRC service management, or host-network edits are exposed.
+Ubuntu install/full source-upgrade scripts configure `ForwardToSyslog=yes`,
+`MaxLevelSyslog=debug`, `ReadKMsg=yes` and `netcontrol-syslog.socket`, and stop/mask
+common competing syslog receivers. They preserve journald and its `/dev/log` input.
+Build-only and signed API/package upgrades do not provision this setup. Saved
+syslog settings remain unchanged: disabling native syslog stops forwarding, not
+local journald capture. The bounded receiver queue may retain messages while
+disabled and forward them on enable; overflow/daemon restart may lose them.
+Capture/rate limits/forwarding settings determine coverage; a running worker is
+not evidence of complete capture or delivery. Enabled native syslog without the
+inherited socket fails preflight explicitly (HTTP 500 on transaction apply under
+the existing error mapping), before service workers are stopped for that apply.
+Malformed activation/socket state can fail daemon startup. Custom receivers
+must release `/run/systemd/journal/syslog`; no socket is stolen or unlinked by
+the worker. See [deployment and recovery](docs/BUILD_AND_INSTALL.md#host-logging-ownership).
+Frontend syslog help and status source labels must describe journald, not direct
+`/dev/log`, `/dev/kmsg` or backend-file capture. Do not offer host process-control
+actions or automatically retry writes after a failed rollback.
 Direct/manual host clock/logging/statistics deployments retain explicit opt-ins
 even when native networking uses the host namespace. Host-network management alone does not authorize
 clock adjustment or take ownership from competing services.
@@ -1711,6 +1743,119 @@ Deployment/operator requirements:
   WAN/DHCP/NAT changes, recursive DNS propagation and appliance reboot remain
   deployment acceptance checks. See [operator setup](README.md#azure-dynamic-dns)
   and [handoff](docs/frontend-handoffs/2026-10-25.md#2026-10-25-01-azure-dynamic-dns).
+
+### 6.1.6 Host name and time zone
+
+`config.system` manages two appliance host settings. It is part of the shared
+configuration draft and is always present in `GET /api/v1/state`, transactions and
+revisions:
+
+```ts
+interface SystemConfig {
+  hostname: string; // "" = unmanaged, else a lowercase RFC 1123 label
+  timezone: string; // "" = unmanaged, else an IANA zone name
+}
+```
+
+```json
+{"system":{"hostname":"fw-1","timezone":"America/New_York"}}
+```
+
+There is no `metadata` on this object. Send the whole object (both fields) like
+every other section; an omitted `system` means both unmanaged.
+
+Validation (`422` on submit; the SSH `commit check` only validates syntax):
+
+- `hostname`: empty, or 1..63 characters of `a-z`, `0-9` and `-`, not starting or
+  ending with `-`. Uppercase, dots, underscores and spaces are rejected; there is
+  no FQDN or domain setting.
+- `timezone`: empty, or at most 64 characters in at most three `/`-separated parts of
+  letters, digits, `_`, `+` and `-` (`UTC`, `America/New_York`, `Etc/GMT+5`). Dots,
+  `..`, empty parts and spaces are rejected.
+- When the **timezone value changes**, it must also exist in the host's timezone
+  database (`422`, "timezone is not available on this host"). Unchanged values are
+  not rechecked, so unrelated edits still work if the database later disappears.
+- Non-empty values are rejected (`422`, "host system settings are unavailable for this
+  backend") when the daemon cannot manage the host, such as a namespace lab.
+  The simulator accepts any well-formed zone.
+
+Permissions: `transactions.write` plus the new **`system.write`** for any change to
+`config.system`. Scoped credential files must list `system.write`; device-account
+keys have it automatically.
+
+**When it takes effect.** Like MQTT and Dynamic DNS, `system` is daemon-owned and is
+**not** part of the networking apply: it never changes the network, never delays
+confirmation, and a rolled-back or unconfirmed transaction never touches the host.
+Within about a second of confirmation the daemon applies the saved values. While
+a transaction is pending, nothing is applied. The values are enforced: if another
+agent changes them, the daemon sets them again (at most every 10 seconds); a failed
+apply is retried every 30 seconds. **Clearing a value (empty string) stops managing
+it and leaves the host as it is**; it does not restore the previous name or zone.
+
+Host effects:
+
+- `hostname`: the kernel hostname and `/etc/hostname`. The daemon's syslog
+  forwarding picks the new name up within a second. `/etc/hosts` is not edited, and
+  the per-interface DHCP-client `hostname` is a separate setting.
+- `timezone`: `/etc/localtime` becomes a symlink to the zone file, and
+  `/etc/timezone` is rewritten only where it already exists. Processes that were
+  already running may keep the old zone until restarted. API timestamps stay
+  UTC, and NTP and the system clock are unaffected.
+
+Read-only endpoints (`state.read`; no query parameters; `405` for other methods,
+`401`/`403` as usual, `503` when the manager is unavailable):
+
+| Method and path | Result |
+| --- | --- |
+| `GET /api/v1/system/status` | `SystemStatus`, the confirmed settings and what the host reports |
+| `GET /api/v1/system/timezones` | `{"timezones":["America/Chicago","UTC",...]}` sorted valid zone names |
+
+```ts
+type SystemSettingState =
+  | "unmanaged" | "current" | "applying" | "error" | "paused" | "simulated" | "unavailable";
+interface SystemSettingStatus {
+  configured: string;        // confirmed value, "" when unmanaged
+  observed: string | null;   // what the host reports now; null when unknown
+  state: SystemSettingState;
+  error: string | null;      // set when state is "error" or "unavailable"
+}
+interface SystemStatus {
+  hostname: SystemSettingStatus;
+  timezone: SystemSettingStatus;
+  last_applied_at_unix: number | null; // last time the daemon changed the host
+}
+```
+
+```json
+{"hostname":{"configured":"fw-1","observed":"fw-1","state":"current","error":null},
+ "timezone":{"configured":"America/New_York","observed":"America/New_York","state":"current","error":null},
+ "last_applied_at_unix":1792890000}
+```
+
+`current` means the host matches; `applying` is a short wait (for example after an
+external change, before the daemon sets it again); `paused` means a transaction is
+pending or an upgrade is running; `error` carries a message such as a missing
+privilege or timezone database and is retried; `simulated` and `unavailable`
+(namespace lab or non-Linux) never touch a host. `observed` is the kernel hostname,
+or the zone name from `/etc/localtime` (null when it is not a link into the zone
+database), and is also reported for unmanaged settings. The simulator returns a
+fixed sample zone list; the native list is empty when the host has no timezone
+database.
+
+Frontend tasks: add `SystemConfig` and the status types; a hostname field with the
+rules above and a timezone selector loaded from `/system/timezones` (disable it with
+an explanation when the list is empty); show the status row with `observed`, `state`
+and `error`; keep the empty value as an explicit "Unmanaged" choice and explain that
+clearing does not revert; note that long-running processes may need a restart
+for a new zone; submit through the normal draft, `commit` and confirm flow.
+
+Operator prerequisites: Linux host mode with a daemon that may set the hostname
+(root/`CAP_SYS_ADMIN`); the host's timezone database (the `tzdata` package; the daemon
+installs nothing); no other hostname or timezone manager (cloud-init, a DHCP
+hostname option, or a configuration tool) fighting the daemon. Local fixtures cover
+this logic, but the real hostname and time zone behavior on an appliance is a
+deployment acceptance check. See the
+[handoff](docs/frontend-handoffs/2026-10-25.md#2026-10-25-10-host-name-and-time-zone).
 
 ### 6.2 Managed interfaces and VLANs
 
@@ -2816,6 +2961,7 @@ interface Config {
   ntp: NTPConfig;
   syslog: SyslogConfig;
   vnstat: VNStatConfig;
+  system: SystemConfig; // see section 6.1.6
   dynamic_dns: DynamicDNSConfig[];
   interfaces: ManagedInterface[];
   dhcp_clients?: Record<string, DHCPClientConfig>;
@@ -2851,6 +2997,9 @@ interface ApplianceServiceStatus {
   state: "disabled" | "simulated" | "running" | "error" | "stopped";
   started_at?: Timestamp;
   database_directory?: string;
+  source?: "journald"; // syslog worker only
+  host_source?: "/run/systemd/journal/syslog"; // syslog worker only
+  forwarded_records?: number; // nonnegative integer, per syslog worker start
   error?: string;
   sample_status?: "warming_up" | "available" | "unavailable";
   server?: string;

@@ -65,6 +65,8 @@ pub struct Services {
     host_namespace: std::sync::Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
     managed_namespace: std::sync::Arc<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    syslog_socket: Option<std::sync::Arc<syslog::JournalSocket>>,
 }
 impl Services {
     pub fn new(options: ServiceOptions) -> Result<Self> {
@@ -142,6 +144,9 @@ impl Services {
             host_namespace,
             #[cfg(target_os = "linux")]
             managed_namespace,
+            #[cfg(target_os = "linux")]
+            syslog_socket: syslog::JournalSocket::activated()
+                .context("receive systemd syslog socket")?,
         })
     }
     pub fn validate(&self, value: &Value) -> Result<()> {
@@ -174,6 +179,13 @@ impl Services {
             !c.gateway_monitors.iter().any(|m| m.enabled) || self.options.allow_gateway_monitoring,
             "gateway probes require explicit allow_gateway_monitoring opt-in"
         );
+        #[cfg(target_os = "linux")]
+        if c.syslog.enabled {
+            self.syslog_socket
+                .as_ref()
+                .context("native syslog requires systemd socket activation from netcontrol-syslog.socket and journald ForwardToSyslog=yes")?
+                .check_path()?;
+        }
         #[cfg(not(target_os = "linux"))]
         ensure!(
             !c.ntp.enabled
@@ -239,7 +251,11 @@ impl Services {
             if c.syslog.enabled {
                 let config = c.syslog.clone();
                 let dir = self.options.state_directory.clone();
-                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","backend_source":dir.join("backend.log"),"host_source":"/dev/log","kernel_source":"/dev/kmsg"}),move||syslog::prepare(config,dir,ipv6_enabled))?;
+                let socket = self
+                    .syslog_socket
+                    .clone()
+                    .context("systemd syslog socket missing")?;
+                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","source":"journald","host_source":syslog::JOURNAL_SOCKET}),move||syslog::prepare(config,dir,socket,ipv6_enabled))?;
             }
             if c.vnstat.enabled {
                 for scope in ["host", "managed"] {
@@ -512,6 +528,41 @@ impl Drop for Services {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn syslog_without_systemd_activation_fails_before_stopping_workers() {
+        let directory =
+            std::env::temp_dir().join(format!("nc-syslog-preflight-{}", rand::random::<u64>()));
+        let mut services = Services::new(ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: true,
+            allow_gateway_monitoring: false,
+        })
+        .unwrap();
+        let previous = json!({});
+        services.apply(&previous, &previous).unwrap();
+        let candidate = json!({"syslog":{"enabled":true,"servers":[{"host":"127.0.0.1","port":514,"transport":"udp"}]}});
+        let before = services.status();
+        assert!(
+            services
+                .validate(&candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("requires systemd socket activation")
+        );
+        assert!(
+            services
+                .apply(&previous, &candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("requires systemd socket activation")
+        );
+        assert_eq!(services.status(), before);
+        assert!(services.workers.is_empty());
+        drop(services);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn gateway_validation_requires_both_host_opt_ins_without_starting_workers() {

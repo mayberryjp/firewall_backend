@@ -155,6 +155,89 @@ async fn host_health_http_authentication_permissions_and_cors() {
 }
 
 #[tokio::test]
+async fn host_system_endpoints_authentication_permissions_and_simulated_catalog() {
+    use netcontrold::{
+        host_system::{Manager, Mode},
+        http::Credential,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(
+            &directory.path().join("state.json"),
+            Box::new(Simulator::new()),
+        )
+        .unwrap(),
+    ));
+    let credentials = || {
+        Authentication::Scoped(vec![
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+            Credential {
+                name: "writer".into(),
+                token_sha256: netcontrold::identity::digest("writer"),
+                permissions: vec!["system.write".into()],
+            },
+        ])
+    };
+    let detached = router(App::new(engine.clone(), credentials(), false));
+    let mut app = App::new(engine.clone(), credentials(), false);
+    App::attach_system(&mut app, Manager::open(engine, Mode::Simulated).unwrap()).unwrap();
+    let attached = router(app);
+    let call = |router: axum::Router,
+                method: &'static str,
+                path: &'static str,
+                token: &'static str| async move {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+    for path in ["/api/v1/system/status", "/api/v1/system/timezones"] {
+        assert_eq!(call(attached.clone(), "GET", path, "").await.0, 401);
+        assert_eq!(call(attached.clone(), "GET", path, "writer").await.0, 403);
+        assert_eq!(call(attached.clone(), "POST", path, "reader").await.0, 405);
+        assert_eq!(call(detached.clone(), "GET", path, "reader").await.0, 503);
+    }
+    assert_eq!(
+        call(
+            attached.clone(),
+            "GET",
+            "/api/v1/system/status?unused=1",
+            "reader"
+        )
+        .await
+        .0,
+        400
+    );
+    let (status, body) = call(attached.clone(), "GET", "/api/v1/system/status", "reader").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["hostname"]["state"], "unmanaged");
+    assert_eq!(body["timezone"]["configured"], "");
+    assert!(body["last_applied_at_unix"].is_null());
+    let (status, body) = call(attached, "GET", "/api/v1/system/timezones", "reader").await;
+    assert_eq!(status, 200);
+    assert!(
+        body["timezones"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("UTC"))
+    );
+}
+
+#[tokio::test]
 async fn software_upgrade_requires_permission_and_validates_versions_when_disabled() {
     use netcontrold::http::Credential;
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

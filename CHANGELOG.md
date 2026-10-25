@@ -4,6 +4,21 @@
 
 ### Fixed
 
+- Missing/invalid NTP samples no longer stop the worker after three polling
+  rounds and consequently fail unrelated configuration reads and transaction
+  observation/confirmation. NTP keeps polling with `sample_status: "unavailable"`
+  and a visible row-local warning; the next accepted sample clears it. Startup,
+  socket I/O, clock-adjustment errors and transaction recovery guards are
+  unchanged. Recommended bump: patch; baseline unknown, Unreleased.
+  Required frontend warning/list handling:
+  [handoff 2026-10-25-11](docs/frontend-handoffs/2026-10-25.md#2026-10-25-11-non-blocking-ntp-sample-warnings).
+
+- Fixed the signed-package CI build for the static musl target: the NetFlow
+  capture `recvmmsg` call passed `MSG_DONTWAIT` as `i32`, but musl's libc binding
+  takes `u32` (glibc takes `i32`). The flag is now converted by inference, so both
+  libc variants compile. No behavior, API or frontend change. Recommended bump:
+  none (build fix for unreleased code).
+
 - Further reduced native NetFlow/IPFIX processing overhead with hash-based flow
   lookups, cached timeout classes, one monotonic timestamp per packet update
   and expiry scan, and bounded batching of capacity/counter-rollover exports
@@ -22,6 +37,20 @@
   Unreleased. See [capture details](docs/NETFLOW_IPFIX_SPEC.md#packet-drops).
 
 ### Changed
+
+- Native syslog now requires systemd/journald forwarding through the inherited
+  `netcontrol-syslog` datagram socket at `/run/systemd/journal/syslog`. Journald
+  retains `/dev/log` and kernel/daemon capture; direct `/dev/log`, `/dev/kmsg` and
+  backend-file capture are removed to avoid duplicate forwarding. Ubuntu scripts
+  configure socket activation/journald and mask competing receivers, never the
+  journald dev-log input. Worker repair/rollback reuses systemd's socket; managed
+  service stop/restart also stops/restarts the socket. Status adds
+  `source: "journald"`, changes `host_source`, removes `backend_source` and
+  `kernel_source`. OpenRC/direct native syslog is unsupported; no fallback.
+  This supersedes the earlier unreleased takeover design. Recommended bump:
+  **major** for breaking deployment/source/status contracts; baseline unknown.
+  Required frontend help/status coordination:
+  [handoff 2026-10-25-09](docs/frontend-handoffs/2026-10-25.md#2026-10-25-09-journald-only-native-syslog).
 
 - Documentation only: [FRONTEND_SPEC.md](FRONTEND_SPEC.md) section 6.9 now specifies an
   inline per-row enable/disable toggle for NetFlow/IPFIX exports and the **Add export**
@@ -50,6 +79,21 @@
   [handoff 2026-10-24-19](docs/frontend-handoffs/2026-10-24.md#2026-10-24-19-unknown-configuration-fields-are-dropped-and-reported).
 
 ### Added
+
+- Host name and time zone settings: `config.system` (`hostname`, `timezone`; empty =
+  unmanaged, the default and always present in configuration responses), a new
+  `system.write` permission, `GET /api/v1/system/status` and
+  `GET /api/v1/system/timezones` (`state.read`), and the CLI commands `hostname`,
+  `timezone` and their `no` forms. After confirmation the daemon sets the kernel hostname
+  and `/etc/hostname` and links `/etc/localtime` to the zone (Linux host mode, requires
+  the host timezone database); values are enforced with retry/backoff, a rolled-back
+  transaction never touches the host, and clearing a value does not revert it. The
+  section is excluded from the native networking configuration. Native syslog
+  forwarding now re-reads the kernel hostname every second so a hostname change takes
+  effect without a restart. Changing the Config shape is a breaking addition for
+  clients that validate responses strictly. Recommended bump: minor; baseline unknown.
+  Frontend action required for the UI; see
+  [handoff 2026-10-25-10](docs/frontend-handoffs/2026-10-25.md#2026-10-25-10-host-name-and-time-zone).
 
 - Home Assistant MQTT streaming now also publishes NetFlow/IPFIX (`softflowd`)
   statistics per configured instance: export state, `statistics_complete`, kernel

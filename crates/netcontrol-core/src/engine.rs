@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::Arc,
 };
 
 pub const PERMISSIONS: &[&str] = &[
@@ -23,6 +24,7 @@ pub const PERMISSIONS: &[&str] = &[
     "syslog.write",
     "vnstat.write",
     "mqtt.write",
+    "system.write",
     "dynamic_dns.write",
     "kernel.namespace.write",
     "kernel.host.write",
@@ -222,6 +224,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
         ("mqtt.write", a.mqtt != b.mqtt),
+        ("system.write", a.system != b.system),
         ("dynamic_dns.write", a.dynamic_dns != b.dynamic_dns),
         ("kernel.namespace.write", a.ipv6_enabled != b.ipv6_enabled),
         (
@@ -267,9 +270,13 @@ pub struct Engine {
     maintenance: bool,
     mqtt_passwords: Option<BTreeSet<String>>,
     dynamic_dns_secrets: Option<BTreeSet<String>>,
+    timezone_check: Option<TimezoneCheck>,
     #[cfg(test)]
     now: Option<DateTime<Utc>>,
 }
+
+/// Reports whether a syntactically valid timezone exists on the managed host.
+pub type TimezoneCheck = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 impl Engine {
     pub fn open(path: &Path, backend: Box<dyn Backend>) -> Result<Self> {
         Self::open_inner(path, backend, true, true)
@@ -352,6 +359,7 @@ impl Engine {
             maintenance: false,
             mqtt_passwords: None,
             dynamic_dns_secrets: None,
+            timezone_check: None,
             #[cfg(test)]
             now: None,
         };
@@ -780,6 +788,11 @@ impl Engine {
         self.dynamic_dns_secrets = references;
     }
 
+    /// `None` means this backend cannot manage host settings; managed values are then rejected.
+    pub fn configure_system(&mut self, timezone_check: Option<TimezoneCheck>) {
+        self.timezone_check = timezone_check;
+    }
+
     pub fn factory_reset(&mut self, config: Config) -> Result<Transaction> {
         ensure!(!self.closed, "engine is shut down");
         let request = SubmitRequest {
@@ -834,6 +847,24 @@ impl Engine {
                 422,
                 "MQTT streaming is unavailable for this backend",
             ));
+        }
+        let system = &r.config.system;
+        // Only changed host settings are checked, so unrelated edits survive a missing zone database.
+        if *system != self.state.desired.system
+            && (!system.hostname.is_empty() || !system.timezone.is_empty())
+        {
+            let Some(check) = &self.timezone_check else {
+                return Err(ApiError::new(
+                    422,
+                    "host system settings are unavailable for this backend",
+                ));
+            };
+            if !system.timezone.is_empty() && !check(&system.timezone) {
+                return Err(ApiError::new(
+                    422,
+                    "timezone is not available on this host; list valid names with GET /api/v1/system/timezones",
+                ));
+            }
         }
         if !r.config.mqtt.password_ref.is_empty()
             && !self

@@ -377,6 +377,17 @@ async fn run(options: Options) -> Result<()> {
         dynamic_dns_mode,
     )?;
     App::attach_dynamic_dns(&mut app, dynamic_dns.clone())?;
+    let system_mode = if mqtt_mode == netcontrold::mqtt::Mode::Simulated {
+        netcontrold::host_system::Mode::Simulated
+    } else if mqtt_mode == netcontrold::mqtt::Mode::Native {
+        netcontrold::host_system::Mode::Native
+    } else {
+        netcontrold::host_system::Mode::Unsupported
+    };
+    let system = netcontrold::host_system::Manager::open(engine.clone(), system_mode)?;
+    App::attach_system(&mut app, system.clone())?;
+    let (system_stop, system_receiver) = tokio::sync::watch::channel(false);
+    let system_task = tokio::spawn(system.run(system_receiver));
     let (dynamic_dns_stop, dynamic_dns_receiver) = tokio::sync::watch::channel(false);
     let dynamic_dns_task = tokio::spawn(dynamic_dns.run(dynamic_dns_receiver));
     let (mqtt_stop, mqtt_receiver) = tokio::sync::watch::channel(false);
@@ -481,8 +492,12 @@ async fn run(options: Options) -> Result<()> {
     let _ = stop_tx.send(true);
     let _ = mqtt_stop.send(true);
     let _ = dynamic_dns_stop.send(true);
+    let _ = system_stop.send(true);
     signals.abort();
     mqtt_task.await.context("MQTT worker shutdown failed")?;
+    system_task
+        .await
+        .context("host system worker shutdown failed")?;
     dynamic_dns_task
         .await
         .context("Dynamic DNS worker shutdown failed")??;

@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod dynamic_dns;
+pub mod host_system;
 pub mod http;
 pub mod identity;
 pub mod mqtt;

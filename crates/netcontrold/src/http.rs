@@ -94,6 +94,7 @@ pub struct App {
     updates: Option<crate::updates::Manager>,
     mqtt: Option<Arc<crate::mqtt::Manager>>,
     dynamic_dns: Option<Arc<crate::dynamic_dns::Manager>>,
+    system: Option<Arc<crate::host_system::Manager>>,
 }
 impl App {
     pub fn new(engine: Arc<Mutex<Engine>>, auth: Authentication, tls: bool) -> Arc<Self> {
@@ -105,6 +106,7 @@ impl App {
             updates: None,
             mqtt: None,
             dynamic_dns: None,
+            system: None,
         })
     }
     pub fn with_updates(
@@ -145,6 +147,15 @@ impl App {
         Arc::get_mut(app)
             .context("application is already shared")?
             .dynamic_dns = Some(manager);
+        Ok(())
+    }
+    pub fn attach_system(
+        app: &mut Arc<Self>,
+        manager: Arc<crate::host_system::Manager>,
+    ) -> Result<()> {
+        Arc::get_mut(app)
+            .context("application is already shared")?
+            .system = Some(manager);
         Ok(())
     }
     pub fn authenticate_api_key(&self, token: &str) -> Result<Option<Credential>> {
@@ -683,6 +694,34 @@ fn api(
                 "MQTT password could not be stored; check private storage and its 256-password limit",
                 true,
             ),
+        };
+    }
+    if matches!(path, "/api/v1/system/status" | "/api/v1/system/timezones") {
+        if !credential
+            .permissions
+            .iter()
+            .any(|value| value == "state.read")
+        {
+            return fail(403, "insufficient system permission", true);
+        }
+        if method != "GET" {
+            return fail(405, "unsupported system method", true);
+        }
+        if !query.is_empty() {
+            return fail(400, "system endpoint accepts no query parameters", true);
+        }
+        // Zone enumeration reads the filesystem; do not hold the engine for it.
+        drop(engine);
+        let Some(system) = &app.system else {
+            return fail(503, "host system manager unavailable", true);
+        };
+        return if path.ends_with("/status") {
+            match system.status() {
+                Ok(status) => response(200, status),
+                Err(_) => fail(503, "system status unavailable", true),
+            }
+        } else {
+            response(200, json!({"timezones":system.timezones()}))
         };
     }
     if path == "/api/v1/system/upgrade" {

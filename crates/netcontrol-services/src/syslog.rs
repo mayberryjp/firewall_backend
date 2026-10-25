@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 use std::io::Read;
-#[cfg(any(test, all(target_os = "linux", feature = "tls")))]
+#[cfg(any(test, target_os = "linux"))]
 use std::sync::Arc;
 use std::{
     io::Write,
@@ -172,75 +172,132 @@ impl Remote {
     }
 }
 #[cfg(target_os = "linux")]
+pub(crate) const JOURNAL_SOCKET: &str = "/run/systemd/journal/syslog";
+
+#[cfg(target_os = "linux")]
+fn activation_matches(pid: Option<&str>, fds: Option<&str>, names: Option<&str>) -> Result<bool> {
+    if pid.is_none() && fds.is_none() && names.is_none() {
+        return Ok(false);
+    }
+    let pid: u32 = pid.context("systemd LISTEN_PID is missing")?.parse()?;
+    if pid != std::process::id() {
+        return Ok(false);
+    }
+    ensure!(
+        fds == Some("1") && names == Some("netcontrol-syslog"),
+        "expected exactly one systemd socket named netcontrol-syslog"
+    );
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct JournalSocket {
+    socket: std::os::unix::net::UnixDatagram,
+    path: std::path::PathBuf,
+    identity: (u64, u64),
+}
+
+#[cfg(target_os = "linux")]
+impl JournalSocket {
+    pub(crate) fn activated() -> Result<Option<Arc<Self>>> {
+        fn variable(name: &str) -> Result<Option<String>> {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(error) => Err(error).with_context(|| format!("read {name}")),
+            }
+        }
+        let pid = variable("LISTEN_PID")?;
+        let fds = variable("LISTEN_FDS")?;
+        let names = variable("LISTEN_FDNAMES")?;
+        if !activation_matches(pid.as_deref(), fds.as_deref(), names.as_deref())? {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(Self::from_fd(
+            3,
+            std::path::Path::new(JOURNAL_SOCKET),
+        )?)))
+    }
+
+    fn from_fd(fd: std::os::fd::RawFd, path: &std::path::Path) -> Result<Self> {
+        use std::os::{fd::FromRawFd, unix::fs::MetadataExt};
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        ensure!(
+            flags >= 0,
+            "invalid systemd syslog descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        ensure!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == 0,
+            "protect inherited syslog descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        // Keep the inherited descriptor alive across service worker restarts.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        ensure!(
+            duplicate >= 0,
+            "duplicate systemd syslog descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+        let socket = std::os::unix::net::UnixDatagram::from(owned);
+        let mut kind: libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
+        use std::os::fd::AsRawFd;
+        ensure!(
+            unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    (&mut kind as *mut libc::c_int).cast(),
+                    &mut length,
+                )
+            } == 0
+                && kind == libc::SOCK_DGRAM,
+            "systemd syslog descriptor must be a datagram socket"
+        );
+        ensure!(
+            socket.local_addr()?.as_pathname() == Some(path),
+            "systemd syslog socket must be bound to {}",
+            path.display()
+        );
+        socket.set_nonblocking(true)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        let value = Self {
+            socket,
+            path: path.to_owned(),
+            identity: (metadata.dev(), metadata.ino()),
+        };
+        value.check_path()?;
+        Ok(value)
+    }
+
+    pub(crate) fn check_path(&self) -> Result<()> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let metadata = std::fs::symlink_metadata(&self.path)
+            .context("systemd syslog socket path unavailable")?;
+        ensure!(
+            metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == self.identity,
+            "systemd syslog socket path replaced"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     config: super::config::Syslog,
     directory: std::path::PathBuf,
+    socket: Arc<JournalSocket>,
     ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
-    use std::{
-        fs::OpenOptions,
-        os::unix::{
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::UnixDatagram,
-        },
-    };
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+    socket.check_path()?;
     let mut remotes = Vec::new();
     for server in config.servers {
         remotes.push(Remote::connect(&server, ipv6_enabled)?);
     }
-    // Do not steal a socket or silently omit whole-host logging.
-    ensure!(
-        !std::path::Path::new("/dev/log").try_exists()?,
-        "host /dev/log already owned; stop conflicting logger explicitly"
-    );
-    let socket = UnixDatagram::bind("/dev/log").context("own host /dev/log")?;
-    socket.set_nonblocking(true)?;
-    let metadata = std::fs::symlink_metadata("/dev/log")?;
-    struct Ownership {
-        device: u64,
-        inode: u64,
-    }
-    impl Drop for Ownership {
-        fn drop(&mut self) {
-            if let Ok(m) = std::fs::symlink_metadata("/dev/log") {
-                if m.dev() == self.device && m.ino() == self.inode {
-                    let _ = std::fs::remove_file("/dev/log");
-                }
-            }
-        }
-    }
-    let ownership = Ownership {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-    std::fs::set_permissions("/dev/log", std::fs::Permissions::from_mode(0o666))?;
-    let mut kernel = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open("/dev/kmsg")
-        .context("own kernel log reader (/dev/kmsg required)")?;
-    let backend_path = directory.join("backend.log");
-    let mut create = OpenOptions::new();
-    create
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    ensure!(
-        create.open(&backend_path)?.metadata()?.is_file(),
-        "backend source must be regular file"
-    );
-    let backend = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(&backend_path)?;
-    ensure!(
-        backend.metadata()?.is_file(),
-        "backend log must be regular file"
-    );
-    let mut backend = backend;
-    use std::io::{Seek, SeekFrom};
-    backend.seek(SeekFrom::End(0))?;
     let mut local = OpenOptions::new()
         .create(true)
         .append(true)
@@ -251,76 +308,42 @@ pub(crate) fn prepare(
         local.metadata()?.is_file(),
         "local syslog destination must be regular file"
     );
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")?
+    let mut hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")?
         .trim()
         .to_owned();
     Ok(Box::new(move |ctx| {
-        let _ownership = ownership;
         let mut buffer = vec![0; 65536];
-        let mut lines = Vec::new();
-        let forwarded = std::cell::Cell::new(0u64);
-        let mut forward = |bytes: &[u8], app: &str| -> Result<()> {
-            let record = message(bytes, &hostname, app, &super::worker::now());
-            ensure!(record.len() <= 65000, "syslog record too large");
-            local.write_all(&record)?;
-            local.write_all(b"\n")?;
-            for remote in &mut remotes {
-                remote.forward(&record, &ctx)?;
-            }
-            forwarded.set(forwarded.get() + 1);
-            Ok(())
-        };
+        let mut forwarded = 0u64;
+        let mut hostname_read = Instant::now();
         while !ctx.stopping() {
-            let m = std::fs::symlink_metadata("/dev/log")?;
-            ensure!(
-                m.dev() == _ownership.device && m.ino() == _ownership.inode,
-                "host logging socket ownership lost"
-            );
+            socket.check_path()?;
+            // The appliance hostname is configurable at runtime; keep the last good value on a failed read.
+            if hostname_read.elapsed() >= Duration::from_secs(1) {
+                hostname_read = Instant::now();
+                if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+                    hostname = name.trim().to_owned();
+                }
+            }
             for _ in 0..64 {
-                match socket.recv(&mut buffer) {
+                match socket.socket.recv(&mut buffer) {
                     Ok(n) => {
-                        ensure!(n < buffer.len(), "oversize host syslog datagram");
-                        forward(&buffer[..n], "host")?;
+                        ensure!(n < buffer.len(), "oversize journald syslog datagram");
+                        let record =
+                            message(&buffer[..n], &hostname, "journald", &super::worker::now());
+                        ensure!(record.len() <= 65000, "syslog record too large");
+                        local.write_all(&record)?;
+                        local.write_all(b"\n")?;
+                        for remote in &mut remotes {
+                            remote.forward(&record, &ctx)?;
+                        }
+                        forwarded += 1;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(e).context("journald syslog receive failed"),
                 }
             }
-            for _ in 0..64 {
-                match kernel.read(&mut buffer) {
-                    Ok(0) => anyhow::bail!("kernel logging source closed"),
-                    Ok(n) => forward(&buffer[..n], "kernel")?,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e).context("kernel logging source failed"),
-                }
-            }
-            let disk = std::fs::metadata(&backend_path)?;
-            let open = backend.metadata()?;
-            if disk.dev() != open.dev() || disk.ino() != open.ino() {
-                backend = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-                    .open(&backend_path)?;
-                ensure!(
-                    backend.metadata()?.is_file(),
-                    "rotated backend source is not regular"
-                );
-                lines.clear();
-            }
-            ensure!(
-                backend.stream_position()? <= backend.metadata()?.len(),
-                "backend log truncated; source history loss"
-            );
-            let n = backend.read(&mut buffer)?;
-            lines.extend_from_slice(&buffer[..n]);
-            while let Some(end) = lines.iter().position(|b| *b == b'\n') {
-                let record: Vec<_> = lines.drain(..=end).collect();
-                forward(&record, "netcontrold")?;
-            }
-            ensure!(lines.len() <= 64000, "backend log line exceeds bound");
-            ctx.update(|s| s["forwarded_records"] = serde_json::json!(forwarded.get()));
+            ctx.update(|s| s["forwarded_records"] = serde_json::json!(forwarded));
             ctx.wait(Duration::from_millis(20));
         }
         local.sync_data()?;
@@ -330,6 +353,156 @@ pub(crate) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activation_requires_current_pid_and_exact_named_descriptor() {
+        let pid = std::process::id().to_string();
+        assert!(!activation_matches(None, None, None).unwrap());
+        assert!(!activation_matches(Some("0"), Some("1"), Some("netcontrol-syslog")).unwrap());
+        assert!(activation_matches(Some(&pid), Some("1"), Some("netcontrol-syslog")).unwrap());
+        for (process, fds, names) in [
+            (None, Some("1"), Some("netcontrol-syslog")),
+            (Some("invalid"), Some("1"), Some("netcontrol-syslog")),
+            (Some(pid.as_str()), None, Some("netcontrol-syslog")),
+            (
+                Some(pid.as_str()),
+                Some("2"),
+                Some("netcontrol-syslog:other"),
+            ),
+            (Some(pid.as_str()), Some("1"), Some("syslog")),
+        ] {
+            assert!(activation_matches(process, fds, names).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_socket_validation_lifecycle_and_no_duplicate_sources() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::net::{UnixDatagram, UnixListener},
+        };
+        let directory = std::env::temp_dir().join(format!("nc-journal-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("syslog");
+        let inherited = UnixDatagram::bind(&path).unwrap();
+        let socket = Arc::new(JournalSocket::from_fd(inherited.as_raw_fd(), &path).unwrap());
+        assert!(JournalSocket::from_fd(inherited.as_raw_fd(), &directory.join("wrong")).is_err());
+        let stream_path = directory.join("stream");
+        let stream = UnixListener::bind(&stream_path).unwrap();
+        assert!(JournalSocket::from_fd(stream.as_raw_fd(), &stream_path).is_err());
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(JournalSocket::from_fd(file.as_raw_fd(), &path).is_err());
+        let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+        collector
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let config = super::super::config::Syslog {
+            enabled: true,
+            servers: vec![super::super::config::Destination {
+                host: "127.0.0.1".into(),
+                port: collector.local_addr().unwrap().port(),
+                transport: "udp".into(),
+            }],
+        };
+        let sender = UnixDatagram::unbound().unwrap();
+        for attempt in 0..2 {
+            let mut worker = super::super::worker::Worker::start(
+                "journal-test".into(),
+                None,
+                serde_json::json!({}),
+                {
+                    let directory = directory.clone();
+                    let socket = socket.clone();
+                    let config = config.clone();
+                    move || prepare(config, directory, socket, true)
+                },
+            )
+            .unwrap();
+            std::fs::write(directory.join("backend.log"), b"must not be tailed\n").unwrap();
+            let input = format!("<30>Oct 25 15:00:00 appliance app: synthetic-{attempt}");
+            sender.send_to(input.as_bytes(), &path).unwrap();
+            let mut buffer = [0; 4096];
+            let n = collector.recv(&mut buffer).unwrap();
+            let record = String::from_utf8_lossy(&buffer[..n]);
+            assert!(record.starts_with("<30>1 "));
+            assert!(record.contains(" journald - - - Oct 25"));
+            assert!(record.contains(&format!("synthetic-{attempt}")));
+            assert!(
+                collector.recv(&mut buffer).is_err(),
+                "duplicate/direct backend source forwarded"
+            );
+            worker.shutdown().unwrap();
+            assert_eq!(worker.snapshot()["state"], "stopped");
+            assert_eq!(worker.snapshot()["forwarded_records"], 1);
+            assert!(path.exists(), "worker must not unlink systemd's socket");
+        }
+        let mut services = super::super::Services::new(super::super::ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: true,
+            allow_gateway_monitoring: false,
+        })
+        .unwrap();
+        services.syslog_socket = Some(socket.clone());
+        let enabled = serde_json::json!({"syslog":{"enabled":true,"servers":[{
+            "host":"127.0.0.1","port":collector.local_addr().unwrap().port(),"transport":"udp"
+        }]}});
+        services.apply(&serde_json::json!({}), &enabled).unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let failing = serde_json::json!({"syslog":{"enabled":true,"servers":[{
+            "host":"127.0.0.1","port":unused_port,"transport":"tcp"
+        }]}});
+        assert!(services.apply(&enabled, &failing).is_err());
+        assert_eq!(services.workers["syslog"].snapshot()["state"], "running");
+        services.repair(&enabled).unwrap();
+        sender
+            .send_to(b"<30>restored after rollback and repair", &path)
+            .unwrap();
+        let mut buffer = [0; 4096];
+        let n = collector.recv(&mut buffer).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buffer[..n]).contains("restored after rollback and repair")
+        );
+        services.shutdown().unwrap();
+        assert!(path.exists());
+        drop(services);
+        let mut lost_source = super::super::worker::Worker::start(
+            "journal-path-loss".into(),
+            None,
+            serde_json::json!({}),
+            {
+                let socket = socket.clone();
+                let config = config.clone();
+                let directory = directory.clone();
+                move || prepare(config, directory, socket, true)
+            },
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let _replacement = UnixDatagram::bind(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while lost_source.snapshot()["state"] == "running" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(lost_source.snapshot()["state"], "error");
+        assert!(
+            lost_source.snapshot()["error"]
+                .as_str()
+                .unwrap()
+                .contains("systemd syslog socket path")
+        );
+        lost_source.shutdown().unwrap();
+        assert!(
+            socket.check_path().is_err(),
+            "socket replacement must be detected"
+        );
+        assert!(prepare(config, directory.clone(), socket, true).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn rfc5424_framing_and_injection() {
         let m = message(

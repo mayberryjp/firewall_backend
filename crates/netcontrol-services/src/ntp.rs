@@ -66,11 +66,7 @@ pub(crate) fn prepare(
     config: super::config::Ntp,
     ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
-    use serde_json::json;
-    use std::{
-        net::UdpSocket,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-    };
+    use std::{net::UdpSocket, time::Duration};
     super::linux::capabilities(25)?;
     let mut sockets = Vec::new();
     for host in config.servers {
@@ -95,97 +91,253 @@ pub(crate) fn prepare(
         std::io::Error::last_os_error()
     );
     Ok(Box::new(move |ctx| {
-        let mut failures = 0;
-        while !ctx.stopping() {
-            let mut samples = Vec::new();
-            let mut errors = Vec::new();
-            for (host, socket) in &sockets {
-                if ctx.stopping() {
-                    break;
-                }
-                let mut discard = [0; 512];
-                for _ in 0..64 {
-                    if socket.recv(&mut discard).is_err() {
-                        break;
-                    }
-                }
-                let mut wire = [0; 48];
-                wire[0] = 0x23;
-                let t1 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
-                let origin = stamp(t1);
-                wire[40..48].copy_from_slice(&origin);
-                socket.send(&wire)?;
-                let start = Instant::now();
-                let mut got = false;
-                while start.elapsed() < Duration::from_secs(3) && !ctx.stopping() {
-                    match socket.recv(&mut discard) {
-                        Ok(n) => {
-                            let t4 = t1 + start.elapsed().as_secs_f64();
-                            match sample(&discard[..n], origin, t1, t4) {
-                                Ok((offset, delay)) => {
-                                    samples.push((offset, delay, host));
-                                    got = true;
-                                    break;
-                                }
-                                Err(e) => errors.push(format!("{host}: {e}")),
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            ctx.wait(Duration::from_millis(20));
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                if !got {
-                    errors.push(format!("{host}: no valid NTP sample"));
-                }
-            }
-            if ctx.stopping() {
-                break;
-            }
-            samples.sort_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((offset, delay, host)) = samples.first() {
+        poll(
+            ctx,
+            sockets,
+            Duration::from_secs(64),
+            Duration::from_secs(3),
+            |requested_us| {
                 let mut tx: libc::timex = unsafe { std::mem::zeroed() };
                 tx.modes = 0x8001; // ADJ_OFFSET_SINGLESHOT; never ADJ_SETOFFSET or clock_settime.
-                let (requested_us, uncorrected) = bounded_slew(*offset)?;
                 tx.offset = requested_us as _;
                 ensure!(
                     unsafe { libc::adjtimex(&mut tx) } >= 0,
                     "bounded NTP slew failed: {}",
                     std::io::Error::last_os_error()
                 );
-                failures = 0;
-                ctx.update(|s| {
-                    s["sample_status"] = json!("available");
-                    s["server"] = json!(host);
-                    s["offset_ms"] = json!(offset * 1000.);
-                    s["delay_ms"] = json!(delay * 1000.);
-                    s["requested_slew_ms"] = json!(requested_us as f64 / 1000.);
-                    s["uncorrected_offset_ms"] = json!(uncorrected * 1000.);
-                    s["discipline"] = json!("slew_only");
-                    s["collected_at"] = json!(super::worker::now());
-                    s.as_object_mut().unwrap().remove("error");
-                });
-            } else {
-                failures += 1;
-                ctx.update(|s| {
-                    s["sample_status"] = json!("unavailable");
-                    s["error"] = json!(errors.join("; "));
-                });
-                ensure!(
-                    failures < 3,
-                    "no valid NTP samples after three polling rounds: {}",
-                    errors.join("; ")
-                );
-            }
-            ctx.wait(Duration::from_secs(64));
-        }
-        Ok(())
+                Ok(())
+            },
+        )
     }))
+}
+#[cfg(any(target_os = "linux", test))]
+fn poll(
+    ctx: super::worker::ContextState,
+    sockets: Vec<(String, std::net::UdpSocket)>,
+    interval: std::time::Duration,
+    response_timeout: std::time::Duration,
+    mut slew: impl FnMut(i64) -> Result<()>,
+) -> Result<()> {
+    use serde_json::json;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    while !ctx.stopping() {
+        let mut samples = Vec::new();
+        let mut errors = Vec::new();
+        for (host, socket) in &sockets {
+            if ctx.stopping() {
+                break;
+            }
+            let mut discard = [0; 512];
+            for _ in 0..64 {
+                if socket.recv(&mut discard).is_err() {
+                    break;
+                }
+            }
+            let mut wire = [0; 48];
+            wire[0] = 0x23;
+            let t1 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
+            let origin = stamp(t1);
+            wire[40..48].copy_from_slice(&origin);
+            socket.send(&wire)?;
+            let start = Instant::now();
+            let mut got = false;
+            while start.elapsed() < response_timeout && !ctx.stopping() {
+                match socket.recv(&mut discard) {
+                    Ok(n) => {
+                        let t4 = t1 + start.elapsed().as_secs_f64();
+                        match sample(&discard[..n], origin, t1, t4) {
+                            Ok((offset, delay)) => {
+                                samples.push((offset, delay, host));
+                                got = true;
+                                break;
+                            }
+                            Err(e) => errors.push(format!("{host}: {e}")),
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        ctx.wait(Duration::from_millis(20));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !got {
+                errors.push(format!("{host}: no valid NTP sample"));
+            }
+        }
+        if ctx.stopping() {
+            break;
+        }
+        samples.sort_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((offset, delay, host)) = samples.first() {
+            let (requested_us, uncorrected) = bounded_slew(*offset)?;
+            slew(requested_us)?;
+            ctx.update(|s| {
+                s["sample_status"] = json!("available");
+                s["server"] = json!(host);
+                s["offset_ms"] = json!(offset * 1000.);
+                s["delay_ms"] = json!(delay * 1000.);
+                s["requested_slew_ms"] = json!(requested_us as f64 / 1000.);
+                s["uncorrected_offset_ms"] = json!(uncorrected * 1000.);
+                s["discipline"] = json!("slew_only");
+                s["collected_at"] = json!(super::worker::now());
+                s.as_object_mut().unwrap().remove("error");
+            });
+        } else {
+            ctx.update(|s| {
+                s["sample_status"] = json!("unavailable");
+                s["error"] = json!(errors.join("; "));
+            });
+        }
+        ctx.wait(interval);
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::Worker;
+    use serde_json::{Value, json};
+    use std::{
+        net::UdpSocket,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    fn wait_for(worker: &Worker, predicate: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = worker.snapshot();
+            if predicate(&status) {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "unexpected NTP status: {status}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn respond(server: &UdpSocket) {
+        let mut wire = [0; 48];
+        let (n, from) = server.recv_from(&mut wire).unwrap();
+        assert_eq!(n, 48);
+        let origin = <[u8; 8]>::try_from(&wire[40..48]).unwrap();
+        wire[0] = 0x24;
+        wire[1] = 2;
+        wire[24..32].copy_from_slice(&origin);
+        wire[32..40].copy_from_slice(&origin);
+        server.send_to(&wire, from).unwrap();
+    }
+
+    #[test]
+    fn missing_samples_keep_polling_preserve_stale_sample_and_recover() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server.local_addr().unwrap()).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let (slew_tx, slew_rx) = mpsc::channel();
+        let mut worker = Worker::start("ntp".into(), None, json!({"name":"ntp"}), move || {
+            Ok(Box::new(move |ctx| {
+                poll(
+                    ctx,
+                    vec![("fixture".into(), client)],
+                    Duration::from_millis(5),
+                    Duration::from_millis(100),
+                    |requested| {
+                        slew_tx.send(requested)?;
+                        Ok(())
+                    },
+                )
+            }))
+        })
+        .unwrap();
+        respond(&server);
+        assert!(slew_rx.recv_timeout(Duration::from_secs(2)).unwrap().abs() <= 500000);
+        let available = wait_for(&worker, |s| s["sample_status"] == "available");
+        for _ in 0..4 {
+            let mut request = [0; 48];
+            server.recv_from(&mut request).unwrap();
+        }
+        let unavailable = wait_for(&worker, |s| s["sample_status"] == "unavailable");
+        assert_eq!(unavailable["state"], "running");
+        assert!(
+            unavailable["error"]
+                .as_str()
+                .unwrap()
+                .contains("fixture: no valid NTP sample")
+        );
+        for key in [
+            "server",
+            "collected_at",
+            "offset_ms",
+            "delay_ms",
+            "requested_slew_ms",
+            "uncorrected_offset_ms",
+        ] {
+            assert_eq!(unavailable[key], available[key], "{key}");
+        }
+        respond(&server);
+        assert!(slew_rx.recv_timeout(Duration::from_secs(2)).unwrap().abs() <= 500000);
+        let recovered = wait_for(&worker, |s| s["sample_status"] == "available");
+        assert_eq!(recovered["state"], "running");
+        assert!(recovered.get("error").is_none());
+        assert_ne!(recovered["collected_at"], available["collected_at"]);
+        let start = Instant::now();
+        worker.shutdown().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(worker.snapshot()["state"], "stopped");
+    }
+
+    #[test]
+    fn missing_samples_shutdown_interrupts_poll_wait() {
+        let mut worker = Worker::start("ntp".into(), None, json!({}), || {
+            Ok(Box::new(|ctx| {
+                poll(
+                    ctx,
+                    vec![],
+                    Duration::from_secs(64),
+                    Duration::from_secs(3),
+                    |_| panic!("no samples must not adjust the clock"),
+                )
+            }))
+        })
+        .unwrap();
+        wait_for(&worker, |s| s["sample_status"] == "unavailable");
+        let start = Instant::now();
+        worker.shutdown().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(worker.snapshot()["state"], "stopped");
+    }
+
+    #[test]
+    fn clock_adjustment_failure_remains_a_worker_error() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server.local_addr().unwrap()).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut worker = Worker::start("ntp".into(), None, json!({}), move || {
+            Ok(Box::new(move |ctx| {
+                poll(
+                    ctx,
+                    vec![("fixture".into(), client)],
+                    Duration::from_millis(5),
+                    Duration::from_secs(1),
+                    |_| anyhow::bail!("injected clock adjustment failure"),
+                )
+            }))
+        })
+        .unwrap();
+        respond(&server);
+        let failed = wait_for(&worker, |s| s["state"] == "error");
+        assert_eq!(failed["error"], "injected clock adjustment failure");
+        worker.shutdown().unwrap();
+    }
+
     fn reply() -> ([u8; 48], f64, [u8; 8]) {
         let t = 1_800_000_000.;
         let origin = stamp(t);
