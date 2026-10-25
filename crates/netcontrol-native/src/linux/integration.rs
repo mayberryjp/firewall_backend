@@ -548,7 +548,9 @@ fn native_dhcp_gateway_waiting_apply_rollback_reopen_and_recovery() -> Result<()
     native.repair(&empty)?;
     let mut desired = config(
         json!({"interfaces":[{"name":"wan0","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],
-        "dhcp_clients":{"wan0":{}},"gateway_monitors":[{"name":"wan","mode":"dhcp","enabled":true,"interface":"wan0","target":"1.1.1.1"}]}),
+        "dhcp_clients":{"wan0":{}},
+        "routes":[{"destination":"198.51.100.0/24","gateway":"192.0.2.1","interface":"wan0","table":254,"metric":10}],
+        "gateway_monitors":[{"name":"wan","mode":"dhcp","enabled":true,"interface":"wan0","target":"1.1.1.1"}]}),
     )?;
     desired.normalize();
     desired.validate()?;
@@ -572,6 +574,12 @@ fn native_dhcp_gateway_waiting_apply_rollback_reopen_and_recovery() -> Result<()
     let mut native = Native::open(options.clone())?;
     native.repair(&empty)?;
     native.apply(&empty, &desired)?;
+    native.observe(&desired)?;
+    let mut route_disabled = desired.clone();
+    route_disabled.routes[0].enabled = false;
+    native.apply(&desired, &route_disabled)?;
+    native.observe(&route_disabled)?;
+    native.apply(&route_disabled, &desired)?;
     native.observe(&desired)?;
     let runtime = native.runtime(&desired)?;
     assert_eq!(runtime["gateway_monitors"][0]["health"], "unknown");
@@ -678,6 +686,141 @@ fn native_dhcp_installs_connected_route_before_default_gateway() -> Result<()> {
             Ok(())
         })
     })
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_dhcp_static_routes_survive_renewal_address_change_expiry_and_rollback() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use netlink_packet_route::route::{RouteAttribute, RouteProtocol};
+    use rtnetlink::IpVersion;
+
+    let fixture = Fixture::new()?;
+    session(Arc::new(File::open(&fixture.namespace)?), |rt, handle| {
+        rt.block_on(async {
+            handle.link().add().dummy("dhcp0".into()).execute().await?;
+            let index = networking::links(handle).await?.iter()
+                .find(|link| networking::name(link) == "dhcp0")
+                .context("test DHCP interface missing")?.header.index;
+            handle.link().set(index).up().execute().await?;
+            let lease: dhcp_client::Lease = serde_json::from_value(json!({
+                "client":{}, "address":"192.0.2.10/24", "server":"192.0.2.1",
+                "acquired_at":dhcp_client::now()?, "lifetime":3600,
+                "renewal":1800, "rebinding":3150,
+                "routes":[
+                    {"destination":"0.0.0.0/0","gateway":"192.0.2.1","interface":"dhcp0","table":254,"metric":0},
+                    {"destination":"192.0.2.0/24","interface":"dhcp0","table":254,"metric":0}
+                ], "dns":[], "domain":"", "mtu":null
+            }))?;
+            let addressing = dhcp_client::Addressing {
+                mtu: 1500,
+                routes: serde_json::from_value(json!([
+                    {"destination":"198.51.100.0/24","gateway":"192.0.2.1","interface":"dhcp0","table":254,"metric":10},
+                    {"destination":"203.0.113.0/24","interface":"dhcp0","table":10001,"metric":20}
+                ]))?,
+                ..Default::default()
+            };
+            let owned = || async {
+                let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+                let mut routes = messages.iter()
+                    .filter(|message| message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL))
+                    .map(|message| networking::decode_route(message, &BTreeMap::from([(index, "dhcp0".into())])))
+                    .collect::<Result<Vec<_>>>()?;
+                routes.sort();
+                Ok::<_, anyhow::Error>(routes)
+            };
+            let mut expected = addressing.routes.clone();
+            expected.sort();
+            handle.link().add().dummy("other0".into()).execute().await?;
+            let other = networking::links(handle).await?.iter()
+                .find(|link| networking::name(link) == "other0")
+                .context("unrelated test interface missing")?.header.index;
+            handle.link().set(other).up().execute().await?;
+            handle.route().add().v4().destination_prefix("198.19.0.0".parse()?, 16)
+                .output_interface(other).priority(30).protocol(RouteProtocol::Other(99))
+                .scope(netlink_packet_route::route::RouteScope::Link).execute().await?;
+            networking::dhcp_lease(handle, "dhcp0", None, Some(&lease), &addressing, false).await?;
+            assert_eq!(owned().await?, expected);
+            networking::dhcp_lease(handle, "dhcp0", Some(&lease), Some(&lease), &addressing, false).await?;
+            assert_eq!(owned().await?, expected);
+
+            // A known configured route lost by the kernel is restored on the next lease update.
+            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let route = messages.into_iter().find(|message| message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL))
+                .context("static test route missing")?;
+            handle.route().del(route).execute().await?;
+            networking::dhcp_lease(handle, "dhcp0", Some(&lease), Some(&lease), &addressing, false).await?;
+            assert_eq!(owned().await?, expected);
+
+            let mut changed = lease.clone();
+            changed.address = "192.0.2.11/24".into();
+            networking::dhcp_lease(handle, "dhcp0", Some(&lease), Some(&changed), &addressing, false).await?;
+            assert_eq!(owned().await?, expected);
+            networking::dhcp_lease(handle, "dhcp0", Some(&changed), None, &addressing, false).await?;
+            assert!(owned().await?.is_empty());
+            networking::dhcp_lease(handle, "dhcp0", None, Some(&changed), &addressing, false).await?;
+            assert_eq!(owned().await?, expected);
+
+            let mut unreachable = changed.clone();
+            unreachable.address = "198.18.0.10/24".into();
+            unreachable.routes = serde_json::from_value(json!([
+                {"destination":"198.18.0.0/24","interface":"dhcp0","table":254,"metric":0}
+            ]))?;
+            let error = networking::dhcp_lease(handle, "dhcp0", Some(&changed), Some(&unreachable), &addressing, false).await.unwrap_err();
+            assert!(format!("{error:#}").contains("restore DHCP-dependent static route"), "{error:#}");
+            networking::dhcp_lease(handle, "dhcp0", Some(&unreachable), Some(&changed), &addressing, false).await?;
+            assert_eq!(owned().await?, expected);
+
+            // Never replace an operator's route sharing a configured identity.
+            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            for message in messages {
+                if message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL)
+                    && message.attributes.iter().any(|attribute| matches!(attribute, RouteAttribute::Priority(10))) {
+                    handle.route().del(message).execute().await?;
+                }
+            }
+            handle.route().add().v4().destination_prefix("198.51.100.0".parse()?, 24)
+                .gateway("192.0.2.1".parse()?).output_interface(index).priority(10)
+                .protocol(RouteProtocol::Other(99)).execute().await?;
+            let error = networking::dhcp_lease(handle, "dhcp0", Some(&changed), Some(&changed), &addressing, false).await.unwrap_err();
+            assert!(format!("{error:#}").contains("conflicts with existing route"), "{error:#}");
+            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            assert_eq!(messages.iter().filter(|message| message.header.protocol == RouteProtocol::Other(99)).count(), 2);
+            Ok(())
+        })
+    })
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_static_routes_rechecked_after_configured_address_replacement() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let keys = fixture.root.join("keys");
+    session(
+        Arc::new(File::open(&fixture.namespace)?),
+        move |rt, handle| {
+            rt.block_on(async {
+            let empty = Network::parse(&Config::empty().operational_value()?)?;
+            let before = Network::parse(&config(json!({
+                "interfaces":[{"name":"test0","kind":"dummy","role":"wan","mtu":1500,"up":true,"addresses":["192.0.2.10/24"]}],
+                "routes":[{"destination":"198.51.100.0/24","gateway":"192.0.2.1","interface":"test0","table":254,"metric":10}]
+            }))?.operational_value()?)?;
+            let mut after = before.clone();
+            after.interfaces[0].addresses = vec!["192.0.2.11/24".into()];
+            let parents = BTreeMap::new();
+            let originals = BTreeMap::new();
+            networking::reconcile(handle, &empty, &before, &parents, &keys, &originals).await?;
+            networking::verify(handle, &before, &parents, &keys).await?;
+            networking::reconcile(handle, &before, &after, &parents, &keys, &originals).await?;
+            networking::verify(handle, &after, &parents, &keys).await?;
+            networking::reconcile(handle, &after, &before, &parents, &keys, &originals).await?;
+            networking::verify(handle, &before, &parents, &keys).await?;
+            networking::reconcile(handle, &before, &empty, &parents, &keys, &originals).await?;
+            networking::verify(handle, &empty, &parents, &keys).await?;
+            Ok(())
+        })
+        },
+    )
 }
 
 #[test]

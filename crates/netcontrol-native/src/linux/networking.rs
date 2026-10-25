@@ -1120,12 +1120,9 @@ pub async fn reconcile(
         .iter()
         .map(|l| (l.header.index, name(l)))
         .collect();
-    let mut present_routes = BTreeSet::new();
     for message in owned_routes(handle).await? {
         let route = decode_owned_route(&message, &by_index, Some(&after.blackhole))?;
-        if after.routes.contains(&route) {
-            present_routes.insert(route);
-        } else {
+        if !after.routes.contains(&route) {
             handle.route().del(message).execute().await?;
         }
     }
@@ -1311,51 +1308,21 @@ pub async fn reconcile(
         }
     }
     available = links(handle).await?;
+    let by_index = available
+        .iter()
+        .map(|link| (link.header.index, name(link)))
+        .collect();
+    // Address removal can invalidate routes that were present before reconciliation.
+    let present_routes = owned_routes(handle)
+        .await?
+        .iter()
+        .map(|message| decode_owned_route(message, &by_index, Some(&after.blackhole)))
+        .collect::<Result<BTreeSet<_>>>()?;
     for route in &after.routes {
         if present_routes.contains(route) {
             continue;
         }
-        let (destination, length) = parse_prefix(&route.destination, true)?;
-        let blackhole = after.blackhole.targets(&route.interface);
-        let scope = if blackhole || !destination.is_ipv4() || !route.gateway.is_empty() {
-            RouteScope::Universe
-        } else {
-            RouteScope::Link
-        };
-        let mut request = handle
-            .route()
-            .add()
-            .table_id(route.table)
-            .priority(route.metric)
-            .protocol(RouteProtocol::Other(PROTOCOL))
-            .scope(scope);
-        request = if blackhole {
-            request.kind(blackhole_type(&after.blackhole.action)?)
-        } else {
-            let index = available
-                .iter()
-                .find(|l| name(l) == route.interface)
-                .context("route interface unavailable")?
-                .header
-                .index;
-            request.output_interface(index)
-        };
-        match destination {
-            IpAddr::V4(ip) => {
-                let mut request = request.v4().destination_prefix(ip, length);
-                if !route.gateway.is_empty() {
-                    request = request.gateway(route.gateway.parse()?);
-                }
-                request.execute().await?;
-            }
-            IpAddr::V6(ip) => {
-                let mut request = request.v6().destination_prefix(ip, length);
-                if !route.gateway.is_empty() {
-                    request = request.gateway(route.gateway.parse()?);
-                }
-                request.execute().await?;
-            }
-        }
+        install_route(handle, route, &available, &after.blackhole).await?;
     }
     for rule in &after.policy_rules {
         if present_rules.contains(rule) {
@@ -1372,6 +1339,152 @@ pub async fn reconcile(
             IpAddr::V4(ip) => request.v4().source_prefix(ip, length).execute().await?,
             IpAddr::V6(ip) => request.v6().source_prefix(ip, length).execute().await?,
         }
+    }
+    Ok(())
+}
+
+async fn install_route(
+    handle: &Handle,
+    route: &Route,
+    available: &[LinkMessage],
+    blackhole: &netcontrol_core::BlackholeConfig,
+) -> Result<()> {
+    let (destination, length) = parse_prefix(&route.destination, true)?;
+    let drop = blackhole.targets(&route.interface);
+    let scope = if drop || !destination.is_ipv4() || !route.gateway.is_empty() {
+        RouteScope::Universe
+    } else {
+        RouteScope::Link
+    };
+    let mut request = handle
+        .route()
+        .add()
+        .table_id(route.table)
+        .priority(route.metric)
+        .protocol(RouteProtocol::Other(PROTOCOL))
+        .scope(scope);
+    request = if drop {
+        request.kind(blackhole_type(&blackhole.action)?)
+    } else {
+        let index = available
+            .iter()
+            .find(|link| name(link) == route.interface)
+            .context("route interface unavailable")?
+            .header
+            .index;
+        request.output_interface(index)
+    };
+    match destination {
+        IpAddr::V4(ip) => {
+            let mut request = request.v4().destination_prefix(ip, length);
+            if !route.gateway.is_empty() {
+                request = request.gateway(route.gateway.parse()?);
+            }
+            request.execute().await?;
+        }
+        IpAddr::V6(ip) => {
+            let mut request = request.v6().destination_prefix(ip, length);
+            if !route.gateway.is_empty() {
+                request = request.gateway(route.gateway.parse()?);
+            }
+            request.execute().await?;
+        }
+    }
+    Ok(())
+}
+
+async fn dhcp_static_routes(
+    handle: &Handle,
+    interface: &str,
+    configured: &[Route],
+    install: bool,
+) -> Result<()> {
+    let available = links(handle).await?;
+    let names = available
+        .iter()
+        .map(|link| (link.header.index, name(link)))
+        .collect();
+    let messages: Vec<RouteMessage> = handle
+        .route()
+        .get(IpVersion::V4)
+        .execute()
+        .try_collect()
+        .await?;
+    let mut missing = Vec::new();
+    let mut remove = Vec::new();
+    for route in configured {
+        let (destination, _) = parse_prefix(&route.destination, true)?;
+        if !destination.is_ipv4() {
+            continue;
+        }
+        ensure!(
+            route.interface == interface,
+            "DHCP static route interface mismatch"
+        );
+        let key = (route.table, route.metric, route.destination.clone());
+        let mut found = false;
+        for message in &messages {
+            if route_key(message)? != key {
+                continue;
+            }
+            crate::ensure_unchanged(
+                message.header.protocol == RouteProtocol::Other(PROTOCOL)
+                    && decode_route(message, &names)? == *route,
+                format!(
+                    "DHCP static route {} conflicts with existing route",
+                    route.destination
+                ),
+            )?;
+            found = true;
+            if !install {
+                remove.push(message.clone());
+            }
+        }
+        if install && !found {
+            missing.push(route);
+        }
+    }
+    for message in remove {
+        handle.route().del(message).execute().await?;
+    }
+    missing.sort_by_key(|route| !route.gateway.is_empty());
+    for route in missing {
+        install_route(handle, route, &available, &Default::default())
+            .await
+            .with_context(|| {
+                format!("restore DHCP-dependent static route {}", route.destination)
+            })?;
+    }
+    let observed: Vec<RouteMessage> = handle
+        .route()
+        .get(IpVersion::V4)
+        .execute()
+        .try_collect()
+        .await?;
+    for route in configured {
+        let (destination, _) = parse_prefix(&route.destination, true)?;
+        if !destination.is_ipv4() {
+            continue;
+        }
+        let key = (route.table, route.metric, route.destination.clone());
+        let mut matches = 0;
+        for message in &observed {
+            if route_key(message)? == key {
+                ensure!(
+                    install
+                        && message.header.protocol == RouteProtocol::Other(PROTOCOL)
+                        && decode_route(message, &names)? == *route,
+                    "DHCP-dependent static route {} did not converge",
+                    route.destination
+                );
+                matches += 1;
+            }
+        }
+        ensure!(
+            matches == usize::from(install),
+            "DHCP-dependent static route {} did not converge",
+            route.destination
+        );
     }
     Ok(())
 }
@@ -1413,6 +1526,10 @@ pub async fn dhcp_lease(
                 "DHCP route {prefix} conflicts with a route not owned by this client"
             );
         }
+    }
+    // Remove only this client's configured routes before lease loss removes its address.
+    if next.is_none() {
+        dhcp_static_routes(handle, name, &addressing.routes, false).await?;
     }
     let mtu = next.and_then(|lease| lease.mtu).unwrap_or(addressing.mtu);
     if mtu != 0 {
@@ -1498,6 +1615,7 @@ pub async fn dhcp_lease(
             }
             request.execute().await?;
         }
+        dhcp_static_routes(handle, name, &addressing.routes, true).await?;
     }
     if publish_dns {
         super::adoption::set_dns(index, &addressing.dns, next)?;

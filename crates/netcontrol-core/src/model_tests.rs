@@ -12,6 +12,13 @@ fn candidate() -> Config {
 #[test]
 fn blackhole_section_is_named_once_and_many_routes_may_target_it() {
     let mut config = candidate();
+    let default_json = serde_json::to_value(&config).unwrap();
+    assert!(default_json.get("blackhole").is_none());
+    assert!(default_json.get("dynamic_dns").is_none());
+    assert_eq!(
+        serde_json::from_value::<Config>(default_json).unwrap(),
+        config
+    );
     assert!(!config.blackhole.configured());
     assert_eq!(config.blackhole.action, "blackhole");
     let route = |destination: &str, metric: i64| {

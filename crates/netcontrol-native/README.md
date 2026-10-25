@@ -246,7 +246,27 @@ protocol 243; static routes remain protocol 242. A lease-update intent protects
 address/route/persistence convergence. Renewal, rebind, NAK, expiry, bounded worker
 shutdown and restart are implemented using a locally patched Apache-2.0 mozim
 engine; its optional second netlink implementation is disabled.
-This work is not yet Linux build/runtime validated. Restart handover-selection
+
+Enabled IPv4 static routes on a DHCP-managed interface depend on its valid,
+matching lease. They remain in saved/returned configuration while suspended
+without a lease; they are not installed or expected by native verification until
+acquisition. Each lease update restores missing configured routes after installing
+DHCP connected/gateway routes, with direct static routes before gateway static
+routes. Lease loss removes only that interface's configured IPv4 static routes.
+IPv6, other interfaces, disabled routes and unowned routes are not repaired by
+this path. A pinned static gateway is never rewritten to the DHCP gateway:
+an unreachable configured gateway or conflicting route produces an explicit error.
+Routes are added without replacement, checked for ownership/conflicts and read
+back; the existing lease intent and rollback also cover static restoration.
+Route plans are rebuilt from current configuration on startup/recovery and
+updated under the lease-state lock during transactions. Normal configuration
+reconciliation rereads route presence after interface/address changes, because
+the kernel may have removed routes during those operations. Reads remain
+read-only and unrelated drift is not automatically overwritten.
+Linux namespace tests cover these lifecycle paths, rollback and foreign-route
+protection; physical-appliance DHCP/networkd/resolved acceptance remains separate.
+
+Host handover still requires physical-appliance runtime acceptance. Restart handover-selection
 regression tests cover owned/released interfaces and the lab/non-inherited
 boundary; real networkd/resolved reboot and recovery acceptance remains required.
 

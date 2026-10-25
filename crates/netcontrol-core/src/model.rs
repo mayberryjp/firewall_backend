@@ -22,6 +22,7 @@ pub struct Config {
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
     pub mqtt: MQTTConfig,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dynamic_dns: Vec<crate::DynamicDNSConfig>,
     pub gateway_monitors: Vec<GatewayMonitor>,
     pub interfaces: Vec<Interface>,
@@ -30,6 +31,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub dns: BTreeMap<String, DNSConfig>,
     pub routes: Vec<Route>,
+    #[serde(skip_serializing_if = "BlackholeConfig::is_default")]
     pub blackhole: BlackholeConfig,
     pub firewall: Firewall,
     pub softflowd: Vec<SoftflowdConfig>,
@@ -78,6 +80,9 @@ impl Default for BlackholeConfig {
 }
 
 impl BlackholeConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
     pub fn configured(&self) -> bool {
         !self.name.is_empty()
     }

@@ -520,7 +520,7 @@ impl Native {
             .state
             .lock()
             .map_err(|_| anyhow!("DHCP state poisoned"))?;
-        dhcp_client::effective(&mut network, &leases);
+        dhcp_client::effective(&mut network, &leases)?;
         firewall::validate(&network.firewall)?;
         let parents = self.parents.clone();
         let ownership = self.ownership()?;
@@ -643,8 +643,8 @@ impl Native {
             .state
             .lock()
             .map_err(|_| anyhow!("DHCP state poisoned"))?;
-        dhcp_client::effective(&mut before, &leases);
-        dhcp_client::effective(&mut after, &leases);
+        dhcp_client::effective(&mut before, &leases)?;
+        dhcp_client::effective(&mut after, &leases)?;
         let parents = self.parents.clone();
         let keys = self.options.keys.clone();
         let namespace_values = kernel.namespace.clone();

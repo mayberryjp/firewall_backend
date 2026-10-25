@@ -212,7 +212,9 @@ replace it with the upload result and select an up managed interface):
 Default disabled, interval 60 seconds (allowed 10..3600). Only confirmed settings
 activate publishing. A persistent source-interface-bound MQTT 3.1.1 connection
 publishes Home Assistant device discovery, availability, gateway health/probe-window
-summaries, interface counters, configuration revision and daemon uptime. The version
+summaries, interface counters, configuration revision and daemon uptime, plus host
+health: memory/swap, load, uptime, pressure, **per-core CPU busy percent**, **per
+temperature/fan sensor** (thermal zones and hwmon) and local filesystem space. The version
 sensor is unknown while package metadata remains the unreleased placeholder
 `0.0.0`. MQTT is telemetry-only. Linux host mode is required; simulator makes no
 connection and namespace lab mode rejects enabled streaming. Binding fails closed;

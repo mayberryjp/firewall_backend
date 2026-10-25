@@ -3,6 +3,7 @@ pub mod dynamic_dns;
 pub mod http;
 pub mod identity;
 pub mod mqtt;
+mod mqtt_host;
 mod private_store;
 pub mod ssh;
 pub mod updates;

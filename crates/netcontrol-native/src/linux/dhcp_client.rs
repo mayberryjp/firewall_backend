@@ -155,12 +155,28 @@ pub struct State {
 pub struct Addressing {
     pub dns: DNSConfig,
     pub mtu: u32,
+    pub routes: Vec<Route>,
 }
 
-pub fn effective(network: &mut Network, state: &State) {
+pub fn effective(network: &mut Network, state: &State) -> Result<()> {
+    let mut routes = Vec::new();
+    for route in &network.routes {
+        let (destination, _) = crate::model::parse_prefix(&route.destination, true)?;
+        if !destination.is_ipv4()
+            || !network.dhcp_clients.contains_key(&route.interface)
+            || state.leases.get(&route.interface).is_some_and(|lease| {
+                lease.valid() && network.dhcp_clients.get(&route.interface) == Some(&lease.client)
+            })
+        {
+            routes.push(route.clone());
+        }
+    }
+    network.routes = routes;
     for link in &mut network.interfaces {
         if network.dhcp_clients.contains_key(&link.name) {
-            if let Some(lease) = state.leases.get(&link.name).filter(|lease| lease.valid()) {
+            if let Some(lease) = state.leases.get(&link.name).filter(|lease| {
+                lease.valid() && network.dhcp_clients.get(&link.name) == Some(&lease.client)
+            }) {
                 link.addresses.push(lease.address.clone());
                 link.addresses.sort();
                 link.addresses.dedup();
@@ -170,6 +186,7 @@ pub fn effective(network: &mut Network, state: &State) {
             }
         }
     }
+    Ok(())
 }
 
 struct Worker {
@@ -248,6 +265,7 @@ impl Manager {
 
     fn configure_selected(&mut self, value: &Value, only: Option<&str>) -> Result<()> {
         let config: Config = serde_json::from_value(value.clone())?;
+        let network = Network::parse(&config.operational_value()?)?;
         let addressing: BTreeMap<_, _> = config
             .interfaces
             .iter()
@@ -257,6 +275,12 @@ impl Manager {
                     Addressing {
                         dns: config.dns.get(&link.name).cloned().unwrap_or_default(),
                         mtu: link.mtu as u32,
+                        routes: network
+                            .routes
+                            .iter()
+                            .filter(|route| route.interface == link.name)
+                            .cloned()
+                            .collect(),
                     },
                 )
             })
@@ -296,7 +320,7 @@ impl Manager {
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?;
-            if let Some(lease) = state.leases.remove(&name) {
+            if let Some(lease) = state.leases.get(&name).cloned() {
                 let settings = state.addressing.get(&name).cloned().unwrap_or_default();
                 change_lease(
                     self.namespace.clone(),
@@ -306,6 +330,7 @@ impl Manager {
                     None,
                     settings,
                 )?;
+                state.leases.remove(&name);
             }
             state.errors.remove(&name);
         }
@@ -584,9 +609,10 @@ fn run(task: ClientTask) -> Result<()> {
                             if stop.load(Ordering::Acquire) { return Ok(()); }
                             let mut state = shared.lock().map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?;
                             if state.leases.get(&name).is_some_and(|lease| !lease.valid()) {
-                                let previous = state.leases.remove(&name);
+                                let previous = state.leases.get(&name).cloned();
                                 change_lease(namespace.clone(), publish_dns, name.clone(), previous, None,
                                     state.addressing.get(&name).cloned().context("DHCP addressing missing")?)?;
+                                state.leases.remove(&name);
                                 super::remove_durable(&path)?;
                                 break None;
                             }
@@ -623,9 +649,10 @@ fn run(task: ClientTask) -> Result<()> {
                             {
                                 let mut state = shared.lock().map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?;
                                 if matches!(error.kind(), mozim::ErrorKind::LeaseExpired | mozim::ErrorKind::NoLease) {
-                                    let previous = state.leases.remove(&name);
+                                    let previous = state.leases.get(&name).cloned();
                                     change_lease(namespace.clone(), publish_dns, name.clone(), previous, None,
                                         state.addressing.get(&name).cloned().context("DHCP addressing missing")?)?;
+                                    state.leases.remove(&name);
                                     super::remove_durable(&path)?;
                                 }
                                 state.errors.insert(name.clone(), error.to_string());
@@ -642,6 +669,78 @@ fn run(task: ClientTask) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dhcp_static_routes_follow_valid_matching_leases() -> Result<()> {
+        let config: Config = serde_json::from_value(json!({
+            "interfaces": [
+                {"name":"wan0","kind":"dummy","role":"wan","mtu":1500,"up":true},
+                {"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true}
+            ],
+            "dhcp_clients":{"wan0":{}},
+            "routes":[
+                {"destination":"198.51.100.0/24","gateway":"192.0.2.1","interface":"wan0","table":254,"metric":10},
+                {"destination":"203.0.113.0/24","interface":"wan0","table":10001,"metric":10},
+                {"destination":"2001:db8:1::/64","interface":"wan0","table":254,"metric":10},
+                {"destination":"198.18.0.0/16","interface":"lan0","table":254,"metric":10},
+                {"enabled":false,"destination":"198.19.0.0/16","interface":"wan0","table":254,"metric":10}
+            ]
+        }))?;
+        let network = Network::parse(&config.operational_value()?)?;
+        let mut state = State::default();
+        let check = |state: &State, count: usize| -> Result<()> {
+            let mut actual = network.clone();
+            effective(&mut actual, state)?;
+            assert_eq!(actual.routes.len(), count);
+            assert!(actual.routes.iter().any(|route| route.interface == "lan0"));
+            assert!(
+                actual
+                    .routes
+                    .iter()
+                    .any(|route| route.destination == "2001:db8:1::/64")
+            );
+            Ok(())
+        };
+        check(&state, 2)?;
+        let lease: Lease = serde_json::from_value(json!({
+            "client":{}, "address":"192.0.2.10/24", "server":"192.0.2.1",
+            "acquired_at":now()?, "lifetime":3600, "renewal":1800, "rebinding":3150,
+            "routes":[], "dns":[], "domain":"", "mtu":null
+        }))?;
+        state.leases.insert("wan0".into(), lease.clone());
+        check(&state, 4)?;
+        state.leases.get_mut("wan0").unwrap().lifetime = 0;
+        check(&state, 2)?;
+        state.leases.insert("wan0".into(), lease);
+        state.leases.get_mut("wan0").unwrap().client.route_metric = 500;
+        check(&state, 2)?;
+        state.leases.clear();
+        check(&state, 2)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dhcp_worker_route_plan_tracks_enabled_configuration() -> Result<()> {
+        let mut manager = manager();
+        // No up interfaces: exercise plan publication without starting network workers.
+        manager.configure(&json!({
+            "interfaces":[{"name":"wan0","kind":"dummy","role":"wan","mtu":1500,"up":false}],
+            "dhcp_clients":{"wan0":{}},
+            "routes":[
+                {"destination":"198.51.100.0/24","interface":"wan0","table":254,"metric":10},
+                {"enabled":false,"destination":"203.0.113.0/24","interface":"wan0","table":254,"metric":10}
+            ]
+        }))?;
+        assert_eq!(
+            manager.state.lock().unwrap().addressing["wan0"]
+                .routes
+                .len(),
+            1
+        );
+        manager.configure(&serde_json::to_value(Config::empty())?)?;
+        assert!(manager.state.lock().unwrap().addressing.is_empty());
+        Ok(())
+    }
 
     fn blocked_worker() -> (Worker, mpsc::Sender<()>) {
         let (release, waiting) = mpsc::channel();

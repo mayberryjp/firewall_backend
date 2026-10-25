@@ -20,6 +20,17 @@
 
 ### Added
 
+- Home Assistant MQTT streaming now also publishes host health from the existing
+  host snapshot: memory/swap, load, host uptime, OOM kills, PSI averages, per-core
+  CPU busy percent (computed from tick deltas; unknown on the first sample or
+  after a reset), per thermal zone and hwmon temperature/fan sensor, and local
+  filesystem total/used/available bytes. Failed readings are unknown, never zero;
+  sections that cannot be enumerated keep their existing entities. Entity counts
+  are capped per kind. No configuration, API or permission change. Recommended
+  bump: minor; baseline unknown. Frontend action: none required, optional
+  documentation; see
+  [handoff 2026-10-25-03](docs/frontend-handoffs/2026-10-25.md#2026-10-25-03-mqtt-host-health-sensors).
+
 - Azure public DNS IPv4 Dynamic DNS with per-entry WAN interface monitoring or
   NAT-aware HTTPS public-IP detection, service-principal authentication,
   write-only private secret references and authenticated upload/status APIs.
@@ -245,6 +256,16 @@
   release baseline.
 
 ### Fixed
+
+- DHCP-managed interfaces now reconcile their enabled IPv4 static routes after
+  lease acquisition, renewal and address replacement, restoring protocol-242
+  routes lost by the kernel. Lease loss suspends those routes without changing
+  saved settings; valid acquisition restores them after connected DHCP routes.
+  Scoped ownership/conflict checks, readback, lease intents and rollback remain
+  enforced. Normal configuration reconciliation also rereads routes after address
+  changes instead of trusting a stale presence cache. Recommended bump: patch;
+  baseline unknown. Frontend action required for lease-dependent status wording;
+  see [handoff 2026-10-25-02](docs/frontend-handoffs/2026-10-25.md#2026-10-25-02-dhcp-dependent-static-route-lifecycle).
 
 - Native startup/reboot ownership comparison now projects recorded configurations
   through the same strict typed operational representation as current candidates.

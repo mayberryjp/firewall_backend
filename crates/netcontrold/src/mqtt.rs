@@ -165,6 +165,7 @@ pub struct Manager {
     mode: Mode,
     started: Instant,
     device_id: String,
+    cpu_baseline: Mutex<Option<crate::mqtt_host::CpuBaseline>>,
 }
 
 type Publication = (String, Vec<u8>, bool);
@@ -191,6 +192,7 @@ impl Manager {
             mode,
             started: Instant::now(),
             device_id,
+            cpu_baseline: Mutex::new(None),
         }))
     }
 
@@ -302,29 +304,57 @@ impl Manager {
         Ok((client, events))
     }
 
-    fn collect(&self, config: &MQTTConfig) -> Result<(Value, Value)> {
-        let mut engine = self
-            .engine
-            .lock()
-            .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
-        ensure!(!engine.configuration_busy(), "configuration is changing");
-        let revision = engine.committed_revision();
-        let reply = engine.request(
-            "GET",
-            "/api/v1/statistics",
-            "",
-            "mqtt-publisher",
-            &["state.read".into()],
-            &[],
-        );
-        ensure!(reply.status == 200, "statistics unavailable");
-        telemetry(
+    fn collect(&self, config: &MQTTConfig) -> Result<(Value, Value, Vec<&'static str>)> {
+        let (revision, statistics) = {
+            let mut engine = self
+                .engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+            ensure!(!engine.configuration_busy(), "configuration is changing");
+            let revision = engine.committed_revision();
+            let reply = engine.request(
+                "GET",
+                "/api/v1/statistics",
+                "",
+                "mqtt-publisher",
+                &["state.read".into()],
+                &[],
+            );
+            ensure!(reply.status == 200, "statistics unavailable");
+            (revision, reply.body)
+        };
+        // Host health is optional: a failed read leaves its sensors unknown instead of dropping the sample.
+        let snapshot = {
+            let mut engine = self
+                .engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+            let reply = engine.request(
+                "GET",
+                "/api/v1/statistics/host",
+                "",
+                "mqtt-publisher",
+                &["state.read".into()],
+                &[],
+            );
+            (reply.status == 200).then_some(reply.body)
+        };
+        let host = {
+            let mut baseline = self
+                .cpu_baseline
+                .lock()
+                .map_err(|_| anyhow::anyhow!("CPU baseline unavailable"))?;
+            crate::mqtt_host::sensors(snapshot.as_ref(), &mut baseline)
+        };
+        let (discovery, state) = telemetry(
             &self.device_id,
             config,
             revision,
             self.started.elapsed().as_secs(),
-            &reply.body,
-        )
+            &statistics,
+            &host,
+        )?;
+        Ok((discovery, state, host.retained))
     }
 
     async fn session(
@@ -333,6 +363,10 @@ impl Manager {
         mut stop: watch::Receiver<bool>,
     ) -> Result<()> {
         let (client, mut events) = self.connection(&config)?;
+        *self
+            .cpu_baseline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU baseline unavailable"))? = None;
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(32);
         let mut polling = tokio::task::JoinSet::new();
         polling.spawn(async move {
@@ -356,7 +390,8 @@ impl Manager {
         let mut previous_discovery = None::<Value>;
         let mut force_discovery = true;
         let mut next_sample = Instant::now();
-        let mut collecting = None::<tokio::task::JoinHandle<Result<(Value, Value)>>>;
+        let mut collecting =
+            None::<tokio::task::JoinHandle<Result<(Value, Value, Vec<&'static str>)>>>;
         loop {
             while let Some((topic, payload, retain)) = queue.front() {
                 if client
@@ -385,21 +420,30 @@ impl Manager {
                 result = async { collecting.as_mut().unwrap().await }, if collecting.is_some() => {
                     collecting = None;
                     match result {
-                        Ok(Ok((discovery, state))) => {
+                        Ok(Ok((mut discovery, state, retained))) => {
+                            if let Some(previous) = previous_discovery.as_ref().and_then(|previous| previous["components"].as_object()) {
+                                for (key, component) in previous.iter().filter(|(key, _)| retained.iter().any(|kind| key.starts_with(&format!("{kind}_")))) {
+                                    discovery["components"][key] = component.clone();
+                                }
+                            }
                             if force_discovery || previous_discovery.as_ref() != Some(&discovery) {
                                 let secrets = self.secrets.lock().map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?;
                                 let before = secrets.components()?;
                                 let after: BTreeSet<_> = discovery["components"].as_object().unwrap().keys().cloned().collect();
+                                // Entities of a section that could not be enumerated now are kept, not removed.
+                                let kept: BTreeSet<_> = before.iter().filter(|key| retained.iter().any(|kind| key.starts_with(&format!("{kind}_")))).cloned().collect();
                                 let mut removal = discovery.clone();
-                                for key in before.difference(&after) {
+                                let mut removed = false;
+                                for key in before.difference(&after).filter(|key| !kept.contains(*key)) {
                                     removal["components"][key] = json!({"platform":"sensor"});
+                                    removed = true;
                                 }
                                 secrets.save_components(&before.union(&after).cloned().collect())?;
-                                if before != after {
+                                if removed {
                                     queue.push_back((discovery_topic.clone(), serde_json::to_vec(&removal)?, true));
                                 }
                                 queue.push_back((discovery_topic.clone(), serde_json::to_vec(&discovery)?, true));
-                                manifest = Some(after);
+                                manifest = Some(after.union(&kept).cloned().collect());
                                 previous_discovery = Some(discovery);
                                 force_discovery = false;
                             }
@@ -484,7 +528,7 @@ fn bind_source(events: &mut EventLoop, interface: &str) -> Result<()> {
     }
 }
 
-fn metric_key(kind: &str, name: &str, field: &str) -> String {
+pub(crate) fn metric_key(kind: &str, name: &str, field: &str) -> String {
     format!(
         "{kind}_{}_{field}",
         hex::encode(Sha256::digest(name.as_bytes()))
@@ -497,6 +541,7 @@ fn telemetry(
     revision: u64,
     uptime: u64,
     statistics: &Value,
+    host: &crate::mqtt_host::HostSensors,
 ) -> Result<(Value, Value)> {
     let base = format!("netcontrol/{device_id}");
     let mut metrics = Map::new();
@@ -505,17 +550,18 @@ fn telemetry(
                    name: String,
                    value: Value,
                    unit: Option<&str>,
-                   cumulative: bool| {
+                   class: Option<&str>| {
         let mut component = json!({"platform":"sensor","name":name,"unique_id":format!("netcontrol_{device_id}_{key}"),
             "value_template":format!("{{{{ value_json.metrics.get('{key}') if value_json.metrics.get('{key}') is not none else 'unknown' }}}}"),
             "expire_after":config.interval_seconds * 3});
         if let Some(unit) = unit {
             component["unit_of_measurement"] = json!(unit);
-            component["state_class"] = json!(if cumulative {
-                "total_increasing"
-            } else {
-                "measurement"
-            });
+            if unit == "°C" {
+                component["device_class"] = json!("temperature");
+            }
+        }
+        if let Some(class) = class {
+            component["state_class"] = json!(class);
         }
         metrics.insert(key.clone(), value);
         components.insert(key, component);
@@ -525,14 +571,14 @@ fn telemetry(
         "Configuration revision".into(),
         json!(revision),
         None,
-        false,
+        None,
     );
     add(
         "uptime".into(),
         "Daemon uptime".into(),
         json!(uptime),
         Some("s"),
-        false,
+        Some("measurement"),
     );
     let version = env!("CARGO_PKG_VERSION");
     add(
@@ -544,7 +590,7 @@ fn telemetry(
             json!(version)
         },
         None,
-        false,
+        None,
     );
     for interface in statistics["interfaces"]
         .as_array()
@@ -563,7 +609,7 @@ fn telemetry(
                 Value::Null
             },
             None,
-            false,
+            None,
         );
         for field in [
             "rx_bytes",
@@ -588,7 +634,7 @@ fn telemetry(
                 } else {
                     "packets"
                 }),
-                true,
+                Some("total_increasing"),
             );
         }
     }
@@ -630,10 +676,19 @@ fn telemetry(
                     format!("{name} {field}"),
                     value,
                     unit,
-                    false,
+                    unit.map(|_| "measurement"),
                 );
             }
         }
+    }
+    for sensor in &host.sensors {
+        add(
+            sensor.key.clone(),
+            sensor.name.clone(),
+            sensor.value.clone(),
+            sensor.unit,
+            sensor.class,
+        );
     }
     ensure!(components.len() <= 4096, "MQTT entity limit exceeded");
     let discovery = json!({"device":{"identifiers":[format!("netcontrol_{device_id}")],"name":format!("Netcontrol {}", &device_id[..8]),"manufacturer":"Netcontrol","model":"Firewall"},
@@ -1085,17 +1140,25 @@ mod tests {
                 let (messages, mut receive) = tokio::sync::mpsc::channel(64);
                 let broker = tokio::spawn(broker_fixture(listener, messages));
                 let mut connections = Vec::new();
+                let mut host_discovered = false;
                 tokio::time::timeout(Duration::from_secs(25), async {
                     while connections.len() < 3 {
                         let (connection, topic, payload) = receive.recv().await.context("MQTT broker fixture stopped")?;
+                        if topic.ends_with("/config") {
+                            let value: Value = serde_json::from_slice(&payload)?;
+                            let components = &value["components"];
+                            host_discovered |= components.get("memory_used_bytes").is_some() && components.get("load_1m").is_some();
+                        }
                         if topic.ends_with("/state") {
                             let value: Value = serde_json::from_slice(&payload)?;
                             ensure!(value["metrics"]["revision"] == 1, "unconfirmed or wrong revision published");
+                            ensure!(value["metrics"].get("memory_used_bytes").is_some_and(Value::is_null), "host sensor missing or fabricated by the simulator");
                             connections.push(connection);
                         }
                     }
                     Ok::<(), anyhow::Error>(())
                 }).await.with_context(|| format!("MQTT sample sequence incomplete: status={}, connections={connections:?}, broker_finished={}", manager.status().unwrap(), broker.is_finished()))??;
+                ensure!(host_discovered, "host sensors missing from discovery");
                 ensure!(connections == [1, 1, 2], "MQTT connection was not persistent or failed to reconnect");
                 config.mqtt.enabled = false;
                 let transaction = submit(&config, 1);
@@ -1178,7 +1241,15 @@ mod tests {
         let stats = json!({"interfaces":[{"name":"wan.1","status":"available","oper_state":"up","counters":{"rx_bytes":"18446744073709551615"}}],
             "gateways":[{"name":"wan","sample_status":"stale","health":"up","sent":30,"rtt_avg_ms":5.0}]});
         let id = "0123456789abcdef0123456789abcdef";
-        let (discovery, state) = telemetry(id, &config, 42, 60, &stats).unwrap();
+        let (discovery, state) = telemetry(
+            id,
+            &config,
+            42,
+            60,
+            &stats,
+            &crate::mqtt_host::HostSensors::default(),
+        )
+        .unwrap();
         assert_eq!(
             state["metrics"][metric_key("interface", "wan.1", "rx_bytes")],
             "18446744073709551615"

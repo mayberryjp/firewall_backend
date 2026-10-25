@@ -1528,6 +1528,28 @@ Publisher and deployment contract:
   These are rolling summaries, not individual probes/cumulative probe totals.
   Counter decimal strings remain lossless; stale/unavailable values are unknown,
   not zero. Package placeholder `0.0.0` means unknown software version.
+- Host health sensors, read from the same snapshot as `GET /api/v1/statistics/host`
+  on each sample (`state.read`; scope is the daemon's host, not the lab namespace):
+  fixed entities `memory_total_bytes`, `memory_available_bytes`, `memory_used_bytes`,
+  `swap_total_bytes`, `swap_used_bytes` (B), `load_1m`/`load_5m`/`load_15m`,
+  `host_uptime_seconds`, `oom_kills` (cumulative), and PSI 10-second averages
+  `pressure_cpu_some`, `pressure_memory_some`/`_full`, `pressure_io_some`/`_full` (%).
+  Dynamic entities, one per item, keyed by a hash of the identity: **per CPU core**
+  busy percent plus a total (`cpu`), **per thermal zone** temperature (°C), **per
+  hwmon temperature/fan sensor** (°C or RPM) and **per local filesystem mount**
+  total/used/available bytes. CPU busy percent is computed by the daemon from tick
+  deltas between consecutive samples as specified above (guest ticks not
+  double-counted); the first sample after (re)connect, a boot change, a counter
+  decrease or no elapsed ticks is unknown. Entity names are stable and
+  id-based (`thermal_zone0 temperature`, `coretemp hwmon2/temp1`): sensor
+  type and label are not shown, rename entities in Home Assistant. Zero fan RPM and
+  negative temperatures are real readings; a failed section, sensor or filesystem is
+  unknown, never zero. When a whole section cannot be enumerated its existing
+  entities are kept (unknown, expiring) rather than removed. Caps: 256 CPU rows,
+  64 thermal zones, 128 hwmon sensors, 64 filesystems (first in snapshot order);
+  extras are ignored. Not published: disks, per-disk I/O, VM counters other than
+  OOM kills, and scheduler gauges. A host snapshot that fails to read leaves these
+  sensors unknown without failing the sample.
 - Samples expire after three publication intervals. Active configuration/maintenance
   and failed collection pause samples with offline availability; the next successful
   sample restores availability. No offline backlog or command topics. Limits:
@@ -1834,6 +1856,19 @@ Poll runtime using existing cadence and preserve expired/unavailable/error
 distinctions. Renewal does not create a new configuration revision. Never
 auto-confirm a transaction because a lease exists or the HTTP process is active.
 
+Enabled IPv4 static routes referencing a DHCP-managed interface are
+lease-dependent: without a valid matching lease they remain configured but are
+suspended in the native route plan. Acquisition/renewal/address replacement
+restores missing configured protocol-242 routes after DHCP routes; expiry/NAK
+removes the dependent static routes. This does not change `enabled`, revision,
+history or the configured static gateway. An unreachable pinned gateway or an
+unowned conflicting route remains an explicit backend/worker error, not a
+successful fallback. IPv6 routes and other interfaces are outside this recovery.
+Use `dhcp_clients.leases` acquisition/lifetime and `errors` for status; do not
+equate an enabled route, a retained expired lease, or a `200` configuration read
+with installed/forwarding traffic. No per-static-route installation field or
+automatic network-repair API is introduced. Reads do not repair drift.
+
 **Manual DHCPv4 retry:** `POST /api/v1/interfaces/{name}/dhcp/retry` requires an
 API-key Bearer token with `interfaces.write`; `transactions.write` and
 `state.read` are not required for the action itself. Polling runtime separately
@@ -2044,6 +2079,14 @@ Disabling an installed route removes only that owned static route; re-enabling
 installs it. Rollback/recovery uses the same route selection. Editing fields of a
 disabled route does not install it. Initial host adoption records inherited
 static routes with `enabled: true`.
+
+For DHCP-managed interfaces, enabled IPv4 routes may be temporarily suspended
+while no valid matching lease exists. Keep the toggle enabled and show a
+"waiting for DHCP" distinction using runtime lease/error state; do not silently
+disable or remove the configuration. See the DHCP lifecycle contract above.
+`GET /api/v1/state`, `/api/v1/routes` and interface reads keep their existing
+response shapes and can succeed while these routes are suspended. Other
+networking drift and worker failures still produce `503`, not synthetic success.
 
 Disabled routes still require valid canonical prefixes, matching gateway family,
 a managed interface, table 254 or 10000..19999, and a positive 32-bit metric.
