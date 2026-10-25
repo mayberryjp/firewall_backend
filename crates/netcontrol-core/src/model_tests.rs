@@ -573,12 +573,12 @@ fn all_current_example_feature_schemas_validate() {
                     "family",
                     "interface",
                     "name",
-                    "host",
                     "hostname",
                     "domains",
                 ]
                 .iter()
                 .any(|key| object.contains_key(*key))
+                    || object.get("host").is_some_and(Value::is_string)
                 {
                     object.insert("metadata".into(), json!({"display_name": "Descriptive name", "description": "Operator notes"}));
                     paths.push(format!("{path}/metadata"));
@@ -611,6 +611,7 @@ fn all_current_example_feature_schemas_validate() {
         let mut paths = vec![];
         annotate(&mut annotated, "", &mut paths);
         assert!(!paths.is_empty());
+        assert!(annotated["kernel"].get("metadata").is_none());
         let described: Config = serde_json::from_value(annotated.clone()).unwrap();
         described.validate().unwrap();
         assert_eq!(

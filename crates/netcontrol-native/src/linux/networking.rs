@@ -1290,6 +1290,25 @@ pub async fn dhcp_lease(
     if mtu != 0 {
         handle.link().set(index).mtu(mtu).execute().await?;
     }
+    let names = BTreeMap::from([(index, name.to_owned())]);
+    for message in routes {
+        if message.header.protocol != RouteProtocol::Other(super::dhcp_client::PROTOCOL)
+            || !message
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, RouteAttribute::Oif(value) if *value == index))
+        {
+            continue;
+        }
+        let mut decoded = message.clone();
+        decoded
+            .attributes
+            .retain(|attribute| !matches!(attribute, RouteAttribute::PrefSource(_)));
+        let observed = decode_route(&decoded, &names)?;
+        if !next.is_some_and(|lease| lease.routes.contains(&observed)) {
+            handle.route().del(message).execute().await?;
+        }
+    }
     if let Some(previous) = previous {
         if next.is_none_or(|lease| lease.address != previous.address) {
             for address in addresses(handle, index).await? {
@@ -1322,25 +1341,6 @@ pub async fn dhcp_lease(
                 netlink_packet_route::address::AddressFlag::Noprefixroute,
             ]));
         request.execute().await?;
-    }
-    let names = BTreeMap::from([(index, name.to_owned())]);
-    for message in routes {
-        if message.header.protocol != RouteProtocol::Other(super::dhcp_client::PROTOCOL)
-            || !message
-                .attributes
-                .iter()
-                .any(|attribute| matches!(attribute, RouteAttribute::Oif(value) if *value == index))
-        {
-            continue;
-        }
-        let mut decoded = message.clone();
-        decoded
-            .attributes
-            .retain(|attribute| !matches!(attribute, RouteAttribute::PrefSource(_)));
-        let observed = decode_route(&decoded, &names)?;
-        if !next.is_some_and(|lease| lease.routes.contains(&observed)) {
-            handle.route().del(message).execute().await?;
-        }
     }
     if let Some(lease) = next {
         let mut routes: Vec<_> = lease.routes.iter().collect();

@@ -178,6 +178,15 @@
 
 ### Fixed
 
+- CI metadata fixtures distinguish string-valued host records from the kernel
+  `host` map, avoiding unsupported metadata injection without relaxing schemas.
+  Empty native host startup checks its no-firewall guard before bootstrap,
+  preserving verification-only startup and failed-first-transaction rollback.
+  DHCP cleanup removes obsolete owned routes before deleting the leased address,
+  avoiding stale route deletions after kernel address cleanup (`ESRCH`). Full
+  workspace tests and all 17 privileged native/service regressions now pass
+  locally. No API/schema/frontend change. Recommended bump: patch; baseline unknown.
+
 - State checksum verification hashes the saved JSON payload before current-model
   decoding, instead of reserializing typed state. Model field ordering/defaults
   (including `ipv6_enabled`) no longer falsely report valid journals as corrupt.
@@ -191,7 +200,8 @@
   first while the leased address used `NOPREFIXROUTE`, so a fresh lease could
   fail with an unreachable gateway and roll its address back despite a DHCP ACK.
   Added isolated Linux lease application/renewal/removal regression coverage;
-  privileged execution remains unverified. No API/schema change. Recommended
+  privileged execution now passes, including the cleanup correction above.
+  No API/schema change. Recommended
   bump: patch; baseline unknown.
 
 - Local factory reset reads saved desired configuration directly rather than

@@ -1397,16 +1397,16 @@ impl Backend for Native {
         // Empty initial state has no owned nftables table yet. Bootstrap only the verified
         // current firewall; never overwrite a foreign table or repair unrelated drift.
         let mut ownership = self.ownership()?;
-        if ownership.committed_config.is_none() {
-            self.apply(config, config)?;
-            ownership = self.ownership()?;
-        }
         if self.options.namespace.is_empty()
             && ownership.firewall_fingerprint.is_none()
             && config == &Config::empty()
         {
             self.repair_services(&value)?;
             return Ok(self.services.status());
+        }
+        if ownership.committed_config.is_none() {
+            self.apply(config, config)?;
+            ownership = self.ownership()?;
         }
         if ownership.firewall_fingerprint.is_none() {
             let firewall = Network::parse(&value)?.firewall;
