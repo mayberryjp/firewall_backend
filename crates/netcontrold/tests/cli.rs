@@ -81,6 +81,19 @@ impl Fixture {
 }
 
 #[test]
+fn host_health_cli_uses_readonly_statistics_route() {
+    let fixture = Fixture::new(&["state.read"]);
+    let mut cli = CliSession::new();
+    let output = fixture.ok(&mut cli, "show statistics host");
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["schema"], "netcontrol-host-health/v1");
+    assert_eq!(value["sample"]["status"], "simulated");
+    assert!(value["sections"]["memory"]["data"].is_null());
+    let denied = Fixture::new(&[]);
+    denied.fail(&mut cli, "show statistics host", "permission");
+}
+
+#[test]
 fn static_route_delete_accepts_disabled_record_with_metadata() {
     let f = Fixture::new(PERMISSIONS);
     let config = json!({

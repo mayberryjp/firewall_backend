@@ -1325,6 +1325,9 @@ impl Backend for Native {
             query.is_empty(),
             "statistics endpoints do not accept query parameters"
         );
+        if path == "/api/v1/statistics/host" {
+            return crate::host_health::snapshot();
+        }
         self.check_scope()?;
         if path == "/api/v1/statistics/gateways" || path.starts_with("/api/v1/statistics/gateways/")
         {

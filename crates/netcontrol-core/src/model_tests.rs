@@ -10,6 +10,47 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn mqtt_configuration_defaults_validation_and_no_inline_password() {
+    let mut config = candidate();
+    assert!(!config.mqtt.enabled);
+    assert_eq!(config.mqtt.interval_seconds, 60);
+    config.mqtt.enabled = true;
+    assert!(config.validate().is_err());
+    config.mqtt.endpoint = "mqtts://broker.example.test:8883".into();
+    config.mqtt.source_interface = "lan0".into();
+    config.validate().unwrap();
+    assert_eq!(
+        config.mqtt.broker().unwrap(),
+        ("broker.example.test".into(), 8883, true)
+    );
+    let mut ipv6 = config.clone();
+    ipv6.mqtt.endpoint = "mqtt://[2001:db8::1]".into();
+    assert_eq!(
+        ipv6.mqtt.broker().unwrap(),
+        ("2001:db8::1".into(), 1883, false)
+    );
+    ipv6.validate().unwrap();
+    ipv6.ipv6_enabled = false;
+    assert!(ipv6.validate().is_err());
+    for endpoint in [
+        "http://broker.example.test",
+        "mqtt://user:secret@broker.example.test",
+        "mqtt://broker.example.test/path",
+        "mqtt://broker.example.test?option=1",
+        "mqtt://broker.example.test:0",
+    ] {
+        let mut invalid = config.clone();
+        invalid.mqtt.endpoint = endpoint.into();
+        assert!(invalid.validate().is_err());
+    }
+    let mut value = serde_json::to_value(&config).unwrap();
+    value["mqtt"]["password"] = json!("synthetic-test-only");
+    assert!(serde_json::from_value::<Config>(value).is_err());
+    config.mqtt.interval_seconds = 0;
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn static_route_enabled_controls_operational_projection() {
     let mut config = candidate();
     config.validate().unwrap();
@@ -643,6 +684,9 @@ fn policy_references_ports_expansion_and_family() {
 #[test]
 fn all_current_example_feature_schemas_validate() {
     fn annotate(value: &mut Value, path: &str, paths: &mut Vec<String>) {
+        if path == "/mqtt" {
+            return;
+        }
         match value {
             Value::Object(object) => {
                 for (key, child) in object.iter_mut() {
@@ -696,6 +740,7 @@ fn all_current_example_feature_schemas_validate() {
         annotate(&mut annotated, "", &mut paths);
         assert!(!paths.is_empty());
         assert!(annotated["kernel"].get("metadata").is_none());
+        assert!(annotated["mqtt"].get("metadata").is_none());
         let described: Config = serde_json::from_value(annotated.clone()).unwrap();
         described.validate().unwrap();
         assert_eq!(

@@ -4,6 +4,25 @@
 
 ### Added
 
+- API-managed Home Assistant MQTT discovery/statistics streaming, default disabled,
+  with broker, username, write-only password reference, source interface and
+  configurable 60-second interval (10..3600 seconds). Persistent Linux host-bound
+  MQTT, verified TLS when selected, QoS 1, reconnect, availability/LWT and discovery
+  reconciliation; confirmed settings only, simulator makes no connection. Gateway
+  summaries, interface counters, revision, uptime and version (unknown for placeholder
+  0.0.0). Private credentials/device identity in `<state>.mqtt`; new `mqtt.write`
+  and password/status APIs. Recommended bump: minor; baseline unknown. Frontend
+  action required; see [handoff 2026-10-24-18](docs/frontend-handoffs/2026-10-24.md#2026-10-24-18-home-assistant-mqtt-statistics).
+
+- Read-only Linux host-health snapshots at `GET /api/v1/statistics/host`
+  (`state.read`) and `show statistics host`: CPU ticks/scheduler, memory/swap,
+  load/uptime, VM/OOM counters, PSI, disk I/O, local filesystem bytes/inodes,
+  thermal-zone and hwmon temperatures/fans. Exact decimal counter strings,
+  independent source/sensor errors and explicit simulated/unmeasured responses;
+  daemon-visible host scope, no kernel writes, external workers or saved history.
+  Recommended bump: minor; baseline unknown. Frontend action required; see
+  [handoff 2026-10-24-17](docs/frontend-handoffs/2026-10-24.md#2026-10-24-17-kernel-host-health-sensors).
+
 - Static-route `enabled` boolean, defaulting to true when omitted in requests or
   saved configuration. Explicit false remains disabled; null/nonboolean values
   are rejected. Disabled routes remain validated and

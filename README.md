@@ -127,7 +127,64 @@ HttpOnly, SameSite=Strict session cookies. HTTP cookies are not Secure; HTTPS
 cookies are Secure. CORS does not bypass mixed-content, certificate,
 private-network, or network-reachability restrictions.
 
+## Home Assistant MQTT Statistics
+
+Optional streaming is API-managed. Upload a broker password with
+`POST /api/v1/services/mqtt/passwords` (`mqtt.write`), then put the returned
+`password_ref` in `config.mqtt` in an ordinary configuration transaction and
+confirm it. Changes require `transactions.write` and `mqtt.write`; status uses
+`state.read` at `GET /api/v1/services/mqtt/status`. Passwords are never returned
+or included in configuration/history. Use HTTPS or a trusted management channel.
+
+Example settings inside a complete candidate configuration (synthetic reference;
+replace it with the upload result and select an up managed interface):
+
+```json
+{"mqtt":{"enabled":true,"endpoint":"mqtts://broker.example.test:8883","username":"netcontrol","password_ref":"0123456789abcdef0123456789abcdef","source_interface":"lan0","interval_seconds":60}}
+```
+
+Default disabled, interval 60 seconds (allowed 10..3600). Only confirmed settings
+activate publishing. A persistent source-interface-bound MQTT 3.1.1 connection
+publishes Home Assistant device discovery, availability, gateway health/probe-window
+summaries, interface counters, configuration revision and daemon uptime. The version
+sensor is unknown while package metadata remains the unreleased placeholder
+`0.0.0`. MQTT is telemetry-only. Linux host mode is required; simulator makes no
+connection and namespace lab mode rejects enabled streaming. Binding fails closed;
+hostname resolution still uses the host resolver, not the selected interface.
+
+Prefer `mqtts://` (port 8883), with a system-trusted certificate and matching
+hostname. Explicit `mqtt://` (1883) sends credentials/data without TLS. Endpoint
+URLs must not contain credentials, paths other than `/`, query or fragment.
+Broker ACLs must allow retained discovery publication at
+`homeassistant/device/netcontrol_<device_id>/config`, publication under
+`netcontrol/<device_id>/`, and subscription to `homeassistant/status`. Discovery
+and availability are retained; samples are not. QoS 1 can duplicate messages.
+
+Back up `<state>.mqtt` together with the journal (default
+`/var/lib/netcontrol/native-state.json.mqtt`). Its daemon-owned private files hold
+stable device identity, password references and the discovery manifest. Preserve
+ownership/permissions; never clone this identity to another active appliance.
+Passwords are plaintext at rest in owner-only files, not encrypted. References
+are immutable and retained for revisions; limit 256 passwords. There is no pruning
+or deletion API: do not remove files referenced by configuration/history. Missing
+or corrupt private state requires operator recovery, not an identity reset.
+See the [exact contract](FRONTEND_SPEC.md#614-home-assistant-mqtt-streaming).
+
 ## Configuration workflow
+
+### Host health
+
+`GET /api/v1/statistics/host` (`state.read`) reads Linux CPU ticks/scheduler,
+memory/swap, load/uptime, VM/OOM counters, pressure stalls, disk I/O, local
+filesystem space/inodes and thermal/hwmon temperatures/fans in-process.
+CLI: `show statistics host`. Missing features/sensor faults are explicit
+per-source errors, never zero measurements. Counters are exact decimal strings;
+CPU utilization and I/O rates need two samples. No configuration changes,
+external sensor programs, drivers, stored history or additional host-service
+permission. This uses the daemon-visible host/procfs/mount context, not a
+network lab namespace or cgroup limits. Simulator data is unmeasured.
+See the [host-health contract](FRONTEND_SPEC.md#host-health-sensors) for fields,
+units, filesystem exclusions, rate calculations and frontend requirements.
 
 ### Routing scope
 

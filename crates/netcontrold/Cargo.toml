@@ -32,10 +32,13 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 mime = "0.3"
 russh = { version = "=0.63.1", default-features = false, features = ["ring"] }
 zeroize = "1"
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
+rustls-native-certs = "0.8"
 # Russh's debug/trace logs can contain plaintext protocol packets.
 log = { version = "0.4", features = ["max_level_info"] }
 
 [dev-dependencies]
+bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 rcgen = "0.13"

@@ -1467,6 +1467,7 @@ fn all_domain_permissions_are_independently_required() {
             json!({"syslog":{"servers":[{"host":"log.invalid","port":514,"transport":"udp"}]}}),
         ),
         ("vnstat.write", json!({"vnstat":{"enabled":true}})),
+        ("mqtt.write", json!({"mqtt":{"interval_seconds":120}})),
         (
             "firewall.write",
             json!({"firewall":{"allow_all_icmp":false}}),
@@ -1903,6 +1904,66 @@ fn simulator_kernel_removal_and_rollback_restore_original_values() {
     assert_eq!(
         kernel.body["effective"]["namespace"]["net.core.somaxconn"],
         "8192"
+    );
+}
+
+#[test]
+fn host_health_is_authorized_readonly_and_independent_of_configuration_observation() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let path = "/api/v1/statistics/host";
+    let expected = json!({"schema":"netcontrol-host-health/v1","sample":{"scope":"host","status":"partial"},"sections":{}});
+    backend.lock().unwrap().traffic_response = Some(expected.clone());
+    backend.lock().unwrap().fail_observe = true;
+    assert_eq!(
+        engine.request("GET", path, "", "reader", &[], &[]).status,
+        403
+    );
+    assert_eq!(
+        engine
+            .request("GET", path, "x=1", "reader", &all(), &[])
+            .status,
+        400
+    );
+    assert_eq!(request(&mut engine, "POST", path, Value::Null).status, 405);
+    assert_eq!(
+        request(
+            &mut engine,
+            "GET",
+            "/api/v1/statistics/host/extra",
+            Value::Null
+        )
+        .status,
+        404
+    );
+    assert!(backend.lock().unwrap().statistics_calls.is_empty());
+    let reply = engine.request("GET", path, "", "reader", &["state.read".into()], &[]);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body, expected);
+    backend.lock().unwrap().traffic_error = Some("host metrics unavailable".into());
+    assert_eq!(request(&mut engine, "GET", path, Value::Null).status, 503);
+}
+
+#[test]
+fn host_health_simulator_never_measures_the_development_host() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let before = request(&mut engine, "GET", "/api/v1/state", Value::Null);
+    let reply = request(&mut engine, "GET", "/api/v1/statistics/host", Value::Null);
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["sample"]["scope"], "simulator");
+    assert_eq!(reply.body["sample"]["status"], "simulated");
+    assert!(reply.body["sample"]["boot_id"].is_null());
+    let sections = reply.body["sections"].as_object().unwrap();
+    assert_eq!(sections.len(), 12);
+    for value in sections.values() {
+        assert_eq!(value["status"], "simulated");
+        assert!(value["data"].is_null());
+        assert!(value["error"].is_string());
+    }
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/state", Value::Null).body,
+        before.body
     );
 }
 

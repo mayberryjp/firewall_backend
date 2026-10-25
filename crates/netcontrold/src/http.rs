@@ -92,6 +92,7 @@ pub struct App {
     tls: bool,
     attempts: Mutex<(Instant, usize)>,
     updates: Option<crate::updates::Manager>,
+    mqtt: Option<Arc<crate::mqtt::Manager>>,
 }
 impl App {
     pub fn new(engine: Arc<Mutex<Engine>>, auth: Authentication, tls: bool) -> Arc<Self> {
@@ -101,6 +102,7 @@ impl App {
             tls,
             attempts: Mutex::new((Instant::now(), 0)),
             updates: None,
+            mqtt: None,
         })
     }
     pub fn with_updates(
@@ -126,6 +128,12 @@ impl App {
                 .map_err(|_| anyhow::anyhow!("engine unavailable"))?
                 .set_upgrade_maintenance(updates.active()?)?;
         }
+        Ok(())
+    }
+    pub fn attach_mqtt(app: &mut Arc<Self>, mqtt: Arc<crate::mqtt::Manager>) -> Result<()> {
+        Arc::get_mut(app)
+            .context("application is already shared")?
+            .mqtt = Some(mqtt);
         Ok(())
     }
     pub fn authenticate_api_key(&self, token: &str) -> Result<Option<Credential>> {
@@ -553,6 +561,62 @@ fn api(
             Ok(()) => (),
             Err(_) => return fail(503, "upgrade state unavailable", true),
         }
+    }
+    if matches!(
+        path,
+        "/api/v1/services/mqtt/status" | "/api/v1/services/mqtt/passwords"
+    ) {
+        let password = path.ends_with("/passwords");
+        let permission = if password { "mqtt.write" } else { "state.read" };
+        if !credential
+            .permissions
+            .iter()
+            .any(|value| value == permission)
+        {
+            return fail(403, "insufficient MQTT permission", true);
+        }
+        if method != if password { "POST" } else { "GET" } {
+            return fail(405, "unsupported MQTT method", true);
+        }
+        if !query.is_empty() {
+            return fail(400, "MQTT endpoint accepts no query parameters", true);
+        }
+        let Some(mqtt) = &app.mqtt else {
+            return fail(503, "MQTT publisher unavailable", true);
+        };
+        if !password {
+            return match mqtt.status() {
+                Ok(status) => response(200, status),
+                Err(_) => fail(503, "MQTT status unavailable", true),
+            };
+        }
+        if engine.configuration_busy() {
+            return fail(409, "configuration transaction or upgrade is active", true);
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PasswordRequest {
+            password: String,
+        }
+        let Ok(input) = serde_json::from_slice::<PasswordRequest>(&body) else {
+            return fail(400, "expected JSON object with password string", true);
+        };
+        let password = zeroize::Zeroizing::new(input.password);
+        if password.is_empty() || password.len() > 4096 || password.contains('\0') {
+            return fail(
+                400,
+                "MQTT password must be 1..4096 UTF-8 bytes without NUL",
+                true,
+            );
+        }
+        return match mqtt.create_password(&mut engine, &password) {
+            Ok(reference) => response(201, json!({"password_ref":reference})),
+            Err(_) => fail(
+                503,
+                "MQTT password could not be stored; check private storage and its 256-password limit",
+                true,
+            ),
+        };
     }
     if path == "/api/v1/system/upgrade" {
         let permission = if method == "POST" {

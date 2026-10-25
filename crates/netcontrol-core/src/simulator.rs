@@ -159,6 +159,33 @@ impl Backend for Simulator {
             query.is_empty(),
             "statistics endpoints do not accept query parameters"
         );
+        if path == "/api/v1/statistics/host" {
+            let mut sections = serde_json::Map::new();
+            for name in [
+                "cpu",
+                "memory",
+                "load",
+                "uptime",
+                "vm",
+                "pressure_cpu",
+                "pressure_memory",
+                "pressure_io",
+                "disks",
+                "filesystems",
+                "thermal",
+                "hwmon",
+            ] {
+                sections.insert(name.into(), json!({
+                    "status":"simulated","data":null,"error":"simulator does not measure host health"
+                }));
+            }
+            return Ok(json!({
+                "schema":"netcontrol-host-health/v1",
+                "sample":{"scope":"simulator","boot_id":null,"started_at":Utc::now(),
+                    "collected_at":Utc::now(),"status":"simulated"},
+                "sections":sections
+            }));
+        }
         if [
             "/api/v1/statistics/vnstat",
             "/api/v1/statistics/vnstat/host",

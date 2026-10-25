@@ -288,6 +288,14 @@ async fn run(options: Options) -> Result<()> {
             "no saved native configuration; run install.sh for initial provisioning instead of upgrading an unconfigured device"
         );
     }
+    let mqtt_mode = if options.backend == "simulator" {
+        netcontrold::mqtt::Mode::Simulated
+    } else if options.namespace.is_empty() {
+        netcontrold::mqtt::Mode::Native
+    } else {
+        netcontrold::mqtt::Mode::Unsupported
+    };
+    let mqtt_root = appended(&options.state, ".mqtt");
     let backend: Box<dyn Backend> = match options.backend.as_str() {
         "linux" => Box::new(Native::open(NativeOptions {
             namespace: options.namespace,
@@ -326,12 +334,16 @@ async fn run(options: Options) -> Result<()> {
         provision::enable_forwarding(&mut engine)?;
     }
     let engine = Arc::new(Mutex::new(engine));
-    let app = if let Some(updates) = updates {
+    let mut app = if let Some(updates) = updates {
         updates.mark_ready()?;
         App::with_updates(engine.clone(), auth, tls.is_some(), updates)?
     } else {
         App::new(engine.clone(), auth, tls.is_some())
     };
+    let mqtt = netcontrold::mqtt::Manager::open(&mqtt_root, engine.clone(), mqtt_mode)?;
+    App::attach_mqtt(&mut app, mqtt.clone())?;
+    let (mqtt_stop, mqtt_receiver) = tokio::sync::watch::channel(false);
+    let mqtt_task = tokio::spawn(mqtt.run(mqtt_receiver));
     let handle = axum_server::Handle::new();
     let (ssh_stop_tx, ssh_stop_rx) = tokio::sync::watch::channel(false);
     let mut ssh_task = ssh.map(|(listener, path)| {
@@ -430,7 +442,9 @@ async fn run(options: Options) -> Result<()> {
         Ok(())
     };
     let _ = stop_tx.send(true);
+    let _ = mqtt_stop.send(true);
     signals.abort();
+    mqtt_task.await.context("MQTT worker shutdown failed")?;
     let tick_result = ticker.await.context("deadline ticker task");
     let shutdown_result = engine
         .lock()

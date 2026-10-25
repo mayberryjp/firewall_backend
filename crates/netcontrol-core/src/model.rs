@@ -21,6 +21,7 @@ pub struct Config {
     pub ntp: NTPConfig,
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
+    pub mqtt: MQTTConfig,
     pub gateway_monitors: Vec<GatewayMonitor>,
     pub interfaces: Vec<Interface>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -40,6 +41,7 @@ impl Default for Config {
             ntp: Default::default(),
             syslog: Default::default(),
             vnstat: Default::default(),
+            mqtt: Default::default(),
             gateway_monitors: Vec::new(),
             interfaces: Vec::new(),
             dhcp_clients: BTreeMap::new(),
@@ -49,6 +51,57 @@ impl Default for Config {
             softflowd: Vec::new(),
             kernel: Default::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MQTTConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub username: String,
+    pub password_ref: String,
+    pub source_interface: String,
+    pub interval_seconds: u64,
+}
+
+impl Default for MQTTConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            username: String::new(),
+            password_ref: String::new(),
+            source_interface: String::new(),
+            interval_seconds: 60,
+        }
+    }
+}
+
+impl MQTTConfig {
+    pub fn broker(&self) -> Result<(String, u16, bool)> {
+        let endpoint = url::Url::parse(&self.endpoint)?;
+        ensure!(
+            matches!(endpoint.scheme(), "mqtt" | "mqtts")
+                && endpoint.host_str().is_some()
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && matches!(endpoint.path(), "" | "/")
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none(),
+            "MQTT endpoint must be mqtt://host[:port] or mqtts://host[:port], without credentials, path or query"
+        );
+        let tls = endpoint.scheme() == "mqtts";
+        let port = endpoint.port().unwrap_or(if tls { 8883 } else { 1883 });
+        ensure!(port != 0, "MQTT broker port must be nonzero");
+        let host = match endpoint
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("MQTT broker host is missing"))?
+        {
+            url::Host::Ipv6(address) => address.to_string(),
+            host => host.to_string(),
+        };
+        Ok((host, port, tls))
     }
 }
 
@@ -652,6 +705,45 @@ impl Config {
         c
     }
     pub fn validate(&self) -> Result<()> {
+        let mqtt = &self.mqtt;
+        ensure!(
+            (10..=3600).contains(&mqtt.interval_seconds)
+                && mqtt.endpoint.len() <= 1024
+                && mqtt.username.len() <= 256
+                && !mqtt.username.chars().any(char::is_control)
+                && (mqtt.password_ref.is_empty()
+                    || (mqtt.password_ref.len() == 32
+                        && mqtt
+                            .password_ref
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())))
+                && (mqtt.source_interface.is_empty()
+                    || crate::valid_interface_name(&mqtt.source_interface)),
+            "invalid MQTT interval (10..3600 seconds), endpoint, username, password reference or source interface"
+        );
+        if !mqtt.endpoint.is_empty() {
+            mqtt.broker()?;
+            ensure!(
+                self.ipv6_enabled || !mqtt.endpoint.contains('['),
+                "IPv6 MQTT endpoint requires ipv6_enabled"
+            );
+        }
+        ensure!(
+            mqtt.password_ref.is_empty() || !mqtt.username.is_empty(),
+            "MQTT password requires a username"
+        );
+        if mqtt.enabled {
+            ensure!(
+                !mqtt.endpoint.is_empty(),
+                "enabled MQTT streaming requires endpoint"
+            );
+            ensure!(
+                self.interfaces
+                    .iter()
+                    .any(|interface| interface.name == mqtt.source_interface && interface.up),
+                "enabled MQTT streaming requires an up managed source interface"
+            );
+        }
         for metadata in self.metadata_values() {
             metadata.validate()?;
         }

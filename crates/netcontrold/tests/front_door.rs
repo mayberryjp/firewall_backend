@@ -97,6 +97,64 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn host_health_http_authentication_permissions_and_cors() {
+    use netcontrold::http::Credential;
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.json"),
+        Box::new(Simulator::new()),
+    )
+    .unwrap();
+    let app = router(App::new(
+        Arc::new(Mutex::new(engine)),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+            Credential {
+                name: "writer".into(),
+                token_sha256: netcontrold::identity::digest("writer"),
+                permissions: vec!["interfaces.write".into()],
+            },
+        ]),
+        false,
+    ));
+    for (method, path, token, expected) in [
+        ("GET", "/api/v1/statistics/host", "", 401),
+        ("GET", "/api/v1/statistics/host", "writer", 403),
+        ("GET", "/api/v1/statistics/host?unused=1", "reader", 400),
+        ("POST", "/api/v1/statistics/host", "reader", 405),
+        ("GET", "/api/v1/statistics/host", "reader", 200),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("origin", "http://dashboard.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        if expected == 200 {
+            assert_eq!(body["schema"], "netcontrol-host-health/v1");
+            assert_eq!(body["sample"]["status"], "simulated");
+        } else {
+            assert!(body["error"].is_string());
+        }
+    }
+}
+
+#[tokio::test]
 async fn software_upgrade_requires_permission_and_validates_versions_when_disabled() {
     use netcontrold::http::Credential;
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -772,6 +772,7 @@ accept no query parameters:
 | `/api/v1/statistics/interfaces/{name}` | `{sample, interface}` |
 | `/api/v1/statistics/protocols` | `{sample, protocols}` |
 | `/api/v1/statistics/connections` | Connection snapshot with filters/paging; `netcontrol-connections/v1` |
+| `/api/v1/statistics/host` | Host health snapshot; `netcontrol-host-health/v1` (see below) |
 | `/api/v1/statistics/gateways` | `{sample, monitors}` |
 | `/api/v1/statistics/gateways/{name}` | `{sample, monitor}` |
 
@@ -824,6 +825,96 @@ counter history can be restored with a revision. Statistics remain independent
 of full configuration observation errors. Connection state is available only
 through the explicit endpoint below; interface/protocol statistics do not imply
 driver-specific, host-global softnet/sockstat, WireGuard peer, or streaming APIs.
+
+#### Host health sensors
+
+`GET /api/v1/statistics/host` is a read-only API-key-authenticated `state.read`
+operation. No query parameters or configuration fields. It is deliberately
+**not** included in `GET /api/v1/statistics`: only poll it when displaying host
+health. CLI equivalent: `show statistics host`.
+
+It reads procfs/sysfs and calls `statvfs` in the **daemon's** existing process/
+mount context, without entering the configured networking lab namespace.
+`sample.scope` is `"host"`, not the network statistics' namespace identity.
+In a container these are kernel/host-wide or mount/PID-namespace-visible values,
+not necessarily container/cgroup limits or a physical appliance inventory.
+No cgroup quota normalization, SMART drive-health prediction, external commands,
+sensor driver loading, writes, saved history, alarm policy or background sampler.
+The simulator never reads the development host: its scope/status are
+`"simulator"`/`"simulated"`, boot identity is null, and all section data is null.
+
+Response envelope:
+
+- `schema`: literal `"netcontrol-host-health/v1"`.
+- `sample`: `scope`, `boot_id` (Linux boot UUID string; null only in simulator),
+  `started_at`, `collected_at` (RFC3339 UTC) and `status`
+  (`available`, `partial`, `simulated`). Collection is sequential, not atomic.
+- `sections`: the twelve keys below. Each is
+  `{status, data, error}`. Status is `available`, `partial` (array has failed
+  children), `unavailable`, or `simulated`. An unavailable/simulated section has
+  `data: null` and an explanatory error string, not zero. Available sections have
+  `error: null`; partial array sections retain usable rows and child errors.
+  Missing kernel features, permissions and hot-unplug are explicit failures.
+  An empty available sensor array means no matching sensors were enumerated.
+
+| Section | Data and source |
+| --- | --- |
+| `cpu` | `/proc/stat`: `ticks_per_second` (positive JSON integer from `_SC_CLK_TCK`), `cpus: [{name, ticks}]`, `scheduler` map. CPU names are aggregate `cpu` and `cpuN`. Tick keys: `user`, `nice`, `system`, `idle`, optional `iowait`, `irq`, `softirq`, `steal`, `guest`, `guest_nice`. Scheduler keys when present: `ctxt`, `processes` (cumulative forks), `procs_running`, `procs_blocked` (gauges). |
+| `memory` | `/proc/meminfo`: `bytes` map preserving kernel names for all `kB` fields, multiplied by 1024. Required `MemTotal`, `MemFree`, `MemAvailable`, `SwapTotal`, `SwapFree`. `used_bytes = MemTotal - MemAvailable`, `swap_used_bytes = SwapTotal - SwapFree`. Non-byte HugePages counts are omitted. Reclaimable cache is not automatically treated as unavailable memory. |
+| `load` | `/proc/loadavg`: finite nonnegative JSON numbers `one`, `five`, `fifteen`; decimal strings `runnable_tasks`, `total_tasks`, `last_pid`. Load is not a percentage; includes uninterruptible tasks. |
+| `uptime` | `/proc/uptime`: finite nonnegative JSON numbers `uptime_seconds`, `idle_seconds`; summed CPU idle time can exceed uptime. |
+| `vm` | `/proc/vmstat`: available cumulative keys `pgpgin`, `pgpgout` (KiB), `pswpin`, `pswpout` (pages), `pgfault`, `pgmajfault`, `oom_kill` (events). Missing keys are omitted, never invented. |
+| `pressure_cpu`, `pressure_memory`, `pressure_io` | Corresponding `/proc/pressure/*`: required `some`, optional `full`; each has JSON numeric `avg10`, `avg60`, `avg300` (0..100 percent stall-time averages over seconds) and decimal-string `total` (cumulative microseconds). Optional kernel PSI support; do not substitute zero when absent. |
+| `disks` | `/proc/diskstats`: array `{name, major, minor, counters}`. Major/minor and all counters are decimal strings. Includes disks, partitions and virtual devices, not just managed storage. See fields below. |
+| `filesystems` | `/proc/self/mountinfo` and `statvfs`: array `{mount_id, device, mount_point, filesystem, usage}`. Mount ID is a decimal string, device is `major:minor`, other identity fields strings. `usage` is its own `{status,data,error}`. Data: decimal strings `total_bytes`, `free_bytes`, `available_bytes`, `used_bytes`, `total_inodes`, `free_inodes`, `available_inodes`; boolean `read_only`. Used = total minus free; available excludes reserved space. Zero inode totals may mean no inode accounting. |
+| `thermal` | `/sys/class/thermal/thermal_zoneN`: array of `{id,status,data,error}`; data `{type, temperature_millicelsius}`. Temperature is a signed JSON integer; negative temperatures are valid. |
+| `hwmon` | `/sys/class/hwmon/hwmonN`: temperature and fan input array, `{id,chip,unit,status,data,error}`; unit `millicelsius` or `rpm`, data `{value,label}`. Value is a signed JSON integer (RPM nonnegative), label nullable string. Per-chip enumeration/name failures produce an unavailable row with only `id,status,data,error`. A nonzero/malformed optional kernel `*_fault` marks that sensor unavailable, not healthy. |
+
+Disk `counters`: `reads_completed`, `reads_merged`, `sectors_read`, `read_ms`,
+`writes_completed`, `writes_merged`, `sectors_written`, `write_ms`,
+`io_in_progress` (gauge), `io_ms`, `weighted_io_ms`; optional kernel groups
+`discards_completed`, `discards_merged`, `sectors_discarded`, `discard_ms`,
+`flushes_completed`, `flush_ms`. Sector units are always 512 bytes, regardless
+of physical sector size. `_ms` fields are cumulative milliseconds.
+Do not sum disks and their partitions/device-mapper layers into a host total.
+
+Filesystem collection deliberately includes only local filesystem types:
+ext2/3/4, xfs, btrfs, f2fs, jfs, reiserfs, zfs, overlay, tmpfs, ramfs, squashfs,
+vfat, exfat and ntfs3. Network, FUSE, autofs and other pseudo/unknown filesystems
+are excluded without probing their space. Mounts/bind mounts can duplicate
+storage; values describe the currently path-resolved filesystem, not additive
+physical capacity. Collection is not a hard-deadline I/O service: local storage
+faults or concurrent mount changes can still delay syscalls. Reads are bounded
+to 2 MiB per source; directory enumeration and filesystem/sensor lists to 4096
+entries. Oversized/malformed sources are explicit errors.
+
+**Frontend tasks:** add host-health client types and a monitoring view for memory/
+swap, CPU utilization, load/uptime, PSI, local space/inodes, disk I/O and sensors.
+Poll every 2-5 seconds only while visible, without overlaps; back off on errors.
+Keep state separate from configuration drafts/revisions. Label scope, freshness,
+units, duplicates and partial/missing readings; render kernel labels as text.
+Do not infer universal healthy/warning thresholds for hardware or load.
+
+Counters/large gauges are quoted decimal strings: use strings/BigInt and exact
+deltas, converting only a bounded display result to Number. CPU busy percentage
+requires two valid samples: total ticks = sum user through steal (omit absent
+fields), busy = total minus idle minus iowait, percent = 100 * delta busy /
+delta total. Never add guest/guest_nice again (already included in user/nice).
+Treat iowait-based utilization as approximate. Reset baselines on boot/scope/
+device/CPU identity changes, missing data, any contributing counter decrease or
+nonpositive elapsed/total delta. First samples show no rates. Use actual uptime
+delta for disk/event rates, not the scheduled polling period. Counter resets,
+CPU hotplug and device reuse may be ambiguous; never repair them speculatively.
+Thermal and hwmon may expose the same physical sensor; do not average or sum.
+
+HTTP `200` carries successful or partial snapshots (even if all sections fail).
+`401`/`403` retain normal API-key/permission semantics; query parameters are
+`400`, non-GET methods `405`, unknown subpaths `404`. Boot-identity or top-level
+collection errors are `503` with the normal `{error,transaction:null}` envelope.
+No new privilege/host-service opt-in, persisted state or deployment service:
+readable Linux procfs/sysfs and local mount access are required, with a daemon
+rebuild. Browser polling/rendering and physical hardware coverage require
+frontend/appliance acceptance; portable tests alone are not that evidence.
 
 #### Conntrack connection snapshots
 
@@ -1305,6 +1396,113 @@ Only the latest 10,000 per-interface history records are retained, while
 cumulative totals persist; removed interfaces and reset boundaries remain visible.
 No calendar aggregation, Go/vnStat database compatibility, or chart-ready rate
 series is supplied. Do not sum overlapping interfaces or scopes.
+
+### 6.1.4 Home Assistant MQTT Streaming
+
+Provide API-managed settings in the shared configuration draft. This is outbound
+telemetry, not remote control or individual-probe history. Previously no MQTT
+configuration, publisher or password/status API existed. No CLI credentials or
+inline `config.mqtt.password` are accepted.
+
+Optional `config.mqtt` normalizes in responses to these defaults:
+
+```json
+{"enabled":false,"endpoint":"","username":"","password_ref":"","source_interface":"","interval_seconds":60}
+```
+
+| Field | Type and Validation |
+| --- | --- |
+| `enabled` | Boolean global streaming switch, default false. |
+| `endpoint` | String, max 1024 UTF-8 bytes; `mqtt://host[:port]` or `mqtts://host[:port]`, default ports 1883/8883, explicit port 1..65535. Host required, no credentials, non-root path, query or fragment; nonempty values validate even when disabled. IPv6 literals require enabled IPv6. |
+| `username` | String, max 256 UTF-8 bytes, no controls; default empty. Empty username/reference supports anonymous authentication. Username with empty reference sends an empty password. |
+| `password_ref` | String, empty or exactly 32 lowercase hex characters; a nonempty reference requires username and a locally stored password, even when disabled. Never plaintext. |
+| `source_interface` | String, empty or valid Linux interface name; enabled streaming requires an up managed interface of this name. Binding fails closed. Hostname DNS still uses the host resolver, not this binding. |
+| `interval_seconds` | Integer seconds, default 60, inclusive 10..3600. |
+
+All fields are non-null. Unknown keys/wrong types/null return `400`; semantic
+validation, missing credential references and unsupported enabled namespace mode
+return `422`. Changes require `transactions.write` plus new `mqtt.write` and any
+other changed-resource grants. Normal transactions, confirmation, rollback,
+revisions and restoration carry these settings. Publishing uses confirmed saved
+settings only, never an unconfirmed draft.
+
+Exact new endpoints, API-key Bearer authentication, no query parameters:
+
+| Method and Path | Permission | Success |
+| --- | --- | --- |
+| `POST /api/v1/services/mqtt/passwords` | `mqtt.write` | `201 {"password_ref":"0123456789abcdef0123456789abcdef"}` |
+| `GET /api/v1/services/mqtt/status` | `state.read` | `200` status below |
+
+Upload body is strictly `{"password":"synthetic-example-only"}`: 1..4096 UTF-8
+bytes, no NUL or additional fields. Password is write-only: no read/list/delete
+API, echo or ordinary configuration/history value. Replacement creates a new
+immutable reference. Owner-only files are plaintext at rest, not encrypted;
+limit 256 passwords, no automatic pruning because revisions retain references.
+Uploads during transaction/recovery/maintenance return `409`. Invalid body/query
+is `400`, absent/bad key `401`, insufficient grant `403`, wrong method `405`,
+unavailable manager/storage or exhausted limit `503`. Use normal API error envelopes.
+
+Synthetic status example:
+
+```json
+{"device_id":"0123456789abcdef0123456789abcdef","enabled":true,"state":"running","error":null,"last_published_at_unix":1792800000}
+```
+
+`device_id` is a stable private-store identity string. `enabled` reflects confirmed
+settings after worker observation; startup may briefly report disabled. `state`
+is `disabled`, `connecting`, `running`, `reconnecting`, `error`, `simulated`,
+`unavailable` or `stopped`. `error` is a nullable redacted string.
+`last_published_at_unix` is nullable integer UTC Unix seconds, updated after broker
+acknowledgment of a batch, not Home Assistant ingestion; its last value can remain
+after disable/failure. Poll every 5..10 seconds on the settings screen.
+
+Frontend workflow: masked replacement input, never prefilled from the reference;
+upload first, save only the reference in the shared draft, then submit
+`POST /api/v1/transactions`, confirm via
+`POST /api/v1/transactions/{id}/confirm`, or roll back via
+`POST /api/v1/transactions/{id}/rollback`. Existing `202` submit, `200` confirm/
+rollback and conflict/error behavior remain. New settings also appear in
+`GET /api/v1/state`, transaction/revision reads, and
+`POST /api/v1/revisions/{revision}/restore`. Clear plaintext after upload and on
+error/dismiss; keep it out of logs, exports, URLs and persisted drafts. Discarded
+uploads still consume the private-store limit. Show the global toggle and
+connection/last-publish status without claiming Home Assistant verified ingestion.
+
+Publisher and deployment contract:
+
+- Linux native host mode only. Simulator reports `simulated` without network I/O;
+  namespace lab mode rejects enabled streaming. Host routing/DNS, interface-binding
+  privileges, broker reachability and firewall permission are operator prerequisites.
+- Persistent MQTT 3.1.1, keepalive 30 seconds, clean session, five-second connection
+  timeout and five-second reconnect delay. `mqtts` requires system trust and valid
+  certificate/hostname; no insecure bypass. Explicit `mqtt` is plaintext. Upload
+  passwords over protected HTTPS or a trusted management channel.
+- Device discovery at `homeassistant/device/netcontrol_<device_id>/config`;
+  samples at `netcontrol/<device_id>/state`; availability at
+  `netcontrol/<device_id>/availability`. QoS 1; discovery/availability retained,
+  samples nonretained. Broker ACLs must allow these publications and subscription
+  to `homeassistant/status`. Birth `online` refreshes discovery/sample within
+  five seconds when idle. LWT is retained `offline`; graceful stop/disable attempts
+  offline/disconnect within three seconds. Broken sockets rely on broker LWT.
+- Stable name-hashed sensor IDs and durable component-removal manifest. Entities:
+  configuration revision, uptime, version; interface link state and RX/TX bytes/
+  packets/errors/drops; gateway health/process/sample state, window sent/received/
+  lost/pending/loss percent and RTT min/max/average/stddev/p50/p95/variation.
+  These are rolling summaries, not individual probes/cumulative probe totals.
+  Counter decimal strings remain lossless; stale/unavailable values are unknown,
+  not zero. Package placeholder `0.0.0` means unknown software version.
+- Samples expire after three publication intervals. Active configuration/maintenance
+  and failed collection pause samples with offline availability; the next successful
+  sample restores availability. No offline backlog or command topics. Limits:
+  4096 entities and 1 MiB per discovery/state payload; excess fails collection.
+- Back up `<state>.mqtt` with the journal, preserving ownership/owner-only files,
+  stable ID, passwords and manifest. Default
+  `/var/lib/netcontrol/native-state.json.mqtt`. Never reset missing credentials,
+  silently prune revision references or clone to another active appliance.
+  Decommissioned Home Assistant entities/retained topics need operator removal.
+- Deploy rebuilt daemon/dependencies/system CA trust; no sidecar MQTT process.
+  Verify actual Home Assistant ingestion and trusted/untrusted TLS broker behavior
+  on deployment; local protocol fixtures do not prove these integrations.
 
 ### 6.2 Managed interfaces and VLANs
 

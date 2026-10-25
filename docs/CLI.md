@@ -264,6 +264,7 @@ show routes
 show firewall
 show kernel
 show statistics
+show statistics host
 show statistics vnstat/managed
 show transactions
 show transaction TRANSACTION_ID

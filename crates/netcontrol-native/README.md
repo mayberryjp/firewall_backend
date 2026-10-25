@@ -81,6 +81,16 @@ unload, forwarding enablement or cross-namespace enforcement is introduced.
 Use IPv4 management plus console access when disabling. See the
 [canonical API/runtime contract](../../FRONTEND_SPEC.md#global-ipv6-policy).
 
+## Host health sensors
+
+Host performance sensors are separate from namespace networking statistics:
+`GET /api/v1/statistics/host` reads procfs, sysfs and local `statvfs` data in
+the daemon context, without entering a lab network namespace or mutating the
+kernel. CPU/memory/load/uptime/VM/PSI, disk I/O, space/inodes and temperature/fan
+sources fail independently. Collection does not load sensor drivers or probe
+network/FUSE mounts. See [the full host-health contract](../../FRONTEND_SPEC.md#host-health-sensors)
+for scope, exact decimal counters, bounds, supported filesystems and limitations.
+
 ## Conntrack connection snapshots
 
 `GET /api/v1/statistics/connections` reads namespace-wide Linux conntrack state

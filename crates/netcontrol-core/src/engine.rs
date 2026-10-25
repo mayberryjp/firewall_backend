@@ -22,6 +22,7 @@ pub const PERMISSIONS: &[&str] = &[
     "ntp.write",
     "syslog.write",
     "vnstat.write",
+    "mqtt.write",
     "kernel.namespace.write",
     "kernel.host.write",
     "system.upgrade",
@@ -152,6 +153,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ("ntp.write", a.ntp != b.ntp),
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
+        ("mqtt.write", a.mqtt != b.mqtt),
         ("kernel.namespace.write", a.ipv6_enabled != b.ipv6_enabled),
         (
             "kernel.namespace.write",
@@ -194,6 +196,7 @@ pub struct Engine {
     backend: Box<dyn Backend>,
     closed: bool,
     maintenance: bool,
+    mqtt_passwords: Option<BTreeSet<String>>,
     #[cfg(test)]
     now: Option<DateTime<Utc>>,
 }
@@ -277,6 +280,7 @@ impl Engine {
             backend,
             closed: false,
             maintenance: false,
+            mqtt_passwords: None,
             #[cfg(test)]
             now: None,
         };
@@ -687,6 +691,18 @@ impl Engine {
         &self.state.desired
     }
 
+    pub fn committed_revision(&self) -> u64 {
+        self.state.revision
+    }
+
+    pub fn configuration_busy(&self) -> bool {
+        self.maintenance || self.active().is_some()
+    }
+
+    pub fn configure_mqtt(&mut self, references: Option<BTreeSet<String>>) {
+        self.mqtt_passwords = references;
+    }
+
     pub fn factory_reset(&mut self, config: Config) -> Result<Transaction> {
         ensure!(!self.closed, "engine is shut down");
         let request = SubmitRequest {
@@ -724,6 +740,20 @@ impl Engine {
             return Err(ApiError::new(422, "description must not exceed 1024 bytes"));
         }
         r.config.validate().map_err(|e| ApiError::new(422, e))?;
+        if r.config.mqtt.enabled && self.mqtt_passwords.is_none() {
+            return Err(ApiError::new(
+                422,
+                "MQTT streaming is unavailable for this backend",
+            ));
+        }
+        if !r.config.mqtt.password_ref.is_empty()
+            && !self
+                .mqtt_passwords
+                .as_ref()
+                .is_some_and(|references| references.contains(&r.config.mqtt.password_ref))
+        {
+            return Err(ApiError::new(422, "MQTT password reference is unavailable"));
+        }
         if !(10..=300).contains(&r.confirm_timeout_seconds) {
             return Err(ApiError::new(
                 422,
@@ -1292,6 +1322,7 @@ fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
         "/api/v1/statistics",
         "/api/v1/statistics/interfaces",
         "/api/v1/statistics/protocols",
+        "/api/v1/statistics/host",
         "/api/v1/statistics/gateways",
         "/api/v1/statistics/vnstat",
         "/api/v1/statistics/vnstat/host",
