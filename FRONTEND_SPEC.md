@@ -1550,6 +1550,20 @@ Publisher and deployment contract:
   extras are ignored. Not published: disks, per-disk I/O, VM counters other than
   OOM kills, and scheduler gauges. A host snapshot that fails to read leaves these
   sensors unknown without failing the sample.
+- NetFlow/IPFIX sensors, one set per **configured** `softflowd` instance (enabled or
+  not), read from `GET /api/v1/services/softflowd/status` on each sample and keyed
+  by a hash of the instance name: `state` (`running`, `stopped`, `disabled`, `error`,
+  ...), `statistics_complete` (false once the kernel has dropped any capture
+  packet until the worker restarts), `dropped_packets` (kernel capture-socket drops,
+  exact decimal string, cumulative since worker start), `active_flows` (gauge),
+  `exported_flows`, `excluded_packets`, `filtered_packets` and `malformed_packets`
+  (cumulative). Counters reset when the worker restarts. A stopped, disabled or
+  just-started worker has no counters and they are unknown, never zero; the
+  counters other than drops appear after the first table scan. No entities exist
+  while no instance is configured; if the status read fails the existing entities
+  are kept (unknown, expiring). Names are `<name> flow dropped packets` etc. Cap:
+  64 instances. `running` is local worker health, not collector delivery; see
+  [docs/NETFLOW_IPFIX_SPEC.md](docs/NETFLOW_IPFIX_SPEC.md) section 5.
 - Samples expire after three publication intervals. Active configuration/maintenance
   and failed collection pause samples with offline availability; the next successful
   sample restores availability. No offline backlog or command topics. Limits:
@@ -2346,8 +2360,19 @@ draft automatically.
 
 ### 6.9 softflowd
 
+The complete implementation reference (capture and flow semantics, wire formats,
+expiry rules, runtime fields, prerequisites and non-goals) is
+[docs/NETFLOW_IPFIX_SPEC.md](docs/NETFLOW_IPFIX_SPEC.md). This section is the UI
+contract; that document is the detailed behavior reference.
+
 Table: name, desired enabled, observed enabled, capture interface, collector,
 export version, native worker state/start time when supplied, error, staged state.
+Desired enabled is an inline per-row toggle (`softflowd[].enabled`, same pattern as
+gateway monitors and static routes) that stages the change in the shared draft; it
+never issues a live request and disabled entries remain fully validated and retained.
+The create action is labelled **Add export** (not "Add instance"); it opens the editor
+with the same fields. No backend change: enable/disable already uses the existing
+`softflowd.write` permission and complete configuration transaction.
 
 Editor: name, enabled, capture interface, numeric collector address/port, export
 version, sampling rate, maximum flows, snap length, promiscuous capture, optional
@@ -3064,10 +3089,22 @@ interface ParentInterface {
 interface SoftflowdStatus {
   name: string;
   state: string;
+  scope?: "managed";
+  export_version?: 1 | 5 | 9 | 10;
+  address_family?: "ipv4" | "dual";
+  fragments?: "excluded";
+  capture_filter?: string;
+  sampling_rate?: number;
+  sampling_metadata?: boolean; // false only for NetFlow v1
   started_at?: Timestamp;
   error?: string;
   dropped_packets?: string; // Exact cumulative AF_PACKET drops since worker start.
   statistics_complete?: boolean; // False remains sticky after an observed drop.
+  active_flows?: number; // Present after the first table scan; counters are JSON numbers.
+  exported_flows?: number;
+  excluded_packets?: number;
+  filtered_packets?: number;
+  malformed_packets?: number;
 }
 
 interface RuntimeState {

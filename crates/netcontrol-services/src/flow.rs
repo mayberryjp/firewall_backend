@@ -1,8 +1,8 @@
 use anyhow::{Result, ensure};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Key {
     src: IpAddr,
     dst: IpAddr,
@@ -20,6 +20,137 @@ pub(crate) struct Flow {
     pub flags: u8,
     pub changed: std::time::Instant,
 }
+
+#[cfg(any(target_os = "linux", test))]
+struct FlowTable {
+    flows: std::collections::HashMap<Key, Flow>,
+    oldest: std::collections::BTreeSet<(std::time::Instant, Key)>,
+    capacity: usize,
+    fixed_counters: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl FlowTable {
+    fn new(capacity: usize, fixed_counters: bool) -> Self {
+        Self {
+            flows: std::collections::HashMap::new(),
+            oldest: std::collections::BTreeSet::new(),
+            capacity,
+            fixed_counters,
+        }
+    }
+
+    fn record(
+        &mut self,
+        key: Key,
+        bytes: u32,
+        flags: u8,
+        now: std::time::Instant,
+        uptime: u32,
+    ) -> Option<(Key, Flow)> {
+        let mut evicted = None;
+        if self.flows.len() >= self.capacity && !self.flows.contains_key(&key) {
+            let (_, old) = self
+                .oldest
+                .pop_first()
+                .expect("full flow table has an oldest flow");
+            evicted = Some(self.flows.remove_entry(&old).expect("oldest flow exists"));
+        }
+        let fresh = || Flow {
+            bytes: 0,
+            packets: 0,
+            first: uptime,
+            last: uptime,
+            flags: 0,
+            changed: now,
+        };
+        let flow = match self.flows.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let flow = entry.into_mut();
+                self.oldest.remove(&(flow.changed, key));
+                if self.fixed_counters
+                    && (flow.bytes + u64::from(bytes) > u64::from(u32::MAX)
+                        || flow.packets == u64::from(u32::MAX))
+                {
+                    evicted = Some((key, std::mem::replace(flow, fresh())));
+                }
+                flow
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(fresh()),
+        };
+        flow.bytes += u64::from(bytes);
+        flow.packets += 1;
+        flow.last = uptime;
+        flow.flags |= flags;
+        flow.changed = now;
+        self.oldest.insert((now, key));
+        evicted
+    }
+
+    fn remove(&mut self, key: &Key) -> Option<(Key, Flow)> {
+        let item = self.flows.remove_entry(key)?;
+        self.oldest.remove(&(item.1.changed, item.0));
+        Some(item)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct FlowTimeouts {
+    general: std::time::Duration,
+    tcp: std::time::Duration,
+    tcp_fin: std::time::Duration,
+    tcp_rst: std::time::Duration,
+    udp: std::time::Duration,
+    icmp: std::time::Duration,
+    maxlife_ms: u64,
+    scan_interval: std::time::Duration,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl FlowTimeouts {
+    fn new(values: &BTreeMap<String, u64>) -> Self {
+        let general = values.get("general").copied().unwrap_or(60);
+        let idle =
+            |key: &str| std::time::Duration::from_secs(values.get(key).copied().unwrap_or(general));
+        Self {
+            general: std::time::Duration::from_secs(general),
+            tcp: idle("tcp"),
+            tcp_fin: idle("tcp.fin"),
+            tcp_rst: idle("tcp.rst"),
+            udp: idle("udp"),
+            icmp: idle("icmp"),
+            maxlife_ms: values.get("maxlife").copied().unwrap_or(3600) * 1000,
+            scan_interval: std::time::Duration::from_secs(
+                values.get("expint").copied().unwrap_or(1),
+            ),
+        }
+    }
+
+    fn expired(
+        &self,
+        key: &Key,
+        flow: &Flow,
+        now: std::time::Instant,
+        uptime: u32,
+        fixed_counters: bool,
+    ) -> bool {
+        let idle = match key.proto {
+            6 if flow.flags & 4 != 0 => self.tcp_rst,
+            6 if flow.flags & 1 != 0 => self.tcp_fin,
+            6 => self.tcp,
+            17 => self.udp,
+            1 | 58 => self.icmp,
+            _ => self.general,
+        };
+        (!idle.is_zero() && now.duration_since(flow.changed) >= idle)
+            || (self.maxlife_ms > 0
+                && u64::from(uptime.wrapping_sub(flow.first)) >= self.maxlife_ms)
+            || (fixed_counters
+                && (flow.bytes > u64::from(u32::MAX) - 65535
+                    || flow.packets >= u64::from(u32::MAX)))
+    }
+}
+
 pub(crate) fn parse(frame: &[u8]) -> Result<Option<(Key, u32, u8)>> {
     ensure!(frame.len() >= 14, "short Ethernet frame");
     let mut pos = 14;
@@ -331,6 +462,86 @@ pub(crate) fn template_export(
     Ok(packet)
 }
 #[cfg(target_os = "linux")]
+const CAPTURE_BATCH: usize = 64;
+#[cfg(target_os = "linux")]
+const CAPTURE_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+struct CaptureBatch {
+    buffers: Vec<Vec<u8>>,
+    lengths: [usize; CAPTURE_BATCH],
+}
+
+#[cfg(target_os = "linux")]
+impl CaptureBatch {
+    fn new(snaplen: usize) -> Self {
+        Self {
+            buffers: vec![vec![0; snaplen]; CAPTURE_BATCH],
+            lengths: [0; CAPTURE_BATCH],
+        }
+    }
+
+    fn receive(&mut self, fd: std::os::fd::RawFd) -> Result<usize> {
+        let mut vectors: [_; CAPTURE_BATCH] = std::array::from_fn(|i| libc::iovec {
+            iov_base: self.buffers[i].as_mut_ptr().cast(),
+            iov_len: self.buffers[i].len(),
+        });
+        let mut messages: [_; CAPTURE_BATCH] = std::array::from_fn(|i| {
+            let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            message.msg_hdr.msg_iov = &mut vectors[i];
+            message.msg_hdr.msg_iovlen = 1;
+            message
+        });
+        // All buffers and descriptors remain live and stationary through recvmmsg.
+        let count = unsafe {
+            libc::recvmmsg(
+                fd,
+                messages.as_mut_ptr(),
+                CAPTURE_BATCH as u32,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.kind() {
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => Ok(0),
+                _ => Err(error.into()),
+            };
+        }
+        for (length, message) in self.lengths.iter_mut().zip(&messages).take(count as usize) {
+            *length = message.msg_len as usize;
+        }
+        Ok(count as usize)
+    }
+
+    fn packet(&self, index: usize) -> &[u8] {
+        &self.buffers[index][..self.lengths[index]]
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_capture(fd: std::os::fd::RawFd) -> Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut descriptor, 1, 10) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+    ensure!(
+        descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0,
+        "capture socket poll failed: events {:#x}",
+        descriptor.revents
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     config: super::config::Flow,
     ipv6_enabled: bool,
@@ -343,10 +554,17 @@ pub(crate) fn prepare(
         time::{Duration, Instant, SystemTime},
     };
     let filter = config.filter()?;
+    let timeouts = FlowTimeouts::new(&config.timeouts);
     let fd = l::socket(
         libc::AF_PACKET,
         libc::SOCK_RAW,
         (libc::ETH_P_ALL as u16).to_be() as i32,
+    )?;
+    l::option(
+        fd.as_raw_fd(),
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        &CAPTURE_BUFFER_BYTES,
     )?;
     let index = l::ifindex(&config.interface)?;
     let mut address: libc::sockaddr_ll = unsafe { mem::zeroed() };
@@ -381,9 +599,10 @@ pub(crate) fn prepare(
     socket.set_write_timeout(Some(Duration::from_millis(250)))?;
     Ok(Box::new(move |ctx| {
         let start = Instant::now();
-        let mut buffer = vec![0; config.snaplen];
-        let mut table: BTreeMap<Key, Flow> = BTreeMap::new();
-        let mut oldest = std::collections::BTreeSet::new();
+        let mut capture = CaptureBatch::new(config.snaplen);
+        let mut pending = Vec::with_capacity(CAPTURE_BATCH);
+        let fixed_counters = [1, 5].contains(&config.export_version);
+        let mut table = FlowTable::new(config.max_flows, fixed_counters);
         let mut sampled = 0u64;
         let mut sequence = 0u32;
         let mut exports = 0u64;
@@ -441,131 +660,66 @@ pub(crate) fn prepare(
                 l::ifindex(&config.interface)? == index,
                 "capture interface replaced"
             );
-            for _ in 0..256 {
-                if ctx.stopping() {
-                    break;
-                }
-                let n = unsafe {
-                    libc::recv(
-                        fd.as_raw_fd(),
-                        buffer.as_mut_ptr() as *mut _,
-                        buffer.len(),
-                        0,
-                    )
-                };
-                if n < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::Interrupted
-                    {
+            for _ in 0..4 {
+                let count = capture.receive(fd.as_raw_fd())?;
+                for packet in 0..count {
+                    if ctx.stopping() {
                         break;
                     }
-                    return Err(e.into());
-                }
-                sampled = sampled.wrapping_add(1);
-                if sampled % config.sampling_rate as u64 != 0 {
-                    continue;
-                }
-                let item = match parse(&buffer[..n as usize]) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => {
+                    sampled = sampled.wrapping_add(1);
+                    if sampled % config.sampling_rate as u64 != 0 {
+                        continue;
+                    }
+                    let item = match parse(capture.packet(packet)) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => {
+                            ignored_ipv6 += 1;
+                            continue;
+                        }
+                        Err(_) => {
+                            malformed += 1;
+                            continue;
+                        }
+                    };
+                    let (key, bytes, flags) = item;
+                    if (!ipv6_enabled && key.src.is_ipv6())
+                        || !filter.matches(key.src.is_ipv6(), key.proto)
+                    {
+                        filtered += 1;
+                        continue;
+                    }
+                    if [1, 5].contains(&config.export_version) && key.src.is_ipv6() {
                         ignored_ipv6 += 1;
                         continue;
                     }
-                    Err(_) => {
-                        malformed += 1;
+                    if key.proto == 17 && key.dst == collector.ip() && key.dport == collector.port()
+                    {
                         continue;
                     }
-                };
-                let (key, bytes, flags) = item;
-                if (!ipv6_enabled && key.src.is_ipv6())
-                    || !filter.matches(key.src.is_ipv6(), key.proto)
-                {
-                    filtered += 1;
-                    continue;
-                }
-                if [1, 5].contains(&config.export_version) && key.src.is_ipv6() {
-                    ignored_ipv6 += 1;
-                    continue;
-                }
-                if key.proto == 17 && key.dst == collector.ip() && key.dport == collector.port() {
-                    continue;
-                }
-                if [1, 5].contains(&config.export_version)
-                    && table.get(&key).is_some_and(|flow| {
-                        flow.bytes + bytes as u64 > u32::MAX as u64
-                            || flow.packets == u32::MAX as u64
-                    })
-                {
-                    if let Some(item) = table.remove_entry(&key) {
-                        oldest.remove(&(item.1.changed, item.0.clone()));
-                        export(&[item], &mut sequence, &mut exports)?;
+                    let now = Instant::now();
+                    let uptime = now.duration_since(start).as_millis() as u32;
+                    if let Some(item) = table.record(key, bytes, flags, now, uptime) {
+                        pending.push(item);
                     }
                 }
-                if !table.contains_key(&key) && table.len() >= config.max_flows {
-                    if let Some((_, old)) = oldest.pop_first() {
-                        export(
-                            &[table.remove_entry(&old).unwrap()],
-                            &mut sequence,
-                            &mut exports,
-                        )?;
-                    }
+                if !pending.is_empty() {
+                    export(&pending, &mut sequence, &mut exports)?;
+                    pending.clear();
                 }
-                let uptime = start.elapsed().as_millis() as u32;
-                let f = table.entry(key.clone()).or_insert(Flow {
-                    bytes: 0,
-                    packets: 0,
-                    first: uptime,
-                    last: uptime,
-                    flags: 0,
-                    changed: Instant::now(),
-                });
-                oldest.remove(&(f.changed, key.clone()));
-                f.bytes += bytes as u64;
-                f.packets += 1;
-                f.last = uptime;
-                f.flags |= flags;
-                f.changed = Instant::now();
-                oldest.insert((f.changed, key));
+                if count < CAPTURE_BATCH || ctx.stopping() {
+                    break;
+                }
             }
-            let interval = config.timeouts.get("expint").copied().unwrap_or(1);
-            if last_flush.elapsed() >= Duration::from_secs(interval) {
-                let now = start.elapsed().as_millis() as u32;
+            if last_flush.elapsed() >= timeouts.scan_interval {
+                let now = Instant::now();
+                let uptime = now.duration_since(start).as_millis() as u32;
                 let keys: Vec<Key> = table
+                    .flows
                     .iter()
-                    .filter(|(k, v)| {
-                        let idle = if k.proto == 6 && v.flags & 4 != 0 {
-                            "tcp.rst"
-                        } else if k.proto == 6 && v.flags & 1 != 0 {
-                            "tcp.fin"
-                        } else if k.proto == 6 {
-                            "tcp"
-                        } else if k.proto == 17 {
-                            "udp"
-                        } else if k.proto == 1 || k.proto == 58 {
-                            "icmp"
-                        } else {
-                            "general"
-                        };
-                        let seconds = config.timeouts.get(idle).copied().unwrap_or_else(|| {
-                            config.timeouts.get("general").copied().unwrap_or(60)
-                        });
-                        let max = config.timeouts.get("maxlife").copied().unwrap_or(3600);
-                        (seconds > 0 && v.changed.elapsed() >= Duration::from_secs(seconds))
-                            || (max > 0 && now.wrapping_sub(v.first) as u64 >= max * 1000)
-                            || ([1, 5].contains(&config.export_version)
-                                && (v.bytes > u32::MAX as u64 - 65535
-                                    || v.packets >= u32::MAX as u64))
-                    })
-                    .map(|(k, _)| k.clone())
+                    .filter(|(k, v)| timeouts.expired(k, v, now, uptime, fixed_counters))
+                    .map(|(k, _)| *k)
                     .collect();
-                let batch: Vec<_> = keys
-                    .into_iter()
-                    .filter_map(|k| table.remove_entry(&k))
-                    .collect();
-                for (key, flow) in &batch {
-                    oldest.remove(&(flow.changed, key.clone()));
-                }
+                let batch: Vec<_> = keys.into_iter().filter_map(|k| table.remove(&k)).collect();
                 export(&batch, &mut sequence, &mut exports)?;
                 last_flush = Instant::now();
                 // PACKET_STATISTICS is reset by getsockopt; accumulate drops explicitly.
@@ -584,17 +738,17 @@ pub(crate) fn prepare(
                 ctx.update(|s| {
                     s["dropped_packets"] = serde_json::json!(dropped.to_string());
                     s["statistics_complete"] = serde_json::json!(dropped == 0);
-                    s["active_flows"] = serde_json::json!(table.len());
+                    s["active_flows"] = serde_json::json!(table.flows.len());
                     s["exported_flows"] = serde_json::json!(exports);
                     s["excluded_packets"] = serde_json::json!(ignored_ipv6);
                     s["filtered_packets"] = serde_json::json!(filtered);
                     s["malformed_packets"] = serde_json::json!(malformed);
                 });
             }
-            ctx.wait(Duration::from_millis(10));
+            wait_for_capture(fd.as_raw_fd())?;
         }
         export(
-            &table.into_iter().collect::<Vec<_>>(),
+            &table.flows.into_iter().collect::<Vec<_>>(),
             &mut sequence,
             &mut exports,
         )?;
@@ -604,6 +758,239 @@ pub(crate) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn flow_test_key(index: u32) -> Key {
+        Key {
+            src: Ipv4Addr::from(0x0a000000 | index).into(),
+            dst: "198.51.100.1".parse().unwrap(),
+            sport: 12345,
+            dport: 443,
+            proto: 6,
+            tos: 0,
+        }
+    }
+
+    fn assert_flow_index(table: &FlowTable) {
+        assert_eq!(table.flows.len(), table.oldest.len());
+        assert!(table.flows.len() <= table.capacity);
+        for (key, flow) in &table.flows {
+            assert!(table.oldest.contains(&(flow.changed, *key)));
+        }
+    }
+
+    #[test]
+    fn flow_table_preserves_counts_flags_lru_and_removal() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut table = FlowTable::new(2, true);
+        let a = flow_test_key(1);
+        let b = flow_test_key(2);
+        let c = flow_test_key(3);
+        assert!(table.record(a, 40, 2, now, u32::MAX - 5).is_none());
+        assert!(table.record(b, 50, 0, now, u32::MAX - 5).is_none());
+        assert_flow_index(&table);
+        assert!(
+            table
+                .record(a, 60, 0x10, now + Duration::from_millis(9), 3)
+                .is_none()
+        );
+        let evicted = table
+            .record(c, 70, 0, now + Duration::from_millis(10), 4)
+            .unwrap();
+        assert_eq!(evicted.0, b);
+        assert_eq!(evicted.1.packets, 1);
+        assert_flow_index(&table);
+        let (_, flow) = table.remove(&a).unwrap();
+        assert_eq!((flow.packets, flow.bytes, flow.flags), (2, 100, 0x12));
+        assert_eq!((flow.first, flow.last), (u32::MAX - 5, 3));
+        assert!(table.remove(&a).is_none());
+        assert_flow_index(&table);
+        assert!(
+            table
+                .record(b, 80, 0, now + Duration::from_millis(11), 5)
+                .is_none()
+        );
+        assert_flow_index(&table);
+    }
+
+    #[test]
+    fn flow_table_rolls_fixed_counters_without_losing_incoming_packet() {
+        use std::time::{Duration, Instant};
+        for fixed in [false, true] {
+            let now = Instant::now();
+            let key = flow_test_key(1);
+            let mut table = FlowTable::new(1, fixed);
+            table.record(key, 40, 1, now, 1);
+            table.flows.get_mut(&key).unwrap().bytes = u64::from(u32::MAX) - 10;
+            let evicted = table.record(key, 64, 0x10, now + Duration::from_millis(1), 2);
+            assert_eq!(evicted.is_some(), fixed);
+            let flow = &table.flows[&key];
+            if fixed {
+                let (_, old) = evicted.unwrap();
+                assert_eq!(old.bytes, u64::from(u32::MAX) - 10);
+                assert_eq!(
+                    (flow.packets, flow.bytes, flow.first, flow.flags),
+                    (1, 64, 2, 0x10)
+                );
+            } else {
+                assert_eq!(flow.bytes, u64::from(u32::MAX) + 54);
+                assert_eq!((flow.packets, flow.first, flow.flags), (2, 1, 0x11));
+            }
+            table.flows.get_mut(&key).unwrap().packets = u64::from(u32::MAX);
+            let evicted = table.record(key, 20, 4, now + Duration::from_millis(2), 3);
+            assert_eq!(evicted.is_some(), fixed);
+            assert_eq!(
+                table.flows[&key].packets,
+                if fixed { 1 } else { u64::from(u32::MAX) + 1 }
+            );
+            assert_flow_index(&table);
+        }
+    }
+
+    #[test]
+    fn flow_timeouts_preserve_classes_priority_defaults_and_disabled_values() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut table = FlowTable::new(1, false);
+        let key = flow_test_key(1);
+        table.record(key, 40, 0, now, 0);
+        let mut flow = table.remove(&key).unwrap().1;
+        let timeouts = FlowTimeouts::new(&BTreeMap::from([
+            ("general".into(), 10),
+            ("tcp".into(), 100),
+            ("tcp.fin".into(), 3),
+            ("tcp.rst".into(), 1),
+            ("udp".into(), 0),
+            ("icmp".into(), 2),
+            ("maxlife".into(), 0),
+            ("expint".into(), 0),
+        ]));
+        assert!(timeouts.scan_interval.is_zero());
+        for (proto, flags, seconds) in [
+            (6, 0, 100),
+            (6, 1, 3),
+            (6, 4, 1),
+            (6, 5, 1),
+            (1, 0, 2),
+            (58, 0, 2),
+            (47, 0, 10),
+        ] {
+            let key = Key { proto, ..key };
+            flow.flags = flags;
+            assert!(!timeouts.expired(
+                &key,
+                &flow,
+                now + Duration::from_secs(seconds - 1),
+                0,
+                false
+            ));
+            assert!(timeouts.expired(&key, &flow, now + Duration::from_secs(seconds), 0, false));
+        }
+        assert!(!timeouts.expired(
+            &Key { proto: 17, ..key },
+            &flow,
+            now + Duration::from_secs(1000),
+            0,
+            false
+        ));
+        let defaults = FlowTimeouts::new(&BTreeMap::new());
+        assert_eq!(defaults.general, Duration::from_secs(60));
+        assert_eq!(defaults.tcp_fin, defaults.general);
+        assert_eq!(defaults.maxlife_ms, 3_600_000);
+        assert_eq!(defaults.scan_interval, Duration::from_secs(1));
+        let fallback =
+            FlowTimeouts::new(&BTreeMap::from([("general".into(), 7), ("tcp".into(), 99)]));
+        assert_eq!(fallback.tcp_fin, Duration::from_secs(7));
+        assert_eq!(fallback.tcp_rst, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn flow_expiry_preserves_uptime_wrap_and_fixed_counter_thresholds() {
+        use std::time::Instant;
+        let now = Instant::now();
+        let key = flow_test_key(1);
+        let mut table = FlowTable::new(1, true);
+        table.record(key, 40, 0, now, u32::MAX - 500);
+        let mut flow = table.remove(&key).unwrap().1;
+        let timeouts =
+            FlowTimeouts::new(&BTreeMap::from([("tcp".into(), 0), ("maxlife".into(), 1)]));
+        assert!(!timeouts.expired(&key, &flow, now, 498, true));
+        assert!(timeouts.expired(&key, &flow, now, 499, true));
+        let no_age = FlowTimeouts::new(&BTreeMap::from([("tcp".into(), 0), ("maxlife".into(), 0)]));
+        flow.bytes = u64::from(u32::MAX) - 65535;
+        assert!(!no_age.expired(&key, &flow, now, 0, true));
+        flow.bytes += 1;
+        assert!(no_age.expired(&key, &flow, now, 0, true));
+        assert!(!no_age.expired(&key, &flow, now, 0, false));
+        flow.bytes = 40;
+        flow.packets = u64::from(u32::MAX);
+        assert!(no_age.expired(&key, &flow, now, 0, true));
+        assert!(!no_age.expired(&key, &flow, now, 0, false));
+    }
+
+    #[test]
+    #[ignore = "manual release-mode flow-accounting throughput measurement"]
+    fn flow_accounting_throughput() {
+        use std::time::Instant;
+        const CAPACITY: usize = 4096;
+        const PACKETS: u32 = 1_000_000;
+        let keys: Vec<_> = (0..CAPACITY as u32).map(flow_test_key).collect();
+        for churn in [false, true] {
+            let mut table = FlowTable::new(CAPACITY, true);
+            let mut evicted = 0;
+            let begin = Instant::now();
+            for packet in 0..PACKETS {
+                let key = if churn {
+                    flow_test_key(packet)
+                } else {
+                    keys[packet as usize % CAPACITY]
+                };
+                if let Some((_, flow)) = table.record(key, 64, 0x10, Instant::now(), packet) {
+                    evicted += flow.packets;
+                }
+            }
+            let elapsed = begin.elapsed();
+            assert_eq!(table.flows.len(), CAPACITY);
+            assert_eq!(
+                evicted + table.flows.values().map(|flow| flow.packets).sum::<u64>(),
+                u64::from(PACKETS)
+            );
+            println!(
+                "flow accounting churn={churn}: {PACKETS} packets in {elapsed:?} ({:.0} packets/s)",
+                f64::from(PACKETS) / elapsed.as_secs_f64()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_batches_preserve_order_boundaries_and_snaplen() -> Result<()> {
+        use std::{os::fd::AsRawFd, os::unix::net::UnixDatagram, time::Duration};
+        let (sender, receiver) = UnixDatagram::pair()?;
+        receiver.set_nonblocking(true)?;
+        sender.set_write_timeout(Some(Duration::from_secs(1)))?;
+        let mut batch = CaptureBatch::new(64);
+        assert_eq!(batch.receive(receiver.as_raw_fd())?, 0);
+        for i in 0..CAPTURE_BATCH + 1 {
+            sender.send(&[i as u8; 128])?;
+        }
+        wait_for_capture(receiver.as_raw_fd())?;
+        assert_eq!(batch.receive(receiver.as_raw_fd())?, CAPTURE_BATCH);
+        for i in 0..CAPTURE_BATCH {
+            assert_eq!(batch.packet(i), &[i as u8; 64]);
+        }
+        assert_eq!(batch.receive(receiver.as_raw_fd())?, 1);
+        assert_eq!(batch.packet(0), &[CAPTURE_BATCH as u8; 64]);
+        sender.send(b"short")?;
+        sender.send(b"")?;
+        assert_eq!(batch.receive(receiver.as_raw_fd())?, 2);
+        assert_eq!(batch.packet(0), b"short");
+        assert_eq!(batch.packet(1), b"");
+        assert_eq!(batch.receive(receiver.as_raw_fd())?, 0);
+        assert!(batch.receive(-1).is_err());
+        assert!(wait_for_capture(i32::MAX).is_err());
+        Ok(())
+    }
+
     #[test]
     fn netflow_v1_exact_header_records_lengths_and_endian_fields() {
         let key = Key {
@@ -623,7 +1010,7 @@ mod tests {
             changed: std::time::Instant::now(),
         };
         let epoch = std::time::UNIX_EPOCH + std::time::Duration::new(0x10203040, 100000000);
-        let p = v1(&[(key.clone(), flow.clone())], 0x99aabbcc, epoch).unwrap();
+        let p = v1(&[(key, flow.clone())], 0x99aabbcc, epoch).unwrap();
         let header = [
             0, 1, 0, 1, 0x99, 0xaa, 0xbb, 0xcc, 0x10, 0x20, 0x30, 0x40, 0x05, 0xf5, 0xe1, 0x00,
         ];
@@ -635,16 +1022,16 @@ mod tests {
         assert_eq!(p.len(), 16 + 48);
         assert_eq!(&p[..16], &header);
         assert_eq!(&p[16..], &record);
-        let records = vec![(key.clone(), flow.clone()); 24];
+        let records = vec![(key, flow.clone()); 24];
         let p = v1(&records, 0, epoch).unwrap();
         assert_eq!(p.len(), 16 + 24 * 48);
         assert_eq!(&p[2..4], &24u16.to_be_bytes());
         for r in p[16..].chunks_exact(48) {
             assert_eq!(r, &record);
         }
-        assert!(v1(&vec![(key.clone(), flow.clone()); 25], 0, epoch).is_err());
+        assert!(v1(&vec![(key, flow.clone()); 25], 0, epoch).is_err());
         assert!(v1(&[], 0, epoch).is_err());
-        let mut ipv6 = key.clone();
+        let mut ipv6 = key;
         ipv6.src = "2001:db8::1".parse().unwrap();
         ipv6.dst = "2001:db8::2".parse().unwrap();
         assert!(v1(&[(ipv6, flow.clone())], 0, epoch).is_err());
@@ -731,28 +1118,11 @@ mod tests {
             flags,
             changed: std::time::Instant::now(),
         };
-        assert!(
-            v5(
-                &[(key.clone(), flow.clone())],
-                200,
-                7,
-                std::time::UNIX_EPOCH,
-                1
-            )
-            .is_err()
-        );
+        assert!(v5(&[(key, flow.clone())], 200, 7, std::time::UNIX_EPOCH, 1).is_err());
         for version in [9, 10] {
             let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_800_000_000_000);
-            let p = template_export(
-                &[(key.clone(), flow.clone())],
-                version,
-                200,
-                7,
-                epoch,
-                1000000,
-                123,
-            )
-            .unwrap();
+            let p = template_export(&[(key, flow.clone())], version, 200, 7, epoch, 1000000, 123)
+                .unwrap();
             assert_eq!(&p[..2], &version.to_be_bytes());
             let header = if version == 9 { 20 } else { 16 };
             if version == 9 {

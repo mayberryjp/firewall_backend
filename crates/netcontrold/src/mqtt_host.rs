@@ -41,7 +41,7 @@ fn data<'a>(host: Option<&'a Value>, section: &str) -> Option<&'a Value> {
         .filter(|data| !data.is_null())
 }
 
-fn scalar(value: &Value) -> Value {
+pub(crate) fn scalar(value: &Value) -> Value {
     if value.is_string() || value.is_number() {
         value.clone()
     } else {
@@ -75,7 +75,7 @@ fn busy_percent(previous: &BTreeMap<String, u128>, now: &BTreeMap<String, u128>)
     (total > 0).then(|| 100.0 * (total - idle) as f64 / total as f64)
 }
 
-fn push(
+pub(crate) fn push(
     sensors: &mut Vec<Sensor>,
     key: impl Into<String>,
     name: impl Into<String>,

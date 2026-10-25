@@ -339,13 +339,38 @@ impl Manager {
             );
             (reply.status == 200).then_some(reply.body)
         };
-        let host = {
+        let mut host = {
             let mut baseline = self
                 .cpu_baseline
                 .lock()
                 .map_err(|_| anyhow::anyhow!("CPU baseline unavailable"))?;
             crate::mqtt_host::sensors(snapshot.as_ref(), &mut baseline)
         };
+        // Flow sensors exist only while an instance is configured; a failed read keeps them unknown.
+        let flow = {
+            let mut engine = self
+                .engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+            if engine.saved_configuration().softflowd.is_empty() {
+                None
+            } else {
+                let reply = engine.request(
+                    "GET",
+                    "/api/v1/services/softflowd/status",
+                    "",
+                    "mqtt-publisher",
+                    &["state.read".into()],
+                    &[],
+                );
+                Some((reply.status == 200).then_some(reply.body))
+            }
+        };
+        if let Some(status) = flow {
+            let flow = crate::mqtt_flow::sensors(status.as_ref());
+            host.sensors.extend(flow.sensors);
+            host.retained.extend(flow.retained);
+        }
         let (discovery, state) = telemetry(
             &self.device_id,
             config,

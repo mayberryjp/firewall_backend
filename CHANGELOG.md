@@ -2,7 +2,30 @@
 
 ## Unreleased
 
+### Fixed
+
+- Further reduced native NetFlow/IPFIX processing overhead with hash-based flow
+  lookups, cached timeout classes, one monotonic timestamp per packet update
+  and expiry scan, and bounded batching of capacity/counter-rollover exports
+  instead of one UDP send per early-expired flow. Preserves flow limits,
+  least-recently-updated eviction, counter rollover, timeout precedence,
+  sampling, drop reporting and wire formats. Recommended bump: patch;
+  baseline unknown, Unreleased. No API/schema, frontend or deployment change.
+
+- Reduced native NetFlow/IPFIX capture loss by replacing the unconditional
+  10 ms receive-loop sleep with readiness polling, batching up to 64 frames per
+  receive syscall, and requesting a bounded 4 MiB receive buffer per exporter
+  (subject to the host's `net.core.rmem_max`). Queued traffic no longer waits
+  between 256-packet processing rounds. Sampling, flow/export formats, sticky
+  capture-loss reporting and fatal I/O errors remain unchanged. No API/schema,
+  host sysctl or frontend change. Recommended bump: patch; baseline unknown,
+  Unreleased. See [capture details](docs/NETFLOW_IPFIX_SPEC.md#packet-drops).
+
 ### Changed
+
+- Documentation only: [FRONTEND_SPEC.md](FRONTEND_SPEC.md) section 6.9 now specifies an
+  inline per-row enable/disable toggle for NetFlow/IPFIX exports and the **Add export**
+  create-action label. No API, schema or runtime change; recommended bump: none.
 
 - Native NetFlow/IPFIX capture continues exporting after AF_PACKET packet drops
   instead of stopping the worker and rejecting confirmation solely for capture
@@ -27,6 +50,24 @@
   [handoff 2026-10-24-19](docs/frontend-handoffs/2026-10-24.md#2026-10-24-19-unknown-configuration-fields-are-dropped-and-reported).
 
 ### Added
+
+- Home Assistant MQTT streaming now also publishes NetFlow/IPFIX (`softflowd`)
+  statistics per configured instance: export state, `statistics_complete`, kernel
+  capture **`dropped_packets`** (exact decimal string), active flows, exported flows
+  and excluded/filtered/malformed packet counters, read from the existing
+  `GET /api/v1/services/softflowd/status` rows. Counters are unknown (never zero)
+  without a running worker, reset on worker restart, and are absent when no exporter
+  is configured; a failed status read keeps the existing entities. No configuration,
+  API or permission change. Recommended bump: minor; baseline unknown. Frontend
+  action: none required, optional documentation; see
+  [handoff 2026-10-25-07](docs/frontend-handoffs/2026-10-25.md#2026-10-25-07-mqtt-netflowipfix-sensors).
+
+- Added the standalone [NetFlow/IPFIX implementation reference](docs/NETFLOW_IPFIX_SPEC.md)
+  for the `softflowd` configuration and runtime (written from the code), and completed
+  the `SoftflowdStatus` type in the frontend contract with the counters the daemon
+  already returns. Documentation only; no behavior, API or schema change.
+  Recommended bump: none. Optional frontend action; see
+  [handoff 2026-10-25-06](docs/frontend-handoffs/2026-10-25.md#2026-10-25-06-netflowipfix-implementation-reference).
 
 - WireGuard peer `enabled` boolean (default true when omitted in requests and saved
   configuration; null/non-boolean rejected). A disabled peer keeps all settings in

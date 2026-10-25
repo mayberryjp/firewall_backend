@@ -92,7 +92,21 @@ These are worker states, not external daemon states; there is no `pid` field.
 * **NetFlow:** AF_PACKET Ethernet/VLAN capture and NetFlow v1/v5/v9/IPFIX UDP export,
   bounded flow capacity, configured sampling, idle/protocol/flag/maxlife/export
   timeouts, and shutdown flushing. Excludes its collector traffic to avoid
-  export feedback. AF_PACKET capture drops do not stop the worker or export.
+  export feedback. Capture uses nonblocking batches of up to 64 packets per
+  `recvmmsg`, with at most 256 packets between maintenance checks. A readiness
+  poll waits up to 10 ms only when no capture is ready; queued traffic is drained
+  without the former unconditional 10 ms sleep. Each exporter requests a 4 MiB
+  socket receive buffer (Linux caps this at `net.core.rmem_max` and doubles the
+  accepted value for socket accounting) and uses at most 64 times `snaplen`
+  bytes of userspace packet storage. Flow accounting uses a randomly seeded
+  hash table with an ordered least-recently-updated index; the configured
+  `max_flows` limit is unchanged. Timeout classes are resolved once at startup,
+  with one monotonic timestamp per packet update and per expiry scan.
+  Capacity/counter-rollover exports are coalesced at the end of each receive
+  batch, with at most 64 pending records, rather than sending each early-expired
+  flow separately. No host sysctl is changed. Capture and
+  export still share a worker; CPU overload, long scans or slow export can
+  still cause loss. AF_PACKET capture drops do not stop the worker or export.
   Runtime reports cumulative `dropped_packets` as an exact decimal string and
   `statistics_complete: false` after any observed drop; flow totals may undercount
   traffic. Both reset on worker restart (initially `"0"` and `true`); loss remains
@@ -120,6 +134,10 @@ These are worker states, not external daemon states; there is no `pid` field.
   maximum life 3,600 seconds, scan/export interval one second; protocol-specific
   idle values fall back to general. Explicit protocol idle/maxlife zero disables
   that timeout; explicit `expint: 0` scans each bounded capture poll.
+  For an isolated accounting microbenchmark (not a NIC throughput test), run
+  `cargo test -p netcontrol-services --release --locked flow_accounting_throughput
+  -- --ignored --nocapture`; it exercises repeated flows and capacity churn,
+  verifies packet conservation, and prints elapsed time for one million updates.
 * **Gateway monitoring:** native raw ICMPv4/v6, bound source and interface,
   with explicit routing table 254 (main) or 10000–19999;
   the native backend derives internal host-source rules before starting workers.
