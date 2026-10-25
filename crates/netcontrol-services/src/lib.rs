@@ -195,19 +195,20 @@ impl Services {
         {
             let managed = Some(self.managed_namespace.clone());
             let host = Some(self.host_namespace.clone());
+            let ipv6_enabled = c.ipv6_enabled;
             if c.ntp.enabled {
                 let config = c.ntp.clone();
                 self.insert(
                     "ntp",
                     host.clone(),
                     json!({"name":"ntp","scope":"host","sample_status":"warming_up"}),
-                    move || ntp::prepare(config),
+                    move || ntp::prepare(config, ipv6_enabled),
                 )?;
             }
             if c.syslog.enabled {
                 let config = c.syslog.clone();
                 let dir = self.options.state_directory.clone();
-                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","backend_source":dir.join("backend.log"),"host_source":"/dev/log","kernel_source":"/dev/kmsg"}),move||syslog::prepare(config,dir))?;
+                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","backend_source":dir.join("backend.log"),"host_source":"/dev/log","kernel_source":"/dev/kmsg"}),move||syslog::prepare(config,dir,ipv6_enabled))?;
             }
             if c.vnstat.enabled {
                 for scope in ["host", "managed"] {
@@ -232,7 +233,7 @@ impl Services {
             }
             for f in c.softflowd.iter().filter(|f| f.enabled) {
                 let config = f.clone();
-                self.insert(&format!("flow:{}",f.name),managed.clone(),                                json!({"name":f.name,"scope":"managed","export_version":f.export_version,"address_family":if [1,5].contains(&f.export_version){"ipv4"}else{"dual"},"fragments":"excluded","capture_filter":f.capture_filter,"sampling_rate":f.sampling_rate,"sampling_metadata":f.export_version!=1}),move||flow::prepare(config))?;
+                self.insert(&format!("flow:{}",f.name),managed.clone(),                                json!({"name":f.name,"scope":"managed","export_version":f.export_version,"address_family":if !ipv6_enabled || [1,5].contains(&f.export_version){"ipv4"}else{"dual"},"fragments":"excluded","capture_filter":f.capture_filter,"sampling_rate":f.sampling_rate,"sampling_metadata":f.export_version!=1}),move||flow::prepare(config,ipv6_enabled))?;
             }
             for m in c.gateway_monitors.iter().filter(|m| m.enabled) {
                 let config = m.clone();

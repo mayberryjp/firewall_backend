@@ -53,6 +53,34 @@ without the C/header toolchain: TLS requests then fail explicitly and
 `Native::open` always fails because nftables is essential. It is **not** a
 functional networking build or a permissive firewall fallback.
 
+## Global IPv6 policy
+
+The persisted top-level `ipv6_enabled` switch defaults to true. Native startup
+and transactional apply enforce `net.ipv6.conf.{all,default}.disable_ipv6` and
+all current per-interface controls, including loopback/unmanaged devices, in
+the managed namespace. Disabled is `1`; enabled is `0`. New devices inherit the
+default. These are namespace controls, not host-global tunable opt-ins, and
+cannot be supplied through the arbitrary-tunable allowlist.
+
+IPv6 support and readable procfs controls are required. Required writes need
+writable controls; absent controls or denied writes are explicit startup/apply errors. Proc writes
+are read back and verified, including per-interface drift. IPv6 is enabled
+before restoring configured addresses/routes and disabled after obsolete owned
+IPv6 state is reconciled. Services stop/join before changes and restart with
+IPv4-only resolution/export when disabled.
+
+Durable native intents capture IPv6 controls and unmanaged address/route state;
+same-boot rollback/re-enable restores it with elapsed address/route lifetimes.
+Managed networking uses normal configuration reconciliation and Ethernet
+snapshots. Changed/missing unmanaged interface identities fail explicitly.
+Prior-boot transient snapshots are discarded on boot reconciliation rather than
+resurrecting stale leases or writing to reused indexes. The policy is reapplied
+when the daemon starts, not before: no sysctl.d file, bootloader change, module
+unload, forwarding enablement or cross-namespace enforcement is introduced.
+
+Use IPv4 management plus console access when disabling. See the
+[canonical API/runtime contract](../../FRONTEND_SPEC.md#global-ipv6-policy).
+
 ## Conntrack connection snapshots
 
 `GET /api/v1/statistics/connections` reads namespace-wide Linux conntrack state
@@ -68,7 +96,7 @@ Original/reply tuples expose NAT addresses/ports, with protocol/TCP state,
 status flags, mark, zone, nullable timeout/ID, and per-direction packet/byte
 counts. Counts are exact decimal strings or null when accounting is absent.
 This is neither a per-rule counter nor evidence of a current allow/drop verdict.
-No rule association, connection deletion/flush, packet capture or history API.
+No rule association, packet capture or history API. Reads never delete state.
 
 Ubuntu installation and full development upgrades load `nf_conntrack`, enable
 and persist `net.netfilter.nf_conntrack_acct=1` and
@@ -89,6 +117,37 @@ is over fresh live snapshots, not a consistent retained cursor. The daemon does
 not explicitly load kernel modules, restart services or change accounting
 configuration in this read path. Privileged Linux acceptance remains outstanding in this task's
 [journal](../../docs/journal/2026-10-24.md#conntrack-connection-statistics-api).
+
+## Conntrack state deletion
+
+`DELETE /api/v1/connections` with exactly `{"confirm":true}` flushes the daemon
+namespace's conntrack state. `DELETE /api/v1/connections/{id}` instead requires
+the snapshot's family, protocol, zone and original tuple in its JSON body. Both
+require `connections.delete`, native netfilter write privileges, no active
+configuration transaction and no software-upgrade maintenance. Malformed/empty
+item selectors never become a flush; stale ID+tuple+zone is `404`. Simulator and
+non-Linux backends explicitly refuse destructive actions. See the
+[canonical request/error contract](../../FRONTEND_SPEC.md#connection-state-deletion).
+
+The in-process netfilter transport waits for a kernel acknowledgement and checks
+its source, sequence and echoed request header. Target deletion binds original
+tuple, family, protocol, ID and zone; supported targets are TCP/UDP/SCTP and
+ICMP/ICMPv6 without differing directional zones. Collection deletion is unfiltered
+and includes IPv4/IPv6/all zones and local/unmanaged/other-owner traffic in that
+namespace. It never changes nftables rules, saved configuration, revisions,
+ownership or accounting settings, and does not fabricate a deletion count.
+
+This removes conntrack state, not application sockets: no TCP RST is sent and a
+new handshake is not guaranteed. Packets can recreate state immediately; NAT or
+management connections may be disrupted. This is irreversible operational work,
+not transaction rollback. A timeout/disconnect can leave an unknown or partial
+outcome; refresh rather than automatically retry. Do not flush to enable counters.
+
+Portable selector/encoding/ACK tests and the isolated synthetic-UDP namespace
+regression passed in Linux Docker. The latter checks stale-ID refusal, exact
+deletion preserving another flow, full namespace flush, and unchanged ownership
+and nftables fingerprint. It does not prove appliance TCP/NAT/IPv6 or browser
+acceptance; see the [journal](../../docs/journal/2026-10-24.md#connection-state-deletion).
 
 ## Ownership and reconciliation
 

@@ -39,6 +39,7 @@ Support:
   optional managed egress-interface matches, TCP/UDP destination ports, and
   automatic established/related return traffic.
 - IPv4/IPv6 masquerading.
+- Transactional global IPv6 enable/disable policy, enabled by default.
 - WireGuard key references, peers, endpoints, allowed networks, and keepalive.
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
 - Per-interface DHCPv4 relay server lists and enable flags, native Rust relay,
@@ -410,8 +411,8 @@ serves a small embedded onboarding/key-management website at `/`; the broader
 networking dashboard specified here still needs a separate frontend. Scoped
 `--auth-file` mode serves only the networking API. Both modes allow all origins
 for `/api/v1/` using `Access-Control-Allow-Origin: *`, including error responses.
-Preflight `OPTIONS` requests need no authentication and return `204` for `GET`
-or `POST` with `Authorization` and `Content-Type` request headers (case-insensitive
+Preflight `OPTIONS` requests need no authentication and return `204` for `GET`,
+`POST` or `DELETE` with `Authorization` and `Content-Type` request headers (case-insensitive
 header names). Unsupported preflight methods return `405`; unsupported requested
 headers return `400`, with the normal API JSON error shape. Non-preflight
 `OPTIONS` requests still require authentication and are not new API operations.
@@ -440,8 +441,10 @@ may receive configuration, API keys, session tokens, or diagnostic payloads.
 
 **Frontend decision:** Default to a relative `/api/v1` base and a deployment-supplied
 label/mode (`Linux`, `Simulator`, or `Unknown`). No current API exposes backend
-mode, namespace, version, or feature capabilities. Never infer Linux operation
-from an empty service list or fabricate a namespace label.
+mode or a general namespace/running-version/capability inventory. Software-upgrade
+status (section 4.5) exposes only upgrade configuration and historical success,
+not the running software version. Never infer Linux operation from an empty
+service list or fabricate a namespace label.
 
 ### 4.2 Credential flow
 
@@ -531,7 +534,10 @@ revoke it; use device key management (or operator edits/restart in legacy mode).
 ### 4.3 Authorization
 
 All reads require `state.read`. POST actions require `transactions.write`, except
-the per-interface DHCP retry action, which requires only `interfaces.write`.
+the per-interface DHCP retry action (`interfaces.write`) and software upgrade
+submission (`system.upgrade`). Device-account API keys have all permissions,
+including upgrade authority when the operator explicitly enables self-upgrade;
+scoped credential files must grant `system.upgrade` explicitly.
 Configuration changes additionally require permissions for every changed area:
 
 | Change | Additional permission |
@@ -603,6 +609,75 @@ transaction conflicts, preserve drafts and uncertain-write recovery. No frontend
 client or UI changes are required to use SSH; optional operator help may link
 to the [CLI guide](docs/CLI.md). Host management access, key fingerprint trust,
 namespace provisioning and exposure are operator responsibilities.
+
+### 4.5 Signed Ubuntu Self-Upgrade
+
+Self-upgrade is optional and disabled unless a root-owned trusted GitHub
+repository/public-key configuration is supplied through `--upgrade-config`.
+It supports only Ubuntu amd64/systemd, Linux host appliance mode. It is not an
+OS update, `.ncpkg` installation, factory reset or source build. Release assets
+must be separately signed and explicitly published; no approved release/version
+baseline or channel is implied. See [operator setup and artifact contract](docs/BUILD_AND_INSTALL.md#signed-ubuntu-self-upgrade).
+
+| Method/path | Permission | Behavior |
+| --- | --- | --- |
+| `POST /api/v1/system/upgrade` | `system.upgrade` | Submit a specific signed release version; returns `202` job and `Location: /api/v1/system/upgrade` |
+| `GET /api/v1/system/upgrade` | `state.read` | Read configuration-enabled flag and latest durable job; `200` even when disabled |
+
+POST body is exactly `{"version":"1.2.3"}` (synthetic version). Version is
+canonical SemVer, maximum 80 bytes, no `v` prefix or build metadata; explicit
+prerelease versions are accepted. GitHub tag is `v<version>`. No query parameters,
+unknown/duplicate fields, URL/repository/token/key/path, force or downgrade inputs.
+GET accepts no body/query. Standard error envelope `{error, transaction: null}`:
+`400` invalid input, `401` invalid/missing API key, `403` insufficient permission,
+`405` other methods, `409` active job/configuration transaction or version not
+newer than the last successful API upgrade, `503` disabled/preparation/state
+failure. Errors after acceptance are recorded on the job, not returned by POST.
+
+GET response fields: `enabled: boolean`, `repository: string|null`,
+`last_successful_version: string|null`, `job: object|null`. Enabled means operator
+configuration is present, not that a release exists or is healthy. Historical
+last-successful version is **not** the running software version; manual deploys
+can differ. No initial version is inferred. Latest job is overwritten on a new
+accepted request; no job-history/cancel endpoint exists.
+
+POST returns a job object with string `id`, `version`, `status`, RFC3339
+`created_at`/`updated_at`, nullable string `error` and
+`last_successful_version`. GET nests that same shape under `job`. Synthetic example:
+
+```json
+{"id":"upgrade_example","version":"1.2.3","status":"queued","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z","error":null,"last_successful_version":null}
+```
+
+Statuses: `queued`, `downloading`, `installing`, `checking`, `succeeded`,
+`failed`, `rolled_back`, `recovery_required`. Only `succeeded`, `failed` and
+`rolled_back` are terminal; recovery-required needs local-console intervention
+and remains write-blocking. `202` does not promise that the release was found,
+signature passed or installation succeeded. A new API upgrade must be newer
+than the last successful API-upgrade version when known; there is no downgrade
+override. The first version baseline remains unknown until successful receipt.
+
+Frontend tasks: explicit privileged-action confirmation showing requested
+version/repository and expected management/traffic interruption; strict version
+validation; no credential/URL fields or implicit retry. Poll GET without overlap
+and back off during disconnection, preserving the accepted job ID. Do not mark
+a restart outage as job failure or success; reconnect, compare the latest ID
+and status, and report a superseded job rather than confusing it with a new one.
+Reads remain available until restart, but new configuration/SSH writes and DHCP
+retry return `409` while active; disable those actions and preserve unsaved drafts.
+After reconnect, refetch state/revision before allowing draft submission.
+
+The independent helper verifies the configured signing key, version, target,
+digest and bounded HTTPS downloads, preserves the main service arguments and
+saved configuration, and attempts previous-binary restoration on install/startup
+failure. A required boot recovery unit handles interrupted install/check phases.
+It also applies existing conntrack accounting/checksum prerequisites. Browser
+code must not claim full state rollback, guaranteed connectivity, atomic host
+prerequisites or retroactive conntrack counters. No automatic frontend reload,
+release publication, reboot, connection flush, credential reset or compatibility
+migration is added. Actual systemd/power-loss/release/browser acceptance remains
+pending; [handoff 2026-10-24-07](docs/frontend-handoffs/2026-10-24.md#2026-10-24-07-signed-ubuntu-self-upgrade)
+is Pending frontend review.
 
 ## 5. State and draft model
 
@@ -871,16 +946,90 @@ Simulator returns `200` with `sample.status: "simulated"`, an empty array,
 `summary.total`, `matched`, `accounting_unavailable` null, `returned: 0`, and null
 `next_offset`. It does not fabricate native activity or measured zero totals.
 
-Frontend tasks: add a read-only Connections view with server-side filters,
+Frontend tasks: add a Connections view with server-side filters,
 original/reply/NAT details, state/remaining timeout, directional counters,
 freshness and unavailable accounting messages. Poll only while visible, do not
 overlap requests, back off on `503`, reset offset on filter change and preserve
-drafts. Keep only ephemeral monitoring state; no close/delete/flush action is
-provided. Prefer ID plus zone/tuple identity over array position for row keys.
+drafts. Keep only ephemeral monitoring state. Deletion is a separately authorized
+action described below; reads never delete state. Prefer ID plus zone/tuple
+identity over array position for row keys.
 Existing `GET /api/v1/firewall/rules` and desired firewall configuration remain
 the rule-definition sources. This feature does not add per-rule counters,
 rule-to-connection attribution, packet logs, guaranteed visibility of rejected
 or NOTRACK traffic, historical connections, or automatic policy changes.
+
+#### Connection state deletion
+
+Bearer API keys need the dedicated `connections.delete` permission, not just
+`state.read` or firewall write permission. Device-account keys receive all current
+permissions; scoped keys need an explicit grant. These are immediate operational
+actions, not configuration transactions, and do not change saved configuration,
+revisions, ownership, firewall rules or accounting settings. They require Linux
+conntrack/netfilter write privileges in the daemon's configured namespace.
+Simulator/non-Linux backends return `503`, never simulated destructive success.
+
+`DELETE /api/v1/connections` deletes all conntrack entries in that namespace,
+including IPv4/IPv6, all zones, unmanaged/local/other-owner traffic and management
+or NAT state. It does not apply the Connections view's filters. The body must be
+exactly `{"confirm":true}`; missing/false confirmation is `400`. No item ID means
+collection deletion, not an empty request body. A trailing slash, empty item ID
+or malformed ID is an error, never a fallback to deleting everything.
+
+`DELETE /api/v1/connections/{id}` targets the snapshot row's ID plus original
+tuple, family, protocol and zone. ID must be canonical unsigned 32-bit decimal
+(0..4294967295), without signs, leading zeroes, suffixes or additional slashes.
+The JSON body has exactly `family` (`"ipv4"`/`"ipv6"`), `protocol` (integer),
+`zone` (integer 0..65535) and `original` (tuple object). Synthetic TCP example:
+
+```json
+{
+  "family": "ipv4",
+  "protocol": 6,
+  "zone": 0,
+  "original": {
+    "source": "192.0.2.2",
+    "destination": "198.51.100.2",
+    "source_port": 50000,
+    "destination_port": 443
+  }
+}
+```
+
+Use `/api/v1/connections/123` for a synthetic row with ID `"123"`. Project only
+the four named fields from the row; do not submit reply/counters/state/ID as
+extra body fields. `original.source`/`destination` must match the chosen IP
+family. TCP (6), UDP (17) and SCTP (132) require both ports (integers 0..65535)
+and absent/null ICMP fields. ICMP (1, IPv4) or ICMPv6 (58, IPv6) requires
+`icmp_id` (0..65535), `icmp_type`/`icmp_code` (0..255), and absent/null ports.
+An optional `original.zone` must be null/absent or equal the top-level zone;
+direction-specific differing zones and other protocols are not supported for
+targeted deletion. No unknown fields or query parameters are accepted. Disable
+row deletion if ID or the required identity fields are unavailable/unsupported.
+IDs are ephemeral and can be reused; do not retain a selector as durable identity.
+
+Success is `200` with `{"status":"deleted","scope":"<namespace-scope>"}`
+for one entry or `{"status":"flushed","scope":"<namespace-scope>"}` for
+the collection. There is no deleted-count claim. Kernel acknowledgement is
+required; stale/nonmatching ID+tuple+zone returns `404`, never a flush. Other
+errors use `{error, transaction: null}`: `400` invalid selector/body/query,
+`401` invalid/missing key, `403` missing permission, `405` unsupported method,
+`409` active configuration transaction or software-upgrade maintenance, `503`
+unsupported backend, kernel/privilege/transport failure. No POST flush alias.
+
+Deleting conntrack state does **not** send TCP RSTs, close application sockets or
+guarantee a fresh TCP handshake. Subsequent packets can recreate state immediately
+according to kernel/firewall policy, so even an acknowledged flush need not leave
+the next snapshot empty. Existing management/NAT traffic can be disrupted. There
+is no undo or revision rollback for this operation. On timeout/disconnection or
+transport failure, outcome may be unknown or partial; refresh state, do not
+automatically retry a destructive request.
+
+Frontend tasks: gate row/all-state delete controls by permission and maintenance
+status, require explicit confirmation (stronger warning for whole namespace),
+keep the collection action clearly independent of current filters, disable while
+pending and refresh after success or uncertain outcomes. Treat `404` as a stale
+row and refetch. Preserve configuration drafts and monitoring rate semantics;
+never automatically flush to obtain counters or apply a firewall rule change.
 
 ### 6.1.2 Gateway health and RTT variation
 
@@ -1297,6 +1446,75 @@ change other kernel device/RA settings that are not currently captured for
 transaction rollback. Do not render a supported forwarding toggle or claim
 Netcontrol configures every host subsystem.
 
+#### Global IPv6 policy
+
+The complete configuration has a top-level `ipv6_enabled: boolean`. Omission
+defaults to `true`; normalized configuration/revision/transaction reads include
+it explicitly. `null`, strings and numbers are `400`. Fresh install/factory
+configuration enables IPv6. Preserve this scalar in every full-package edit,
+export/import, compare and historical restore.
+
+Expose an **Enable IPv6** global switch in the candidate editor. Changes use
+`POST /api/v1/transactions` followed by the existing confirmation/rollback
+workflow, not a new immediate-write endpoint. `transactions.write` plus
+`kernel.namespace.write` authorize changing the switch; any accompanying
+resource edits require their existing permissions. Reads use `state.read`:
+`GET /api/v1/state`, `/api/v1/runtime` and existing revision/transaction routes.
+Confirmation and historical restore retain their existing authorization rules.
+
+When false, IPv6 literals/prefixes are invalid across interface addresses,
+WireGuard endpoints/allowed IPs, DNS servers, routes, policy rules, firewall
+source/destination/host/input references, masquerade, NTP/syslog servers,
+gateway monitors and exporter collectors. `ip6`/`icmp6` capture filters are also
+invalid. Validation applies even to disabled service records. Remove/replace
+conflicts in the same candidate; do not silently delete them when toggling.
+Hostnames remain valid and native NTP/syslog resolution uses IPv4 hosts entries,
+IPv4 DNS servers and A queries only. Exporters exclude IPv6 regardless of their
+otherwise-valid filter/version. Family-neutral firewall rules remain valid.
+Conflicting candidates return `422` before any live change.
+
+Native enforcement covers all/default/per-interface Linux `disable_ipv6`
+controls in the managed namespace, including unmanaged links, adopted parents
+and loopback. `false` means `1`, `true` means `0`; new interfaces inherit the
+default. Enabled does not imply configured IPv6 addresses, forwarding, DHCPv6
+or router advertisements. Do not expose arbitrary IPv6 sysctls as substitutes.
+Normal host deployment controls the appliance host; explicit lab namespace mode
+does not disable IPv6 in unrelated namespaces or move the management listener.
+
+`GET /api/v1/runtime` adds:
+
+```json
+{"ipv6":{"enabled":false,"status":"measured","disable_ipv6":{"all":"1","default":"1","lo":"1","lan0":"1"},"drift":false}}
+```
+
+This is a response fragment with synthetic interface names. `enabled` is the
+desired boolean; `status` is `"measured"` natively or `"simulated"` in the
+simulator. `disable_ipv6` is a string-to-`"0"|"1"` map of observed controls,
+or null for the simulator. `drift` is boolean natively, null when simulated.
+Do not label simulated data as verified kernel enforcement. Drift blocks
+ordinary writes/confirmation; existing repair/recovery rules still apply.
+
+Warn that disabling interrupts IPv6 traffic and IPv6-only management, including
+`::1` dependencies. Require deliberate review, recommend IPv4 management and
+independent console access, preserve pending transaction identity across
+disconnects and never infer confirmation from a successful apply.
+Existing errors remain: missing grants `403`, stale base/active transaction/
+maintenance/drift conflicts `409`, native apply/read failures `503` with normal
+transaction recovery details where applicable. A failed or unreachable apply
+is not a successful disable.
+
+Policy is saved and reconciled on daemon startup, including after reboot. It
+does not install bootloader/module blacklists or an OS sysctl.d file and is not
+a guarantee of IPv6 absence before daemon startup. Linux IPv6 kernel controls
+under `/proc/sys/net/ipv6/conf` must be readable and writable when a change is
+needed; absent controls or denied required writes fail explicitly. Same-boot disable/re-enable and rollback preserve unmanaged
+IPv6 addresses/routes with elapsed finite lifetimes; managed addresses/routes
+come from configuration. Missing/changed captured unmanaged interface identities
+fail recovery rather than writing to a replacement. Prior-boot snapshots are
+discarded during boot reconciliation; do not promise restoration of old leases
+or unmanaged transient addresses after reboot. Coordinate backend deployment
+before enabling the switch; no compatibility aliases or state reset.
+
 ### 6.2.1 Per-interface DHCPv4 relay
 
 Include an **Enable DHCP relay** boolean and an editable server-address list in
@@ -1428,8 +1646,10 @@ Display the effective precedence prominently:
 The destination host's own outbound policy is not evaluated. Interface allows
 override host drops as well as interface drops overriding host allows. Warn about
 interface catch-alls that shadow all host policies. Existing connections can
-survive a newly applied block until conntrack expires; no connection-flush action
-exists. `firewall.policies` host/interface rules apply only to forwarded traffic,
+survive a newly applied block until conntrack expires. Explicit
+[connection state deletion](#connection-state-deletion) is separately authorized
+and never performed automatically by rule changes. `firewall.policies`
+host/interface rules apply only to forwarded traffic,
 not management input or local device output. `firewall.input` is a separate
 host-input policy; the global ICMP exception also covers input/output.
 NAT remains separate.
@@ -1940,6 +2160,7 @@ type RevisionNumber = string; // Validated decimal uint64 in application state.
 type Timestamp = string; // RFC 3339.
 
 interface Config {
+  ipv6_enabled: boolean;
   ntp: NTPConfig;
   syslog: SyslogConfig;
   vnstat: VNStatConfig;
@@ -2275,7 +2496,7 @@ Backend errors normally have:
 | `401` | Missing/invalid API key; API error text is `valid API key required` |
 | `403` | Missing permission |
 | `404` | Endpoint/resource/revision/transaction not found |
-| `405` | Unsupported method (`Allow: GET, POST`) |
+| `405` | Unsupported method; CORS preflight advertises `GET, POST, DELETE`, not support for every method on every route |
 | `409` | Stale base, active transaction, drift, invalid lifecycle state, or another conflict |
 | `415` | JSON-body action lacks `application/json` |
 | `422` | Request validation or validation-class preflight failure |

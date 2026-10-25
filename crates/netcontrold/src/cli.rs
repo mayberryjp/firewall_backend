@@ -27,6 +27,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   discard                             Discard only this session's candidate
   end / exit                          Leave mode / close session; never confirms
 Configuration commands:
+  ipv6 enable|disable                 Global IPv6 policy (default enabled)
   interface NAME [ethernet|dummy|vlan|wireguard] / no interface NAME
   ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
   ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
@@ -801,6 +802,9 @@ fn check_family(family: &str, prefix: &str) -> Result<()> {
 
 fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
     match words {
+        ["ipv6", value @ ("enable" | "disable")] => {
+            config["ipv6_enabled"] = json!(*value == "enable");
+        }
         ["no", "interface", name] => {
             remove_where(array(config, "interfaces")?, |v| v["name"] == *name)?
         }

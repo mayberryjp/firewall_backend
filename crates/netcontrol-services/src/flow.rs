@@ -333,6 +333,7 @@ pub(crate) fn template_export(
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     config: super::config::Flow,
+    ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     use crate::linux as l;
     use std::{
@@ -472,7 +473,9 @@ pub(crate) fn prepare(
                     }
                 };
                 let (key, bytes, flags) = item;
-                if !filter.matches(key.src.is_ipv6(), key.proto) {
+                if (!ipv6_enabled && key.src.is_ipv6())
+                    || !filter.matches(key.src.is_ipv6(), key.proto)
+                {
                     filtered += 1;
                     continue;
                 }

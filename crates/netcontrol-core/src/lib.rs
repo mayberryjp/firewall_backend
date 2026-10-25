@@ -21,7 +21,7 @@ impl std::fmt::Display for BackendDrift {
 impl std::error::Error for BackendDrift {}
 
 mod connections;
-pub use connections::ConnectionQuery;
+pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
@@ -39,6 +39,9 @@ pub trait Backend: Send {
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()>;
     fn retry_dhcp(&mut self, _config: &Config, _interface: &str) -> Result<()> {
         anyhow::bail!("DHCP retry is not supported by this backend")
+    }
+    fn delete_connections(&mut self, _target: Option<(u32, &ConnectionTarget)>) -> Result<Value> {
+        anyhow::bail!("connection deletion is not supported by this backend")
     }
     fn factory_reset(&mut self, _before: &Config, _after: &Config) -> Result<()> {
         anyhow::bail!("factory reset is not supported by this backend")

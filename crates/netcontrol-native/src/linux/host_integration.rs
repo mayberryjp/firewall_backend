@@ -355,6 +355,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             ownership_before: previous,
             ethernet_before: captured,
             ethernet_originals: applying.ethernet_originals.clone(),
+            ipv6_before: native.capture_ipv6(&before)?,
         },
     )?;
     native.network_apply(&before, &value, Kernel::default(), &mut applying)?;

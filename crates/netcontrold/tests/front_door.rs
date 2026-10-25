@@ -97,6 +97,113 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn software_upgrade_requires_permission_and_validates_versions_when_disabled() {
+    use netcontrold::http::Credential;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".test-data")
+        .join(secret("").unwrap());
+    fs::create_dir_all(&path).unwrap();
+    let engine = Engine::open(&path.join("state.json"), Box::new(Simulator::new())).unwrap();
+    let fixture = Fixture {
+        path,
+        router: router(App::new(
+            Arc::new(Mutex::new(engine)),
+            Authentication::Scoped(vec![
+                Credential {
+                    name: "reader".into(),
+                    token_sha256: netcontrold::identity::digest("reader"),
+                    permissions: vec!["state.read".into()],
+                },
+                Credential {
+                    name: "upgrader".into(),
+                    token_sha256: netcontrold::identity::digest("upgrader"),
+                    permissions: vec!["system.upgrade".into()],
+                },
+            ]),
+            false,
+        )),
+    };
+    let endpoint = "/api/v1/system/upgrade";
+    assert_eq!(
+        fixture
+            .request("GET", endpoint, "", "", "", "allowed")
+            .await
+            .0,
+        401
+    );
+    let response = fixture.request("GET", endpoint, "", "", "reader", "").await;
+    assert_eq!(response.0, 200);
+    assert_eq!(response.2["enabled"], false);
+    assert!(response.2["last_successful_version"].is_null());
+    assert_eq!(
+        fixture
+            .request("POST", endpoint, r#"{"version":"1.2.3"}"#, "", "reader", "")
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        fixture
+            .request("GET", endpoint, "", "", "upgrader", "")
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        fixture
+            .request("PUT", endpoint, "", "", "reader", "")
+            .await
+            .0,
+        405
+    );
+    for body in [
+        "",
+        "{}",
+        r#"{"version":"latest"}"#,
+        r#"{"version":"../1.2.3"}"#,
+        r#"{"version":"v1.2.3"}"#,
+        r#"{"version":"1.2.3","url":"https://example.invalid"}"#,
+        r#"{"version":"1.2.3","version":"1.2.4"}"#,
+    ] {
+        assert_eq!(
+            fixture
+                .request("POST", endpoint, body, "", "upgrader", "")
+                .await
+                .0,
+            400
+        );
+    }
+    assert_eq!(
+        fixture
+            .request(
+                "POST",
+                endpoint,
+                r#"{"version":"1.2.3"}"#,
+                "",
+                "upgrader",
+                ""
+            )
+            .await
+            .0,
+        503
+    );
+    assert_eq!(
+        fixture
+            .request(
+                "GET",
+                "/api/v1/system/upgrade?limit=1",
+                "",
+                "",
+                "reader",
+                ""
+            )
+            .await
+            .0,
+        400
+    );
+}
+
+#[tokio::test]
 async fn complete_onboarding_revocation_logout_and_login() {
     let f = Fixture::new(false);
     let origin = "http://device.test";
@@ -392,7 +499,8 @@ async fn cors_preflight_is_unauthenticated_and_strictly_scoped() {
     for (method, requested_headers, status) in [
         ("GET", "Authorization, Content-Type", 204),
         ("POST", "authorization,content-type", 204),
-        ("DELETE", "Authorization", 405),
+        ("DELETE", "Authorization", 204),
+        ("PUT", "Authorization", 405),
         ("POST", "X-Other", 400),
     ] {
         let response = f
@@ -414,7 +522,7 @@ async fn cors_preflight_is_unauthenticated_and_strictly_scoped() {
         assert_eq!(response.headers()["access-control-allow-origin"], "*");
         assert_eq!(
             response.headers()["access-control-allow-methods"],
-            "GET, POST"
+            "GET, POST, DELETE"
         );
         assert!(
             !response

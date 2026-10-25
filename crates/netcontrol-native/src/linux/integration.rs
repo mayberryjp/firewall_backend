@@ -80,6 +80,154 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    session(native.namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .dummy("unmanaged0".into())
+                .execute()
+                .await?;
+            let links = networking::links(handle).await?;
+            for name in ["lo", "unmanaged0"] {
+                let index = links
+                    .iter()
+                    .find(|l| networking::name(l) == name)
+                    .unwrap()
+                    .header
+                    .index;
+                handle.link().set(index).up().execute().await?;
+                if name == "unmanaged0" {
+                    handle
+                        .address()
+                        .add(index, "2001:db8::1".parse()?, 64)
+                        .execute()
+                        .await?;
+                    handle
+                        .route()
+                        .add()
+                        .v6()
+                        .destination_prefix("2001:db8:20::".parse()?, 64)
+                        .output_interface(index)
+                        .priority(123)
+                        .protocol(netlink_packet_route::route::RouteProtocol::Static)
+                        .execute()
+                        .await?;
+                }
+            }
+            Ok(())
+        })
+    })?;
+    let mut disabled = empty.clone();
+    disabled.ipv6_enabled = false;
+    native.apply(&empty, &disabled)?;
+    session(native.namespace.clone(), |rt, handle| {
+        ipv6::verify(false)?;
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .dummy("future0".into())
+                .execute()
+                .await?;
+            for link in networking::links(handle).await? {
+                assert!(
+                    networking::addresses(handle, link.header.index)
+                        .await?
+                        .iter()
+                        .all(|a| a.header.family != netlink_packet_route::AddressFamily::Inet6)
+                );
+            }
+            Ok(())
+        })
+    })?;
+    drop(native);
+    let mut native = Native::open(fixture.options())?;
+    native.repair(&disabled)?;
+    native.observe(&disabled)?;
+    native.apply(&disabled, &empty)?;
+    session(native.namespace.clone(), |rt, handle| {
+        ipv6::verify(true)?;
+        rt.block_on(async {
+            let link = networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|l| networking::name(l) == "unmanaged0")
+                .unwrap();
+            assert!(
+                networking::addresses(handle, link.header.index)
+                    .await?
+                    .iter()
+                    .any(|a| networking::address_string(a).unwrap().as_deref()
+                        == Some("2001:db8::1/64"))
+            );
+            use futures_util::TryStreamExt;
+            use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+            let routes: Vec<RouteMessage> = handle.route().get(rtnetlink::IpVersion::V6)
+                .execute().try_collect().await?;
+            assert!(routes.iter().any(|route| route.attributes.iter().any(|a|
+                matches!(a, RouteAttribute::Destination(RouteAddress::Inet6(ip)) if *ip == "2001:db8:20::".parse::<std::net::Ipv6Addr>().unwrap()))));
+            Ok(())
+        })
+    })?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn global_ipv6_managed_addresses_routes_and_interrupted_disable_recover() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let dual = config(json!({
+        "interfaces":[{"name":"dual0","kind":"dummy","role":"lan","mtu":1500,"up":true,
+            "addresses":["192.0.2.1/24","2001:db8::1/64"]}],
+        "routes":[{"destination":"2001:db8:10::/64","interface":"dual0","table":10000,"metric":10}]
+    }))?;
+    native.apply(&empty, &dual)?;
+    let mut disabled = dual.clone();
+    disabled.ipv6_enabled = false;
+    disabled.interfaces[0]
+        .addresses
+        .retain(|address| !address.contains(':'));
+    disabled.routes.clear();
+    native.apply(&dual, &disabled)?;
+    native.observe(&disabled)?;
+    native.apply(&disabled, &dual)?;
+    native.observe(&dual)?;
+
+    let before = dual.operational_value()?;
+    let after = disabled.operational_value()?;
+    let ownership = native.ownership()?;
+    let intent = Intent {
+        scope: native.identity.clone(),
+        before: before.clone(),
+        after: after.clone(),
+        kernel_before: native.capture_kernel(&before, &after)?,
+        ownership_before: ownership.clone(),
+        ethernet_before: BTreeMap::new(),
+        ethernet_originals: BTreeMap::new(),
+        ipv6_before: native.capture_ipv6(&before)?,
+    };
+    write_json(&native.state.join("intent.json"), &intent)?;
+    let mut provisional = ownership;
+    native.network_apply(&before, &after, Kernel::default(), &mut provisional)?;
+    drop(native);
+    let mut native = Native::open(fixture.options())?;
+    assert!(!native.state.join("intent.json").exists());
+    native.observe(&dual)?;
+    assert_eq!(native.runtime(&dual)?["ipv6"]["drift"], false);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/conntrack modules"]
 fn native_connection_statistics_observe_udp_without_mutating_owned_state() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -128,6 +276,91 @@ fn native_connection_statistics_observe_udp_without_mutating_owned_state() -> Re
         port
     );
     assert_eq!(result["connections"][0]["original"]["source"], "127.0.0.1");
+    assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
+    assert_eq!(
+        session(native.namespace.clone(), |_, _| netfilter::fingerprint())?,
+        fingerprint
+    );
+    native.observe(&desired)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated namespace/net_admin privileges and nft/conntrack modules"]
+fn native_connection_delete_targets_one_entry_then_flushes_only_its_namespace() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let mut value = serde_json::to_value(&empty)?;
+    value["firewall"]["input"] = json!({"policy":"accept","interfaces":[]});
+    let desired = config(value)?;
+    native.apply(&empty, &desired)?;
+    let ports = session(native.namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            let index = networking::links(handle)
+                .await?
+                .iter()
+                .find(|link| networking::name(link) == "lo")
+                .context("loopback missing")?
+                .header
+                .index;
+            handle.link().set(index).up().execute().await?;
+            let mut ports = Vec::new();
+            let mut sockets = Vec::new();
+            for _ in 0..2 {
+                let server = std::net::UdpSocket::bind("127.0.0.1:0")?;
+                server.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+                let client = std::net::UdpSocket::bind("127.0.0.1:0")?;
+                client.send_to(b"fixture", server.local_addr()?)?;
+                server.recv_from(&mut [0; 32])?;
+                ports.push(server.local_addr()?.port());
+                sockets.extend([server, client]);
+            }
+            Ok(ports)
+        })
+    })?;
+    let ownership = fs::read(native.state.join("ownership.json"))?;
+    let fingerprint = session(native.namespace.clone(), |_, _| netfilter::fingerprint())?;
+    let path = "/api/v1/statistics/connections";
+    let snapshot = native.statistics(&desired, path, &format!("protocol=udp&port={}", ports[0]))?;
+    assert_eq!(snapshot["summary"]["matched"], 1);
+    let entry = &snapshot["connections"][0];
+    let id: u32 = entry["id"]
+        .as_str()
+        .context("kernel conntrack ID missing")?
+        .parse()?;
+    let target: netcontrol_core::ConnectionTarget = serde_json::from_value(
+        json!({"family":entry["family"],"protocol":entry["protocol"],"zone":entry["zone"],"original":entry["original"]}),
+    )?;
+    let error = native
+        .delete_connections(Some((id.wrapping_add(1), &target)))
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .context("expected typed kernel error")?
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(
+        native.delete_connections(Some((id, &target)))?["status"],
+        "deleted"
+    );
+    assert_eq!(
+        native.statistics(&desired, path, &format!("protocol=udp&port={}", ports[0]))?["summary"]["matched"],
+        0
+    );
+    assert_eq!(
+        native.statistics(&desired, path, &format!("protocol=udp&port={}", ports[1]))?["summary"]["matched"],
+        1
+    );
+    assert!(native.delete_connections(Some((id, &target))).is_err());
+    assert_eq!(native.delete_connections(None)?["status"], "flushed");
+    assert_eq!(
+        native.statistics(&desired, path, "")?["summary"]["total"],
+        0
+    );
     assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
     assert_eq!(
         session(native.namespace.clone(), |_, _| netfilter::fingerprint())?,
@@ -428,6 +661,7 @@ fn native_durable_intent_restores_interrupted_network_changes() -> Result<()> {
         ownership_before: ownership.clone(),
         ethernet_before: BTreeMap::new(),
         ethernet_originals: BTreeMap::new(),
+        ipv6_before: native.capture_ipv6(&before)?,
     };
     write_json(&native.state.join("intent.json"), &intent)?;
     let mut ownership_after = ownership;

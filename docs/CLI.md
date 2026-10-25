@@ -120,6 +120,7 @@ Global editors include:
 ```text
 interface NAME [ethernet|dummy|vlan|wireguard]
 no interface NAME
+ipv6 enable|disable
 ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 no ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
@@ -147,6 +148,14 @@ no gateway-monitor NAME
 kernel host|namespace KEY VALUE
 no kernel host|namespace KEY
 ```
+
+`ipv6 enable|disable` stages the top-level `ipv6_enabled` policy (default true).
+It requires `kernel.namespace.write` when applied, in addition to transaction
+permission. Disabling requires removing conflicting IPv6 configuration in the
+same candidate; use IPv4 management and independently verify connectivity before
+confirmation. It affects loopback/unmanaged interfaces in the managed namespace,
+not only addresses configured through the CLI. See the
+[global IPv6 contract](../FRONTEND_SPEC.md#global-ipv6-policy).
 
 Interface editors include:
 

@@ -107,8 +107,8 @@ fn tls_io(
     Ok(())
 }
 impl Remote {
-    fn connect(destination: &super::config::Destination) -> Result<Self> {
-        let addresses = super::resolve::resolve(&destination.host, destination.port)?;
+    fn connect(destination: &super::config::Destination, ipv6_enabled: bool) -> Result<Self> {
+        let addresses = super::resolve::resolve(&destination.host, destination.port, ipv6_enabled)?;
         let address = addresses.first().context("no syslog destination address")?;
         if destination.transport == "udp" {
             let s = UdpSocket::bind(if address.is_ipv4() {
@@ -175,6 +175,7 @@ impl Remote {
 pub(crate) fn prepare(
     config: super::config::Syslog,
     directory: std::path::PathBuf,
+    ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     use std::{
         fs::OpenOptions,
@@ -185,7 +186,7 @@ pub(crate) fn prepare(
     };
     let mut remotes = Vec::new();
     for server in config.servers {
-        remotes.push(Remote::connect(&server)?);
+        remotes.push(Remote::connect(&server, ipv6_enabled)?);
     }
     // Do not steal a socket or silently omit whole-host logging.
     ensure!(
@@ -365,7 +366,7 @@ mod tests {
             port: udp.local_addr().unwrap().port(),
             transport: "udp".into(),
         };
-        let mut remote = Remote::connect(&destination).unwrap();
+        let mut remote = Remote::connect(&destination, true).unwrap();
         let bytes = message(b"synthetic", "test", "backend", "-");
         remote.forward(&bytes, &ctx()).unwrap();
         let mut buffer = [0; 1024];
@@ -373,11 +374,14 @@ mod tests {
         assert_eq!(&buffer[..n], &bytes);
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = tcp.local_addr().unwrap().port();
-        let mut remote = Remote::connect(&super::super::config::Destination {
-            host: "127.0.0.1".into(),
-            port,
-            transport: "tcp".into(),
-        })
+        let mut remote = Remote::connect(
+            &super::super::config::Destination {
+                host: "127.0.0.1".into(),
+                port,
+                transport: "tcp".into(),
+            },
+            true,
+        )
         .unwrap();
         let (mut server, _) = tcp.accept().unwrap();
         server

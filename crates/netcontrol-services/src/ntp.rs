@@ -64,6 +64,7 @@ pub(crate) fn bounded_slew(offset_seconds: f64) -> Result<(i64, f64)> {
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     config: super::config::Ntp,
+    ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     use serde_json::json;
     use std::{
@@ -73,7 +74,7 @@ pub(crate) fn prepare(
     super::linux::capabilities(25)?;
     let mut sockets = Vec::new();
     for host in config.servers {
-        let address = super::resolve::resolve(&host, 123)?
+        let address = super::resolve::resolve(&host, 123, ipv6_enabled)?
             .into_iter()
             .next()
             .unwrap();

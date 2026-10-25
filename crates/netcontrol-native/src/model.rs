@@ -73,6 +73,8 @@ pub struct Kernel {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Network {
+    #[serde(default = "ipv6_default")]
+    pub ipv6_enabled: bool,
     pub interfaces: Vec<Link>,
     #[serde(default)]
     pub dhcp_clients: BTreeMap<String, netcontrol_core::DHCPClientConfig>,
@@ -83,6 +85,10 @@ pub struct Network {
     pub firewall: Value,
     #[serde(default)]
     pub kernel: Kernel,
+}
+
+fn ipv6_default() -> bool {
+    true
 }
 
 impl Network {

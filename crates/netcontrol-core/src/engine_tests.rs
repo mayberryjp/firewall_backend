@@ -65,6 +65,58 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
 }
 
 #[test]
+fn global_ipv6_permission_commit_restart_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut disabled = Config::empty();
+    disabled.ipv6_enabled = false;
+    let reply = engine.request(
+        "POST",
+        "/api/v1/transactions",
+        "",
+        "limited",
+        &["transactions.write".into()],
+        &serde_json::to_vec(
+            &json!({"base_revision":0,"confirm_timeout_seconds":30,"config":disabled}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(reply.status, 403);
+    assert!(
+        reply.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("kernel.namespace.write")
+    );
+    let reply = submit(&mut engine, disabled.clone());
+    assert_eq!(reply.status, 202);
+    let id = reply.body["id"].as_str().unwrap();
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    assert!(!engine.saved_configuration().ipv6_enabled);
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(disabled).unwrap()),
+    )
+    .unwrap();
+    assert!(!engine.saved_configuration().ipv6_enabled);
+    let reply = submit(&mut engine, Config::empty());
+    assert_eq!(reply.status, 202);
+    let id = reply.body["id"].as_str().unwrap();
+    let rollback = request(
+        &mut engine,
+        "POST",
+        &format!("/api/v1/transactions/{id}/rollback"),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200);
+    assert!(!engine.saved_configuration().ipv6_enabled);
+    let runtime = request(&mut engine, "GET", "/api/v1/runtime", Value::Null);
+    assert_eq!(runtime.body["ipv6"]["enabled"], false);
+    assert_eq!(runtime.body["ipv6"]["status"], "simulated");
+}
+
+#[test]
 fn descriptive_metadata_requires_resource_permission_and_survives_reopen() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
@@ -339,6 +391,10 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    connection_flushes: usize,
+    connection_targets: Vec<Option<(u32, crate::ConnectionTarget)>>,
+    missing_connection: bool,
+    fail_connection_flush: bool,
     dhcp_retries: Vec<String>,
     fail_dhcp_retry: bool,
     state: Config,
@@ -358,6 +414,24 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn delete_connections(
+        &mut self,
+        target: Option<(u32, &crate::ConnectionTarget)>,
+    ) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.connection_flushes += 1;
+        faults
+            .connection_targets
+            .push(target.map(|(id, target)| (id, target.clone())));
+        if faults.missing_connection {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+        }
+        ensure!(
+            !faults.fail_connection_flush,
+            "injected connection flush failure; outcome may be partial"
+        );
+        Ok(json!({"status":"flushed","scope":"fault-test"}))
+    }
     fn retry_dhcp(&mut self, _: &Config, interface: &str) -> Result<()> {
         let mut faults = self.0.lock().unwrap();
         faults.dhcp_retries.push(interface.into());
@@ -545,6 +619,169 @@ fn dhcp_retry_is_authorized_scoped_and_does_not_change_configuration() {
     );
     assert_eq!(fs::read(fixture.path()).unwrap(), before);
     assert_eq!(engine.saved_configuration(), &desired.normalized());
+}
+
+#[test]
+fn connection_flush_requires_explicit_authorization_and_confirmation() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let before = fs::read(fixture.path()).unwrap();
+    let path = "/api/v1/connections";
+    let permissions = ["connections.delete".into()];
+    let body = br#"{"confirm":true}"#;
+    assert_eq!(
+        engine
+            .request("DELETE", path, "", "", &permissions, body)
+            .status,
+        401
+    );
+    for permission in ["state.read", "firewall.write", "transactions.write"] {
+        assert_eq!(
+            engine
+                .request("DELETE", path, "", "operator", &[permission.into()], body)
+                .status,
+            403
+        );
+    }
+    for method in ["GET", "PUT", "POST"] {
+        assert_eq!(
+            engine
+                .request(method, path, "", "operator", &permissions, body)
+                .status,
+            405
+        );
+    }
+    for invalid in [
+        b"".as_slice(),
+        b"{}",
+        b"null",
+        b"[]",
+        br#"{"confirm":false}"#,
+        br#"{"confirm":"true"}"#,
+        br#"{"confirm":true,"family":"ipv4"}"#,
+        br#"{"confirm":true,"confirm":true}"#,
+    ] {
+        assert_eq!(
+            engine
+                .request("DELETE", path, "", "operator", &permissions, invalid)
+                .status,
+            400
+        );
+    }
+    assert_eq!(
+        engine
+            .request("DELETE", path, "limit=1", "operator", &permissions, body)
+            .status,
+        400
+    );
+    engine.set_upgrade_maintenance(true).unwrap();
+    assert_eq!(
+        engine
+            .request("DELETE", path, "", "operator", &permissions, body)
+            .status,
+        409
+    );
+    engine.set_upgrade_maintenance(false).unwrap();
+    assert_eq!(backend.lock().unwrap().connection_flushes, 0);
+    backend.lock().unwrap().fail_observe = true;
+    let reply = engine.request("DELETE", path, "", "operator", &permissions, body);
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body, json!({"status":"flushed","scope":"fault-test"}));
+    backend.lock().unwrap().fail_connection_flush = true;
+    let reply = engine.request("DELETE", path, "", "operator", &permissions, body);
+    assert_eq!(reply.status, 503);
+    assert!(reply.body["transaction"].is_null());
+    assert_eq!(backend.lock().unwrap().connection_flushes, 2);
+    assert_eq!(backend.lock().unwrap().apply_count, 0);
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    backend.lock().unwrap().fail_observe = false;
+    assert_eq!(submit(&mut engine, config()).status, 202);
+    assert_eq!(
+        engine
+            .request("DELETE", path, "", "operator", &permissions, body)
+            .status,
+        409
+    );
+    assert_eq!(backend.lock().unwrap().connection_flushes, 2);
+}
+
+#[test]
+fn simulator_connection_flush_is_explicitly_unsupported() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let reply = engine.request(
+        "DELETE",
+        "/api/v1/connections",
+        "",
+        "operator",
+        &["connections.delete".into()],
+        br#"{"confirm":true}"#,
+    );
+    assert_eq!(reply.status, 503);
+    assert!(
+        reply.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("not supported")
+    );
+}
+
+#[test]
+fn connection_delete_targets_id_tuple_and_zone_and_never_falls_back_to_flush() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let before = fs::read(fixture.path()).unwrap();
+    let permissions = ["connections.delete".into()];
+    let body = br#"{"family":"ipv4","protocol":6,"zone":7,"original":{"source":"192.0.2.2","destination":"198.51.100.2","source_port":50000,"destination_port":443}}"#;
+    for path in [
+        "/api/v1/connections/",
+        "/api/v1/connections/01",
+        "/api/v1/connections/-1",
+        "/api/v1/connections/4294967296",
+        "/api/v1/connections/1/extra",
+        "/api/v1/connections/flush",
+    ] {
+        assert_eq!(
+            engine
+                .request("DELETE", path, "", "operator", &permissions, body)
+                .status,
+            400
+        );
+    }
+    let path = "/api/v1/connections/123";
+    for invalid in [b"".as_slice(),b"{}",br#"{"confirm":true}"#,br#"{"family":"ipv4","protocol":6,"zone":0,"original":{"source":"192.0.2.2","destination":"198.51.100.2"}}"#] {
+        assert_eq!(engine.request("DELETE",path,"","operator",&permissions,invalid).status,400);
+    }
+    assert_eq!(
+        engine
+            .request("DELETE", path, "", "operator", &["state.read".into()], body)
+            .status,
+        403
+    );
+    assert_eq!(backend.lock().unwrap().connection_flushes, 0);
+    let result = engine.request("DELETE", path, "", "operator", &permissions, body);
+    assert_eq!(result.status, 200);
+    let expected: crate::ConnectionTarget = serde_json::from_slice(body).unwrap();
+    assert_eq!(
+        backend.lock().unwrap().connection_targets,
+        vec![Some((123, expected))]
+    );
+    backend.lock().unwrap().missing_connection = true;
+    assert_eq!(
+        engine
+            .request("DELETE", path, "", "operator", &permissions, body)
+            .status,
+        404
+    );
+    assert!(
+        backend
+            .lock()
+            .unwrap()
+            .connection_targets
+            .iter()
+            .all(Option::is_some)
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
 }
 
 #[test]
@@ -1541,6 +1778,38 @@ fn connection_statistics_are_authorized_filtered_and_readonly() {
     );
     assert_eq!(fs::read(fixture.path()).unwrap(), before);
     assert_eq!(backend.lock().unwrap().apply_count, 0);
+}
+
+#[test]
+fn upgrade_maintenance_blocks_configuration_writes_without_changing_saved_state() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let before = fs::read(fixture.path()).unwrap();
+    engine.set_upgrade_maintenance(true).unwrap();
+    assert_eq!(
+        engine
+            .request("POST", "/api/v1/transactions", "", "admin", &all(), b"{}")
+            .status,
+        409
+    );
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/state",
+                "",
+                "reader",
+                &["state.read".into()],
+                b""
+            )
+            .status,
+        200
+    );
+    engine.set_upgrade_maintenance(false).unwrap();
+    assert_eq!(backend.lock().unwrap().apply_count, 0);
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    assert_eq!(submit(&mut engine, config()).status, 202);
+    assert!(engine.set_upgrade_maintenance(true).is_err());
 }
 
 #[test]

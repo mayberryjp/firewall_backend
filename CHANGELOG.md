@@ -4,6 +4,39 @@
 
 ### Added
 
+- Global persisted `ipv6_enabled` policy (default true on installation/factory
+  configuration), using confirmed configuration transactions and
+  `kernel.namespace.write`. Native enforcement sets/verifies all/default/
+  per-interface Linux IPv6 disable controls, including loopback and future
+  links; adds drift/runtime reporting and same-boot address/route recovery.
+  Disabled configurations reject IPv6 references; service resolution/export
+  becomes IPv4-only. CLI adds `ipv6 enable|disable`. Policy is reapplied on
+  daemon startup, not before it; no bootloader/module/sysctl.d changes.
+  Recommended bump: minor; baseline unknown. Frontend changes required; see
+  [handoff 2026-10-24-09](docs/frontend-handoffs/2026-10-24.md#2026-10-24-09-global-ipv6-policy).
+
+- Explicit `DELETE /api/v1/connections` (confirmed namespace-wide flush) and
+  `DELETE /api/v1/connections/{id}` (original tuple/family/protocol/zone plus ID)
+  require new `connections.delete`. Malformed/stale targets never become a flush;
+  active transactions/upgrades block deletion. Native netfilter ACK validation,
+  typed stale-target `404`, DELETE CORS and synthetic isolated-kernel regression;
+  no configuration/rule changes, TCP RST or guaranteed new handshake. Simulator
+  refuses destructive success. Recommended bump: minor; baseline unknown.
+  See [handoff 2026-10-24-08](docs/frontend-handoffs/2026-10-24.md#2026-10-24-08-connection-state-deletion).
+
+- Optional signed Ubuntu amd64 self-upgrade: version-only
+  `POST /api/v1/system/upgrade` (`system.upgrade`), read-only latest-job polling,
+  pinned operator GitHub repository/Ed25519 key, bounded authenticated HTTPS
+  release downloads, independent systemd helper, configuration-write maintenance
+  gate, verified previous-binary restoration and required boot recovery.
+  Offline `netcontrol-package build-update` creates version-bound release assets;
+  nothing is tagged/uploaded/published automatically. Conntrack prerequisites
+  are retained; no state reset, arbitrary URLs, downgrade override or implied
+  state rollback. Recommended bump: minor; release baseline unknown. Linux
+  build/lint/unit/filesystem checks passed, but the full test gate has an existing
+  metadata-fixture failure and real systemd/reboot/release acceptance is pending.
+  See [handoff 2026-10-24-07](docs/frontend-handoffs/2026-10-24.md#2026-10-24-07-signed-ubuntu-self-upgrade).
+
 - Read-only `GET /api/v1/statistics/connections` conntrack snapshots using
   `state.read`: original/reply NAT tuples, protocol state/status, zone/mark,
   nullable remaining timeout/ID and exact nullable per-direction packet/byte

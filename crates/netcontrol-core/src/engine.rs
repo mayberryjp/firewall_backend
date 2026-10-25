@@ -25,6 +25,8 @@ pub const PERMISSIONS: &[&str] = &[
     "vnstat.write",
     "kernel.namespace.write",
     "kernel.host.write",
+    "system.upgrade",
+    "connections.delete",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,6 +154,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ("ntp.write", a.ntp != b.ntp),
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
+        ("kernel.namespace.write", a.ipv6_enabled != b.ipv6_enabled),
         (
             "kernel.namespace.write",
             a.kernel.namespace != b.kernel.namespace,
@@ -192,6 +195,7 @@ pub struct Engine {
     state: State,
     backend: Box<dyn Backend>,
     closed: bool,
+    maintenance: bool,
     #[cfg(test)]
     now: Option<DateTime<Utc>>,
 }
@@ -274,6 +278,7 @@ impl Engine {
             state,
             backend,
             closed: false,
+            maintenance: false,
             #[cfg(test)]
             now: None,
         };
@@ -355,6 +360,14 @@ impl Engine {
         }
         Ok(())
     }
+    pub fn set_upgrade_maintenance(&mut self, enabled: bool) -> Result<()> {
+        ensure!(
+            !enabled || (!self.closed && self.active().is_none()),
+            "upgrade requires a healthy engine with no active transaction"
+        );
+        self.maintenance = enabled;
+        Ok(())
+    }
     pub fn request(
         &mut self,
         method: &str,
@@ -383,6 +396,80 @@ impl Engine {
     ) -> ApiResult<Reply> {
         if actor.trim().is_empty() {
             return Err(ApiError::new(401, "valid API key required"));
+        }
+        if self.maintenance && method != "GET" {
+            return Err(ApiError::new(
+                409,
+                "configuration writes are blocked during software upgrade",
+            ));
+        }
+        if path == "/api/v1/connections" || path.starts_with("/api/v1/connections/") {
+            if method != "DELETE" {
+                return Err(ApiError::new(405, "method not allowed"));
+            }
+            require(permissions, "connections.delete")?;
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "connection deletion does not accept query parameters",
+                ));
+            }
+            let target = if path == "/api/v1/connections" {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct DeleteAll {
+                    confirm: bool,
+                }
+                if !parse::<DeleteAll>(body)?.confirm {
+                    return Err(ApiError::new(
+                        400,
+                        "deleting all connections requires confirm: true",
+                    ));
+                }
+                None
+            } else {
+                let value = path.strip_prefix("/api/v1/connections/").unwrap();
+                let id: u32 = value.parse().map_err(|_| {
+                    ApiError::new(
+                        400,
+                        "connection ID must be a canonical unsigned 32-bit decimal",
+                    )
+                })?;
+                if id.to_string() != value {
+                    return Err(ApiError::new(
+                        400,
+                        "connection ID must be a canonical unsigned 32-bit decimal",
+                    ));
+                }
+                let selector: crate::ConnectionTarget = parse(body)?;
+                selector
+                    .validate()
+                    .map_err(|error| ApiError::new(400, error))?;
+                Some((id, selector))
+            };
+            if self.active().is_some() {
+                return Err(ApiError::new(
+                    409,
+                    "connection deletion requires no active transaction",
+                ));
+            }
+            let value = self
+                .backend
+                .delete_connections(target.as_ref().map(|(id, selector)| (*id, selector)))
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        ApiError::new(
+                            404,
+                            "connection expired or no longer matches its ID, tuple and zone",
+                        )
+                    } else {
+                        service_error(error)
+                    }
+                })?;
+            return Ok(Reply::value(200, value));
         }
         if let Some(name) = path
             .strip_prefix("/api/v1/interfaces/")

@@ -11,6 +11,68 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn global_ipv6_defaults_and_conflicting_configuration() {
+    assert!(Config::empty().ipv6_enabled);
+    assert!(
+        serde_json::from_value::<Config>(json!({}))
+            .unwrap()
+            .ipv6_enabled
+    );
+    assert_eq!(
+        serde_json::to_value(Config::empty()).unwrap()["ipv6_enabled"],
+        true
+    );
+    for invalid in [json!(null), json!("false"), json!(0)] {
+        assert!(serde_json::from_value::<Config>(json!({"ipv6_enabled":invalid})).is_err());
+    }
+    let mut ipv4 = candidate();
+    ipv4.ipv6_enabled = false;
+    ipv4.validate().unwrap();
+    let mut cases = Vec::new();
+    let mut value = serde_json::to_value(&ipv4).unwrap();
+    value["interfaces"][0]["addresses"] = json!(["2001:db8::1/64"]);
+    cases.push(value);
+    let mut value = serde_json::to_value(&ipv4).unwrap();
+    value["routes"][0]["destination"] = json!("2001:db8:1::/64");
+    cases.push(value);
+    let mut value = serde_json::to_value(&ipv4).unwrap();
+    value["policy_rules"][0]["source"] = json!("::/0");
+    cases.push(value);
+    let mut value = serde_json::to_value(&ipv4).unwrap();
+    value["dns"] = json!({"lan0":{"servers":["::1"],"domains":[]}});
+    cases.push(value);
+    let mut value = serde_json::to_value(&ipv4).unwrap();
+    value["ntp"]["servers"] = json!(["2001:db8::123"]);
+    cases.push(value);
+    let mut value = serde_json::to_value(&ipv4).unwrap();
+    value["syslog"]["servers"] = json!([{"host":"2001:db8::514","port":514,"transport":"udp"}]);
+    cases.push(value);
+    let mut value = serde_json::to_value(&ipv4).unwrap();
+    value["firewall"]["rules"][0]["source"] = json!("2001:db8::/64");
+    cases.push(value);
+    for mut value in cases {
+        let config: Config = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ipv6_enabled"),
+            "{value}"
+        );
+        value["ipv6_enabled"] = json!(true);
+        serde_json::from_value::<Config>(value)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+    // Hostnames and descriptive strings are not IP literals.
+    ipv4.ntp.servers.push("time.example.test".into());
+    ipv4.interfaces[0].metadata.description = "IPv6 example: 2001:db8::1".into();
+    ipv4.validate().unwrap();
+}
+
+#[test]
 fn interface_metadata_is_descriptive_not_an_identity() {
     let mut config = candidate();
     config.interfaces[0].metadata = ObjectMetadata {

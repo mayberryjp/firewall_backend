@@ -112,8 +112,12 @@ pub(crate) fn parse(data: &[u8], id: u16, question: &[u8]) -> Result<Vec<IpAddr>
     }
     bail!("DNS alias cycle/depth limit")
 }
-pub(crate) fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+pub(crate) fn resolve(host: &str, port: u16, ipv6_enabled: bool) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
+        ensure!(
+            ipv6_enabled || ip.is_ipv4(),
+            "IPv6 destination requires ipv6_enabled"
+        );
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
@@ -121,7 +125,7 @@ pub(crate) fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     for line in hosts.lines() {
         let mut words = line.split('#').next().unwrap_or("").split_whitespace();
         if let Some(ip) = words.next().and_then(|w| w.parse::<IpAddr>().ok()) {
-            if words.any(|w| w.eq_ignore_ascii_case(host)) {
+            if (ipv6_enabled || ip.is_ipv4()) && words.any(|w| w.eq_ignore_ascii_case(host)) {
                 result.push(SocketAddr::new(ip, port));
             }
         }
@@ -135,10 +139,14 @@ pub(crate) fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         .lines()
         .filter_map(|l| l.strip_prefix("nameserver "))
         .filter_map(|s| s.trim().parse().ok())
+        .filter(|ip: &IpAddr| ipv6_enabled || ip.is_ipv4())
         .take(2)
         .collect();
     for server in servers {
         for kind in [1u16, 28] {
+            if kind == 28 && !ipv6_enabled {
+                continue;
+            }
             let socket = UdpSocket::bind(if server.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -184,6 +192,19 @@ pub(crate) fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ipv4_only_resolution_rejects_ipv6_literals() {
+        assert!(resolve("::1", 123, false).is_err());
+        assert!(resolve("2001:db8::1", 514, false).is_err());
+        assert_eq!(
+            resolve("127.0.0.1", 123, false).unwrap(),
+            vec!["127.0.0.1:123".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolve("::1", 123, true).unwrap(),
+            vec!["[::1]:123".parse::<SocketAddr>().unwrap()]
+        );
+    }
     #[test]
     fn rejects_dns_spoofing_truncation_and_short_packets() {
         assert!(parse(&[0; 11], 1, &[]).is_err());

@@ -66,6 +66,16 @@ enum Command {
         #[arg(long, default_value = "/")]
         root: PathBuf,
     },
+    BuildUpdate {
+        #[arg(long)]
+        daemon: PathBuf,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        signing_key: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,6 +133,40 @@ fn main() {
 
 fn execute(command: Command) -> Result<()> {
     match command {
+        Command::BuildUpdate {
+            daemon,
+            version,
+            signing_key,
+            output_dir,
+        } => {
+            use netcontrol_package::update::{self, Manifest};
+            update::version(&version)?;
+            let binary = read_bounded(&daemon)?;
+            validate_elf(&binary, "x86_64-unknown-linux-musl")?;
+            let manifest = Manifest {
+                schema: 1,
+                version,
+                target: update::TARGET.into(),
+                size: binary.len() as u64,
+                sha256: hash(&binary),
+            };
+            update::verify_binary(&binary, &manifest)?;
+            let bytes = serde_json::to_vec(&manifest)?;
+            let key = SigningKey::from_bytes(&read_key(&signing_key)?);
+            fs::create_dir(&output_dir).context("output directory must not already exist")?;
+            create_file(&output_dir.join("netcontrold-ubuntu-amd64"), &binary, 0o755)?;
+            create_file(
+                &output_dir.join("netcontrol-ubuntu-amd64.json"),
+                &bytes,
+                0o644,
+            )?;
+            create_file(
+                &output_dir.join("netcontrol-ubuntu-amd64.sig"),
+                &key.sign(&bytes).to_bytes(),
+                0o644,
+            )?;
+            println!("Created signed Ubuntu update assets; nothing was uploaded or released.");
+        }
         Command::Keygen {
             private_key,
             public_key,
@@ -691,6 +735,38 @@ mod tests {
         )
         .unwrap();
         (bytes, key)
+    }
+
+    #[test]
+    fn build_update_emits_version_bound_signed_assets_without_overwriting() {
+        let root = tempfile::tempdir().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let daemon = root.path().join("daemon");
+        let signing_key = root.path().join("key");
+        let output_dir = root.path().join("release");
+        fs::write(&daemon, elf()).unwrap();
+        fs::write(&signing_key, key.to_bytes()).unwrap();
+        let command = || Command::BuildUpdate {
+            daemon: daemon.clone(),
+            version: "1.2.3".into(),
+            signing_key: signing_key.clone(),
+            output_dir: output_dir.clone(),
+        };
+        execute(command()).unwrap();
+        assert_eq!(fs::read_dir(&output_dir).unwrap().count(), 3);
+        let manifest = netcontrol_package::update::verify_manifest(
+            &fs::read(output_dir.join("netcontrol-ubuntu-amd64.json")).unwrap(),
+            &fs::read(output_dir.join("netcontrol-ubuntu-amd64.sig")).unwrap(),
+            &key.verifying_key().to_bytes(),
+            "1.2.3",
+        )
+        .unwrap();
+        netcontrol_package::update::verify_binary(
+            &fs::read(output_dir.join("netcontrold-ubuntu-amd64")).unwrap(),
+            &manifest,
+        )
+        .unwrap();
+        assert!(execute(command()).is_err());
     }
 
     #[test]

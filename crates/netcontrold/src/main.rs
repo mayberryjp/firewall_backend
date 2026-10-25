@@ -84,6 +84,15 @@ struct Options {
         help = "Private persistent Ed25519 host key; default <state>.ssh-key"
     )]
     ssh_host_key: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Root-owned private JSON configuration enabling signed Ubuntu self-upgrades"
+    )]
+    upgrade_config: Option<PathBuf>,
+    #[arg(long, hide = true, conflicts_with = "upgrade_recover")]
+    upgrade_worker: bool,
+    #[arg(long, hide = true)]
+    upgrade_recover: bool,
 }
 
 #[tokio::main]
@@ -130,6 +139,20 @@ fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
 }
 async fn run(options: Options) -> Result<()> {
     configure_logging(&options)?;
+    if options.upgrade_worker || options.upgrade_recover {
+        return tokio::task::spawn_blocking(move || {
+            netcontrold::updates::helper(options.upgrade_recover)
+        })
+        .await?;
+    }
+    let updates = if let Some(path) = &options.upgrade_config {
+        if options.backend != "linux" || !options.namespace.is_empty() || !options.appliance {
+            bail!("self-upgrade requires the Linux host appliance backend");
+        }
+        Some(netcontrold::updates::Manager::open(path)?)
+    } else {
+        None
+    };
     if options.appliance && (options.backend != "linux" || !options.namespace.is_empty()) {
         bail!("appliance provisioning and forwarding require the Linux host backend");
     }
@@ -303,7 +326,12 @@ async fn run(options: Options) -> Result<()> {
         provision::enable_forwarding(&mut engine)?;
     }
     let engine = Arc::new(Mutex::new(engine));
-    let app = App::new(engine.clone(), auth, tls.is_some());
+    let app = if let Some(updates) = updates {
+        updates.mark_ready()?;
+        App::with_updates(engine.clone(), auth, tls.is_some(), updates)?
+    } else {
+        App::new(engine.clone(), auth, tls.is_some())
+    };
     let handle = axum_server::Handle::new();
     let (ssh_stop_tx, ssh_stop_rx) = tokio::sync::watch::channel(false);
     let mut ssh_task = ssh.map(|(listener, path)| {
@@ -314,6 +342,7 @@ async fn run(options: Options) -> Result<()> {
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let tick_engine = engine.clone();
+    let tick_app = app.clone();
     let tick_handle = handle.clone();
     let tick_ssh_stop = ssh_stop_tx.clone();
     let ticker = tokio::spawn(async move {
@@ -325,8 +354,11 @@ async fn run(options: Options) -> Result<()> {
                 }
                 _ = interval.tick() => {
                     let engine = tick_engine.clone();
-                    let result = tokio::task::spawn_blocking(move || engine.lock()
-                        .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.tick()).await
+                    let app = tick_app.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        app.refresh_upgrade_gate()?;
+                        engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.tick()
+                    }).await
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("deadline worker failed")));
                     if let Err(error) = result {
                         let _ = tick_ssh_stop.send(true);

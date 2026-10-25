@@ -202,7 +202,7 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                 "flow-test".into(),
                 None,
                 json!({"name":"flow-test"}),
-                move || flow::prepare(config),
+                move || flow::prepare(config, true),
             )?;
             let target = UdpSocket::bind(if [1, 5].contains(&version) {
                 "127.0.0.1:25001"

@@ -218,6 +218,169 @@ namespaces require explicit operator setup in the appropriate namespace; the
 read-only connections API never changes these settings itself. No package,
 daemon-startup, factory-reset or browser hook is added by this shell setup.
 
+## Signed Ubuntu Self-Upgrade
+
+Optional self-upgrade supports Ubuntu amd64, root-run `netcontrold.service`,
+and the Linux host appliance backend only. It downloads a specific GitHub release
+from an operator-configured repository; requests cannot supply URLs, repositories,
+keys, tokens, installation paths, scripts or force/downgrade flags. This is a
+daemon-binary update, not an OS/package update or `.ncpkg`/OpenRC installation.
+It does not build source, invoke Git/APT, replace the main service unit, or reset
+configuration, credentials, keys or revision history. There is no approved
+release baseline or published update channel established by this change.
+
+### Trust and Bootstrap
+
+First deploy a reviewed daemon containing this feature using the ordinary
+upgrade path. Obtain the release-signing **public** key through a separately
+trusted channel. Keep the private signing key off appliances. Public keys contain
+exactly 32 binary Ed25519 bytes. Install the public key root-owned, not writable
+by other users, at `/etc/netcontrol/update.pub`. Create root-owned mode `0600`
+`/etc/netcontrol/updates.json` with this configuration (synthetic example):
+
+```json
+{
+  "repository": "mayberryjp/firewall_backend",
+  "public_key": "/etc/netcontrol/update.pub",
+  "token_file": null
+}
+```
+
+For private repositories, `token_file` is an absolute path to a root-owned mode
+`0600` file containing a GitHub token with read-only repository release access.
+Never include its value in API requests, URLs, documentation or logs. Public
+releases need no token. Configuration/key/token ancestors must be root-owned,
+not writable by other users and not symlinks. Do not put them in temporary or
+user-writable directories. Unknown configuration fields are rejected.
+
+Add `--upgrade-config /etc/netcontrol/updates.json` to the service's effective
+`ExecStart` using a reviewed systemd drop-in, retaining its complete existing
+arguments, state paths and environment. For the unmodified Ubuntu appliance unit,
+the replacement `[Service]` section is:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/netcontrold --backend linux --appliance --listen ${NETCONTROL_LISTEN} --state /var/lib/netcontrol/native-state.json --credential-db /var/lib/netcontrol/credentials.json --keys /etc/netcontrol/keys --services-state-dir /var/lib/netcontrol/services --upgrade-config /etc/netcontrol/updates.json
+```
+
+Reload systemd and restart from an independent OS SSH session/local console.
+Invalid/unsafe upgrade configuration fails startup explicitly. Without the flag,
+upgrades are disabled; a simulator/lab namespace cannot enable them. Keep `kmod`
+and `procps` installed. Successful API upgrades apply/persist the same conntrack
+accounting/checksum prerequisites as the shell paths before binary replacement;
+those host prerequisite changes are not rolled back on later failure.
+
+### Release Assets
+
+The publisher must explicitly approve the release version; `1.2.3` below is
+illustrative, not an assigned baseline. Version strings are canonical SemVer,
+at most 80 bytes, without a `v` prefix or build metadata. Explicit prerelease
+versions are supported. The matching GitHub release tag is `v1.2.3`.
+
+Build the daemon as a static amd64 Linux musl executable and use the package
+tool's offline asset builder on the publishing machine:
+
+```sh
+netcontrol-package build-update \
+  --daemon target/x86_64-unknown-linux-musl/release/netcontrold \
+  --version 1.2.3 \
+  --signing-key signing.key \
+  --output-dir ubuntu-update-assets
+```
+
+The output directory must not already exist. The command validates the static
+ELF and creates exactly these assets; it does not upload, tag or release:
+
+- `netcontrold-ubuntu-amd64`: executable, maximum 256 MiB.
+- `netcontrol-ubuntu-amd64.json`: strict manifest, maximum 4096 bytes, containing
+  `schema: 1`, `version`, `target: "ubuntu-amd64-systemd"`, numeric `size` in bytes
+  and lowercase hexadecimal `sha256`.
+- `netcontrol-ubuntu-amd64.sig`: 64-byte detached Ed25519 signature covering the
+  exact manifest bytes. Do not reformat the manifest after signing it.
+
+Upload those three files to the approved, non-draft release in the configured
+repository using a separate authorized publication workflow. The daemon uses
+GitHub's HTTPS release/asset API, including private-release authentication when
+configured. It checks the tag, exact asset names/sizes, signature, signed version
+and target, binary size/digest/ELF, and the replacement's `--help` support for
+`--upgrade-config`. HTTPS certificate verification stays enabled; credentials
+are sensitive headers, not URLs, and are not forwarded to a different redirect
+host. Requests have 15-second connect and 300-second per-request total timeouts,
+at most five HTTPS redirects and bounded response bodies. No release is
+published by enabling this feature.
+
+### Request, Status and Recovery
+
+Use an API key with `system.upgrade` to submit JSON:
+
+```http
+POST /api/v1/system/upgrade
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+
+{"version":"1.2.3"}
+```
+
+`202` acknowledges a durable queued job, not successful verification/installation.
+`Location` is `/api/v1/system/upgrade`; poll `GET` there with `state.read`.
+The API retains the latest job only. It exposes `last_successful_version`, not
+a claim about the currently running binary: manual deployments can change that
+binary, and there is no established initial version. Requests at or below the
+last successful API-upgrade version are rejected; if no successful receipt exists,
+the version baseline is unknown. There is no force/downgrade/cancel endpoint.
+Unknown/duplicate JSON fields, malformed versions or query parameters are `400`;
+invalid keys `401`, missing permission `403`, unsupported methods `405`, active
+job/transaction or non-newer version `409`, disabled/preparation failure `503`.
+Asynchronous errors appear in job status, not a later HTTP error from the POST.
+
+The original daemon must be the service's `MainPID`, and its effective `ExecStart`
+must directly name the current regular root-owned executable. New configuration
+transactions/actions, including configuration-SSH writes and DHCP retry, are
+blocked with `409` while a job is active; reads and existing protocol workers
+continue until restart. No active configuration transaction may be interrupted
+by acceptance. Do not run other installers/upgraders concurrently: shell/package
+tools do not share this API's maintenance gate.
+
+Private state lives at `/var/lib/netcontrol-updates`: latest `job.json`, copied
+helper/configuration, candidate, previous executable and readiness information.
+Allow disk/memory for multiple bounded binary copies; staging/backup failure
+does not intentionally replace the installed executable. An independent transient
+systemd worker verifies/downloads first, applies conntrack prerequisites, durably
+backs up the executable, records installation intent, stops the daemon, atomically
+replaces the binary beside its existing destination, and starts the same service.
+The replacement must report its initialized PID/digest and remain the same active
+PID for at least five seconds within the readiness budget. This is startup
+readiness, not an independent proof of management-path or packet connectivity.
+
+Before accepting the first job, the API installs/enables
+`netcontrol-upgrade-recovery.service` plus the owned
+`50-netcontrol-upgrade-recovery.conf` dependency drop-in. Differing existing owned
+units/drop-ins are refused; other operator drop-ins and `ExecStart` are preserved.
+The recovery helper remains separate from the replaced binary. On boot, recovery
+runs before and is required by the daemon. An interrupted pre-install job fails
+without binary replacement; interrupted install/check phases restore the
+digest-verified previous executable. Recovery failure blocks startup and requires
+local-console intervention. On ordinary replacement/readiness failure, the worker
+attempts the same binary restoration and restart. A corrupt backup is not installed.
+
+Job statuses: `queued`, `downloading`, `installing`, `checking`, `succeeded`,
+`failed`, `rolled_back`, `recovery_required`. Only the first three terminal
+outcomes (`succeeded`, `failed`, `rolled_back`) release the maintenance gate;
+`recovery_required` does not. Treat API/SSH disconnection during restart as
+expected, reconnect and poll the accepted job instead of resubmitting blindly.
+Inspect `journalctl -u netcontrol-upgrade-worker.service` and the main/recovery
+service journals locally; review them for sensitive details before sharing.
+
+Binary recovery does **not** undo persisted-state changes, guarantee that an
+older binary can read newer state, restore network connectivity, or replace
+consistent protected backups. Publishers/operators must review the release's
+state/deployment contract and test recovery before approving deployment. Never
+delete state or flush connections to force an update. Automated systemd restart,
+boot/power-loss, authenticated release-download and frontend acceptance still
+require a disposable Ubuntu VM; container build/unit/filesystem tests do not
+prove these behaviors. See the [current journal](journal/2026-10-24.md#signed-ubuntu-self-upgrade).
+
 ## Ubuntu prebuilt installation (amd64)
 
 The repository provides [install.sh](../install.sh) for an internet-connected

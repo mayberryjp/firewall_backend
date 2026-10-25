@@ -45,6 +45,7 @@ mod dhcp_client;
 mod host_integration;
 #[cfg(all(test, feature = "nftables"))]
 mod integration;
+mod ipv6;
 mod netfilter;
 mod networking;
 mod sysctl;
@@ -82,6 +83,8 @@ struct Ownership {
     boot: String,
     #[serde(default)]
     committed_config: Option<Value>,
+    #[serde(default)]
+    ipv6_original: Option<ipv6::Snapshot>,
 }
 
 impl Ownership {
@@ -113,6 +116,7 @@ struct Intent {
     ethernet_before: BTreeMap<String, EthernetSnapshot>,
     #[serde(default)]
     ethernet_originals: BTreeMap<String, EthernetSnapshot>,
+    ipv6_before: ipv6::Snapshot,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -443,6 +447,10 @@ impl Native {
         firewall::validate(&network.firewall)?;
         let parents = self.parents.clone();
         let ownership = self.ownership()?;
+        if ownership.committed_config.is_some() {
+            let enabled = network.ipv6_enabled;
+            session(self.namespace.clone(), move |_, _| ipv6::verify(enabled))?;
+        }
         let originals = ownership
             .ethernet_originals
             .iter()
@@ -528,6 +536,8 @@ impl Native {
             );
         }
         self.preflight_kernel(&network.kernel)?;
+        let enabled = network.ipv6_enabled;
+        session(self.namespace.clone(), move |_, _| ipv6::preflight(enabled))?;
         let parents = self.parents.clone();
         let keys = self.options.keys.clone();
         session(self.namespace.clone(), move |rt, handle| {
@@ -567,10 +577,24 @@ impl Native {
             && (!after.dns.is_empty()
                 || !after.dhcp_clients.is_empty()
                 || self.state.join("adoption.json").exists());
-        let fingerprint = session(self.namespace.clone(), move |rt, handle| {
+        let original_ipv6 = ownership.ipv6_original.clone();
+        let (fingerprint, original_ipv6) = session(self.namespace.clone(), move |rt, handle| {
+            let mut original_ipv6 = original_ipv6;
+            if after.ipv6_enabled {
+                ipv6::set(true)?;
+                if let Some(snapshot) = original_ipv6.take() {
+                    rt.block_on(ipv6::restore_network(handle, &snapshot.unmanaged(&after)?))?;
+                }
+            }
             rt.block_on(networking::reconcile(
                 handle, &before, &after, &parents, &keys, &originals,
             ))?;
+            if !after.ipv6_enabled {
+                if original_ipv6.is_none() {
+                    original_ipv6 = Some(rt.block_on(ipv6::capture(handle))?.unmanaged(&after)?);
+                }
+                ipv6::set(false)?;
+            }
             sysctl::write_scope(&namespace_values, "namespace")?;
             firewall::apply(&after.firewall)?;
             let fingerprint = netfilter::fingerprint()?;
@@ -581,8 +605,10 @@ impl Native {
                 rt.block_on(networking::configure_dns(handle, &after, &lease_state))?;
             }
             sysctl::verify_scope(&namespace_values, "namespace")?;
-            Ok(fingerprint)
+            ipv6::verify(after.ipv6_enabled)?;
+            Ok((fingerprint, original_ipv6))
         })?;
+        ownership.ipv6_original = original_ipv6;
         if !kernel.host.is_empty() {
             let host = self
                 .host_namespace
@@ -612,10 +638,18 @@ impl Native {
         for (name, value) in baseline.namespace {
             keys.namespace.entry(name).or_insert(value);
         }
+
         for (name, value) in baseline.host {
             keys.host.entry(name).or_insert(value);
         }
         self.read_kernel(&keys)
+    }
+
+    fn capture_ipv6(&self, before: &Value) -> Result<ipv6::Snapshot> {
+        let network = Network::parse(before)?;
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(ipv6::capture(handle))?.unmanaged(&network)
+        })
     }
 
     fn read_kernel(&self, keys: &Kernel) -> Result<Kernel> {
@@ -693,6 +727,12 @@ impl Native {
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::restore_ethernet(handle, &snapshots))
         })?;
+        let snapshot = intent.ipv6_before;
+        session(self.namespace.clone(), move |rt, handle| {
+            ipv6::restore_controls(&snapshot)?;
+            rt.block_on(ipv6::restore_network(handle, &snapshot))
+        })?;
+        ownership.ipv6_original = intent.ownership_before.ipv6_original;
         ownership.ethernet_originals = intent.ownership_before.ethernet_originals;
         if intent.ownership_before.firewall_fingerprint.is_none() {
             let fingerprint = ownership
@@ -741,6 +781,8 @@ impl Native {
             ))
         })?;
         let mut previous = ownership.clone();
+        // A prior-boot lease or interface index must never be resurrected.
+        ownership.ipv6_original = None;
         if fingerprint == netfilter::empty_fingerprint() {
             previous.firewall_config = None;
             previous.firewall_fingerprint = None;
@@ -789,6 +831,7 @@ impl Native {
             ownership_before: previous,
             ethernet_before,
             ethernet_originals: ownership.ethernet_originals.clone(),
+            ipv6_before: self.capture_ipv6(&before)?,
         };
         write_json(&self.state.join("intent.json"), &intent)?;
         let mut target = ownership.kernel_baseline.clone();
@@ -1003,7 +1046,7 @@ impl Backend for Native {
                 drift.context("native drift guard: committed configuration differs from kernel")
             );
         }
-        if before == after {
+        if before == after && ownership.committed_config.is_some() {
             self.verify_services(&after)?;
             return Ok(());
         }
@@ -1058,6 +1101,7 @@ impl Backend for Native {
             ownership_before: previous_ownership,
             ethernet_before,
             ethernet_originals: ownership.ethernet_originals.clone(),
+            ipv6_before: self.capture_ipv6(&before)?,
         };
         write_json(&self.state.join("intent.json"), &intent)?;
         // Stop services before interface changes; their manager must restore prior workers on failure.
@@ -1139,6 +1183,8 @@ impl Backend for Native {
         value["parents"] = parent_status;
         value["dhcp_clients"] = self.dhcp.status()?;
         value["scope"] = json!(self.identity);
+        let enabled = config.ipv6_enabled;
+        value["ipv6"] = session(self.namespace.clone(), move |_, _| ipv6::status(enabled))?;
         let desired = Network::parse(&config.operational_value()?)?.kernel;
         let baseline = self.ownership()?.kernel_baseline;
         let mut effective = baseline.clone();
@@ -1161,6 +1207,19 @@ impl Backend for Native {
             ))
         })?;
         Ok(value)
+    }
+
+    fn delete_connections(
+        &mut self,
+        target: Option<(u32, &netcontrol_core::ConnectionTarget)>,
+    ) -> Result<Value> {
+        self.check_scope()?;
+        let target = target.map(|(id, target)| (id, target.clone()));
+        let single = target.is_some();
+        session(self.namespace.clone(), move |_, _| {
+            netfilter::delete_connections(target.as_ref().map(|(id, target)| (*id, target)))
+        })?;
+        Ok(json!({"status":if single {"deleted"} else {"flushed"},"scope":self.identity}))
     }
 
     fn statistics(&mut self, config: &Config, path: &str, query: &str) -> Result<Value> {
@@ -1256,6 +1315,10 @@ impl Backend for Native {
         // Empty initial state has no owned nftables table yet. Bootstrap only the verified
         // current firewall; never overwrite a foreign table or repair unrelated drift.
         let mut ownership = self.ownership()?;
+        if ownership.committed_config.is_none() {
+            self.apply(config, config)?;
+            ownership = self.ownership()?;
+        }
         if self.options.namespace.is_empty()
             && ownership.firewall_fingerprint.is_none()
             && config == &Config::empty()
@@ -1274,6 +1337,7 @@ impl Backend for Native {
                 ownership_before: ownership.clone(),
                 ethernet_before: BTreeMap::new(),
                 ethernet_originals: ownership.ethernet_originals.clone(),
+                ipv6_before: self.capture_ipv6(&value)?,
             };
             write_json(&self.state.join("intent.json"), &intent)?;
             self.network_apply(&value, &value, captured, &mut ownership)

@@ -81,6 +81,28 @@ impl Fixture {
 }
 
 #[test]
+fn global_ipv6_cli_stages_checks_commits_and_rolls_back() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "ipv6 disable");
+    f.ok(&mut cli, "commit check");
+    assert_eq!(f.request("/api/v1/state")["desired"]["ipv6_enabled"], true);
+    f.ok(&mut cli, "commit confirmed 30 Disable IPv6");
+    assert_eq!(f.request("/api/v1/runtime")["ipv6"]["enabled"], false);
+    f.ok(&mut cli, "rollback");
+    assert_eq!(f.request("/api/v1/runtime")["ipv6"]["enabled"], true);
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "ipv6 disable");
+    f.ok(&mut cli, "ipv6 enable");
+    f.ok(&mut cli, "commit check");
+    assert!(
+        f.ok(&mut cli, "show candidate-config")
+            .contains("\"ipv6_enabled\": true")
+    );
+}
+
+#[test]
 fn ethernet_candidate_main_routes_and_readonly_discovery_use_shared_engine() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

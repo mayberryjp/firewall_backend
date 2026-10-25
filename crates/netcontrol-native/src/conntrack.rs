@@ -5,6 +5,65 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
+    let mut bytes = ((value.len() + 4) as u16).to_ne_bytes().to_vec();
+    bytes.extend(kind.to_ne_bytes());
+    bytes.extend(value);
+    bytes.resize((bytes.len() + 3) & !3, 0);
+    bytes
+}
+
+pub fn delete_attributes(
+    id: u32,
+    target: &netcontrol_core::ConnectionTarget,
+) -> Result<(u8, Vec<u8>)> {
+    target.validate()?;
+    let mut ip = Vec::new();
+    match (target.original.source, target.original.destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            ip.extend(attribute(1, &source.octets()));
+            ip.extend(attribute(2, &destination.octets()));
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            ip.extend(attribute(3, &source.octets()));
+            ip.extend(attribute(4, &destination.octets()));
+        }
+        _ => anyhow::bail!("connection address families disagree"),
+    }
+    let mut protocol = attribute(1, &[target.protocol]);
+    if let (Some(source), Some(destination)) = (
+        target.original.source_port,
+        target.original.destination_port,
+    ) {
+        protocol.extend(attribute(2, &source.to_be_bytes()));
+        protocol.extend(attribute(3, &destination.to_be_bytes()));
+    } else {
+        let kind = if target.protocol == 58 { 7 } else { 4 };
+        protocol.extend(attribute(
+            kind,
+            &target
+                .original
+                .icmp_id
+                .context("missing ICMP ID")?
+                .to_be_bytes(),
+        ));
+        protocol.extend(attribute(
+            kind + 1,
+            &[target.original.icmp_type.context("missing ICMP type")?],
+        ));
+        protocol.extend(attribute(
+            kind + 2,
+            &[target.original.icmp_code.context("missing ICMP code")?],
+        ));
+    }
+    let mut tuple = attribute(0x8001, &ip);
+    tuple.extend(attribute(0x8002, &protocol));
+    let mut attrs = attribute(0x8001, &tuple);
+    attrs.extend(attribute(12, &id.to_be_bytes()));
+    attrs.extend(attribute(18, &target.zone.to_be_bytes()));
+    Ok((if target.family == "ipv4" { 2 } else { 10 }, attrs))
+}
+
 type Attributes = Vec<(u16, Vec<u8>)>;
 
 fn field(attrs: &Attributes, kind: u16) -> Result<Option<&[u8]>> {
@@ -284,6 +343,36 @@ pub fn snapshot(payloads: &[Vec<u8>], query: &ConnectionQuery) -> Result<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conntrack_delete_attributes_bind_original_tuple_id_and_zone() {
+        let mut target: netcontrol_core::ConnectionTarget = serde_json::from_value(serde_json::json!({"family":"ipv4","protocol":6,"zone":7,"original":{"source":"192.0.2.2","destination":"198.51.100.2","source_port":50000,"destination_port":443}})).unwrap();
+        let (family, bytes) = delete_attributes(123, &target).unwrap();
+        assert_eq!(family, 2);
+        let attrs = attributes(&bytes).unwrap();
+        assert_eq!(integer(&attrs, 12).unwrap(), Some(123));
+        assert_eq!(short(&attrs, 18).unwrap(), Some(7));
+        let (protocol, original) = tuple(required(&attrs, 1).unwrap(), family).unwrap();
+        assert_eq!(protocol, 6);
+        assert_eq!(original.source.to_string(), "192.0.2.2");
+        assert_eq!(original.destination_port, Some(443));
+        target.family = "ipv6".into();
+        target.protocol = 58;
+        target.original.source = "2001:db8::1".parse().unwrap();
+        target.original.destination = "2001:db8::2".parse().unwrap();
+        target.original.source_port = None;
+        target.original.destination_port = None;
+        target.original.icmp_id = Some(0x1234);
+        target.original.icmp_type = Some(128);
+        target.original.icmp_code = Some(0);
+        let (family, bytes) = delete_attributes(456, &target).unwrap();
+        let attrs = attributes(&bytes).unwrap();
+        let (protocol, original) = tuple(required(&attrs, 1).unwrap(), family).unwrap();
+        assert_eq!(family, 10);
+        assert_eq!(protocol, 58);
+        assert_eq!(original.icmp_id, Some(0x1234));
+        assert_eq!(original.icmp_type, Some(128));
+    }
 
     fn attr(kind: u16, value: &[u8]) -> Vec<u8> {
         let mut bytes = ((value.len() + 4) as u16).to_ne_bytes().to_vec();

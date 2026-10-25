@@ -13,9 +13,11 @@ fn accept() -> String {
     "accept".into()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "yes")]
+    pub ipv6_enabled: bool,
     pub ntp: NTPConfig,
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
@@ -30,6 +32,26 @@ pub struct Config {
     pub firewall: Firewall,
     pub softflowd: Vec<SoftflowdConfig>,
     pub kernel: KernelConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ipv6_enabled: true,
+            ntp: Default::default(),
+            syslog: Default::default(),
+            vnstat: Default::default(),
+            gateway_monitors: Vec::new(),
+            interfaces: Vec::new(),
+            dhcp_clients: BTreeMap::new(),
+            dns: BTreeMap::new(),
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+            firewall: Default::default(),
+            softflowd: Vec::new(),
+            kernel: Default::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -934,6 +956,96 @@ impl Config {
         }
         self.validate_softflowd()?;
         self.validate_monitors()?;
+        if !self.ipv6_enabled {
+            self.validate_ipv4_only()?;
+        }
+        Ok(())
+    }
+    fn validate_ipv4_only(&self) -> Result<()> {
+        let mut literals: Vec<&str> = self.ntp.servers.iter().map(String::as_str).collect();
+        literals.extend(self.syslog.servers.iter().map(|s| s.host.as_str()));
+        let mut prefixes: Vec<&str> = Vec::new();
+        for link in &self.interfaces {
+            prefixes.extend(link.addresses.iter().map(String::as_str));
+            if let Some(wg) = &link.wireguard {
+                for peer in &wg.peers {
+                    prefixes.extend(peer.allowed_ips.iter().map(String::as_str));
+                    if !peer.endpoint.is_empty() {
+                        ensure!(
+                            socket(&peer.endpoint)?.is_ipv4(),
+                            "IPv6 WireGuard endpoint requires ipv6_enabled"
+                        );
+                    }
+                }
+            }
+        }
+        for dns in self.dns.values() {
+            literals.extend(dns.servers.iter().map(String::as_str));
+        }
+        for route in &self.routes {
+            prefixes.push(&route.destination);
+            literals.push(&route.gateway);
+        }
+        prefixes.extend(self.policy_rules.iter().map(|r| r.source.as_str()));
+        for rule in &self.firewall.rules {
+            prefixes.extend([rule.source.as_str(), rule.destination.as_str()]);
+        }
+        let mut policy_rules = Vec::new();
+        if let Some(policies) = &self.firewall.policies {
+            for host in &policies.hosts {
+                literals.extend(host.addresses.iter().map(String::as_str));
+                policy_rules.extend(&host.rules);
+            }
+            for interface in &policies.interfaces {
+                policy_rules.extend(&interface.rules);
+            }
+        }
+        if let Some(input) = &self.firewall.input {
+            for interface in &input.interfaces {
+                policy_rules.extend(&interface.rules);
+            }
+        }
+        prefixes.extend(
+            policy_rules
+                .iter()
+                .map(|r: &&HostPolicyRule| r.destination.as_str()),
+        );
+        for nat in &self.firewall.nat.masquerade {
+            ensure!(
+                nat.family == "ipv4",
+                "IPv6 masquerade requires ipv6_enabled"
+            );
+            prefixes.push(&nat.source);
+        }
+        for monitor in &self.gateway_monitors {
+            literals.extend([
+                monitor.source_address.as_str(),
+                monitor.gateway.as_str(),
+                monitor.target.as_str(),
+            ]);
+        }
+        for flow in &self.softflowd {
+            ensure!(
+                socket(&flow.collector)?.is_ipv4(),
+                "IPv6 collector requires ipv6_enabled"
+            );
+            ensure!(
+                !matches!(flow.capture_filter.as_str(), "ip6" | "icmp6"),
+                "IPv6 capture filter requires ipv6_enabled"
+            );
+        }
+        for prefix in prefixes.into_iter().filter(|value| !value.is_empty()) {
+            ensure!(
+                canonical_prefix(prefix, false)?.0.is_ipv4(),
+                "IPv6 prefix {prefix} requires ipv6_enabled"
+            );
+        }
+        for literal in literals {
+            ensure!(
+                !literal.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()),
+                "IPv6 address {literal} requires ipv6_enabled"
+            );
+        }
         Ok(())
     }
     fn validate_softflowd(&self) -> Result<()> {

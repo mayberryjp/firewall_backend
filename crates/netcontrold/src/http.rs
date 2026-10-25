@@ -91,6 +91,7 @@ pub struct App {
     auth: Authentication,
     tls: bool,
     attempts: Mutex<(Instant, usize)>,
+    updates: Option<crate::updates::Manager>,
 }
 impl App {
     pub fn new(engine: Arc<Mutex<Engine>>, auth: Authentication, tls: bool) -> Arc<Self> {
@@ -99,7 +100,33 @@ impl App {
             auth,
             tls,
             attempts: Mutex::new((Instant::now(), 0)),
+            updates: None,
         })
+    }
+    pub fn with_updates(
+        engine: Arc<Mutex<Engine>>,
+        auth: Authentication,
+        tls: bool,
+        updates: crate::updates::Manager,
+    ) -> Result<Arc<Self>> {
+        engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .set_upgrade_maintenance(updates.active()?)?;
+        let mut app = Self::new(engine, auth, tls);
+        Arc::get_mut(&mut app)
+            .context("new application is shared")?
+            .updates = Some(updates);
+        Ok(app)
+    }
+    pub fn refresh_upgrade_gate(&self) -> Result<()> {
+        if let Some(updates) = &self.updates {
+            self.engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+                .set_upgrade_maintenance(updates.active()?)?;
+        }
+        Ok(())
     }
     pub fn authenticate_api_key(&self, token: &str) -> Result<Option<Credential>> {
         if token.is_empty() {
@@ -276,7 +303,11 @@ async fn front_door(State(app): State<Arc<App>>, request: Request) -> Response {
             "Location, WWW-Authenticate, Retry-After",
         );
         if preflight {
-            set(&mut result, "access-control-allow-methods", "GET, POST");
+            set(
+                &mut result,
+                "access-control-allow-methods",
+                "GET, POST, DELETE",
+            );
             set(
                 &mut result,
                 "access-control-allow-headers",
@@ -469,9 +500,9 @@ fn api(
     {
         if !matches!(
             text(headers, "access-control-request-method").as_str(),
-            "GET" | "POST"
+            "GET" | "POST" | "DELETE"
         ) {
-            return fail(405, "cross-origin method must be GET or POST", true);
+            return fail(405, "cross-origin method must be GET, POST or DELETE", true);
         }
         for name in text(headers, "access-control-request-headers")
             .split(',')
@@ -514,6 +545,123 @@ fn api(
     let Ok(mut engine) = app.engine.lock() else {
         return fail(503, "engine unavailable", true);
     };
+    if let Some(updates) = &app.updates {
+        match updates
+            .active()
+            .and_then(|active| engine.set_upgrade_maintenance(active))
+        {
+            Ok(()) => (),
+            Err(_) => return fail(503, "upgrade state unavailable", true),
+        }
+    }
+    if path == "/api/v1/system/upgrade" {
+        let permission = if method == "POST" {
+            "system.upgrade"
+        } else {
+            "state.read"
+        };
+        if !credential
+            .permissions
+            .iter()
+            .any(|value| value == permission)
+        {
+            return fail(403, "insufficient upgrade permission", true);
+        }
+        if !matches!(method, "GET" | "POST") {
+            return fail(405, "method not allowed", true);
+        }
+        if !query.is_empty() {
+            return fail(
+                400,
+                "upgrade endpoint does not accept query parameters",
+                true,
+            );
+        }
+        if method == "GET" {
+            if !body.is_empty() {
+                return fail(400, "upgrade status does not accept a body", true);
+            }
+            return match &app.updates {
+                None => response(
+                    200,
+                    json!({"enabled":false,"repository":null,"job":null,"last_successful_version":null}),
+                ),
+                Some(updates) => match updates.job() {
+                    Ok(job) => response(
+                        200,
+                        json!({"enabled":true,"repository":updates.repository(),"last_successful_version":job.as_ref().and_then(|job| job.last_successful_version.clone()),"job":job.map(|job|job.public())}),
+                    ),
+                    Err(_) => fail(503, "upgrade state unavailable", true),
+                },
+            };
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Upgrade {
+            version: String,
+        }
+        let input: Upgrade = match serde_json::from_slice(&body) {
+            Ok(input) => input,
+            Err(_) => return fail(400, "expected an object containing only version", true),
+        };
+        let version = match netcontrol_package::update::version(&input.version) {
+            Ok(version) => version,
+            Err(_) => {
+                return fail(
+                    400,
+                    "version must be canonical SemVer without build metadata or a v prefix",
+                    true,
+                );
+            }
+        };
+        let Some(updates) = &app.updates else {
+            return fail(503, "self-upgrade is not configured", true);
+        };
+        let current = match updates.job() {
+            Ok(job) => job,
+            Err(_) => return fail(503, "upgrade state unavailable", true),
+        };
+        if current.as_ref().is_some_and(|job| {
+            job.active()
+                || job
+                    .last_successful_version
+                    .as_ref()
+                    .is_some_and(|previous| {
+                        netcontrol_package::update::version(previous)
+                            .is_ok_and(|previous| version <= previous)
+                    })
+        }) {
+            return fail(
+                409,
+                "upgrade active or requested version is not newer than the last successful upgrade",
+                true,
+            );
+        }
+        if engine.set_upgrade_maintenance(true).is_err() {
+            return fail(
+                409,
+                "upgrade requires no active configuration transaction",
+                true,
+            );
+        }
+        return match updates.start(&input.version) {
+            Ok(job) => {
+                let mut reply = response(202, job.public());
+                set(&mut reply, "location", "/api/v1/system/upgrade");
+                reply
+            }
+            Err(_) => {
+                if let Ok(false) = updates.active() {
+                    let _ = engine.set_upgrade_maintenance(false);
+                }
+                fail(
+                    503,
+                    "could not start software upgrade; inspect the service journal",
+                    true,
+                )
+            }
+        };
+    }
     let reply = engine.request(
         method,
         path,

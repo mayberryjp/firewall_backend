@@ -114,7 +114,42 @@ pub fn connections() -> Result<Vec<Vec<u8>>> {
     dump_messages(1, 1, libc::AF_UNSPEC as u8, &[])
 }
 
+pub fn delete_connections(target: Option<(u32, &netcontrol_core::ConnectionTarget)>) -> Result<()> {
+    let (family, attrs) = match target {
+        Some((id, target)) => crate::conntrack::delete_attributes(id, target)?,
+        None => (libc::AF_UNSPEC as u8, Vec::new()),
+    };
+    exchange(1, 2, family, &attrs, true)?;
+    Ok(())
+}
+
 fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Result<Vec<Vec<u8>>> {
+    exchange(subsystem, message, family, attrs, false)
+}
+
+fn delete_acknowledgement(payload: &[u8], request: &[u8]) -> Result<()> {
+    ensure!(
+        payload.len() >= 20 && payload[4..20] == request[..16],
+        "invalid netfilter delete acknowledgement"
+    );
+    let error = i32::from_ne_bytes(payload[..4].try_into()?);
+    ensure!(
+        (-4095..=0).contains(&error),
+        "invalid netfilter delete error number"
+    );
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(-error).into());
+    }
+    Ok(())
+}
+
+fn exchange(
+    subsystem: u16,
+    message: u16,
+    family: u8,
+    attrs: &[u8],
+    ack: bool,
+) -> Result<Vec<Vec<u8>>> {
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -160,7 +195,7 @@ fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Resu
     let mut request = Vec::new();
     request.extend((20u32 + attrs.len() as u32).to_ne_bytes());
     request.extend(((subsystem << 8) | message).to_ne_bytes());
-    request.extend(0x301u16.to_ne_bytes()); // REQUEST | ROOT | MATCH
+    request.extend(if ack { 5u16 } else { 0x301u16 }.to_ne_bytes());
     request.extend(1u32.to_ne_bytes());
     request.extend(0u32.to_ne_bytes());
     request.extend([family, 0, 0, 0]);
@@ -244,6 +279,10 @@ fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Resu
             );
             let payload = &data[16..length];
             if kind == 2 {
+                if ack {
+                    delete_acknowledgement(payload, &request)?;
+                    return Ok(result);
+                }
                 ensure!(payload.len() >= 4, "short netlink error");
                 let error = i32::from_ne_bytes(payload[..4].try_into()?);
                 ensure!(
@@ -252,6 +291,7 @@ fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Resu
                     std::io::Error::from_raw_os_error(-error)
                 );
             } else if kind == 3 {
+                ensure!(!ack, "unexpected dump completion for conntrack delete");
                 if payload.len() >= 4 {
                     ensure!(
                         i32::from_ne_bytes(payload[..4].try_into()?) == 0,
@@ -260,6 +300,7 @@ fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Resu
                 }
                 return Ok(result);
             } else {
+                ensure!(!ack, "unexpected data record for conntrack delete");
                 ensure!(kind >> 8 == subsystem, "unexpected netfilter message type");
                 ensure!(
                     subsystem != 1 || kind & 0xff == 0,
@@ -275,5 +316,43 @@ fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Resu
             ensure!(aligned <= data.len(), "short netlink message padding");
             data = &data[aligned..];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conntrack_delete_requires_exact_ack_and_preserves_not_found() {
+        let mut request = Vec::new();
+        request.extend(20u32.to_ne_bytes());
+        request.extend(0x102u16.to_ne_bytes());
+        request.extend(5u16.to_ne_bytes());
+        request.extend(1u32.to_ne_bytes());
+        request.extend(0u32.to_ne_bytes());
+        request.extend([0; 4]);
+        let mut payload = 0i32.to_ne_bytes().to_vec();
+        payload.extend(&request[..16]);
+        delete_acknowledgement(&payload, &request).unwrap();
+        assert!(delete_acknowledgement(&payload[..19], &request).is_err());
+        payload[12] ^= 1;
+        assert!(delete_acknowledgement(&payload, &request).is_err());
+        payload[12] ^= 1;
+        payload[..4].copy_from_slice(&(-libc::ENOENT).to_ne_bytes());
+        let error = delete_acknowledgement(&payload, &request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        payload[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert_eq!(
+            delete_acknowledgement(&payload, &request)
+                .unwrap_err()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 }

@@ -65,6 +65,12 @@ Ubuntu installation and full upgrades also enable and persist conntrack accounti
 and checksum validation; existing flows may retain null counters. See
 [conntrack host prerequisites](docs/BUILD_AND_INSTALL.md#conntrack-host-prerequisites).
 
+Optional Ubuntu amd64 self-upgrade uses `POST /api/v1/system/upgrade` with a
+specific SemVer version and `GET` on the same path for durable job status.
+It is disabled until a trusted release-signing public key and fixed GitHub
+repository are configured. See [signed self-upgrades](docs/BUILD_AND_INSTALL.md#signed-ubuntu-self-upgrade)
+for bootstrap, artifact publishing, recovery and validation limitations.
+
 For optional Ubuntu OS footprint reduction, start with `sudo bash hardening.sh`
 to preview the explicit service/package profile. Nothing changes without
 `--apply`. AppArmor remains enabled unless `--disable-apparmor` is explicitly
@@ -122,6 +128,39 @@ cookies are Secure. CORS does not bypass mixed-content, certificate,
 private-network, or network-reachability restrictions.
 
 ## Configuration workflow
+
+### Global IPv6 policy
+
+The top-level `ipv6_enabled` boolean defaults to `true`, including fresh
+installation and factory configuration. Set `"ipv6_enabled": false` in the
+complete configuration submitted through the normal confirmed transaction
+workflow, or stage `ipv6 disable` in the configuration CLI. Changing it requires
+`kernel.namespace.write` as well as `transactions.write`.
+
+On Linux, disabling writes and verifies `net.ipv6.conf.default.disable_ipv6=1`,
+`net.ipv6.conf.all.disable_ipv6=1` and every existing interface's `disable_ipv6`,
+including loopback and unmanaged links. New interfaces inherit the disabled
+default. The scope is the daemon's managed network namespace (the appliance
+host in normal installations). Re-enabling sets these controls to `0` before
+restoring configured IPv6 networking; it does not enable IPv6 forwarding.
+
+Remove IPv6 addresses, routes, policy/firewall/NAT references, DNS/server
+literals, WireGuard endpoints/allowed prefixes, monitors and exporter collectors/
+IPv6-only filters from the same candidate before disabling. Conflicts return
+validation errors rather than silently dropping configuration. Service hostname
+resolution becomes IPv4-only and flow exporters exclude IPv6. Runtime reports
+the desired switch and observed controls under `ipv6`; simulator values are
+explicitly unmeasured.
+
+IPv6 management sessions will disconnect: apply over IPv4 with independent
+console access and explicitly confirm or roll back. Saved policy is reapplied
+on daemon startup/reboot; this does not change bootloader arguments, unload IPv6,
+or disable it before the daemon starts. Missing kernel controls or required
+writes to read-only sysctls fail explicitly. Same-boot rollback/re-enable restores captured unmanaged IPv6
+addresses/routes without extending finite lifetimes; stale prior-boot snapshots
+are not resurrected. See the [frontend contract](FRONTEND_SPEC.md#global-ipv6-policy).
+
+### Editing configuration
 
 Configuration resources support optional `metadata.display_name` and
 `metadata.description`, including Ethernet/VLAN/WireGuard interfaces, peers,

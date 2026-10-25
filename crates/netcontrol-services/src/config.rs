@@ -145,9 +145,10 @@ fn failure_hold() -> u64 {
 fn recovery_hold() -> u64 {
     5000
 }
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct Config {
+    pub ipv6_enabled: bool,
     pub ntp: Ntp,
     pub syslog: Syslog,
     pub vnstat: Vnstat,
@@ -156,6 +157,21 @@ pub(crate) struct Config {
     pub gateway_monitors: Vec<Gateway>,
     pub routes: Vec<Value>,
     pub rules: Vec<Value>,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ipv6_enabled: true,
+            ntp: Ntp::default(),
+            syslog: Syslog::default(),
+            vnstat: Vnstat::default(),
+            interfaces: Vec::new(),
+            softflowd: Vec::new(),
+            gateway_monitors: Vec::new(),
+            routes: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
 }
 pub(crate) fn name(value: &str, max: usize) -> bool {
     !value.is_empty()

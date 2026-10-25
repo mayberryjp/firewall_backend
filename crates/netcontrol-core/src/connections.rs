@@ -2,6 +2,73 @@ use anyhow::{Result, ensure};
 use serde::Deserialize;
 use std::net::IpAddr;
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionTuple {
+    pub source: IpAddr,
+    pub destination: IpAddr,
+    pub source_port: Option<u16>,
+    pub destination_port: Option<u16>,
+    pub icmp_id: Option<u16>,
+    pub icmp_type: Option<u8>,
+    pub icmp_code: Option<u8>,
+    pub zone: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionTarget {
+    pub family: String,
+    pub protocol: u8,
+    pub zone: u16,
+    pub original: ConnectionTuple,
+}
+
+impl ConnectionTarget {
+    pub fn validate(&self) -> Result<()> {
+        let tuple = &self.original;
+        ensure!(
+            matches!(self.family.as_str(), "ipv4" | "ipv6"),
+            "connection family must be ipv4 or ipv6"
+        );
+        ensure!(
+            (self.family == "ipv4") == tuple.source.is_ipv4()
+                && tuple.source.is_ipv4() == tuple.destination.is_ipv4(),
+            "connection family and tuple addresses disagree"
+        );
+        ensure!(
+            tuple.zone.is_none_or(|zone| zone == self.zone),
+            "direction-specific zones are not supported for deletion"
+        );
+        match self.protocol {
+            6 | 17 | 132 => ensure!(
+                tuple.source_port.is_some()
+                    && tuple.destination_port.is_some()
+                    && tuple.icmp_id.is_none()
+                    && tuple.icmp_type.is_none()
+                    && tuple.icmp_code.is_none(),
+                "TCP/UDP/SCTP deletion requires both ports and no ICMP fields"
+            ),
+            1 | 58 => {
+                ensure!(
+                    (self.protocol == 1) == (self.family == "ipv4"),
+                    "ICMP protocol and family disagree"
+                );
+                ensure!(
+                    tuple.source_port.is_none()
+                        && tuple.destination_port.is_none()
+                        && tuple.icmp_id.is_some()
+                        && tuple.icmp_type.is_some()
+                        && tuple.icmp_code.is_some(),
+                    "ICMP deletion requires ID/type/code and no ports"
+                );
+            }
+            _ => anyhow::bail!("targeted deletion supports TCP, UDP, SCTP, ICMP and ICMPv6 only"),
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionQuery {
     pub limit: usize,
@@ -113,6 +180,32 @@ impl ConnectionQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeted_connection_deletion_validates_complete_protocol_identity() {
+        let mut target: ConnectionTarget = serde_json::from_value(serde_json::json!({"family":"ipv4","protocol":17,"zone":0,"original":{"source":"192.0.2.2","destination":"198.51.100.2","source_port":1234,"destination_port":53}})).unwrap();
+        target.validate().unwrap();
+        target.original.destination_port = None;
+        assert!(target.validate().is_err());
+        target.protocol = 1;
+        target.original.source_port = None;
+        target.original.icmp_id = Some(42);
+        target.original.icmp_type = Some(8);
+        target.original.icmp_code = Some(0);
+        target.validate().unwrap();
+        target.protocol = 58;
+        assert!(target.validate().is_err());
+        target.family = "ipv6".into();
+        target.original.source = "2001:db8::1".parse().unwrap();
+        target.original.destination = "2001:db8::2".parse().unwrap();
+        target.original.icmp_type = Some(128);
+        target.validate().unwrap();
+        target.original.zone = Some(7);
+        assert!(target.validate().is_err());
+        target.original.zone = None;
+        target.protocol = 47;
+        assert!(target.validate().is_err());
+    }
 
     #[test]
     fn connection_query_defaults_filters_and_url_decoding() {
