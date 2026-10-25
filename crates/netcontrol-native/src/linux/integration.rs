@@ -895,6 +895,80 @@ fn native_vnstat_statistics_delegates_live_history_and_scope() -> Result<()> {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/WireGuard modules"]
+fn native_wireguard_peer_enabled_toggle_restart_and_rollback() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let options = fixture.options();
+    wireguard::create_key(&options.keys, "wg-key")?;
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let key = |byte: u8| wireguard_control::Key([byte; 32]).to_base64();
+    let build = |first: bool, second: bool| -> Result<Config> {
+        let config = config(json!({
+            "interfaces":[{"name":"wg0","kind":"wireguard","role":"unassigned","mtu":1420,"up":true,
+                "addresses":["192.0.2.10/24"],
+                "wireguard":{"key_ref":"wg-key","listen_port":51820,"peers":[
+                    {"enabled":first,"public_key":key(5),"endpoint":"192.0.2.50:51820","allowed_ips":["198.51.100.0/24"],"persistent_keepalive_seconds":25},
+                    {"enabled":second,"public_key":key(6),"allowed_ips":["203.0.113.0/24"]}]}}]
+        }))?;
+        config.validate()?;
+        Ok(config)
+    };
+    let installed = |native: &mut Native, config: &Config| -> Result<Vec<String>> {
+        let runtime = native.runtime(config)?;
+        let mut peers: Vec<String> = runtime["wireguard"][0]["peers"]
+            .as_array()
+            .context("WireGuard runtime missing")?
+            .iter()
+            .map(|peer| peer["public_key"].as_str().unwrap().to_owned())
+            .collect();
+        peers.sort();
+        Ok(peers)
+    };
+    let sorted = |mut keys: Vec<String>| {
+        keys.sort();
+        keys
+    };
+    let both = build(true, true)?;
+    native.apply(&empty, &both)?;
+    assert_eq!(native.observe(&both)?, both);
+    assert_eq!(installed(&mut native, &both)?, sorted(vec![key(5), key(6)]));
+
+    let only_second = build(false, true)?;
+    native.apply(&both, &only_second)?;
+    assert_eq!(native.observe(&only_second)?, only_second);
+    assert_eq!(installed(&mut native, &only_second)?, [key(6)]);
+
+    let none = build(false, false)?;
+    native.apply(&only_second, &none)?;
+    assert_eq!(native.observe(&none)?, none);
+    assert!(installed(&mut native, &none)?.is_empty());
+
+    let only_first = build(true, false)?;
+    native.apply(&none, &only_first)?;
+    assert_eq!(native.observe(&only_first)?, only_first);
+    assert_eq!(installed(&mut native, &only_first)?, [key(5)]);
+
+    drop(native);
+    let mut native = Native::open(options.clone())?;
+    native.repair(&only_first)?;
+    assert_eq!(native.observe(&only_first)?, only_first);
+    assert_eq!(installed(&mut native, &only_first)?, [key(5)]);
+
+    let mut failing = build(true, true)?;
+    failing.ntp.enabled = true;
+    failing.ntp.servers = vec!["192.0.2.123".into()];
+    assert!(native.apply(&only_first, &failing).is_err());
+    assert_eq!(native.observe(&only_first)?, only_first);
+    assert_eq!(installed(&mut native, &only_first)?, [key(5)]);
+
+    native.apply(&only_first, &empty)?;
+    native.observe(&empty)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/WireGuard modules"]
 fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()> {
     let fixture = Fixture::new()?;
     fs::create_dir(&fixture.options().keys)?;

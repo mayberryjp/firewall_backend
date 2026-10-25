@@ -1561,6 +1561,58 @@ fn all_domain_permissions_are_independently_required() {
     }
 }
 #[test]
+fn toggling_a_wireguard_peer_requires_wireguard_write_and_commits_through_a_transaction() {
+    use base64::Engine as _;
+    let fixture = Fixture::new();
+    let mut e = fixture.engine();
+    let mut config = config();
+    config.interfaces[0].kind = "wireguard".into();
+    config.interfaces[0].wireguard = Some(crate::WireGuard {
+        key_ref: "lab-key".into(),
+        listen_port: 51820,
+        peers: vec![crate::Peer {
+            metadata: Default::default(),
+            enabled: true,
+            public_key: base64::engine::general_purpose::STANDARD.encode([3u8; 32]),
+            endpoint: String::new(),
+            allowed_ips: vec!["198.51.100.0/24".into()],
+            persistent_keepalive_seconds: 25,
+        }],
+    });
+    let reply = submit(&mut e, config.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut e, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let mut disabled = config.clone();
+    disabled.interfaces[0].wireguard.as_mut().unwrap().peers[0].enabled = false;
+    let without: Vec<_> = all()
+        .into_iter()
+        .filter(|permission| permission != "wireguard.write")
+        .collect();
+    let denied = authorize(&without, &config, &disabled).unwrap_err();
+    assert_eq!(denied.status, 403);
+    assert!(denied.error.contains("wireguard.write"));
+    assert!(authorize(&all(), &config, &disabled).is_ok());
+    let reply = submit(&mut e, disabled.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        reply.body["candidate"]["interfaces"][0]["wireguard"]["peers"][0]["enabled"],
+        false
+    );
+    assert_eq!(
+        confirm(&mut e, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let state = request(&mut e, "GET", "/api/v1/state", Value::Null);
+    assert_eq!(
+        state.body["desired"]["interfaces"][0]["wireguard"]["peers"][0]["enabled"],
+        false
+    );
+}
+
+#[test]
 fn reconcile_repairs_failed_workers_without_weakening_normal_observation() {
     let fixture = Fixture::new();
     let (mut engine, backend) = faulty(&fixture);

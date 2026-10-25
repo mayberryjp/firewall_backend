@@ -192,6 +192,13 @@ dhcp-relay enable|disable
 [key creation command](BUILD_AND_INSTALL.md#creating-a-wireguard-private-key),
 which also prints the public key for the peer.
 
+Peers have an `enabled` flag (default true). A disabled peer stays in the candidate
+and saved configuration but is not installed on the interface. Toggle it by
+pointer, for example `set /interfaces/0/wireguard/peers/0/enabled false` (back with
+`true`), or resend the peer with `"enabled":false` in `wireguard peer JSON`.
+Resending a peer without `enabled` makes it enabled again. Check the live result
+with `show runtime`: only installed peers appear there.
+
 New candidate entries start as administratively down, role LAN, MTU 1500;
 omitted kind is dummy. These are visible CLI creation defaults, not role-based
 network policy. Use `show interfaces discovered` before staging

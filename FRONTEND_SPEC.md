@@ -2311,7 +2311,26 @@ owned nftables table.
 
 Show WireGuard interfaces and peers using the same underlying draft as Interfaces.
 Fields: key reference, stable listen port, peer public key, optional numeric
-endpoint, allowed network list, persistent keepalive seconds.
+endpoint, allowed network list, persistent keepalive seconds, and a per-peer
+`enabled` toggle.
+
+Peers accept `enabled: boolean`; omission defaults to `true` in requests and saved
+configurations (including revision records), and canonical responses always include
+it. Explicit `null` or non-boolean values return `400`. New-peer forms should start
+with `true`; preserve explicit `false` rather than using a truthiness default. A
+disabled peer keeps its full settings and metadata in desired configuration, drafts,
+transactions, revision history and exports, but is **not installed** on the interface:
+its handshake and traffic stop, and re-enabling installs it again with a fresh
+handshake. Toggling is an ordinary complete `POST /api/v1/transactions` with normal
+confirmation and rollback, requiring `transactions.write` and `wireguard.write`.
+There is no per-peer endpoint or new permission. Disabled peers still require a valid,
+unique public key and canonical allowed networks (and obey the IPv6 policy), but a
+disabled peer may reuse an allowed network that an enabled peer uses, so a spare can
+be staged; only enabled peers (and a single peer's own list) must not duplicate.
+Native runtime lists only installed peers, so a disabled peer has no runtime row,
+handshake or byte counters; do not show stale values for it. Disabling the only
+peer that carries management traffic cuts that path, so warn before committing.
+Peer identity stays the public key; `enabled` is not part of identity.
 
 Show key reference as a name, never a filesystem path. No private-key input,
 reveal, upload, download, or browser key generation. Explain immutable operator
@@ -2560,7 +2579,7 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Listen port | 1..65535; stable nonzero port required |
 | Peer public key | Base64 decodes to a nonzero 32-byte WireGuard key; unique within interface |
 | Endpoint | Optional numeric IP:port, nonzero port, IPv6 bracketed; no DNS, zone, or mapped IPv6 |
-| Allowed IPs | Canonical networks; exact duplicates prohibited across all peers on that WireGuard interface; overlaps are not generically forbidden |
+| Allowed IPs | Canonical networks; exact duplicates prohibited within a peer and across all **enabled** peers on that WireGuard interface (a disabled peer may reuse one); overlaps are not generically forbidden |
 | Keepalive | 0..65535 seconds; 0 means disabled |
 | Route destination | Canonical network |
 | Route gateway | Optional canonical numeric address; same family as destination, no mapped IPv6 or zone |
@@ -2880,6 +2899,7 @@ interface ManagedInterface {
 }
 
 interface Peer {
+  enabled?: boolean; // omitted means true in requests; responses always include it
   public_key: string;
   endpoint?: string;
   allowed_ips: string[];

@@ -207,6 +207,8 @@ pub struct WireGuard {
 pub struct Peer {
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
+    #[serde(default = "yes")]
+    pub enabled: bool,
     pub public_key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint: String,
@@ -681,6 +683,17 @@ impl Config {
         if let Some(routes) = value["routes"].as_array_mut() {
             routes.retain(|route| route["enabled"] == true);
         }
+        if let Some(interfaces) = value["interfaces"].as_array_mut() {
+            for interface in interfaces {
+                if let Some(peers) = interface
+                    .get_mut("wireguard")
+                    .and_then(|wireguard| wireguard.get_mut("peers"))
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    peers.retain(|peer| peer["enabled"] == true);
+                }
+            }
+        }
         Ok(value)
     }
 
@@ -868,9 +881,15 @@ impl Config {
                             (0..=65535).contains(&p.persistent_keepalive_seconds),
                             "invalid keepalive"
                         );
+                        let mut own = BTreeSet::new();
                         for a in &p.allowed_ips {
                             canonical_prefix(a, true)?;
-                            ensure!(allowed.insert(a), "duplicate WireGuard allowed IP");
+                            ensure!(own.insert(a), "duplicate WireGuard allowed IP");
+                            // A disabled spare may reuse a prefix; only installed peers must not overlap.
+                            ensure!(
+                                !p.enabled || allowed.insert(a),
+                                "duplicate WireGuard allowed IP"
+                            );
                         }
                     }
                 }

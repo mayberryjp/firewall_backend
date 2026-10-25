@@ -649,6 +649,7 @@ fn wireguard_keys_endpoints_and_allowed_ips() {
         listen_port: 51820,
         peers: vec![Peer {
             metadata: Default::default(),
+            enabled: true,
             public_key: base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
             endpoint: "[2001:db8::1]:51820".into(),
             allowed_ips: vec!["198.51.100.0/24".into()],
@@ -675,6 +676,86 @@ fn wireguard_keys_endpoints_and_allowed_ips() {
     bad.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint = "host.invalid:1".into();
     assert!(bad.validate().is_err());
 }
+#[test]
+fn wireguard_peer_enabled_defaults_true_and_disabled_peers_are_saved_but_not_installed() {
+    use base64::Engine as _;
+    let key = |byte: u8| base64::engine::general_purpose::STANDARD.encode([byte; 32]);
+    let mut config = candidate();
+    config.interfaces[0].kind = "wireguard".into();
+    let peer = |byte: u8, ip: &str| Peer {
+        metadata: Default::default(),
+        enabled: true,
+        public_key: key(byte),
+        endpoint: String::new(),
+        allowed_ips: vec![ip.into()],
+        persistent_keepalive_seconds: 25,
+    };
+    config.interfaces[0].wireguard = Some(WireGuard {
+        key_ref: "lab-key".into(),
+        listen_port: 51820,
+        peers: vec![peer(1, "198.51.100.0/24"), peer(2, "203.0.113.0/24")],
+    });
+    config.validate().unwrap();
+    let installed = |config: &Config| -> Vec<String> {
+        config.operational_value().unwrap()["interfaces"][0]["wireguard"]["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|peer| peer["public_key"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(installed(&config), [key(1), key(2)]);
+    let mut value = serde_json::to_value(&config).unwrap();
+    let saved = &mut value["interfaces"][0]["wireguard"]["peers"][0];
+    assert_eq!(saved["enabled"], true);
+    saved.as_object_mut().unwrap().remove("enabled");
+    let defaulted: Config = serde_json::from_value(value).unwrap();
+    assert!(defaulted.interfaces[0].wireguard.as_ref().unwrap().peers[0].enabled);
+    for invalid in [json!(null), json!("false"), json!(0)] {
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["interfaces"][0]["wireguard"]["peers"][0]["enabled"] = invalid;
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
+    config.interfaces[0].wireguard.as_mut().unwrap().peers[0].enabled = false;
+    config.validate().unwrap();
+    assert_eq!(installed(&config), [key(2)]);
+    let saved = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        saved["interfaces"][0]["wireguard"]["peers"][0]["enabled"],
+        false
+    );
+    assert_eq!(serde_json::from_value::<Config>(saved).unwrap(), config);
+    // Disabled peers are still validated and keep a unique identity.
+    let mut bad = config.clone();
+    bad.interfaces[0].wireguard.as_mut().unwrap().peers[0].public_key = "bad".into();
+    assert!(bad.validate().is_err());
+    let mut bad = config.clone();
+    bad.interfaces[0].wireguard.as_mut().unwrap().peers[0].public_key = key(2);
+    assert!(bad.validate().is_err());
+    let mut bad = config.clone();
+    bad.interfaces[0].wireguard.as_mut().unwrap().peers[0].allowed_ips =
+        vec!["198.51.100.0/24".into(), "198.51.100.0/24".into()];
+    assert!(bad.validate().is_err());
+    // A disabled spare may reuse a prefix, but two installed peers may not.
+    let mut spare = config.clone();
+    spare.interfaces[0].wireguard.as_mut().unwrap().peers[0].allowed_ips =
+        vec!["203.0.113.0/24".into()];
+    spare.validate().unwrap();
+    assert_eq!(installed(&spare), [key(2)]);
+    spare.interfaces[0].wireguard.as_mut().unwrap().peers[0].enabled = true;
+    assert!(spare.validate().is_err());
+    // No other interface gains a wireguard object in the projection.
+    let mut other = candidate();
+    other.interfaces.push(other.interfaces[0].clone());
+    other.interfaces[1].name = "lan1".into();
+    other.interfaces[1].addresses = vec!["192.0.2.9/24".into()];
+    assert!(
+        other.operational_value().unwrap()["interfaces"][1]
+            .get("wireguard")
+            .is_none()
+    );
+}
+
 #[test]
 fn relay_requires_servers_and_unique_bound_address() {
     let mut c = candidate();

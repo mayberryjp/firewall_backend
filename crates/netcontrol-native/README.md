@@ -301,6 +301,13 @@ pure rename with the same action leaves the kernel unchanged. A deviceless route
 with a gateway or another device is drift. Foreign deviceless routes and initial
 adoption are unaffected.
 
+WireGuard peers default to enabled when `enabled` is omitted. A disabled peer stays
+in core configuration and history but is excluded from the operational plan, so its
+peer is replaced out of the kernel device on the next apply and absent from runtime
+statistics; toggling reconciles only that interface's peer set (the device is
+verified, then re-applied when it differs), including rollback and restart
+recovery. Disabled peers do not count toward allowed-network overlap checks.
+
 Routes use protocol 242 and table 254 (main) or tables 10000–19999. Policy rules
 use priorities 10000–19999 and those same target tables. Outside validated
 first-start inheritance, unowned kernel/DHCP/

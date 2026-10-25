@@ -390,6 +390,11 @@ pub(crate) fn prepare(
         let mut ignored_ipv6 = 0u64;
         let mut malformed = 0u64;
         let mut filtered = 0u64;
+        let mut dropped = 0u64;
+        ctx.update(|s| {
+            s["dropped_packets"] = serde_json::json!("0");
+            s["statistics_complete"] = serde_json::json!(true);
+        });
         let domain = rand::random::<u32>();
         let mut last_flush = Instant::now();
         let export = |batch: &[(Key, Flow)], sequence: &mut u32, exports: &mut u64| -> Result<()> {
@@ -575,12 +580,10 @@ pub(crate) fn prepare(
                         &mut size,
                     )
                 })?;
-                ensure!(
-                    stats.tp_drops == 0,
-                    "AF_PACKET dropped {} packets; statistics incomplete",
-                    stats.tp_drops
-                );
+                dropped += u64::from(stats.tp_drops);
                 ctx.update(|s| {
+                    s["dropped_packets"] = serde_json::json!(dropped.to_string());
+                    s["statistics_complete"] = serde_json::json!(dropped == 0);
                     s["active_flows"] = serde_json::json!(table.len());
                     s["exported_flows"] = serde_json::json!(exports);
                     s["excluded_packets"] = serde_json::json!(ignored_ipv6);

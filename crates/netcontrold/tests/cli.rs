@@ -545,6 +545,60 @@ fn every_current_example_can_be_loaded_checked_and_edited_without_live_writes() 
 }
 
 #[test]
+fn wireguard_peer_can_be_disabled_and_reenabled_without_losing_its_settings() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "interface wg0 wireguard");
+    f.ok(&mut cli, "role wan");
+    f.ok(&mut cli, "mtu 1420");
+    f.ok(&mut cli, "wireguard key-ref wg0");
+    f.ok(&mut cli, "wireguard listen-port 51820");
+    let public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    let peer = json!({
+        "public_key":public_key,"endpoint":"203.0.113.1:51820",
+        "allowed_ips":["198.51.100.0/24"],"persistent_keepalive_seconds":25
+    });
+    f.ok(&mut cli, &format!("wireguard peer {peer}"));
+    f.ok(&mut cli, "exit");
+    let enabled = |cli: &mut CliSession| -> Value {
+        let output = f.ok(cli, "show candidate-config");
+        let json = output.split_once(":\n").unwrap().1;
+        let candidate: Value = serde_json::from_str(json).unwrap();
+        candidate["interfaces"][0]["wireguard"]["peers"][0]["enabled"].clone()
+    };
+    assert_eq!(enabled(&mut cli), true);
+    f.ok(
+        &mut cli,
+        "set /interfaces/0/wireguard/peers/0/enabled false",
+    );
+    f.ok(&mut cli, "commit check");
+    assert_eq!(enabled(&mut cli), false);
+    let candidate = f.ok(&mut cli, "show candidate-config");
+    assert!(candidate.contains(public_key) && candidate.contains("203.0.113.1:51820"));
+    f.fail(
+        &mut cli,
+        "set /interfaces/0/wireguard/peers/0/enabled null",
+        "",
+    );
+    f.fail(
+        &mut cli,
+        "set /interfaces/0/wireguard/peers/0/enabled \"no\"",
+        "",
+    );
+    f.ok(&mut cli, "set /interfaces/0/wireguard/peers/0/enabled true");
+    assert_eq!(enabled(&mut cli), true);
+    f.ok(&mut cli, "interface wg0");
+    let disabled =
+        json!({"enabled":false,"public_key":public_key,"allowed_ips":["198.51.100.0/24"]});
+    f.ok(&mut cli, &format!("wireguard peer {disabled}"));
+    f.ok(&mut cli, "exit");
+    assert_eq!(enabled(&mut cli), false);
+    f.ok(&mut cli, "commit check");
+    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+}
+
+#[test]
 fn wireguard_peer_staging_and_removal_preserve_interface_settings() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

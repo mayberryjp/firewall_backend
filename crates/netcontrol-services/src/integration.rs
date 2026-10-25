@@ -177,6 +177,77 @@ fn native_ntp_udp_fixture_validates_origin_without_changing_clock() {
 }
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
+fn native_af_packet_drops_report_incomplete_statistics_and_keep_exporting() {
+    isolated(|| {
+        let collector = UdpSocket::bind("127.0.0.1:2055")?;
+        collector.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let target = UdpSocket::bind("127.0.0.1:25001")?;
+        let sender = UdpSocket::bind("127.0.0.1:25002")?;
+        let config = config::Flow {
+            name: "loss-test".into(),
+            enabled: true,
+            interface: "lo".into(),
+            collector: "127.0.0.1:2055".into(),
+            export_version: 5,
+            sampling_rate: 1,
+            max_flows: 100,
+            snaplen: 128,
+            promiscuous: false,
+            capture_filter: String::new(),
+            timeouts: std::collections::BTreeMap::from([("general".into(), 1)]),
+        };
+        let mut worker = worker::Worker::start(
+            "flow-loss-test".into(),
+            None,
+            json!({"name":"loss-test"}),
+            move || {
+                let run = flow::prepare(config, true)?;
+                // Fill the capture socket before its receive loop starts.
+                for _ in 0..16_384 {
+                    sender.send_to(&[0; 1024], target.local_addr()?)?;
+                }
+                Ok(run)
+            },
+        )?;
+        let mut buffer = [0; 2048];
+        let n = collector.recv(&mut buffer)?;
+        ensure!(n >= 72 && buffer[..2] == 5u16.to_be_bytes(), "missing export after capture loss");
+        let start = Instant::now();
+        while worker.snapshot()["statistics_complete"] != false
+            && start.elapsed() < Duration::from_secs(3)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let first = worker.snapshot();
+        let dropped: u64 = first["dropped_packets"]
+            .as_str()
+            .context("missing exact capture-drop counter")?
+            .parse()?;
+        ensure!(dropped > 0, "capture-drop fixture did not overflow the socket");
+        ensure!(
+            first["state"] == "running" && first["statistics_complete"] == false,
+            "capture loss stopped the worker or was hidden: {first}"
+        );
+        let target = UdpSocket::bind("127.0.0.1:25003")?;
+        let sender = UdpSocket::bind("127.0.0.1:25004")?;
+        sender.send_to(b"after-loss", target.local_addr()?)?;
+        let n = collector.recv(&mut buffer)?;
+        ensure!(n >= 72 && buffer[..2] == 5u16.to_be_bytes(), "export did not continue");
+        worker.shutdown()?;
+        let final_status = worker.snapshot();
+        ensure!(
+            final_status["state"] == "stopped"
+                && final_status["statistics_complete"] == false
+                && final_status["dropped_packets"].as_str().context("missing drops")?.parse::<u64>()? >= dropped
+                && final_status["exported_flows"].as_u64() > first["exported_flows"].as_u64()
+                && final_status.get("error").is_none(),
+            "loss accounting, continued export or shutdown failed: {final_status}"
+        );
+        Ok(())
+    });
+}
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
 fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
     isolated(|| {
         let directory =
