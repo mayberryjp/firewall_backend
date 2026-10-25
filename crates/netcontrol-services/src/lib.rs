@@ -17,7 +17,10 @@ mod worker;
 use anyhow::{Context, Result, bail, ensure};
 use config::Config;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 use worker::Worker;
 
 pub struct GatewayProbe {
@@ -202,12 +205,7 @@ impl Services {
         let previous = Config::parse(before)?;
         let next = Config::parse(after)?;
         self.preflight(&next)?;
-        if self.config == next
-            && self
-                .workers
-                .values()
-                .all(|w| w.snapshot()["state"] == "running")
-        {
+        if self.config == next && self.workers_current(&next) {
             return Ok(());
         }
         ensure!(
@@ -232,6 +230,15 @@ impl Services {
         self.config = next;
         self.error = None;
         Ok(())
+    }
+    /// True only when exactly the workers this configuration needs exist and all are running.
+    /// A shutdown leaves the stored configuration in place, so an empty worker set is not current.
+    fn workers_current(&self, c: &Config) -> bool {
+        self.workers.keys().cloned().collect::<BTreeSet<_>>() == expected_workers(c)
+            && self
+                .workers
+                .values()
+                .all(|w| w.snapshot()["state"] == "running")
     }
     fn start(&mut self, c: &Config) -> Result<()> {
         #[cfg(target_os = "linux")]
@@ -498,6 +505,34 @@ impl Services {
         self.stop_all()
     }
 }
+fn expected_workers(c: &Config) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    if c.ntp.enabled {
+        keys.insert("ntp".to_owned());
+    }
+    if c.syslog.enabled {
+        keys.insert("syslog".to_owned());
+    }
+    if c.vnstat.enabled {
+        keys.extend(["vnstat-host".to_owned(), "vnstat-managed".to_owned()]);
+    }
+    if c.interfaces.iter().any(|i| i.dhcp_relay.enabled) {
+        keys.insert("dhcp-relay".to_owned());
+    }
+    keys.extend(
+        c.softflowd
+            .iter()
+            .filter(|f| f.enabled)
+            .map(|f| format!("flow:{}", f.name)),
+    );
+    keys.extend(
+        c.gateway_monitors
+            .iter()
+            .filter(|m| m.enabled && m.mode == "explicit")
+            .map(|m| format!("gateway:{}", m.name)),
+    );
+    keys
+}
 fn stringify_counts(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -669,6 +704,50 @@ mod tests {
             json!([])
         );
         services.shutdown().unwrap();
+        drop(services);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn a_shutdown_leaves_the_config_but_apply_must_not_treat_empty_workers_as_current() {
+        let directory = std::env::current_dir().unwrap().join(format!(
+            "services-workers-current-{}",
+            rand::random::<u64>()
+        ));
+        let mut services = Services::new(ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: true,
+            allow_gateway_monitoring: false,
+        })
+        .unwrap();
+        let idle = || {
+            Worker::start("fixture".into(), None, json!({}), || {
+                Ok(Box::new(|ctx| {
+                    while !ctx.wait(std::time::Duration::from_millis(10)) {}
+                    Ok(())
+                }))
+            })
+            .unwrap()
+        };
+        let disabled = Config::parse(&json!({})).unwrap();
+        let enabled = Config::parse(&json!({
+            "ntp":{"enabled":true,"servers":["192.0.2.1"]},
+            "vnstat":{"enabled":true}
+        }))
+        .unwrap();
+        assert!(services.workers_current(&disabled));
+        assert!(!services.workers_current(&enabled));
+        for name in ["ntp", "vnstat-host"] {
+            services.workers.insert(name.into(), idle());
+        }
+        assert!(!services.workers_current(&enabled));
+        assert!(!services.workers_current(&disabled));
+        services.workers.insert("vnstat-managed".into(), idle());
+        assert!(services.workers_current(&enabled));
+        services.workers.insert("syslog".into(), idle());
+        assert!(!services.workers_current(&enabled));
+        services.shutdown().unwrap();
+        assert!(!services.workers_current(&enabled));
         drop(services);
         std::fs::remove_dir_all(directory).unwrap();
     }

@@ -894,6 +894,35 @@ fn native_vnstat_statistics_delegates_live_history_and_scope() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn native_network_only_change_restarts_the_services_it_stopped() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut options = fixture.options();
+    options.allow_host_services = true;
+    let mut native = Native::open(options)?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    // The MTU is not part of the services view, so only the stop/start around the apply matters.
+    let build = |mtu: u32| -> Result<Config> {
+        config(json!({
+            "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":mtu,"up":true,
+                "addresses":["192.0.2.1/24"]}],
+            "vnstat":{"enabled":true}
+        }))
+    };
+    let first = build(1500)?;
+    native.apply(&empty, &first)?;
+    native.observe(&first)?;
+    let second = build(1400)?;
+    native.apply(&first, &second)?;
+    native.observe(&second)?;
+    native.apply(&second, &first)?;
+    native.observe(&first)?;
+    native.apply(&first, &empty)?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/WireGuard modules"]
 fn native_wireguard_peer_enabled_toggle_restart_and_rollback() -> Result<()> {
     let fixture = Fixture::new()?;

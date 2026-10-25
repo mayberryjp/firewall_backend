@@ -62,26 +62,36 @@ pub(crate) fn bounded_slew(offset_seconds: f64) -> Result<(i64, f64)> {
     ))
 }
 #[cfg(target_os = "linux")]
+fn open_server(host: &str, ipv6_enabled: bool) -> Result<std::net::UdpSocket> {
+    use std::net::UdpSocket;
+    let address = super::resolve::resolve(host, 123, ipv6_enabled)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no NTP server address"))?;
+    let s = UdpSocket::bind(if address.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })?;
+    s.connect(address)?;
+    s.set_nonblocking(true)?;
+    Ok(s)
+}
+#[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     config: super::config::Ntp,
     ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
-    use std::{net::UdpSocket, time::Duration};
+    use std::time::Duration;
     super::linux::capabilities(25)?;
+    // Unresolvable servers are retried every poll; DNS may be down when the worker starts.
     let mut sockets = Vec::new();
+    let mut pending = Vec::new();
     for host in config.servers {
-        let address = super::resolve::resolve(&host, 123, ipv6_enabled)?
-            .into_iter()
-            .next()
-            .unwrap();
-        let s = UdpSocket::bind(if address.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })?;
-        s.connect(address)?;
-        s.set_nonblocking(true)?;
-        sockets.push((host, s));
+        match open_server(&host, ipv6_enabled) {
+            Ok(socket) => sockets.push((host, socket)),
+            Err(_) => pending.push(host),
+        }
     }
     // Query privilege/clock support before reporting a running service.
     let mut check: libc::timex = unsafe { std::mem::zeroed() };
@@ -94,6 +104,8 @@ pub(crate) fn prepare(
         poll(
             ctx,
             sockets,
+            pending,
+            move |host| open_server(host, ipv6_enabled),
             Duration::from_secs(64),
             Duration::from_secs(3),
             |requested_us| {
@@ -113,7 +125,9 @@ pub(crate) fn prepare(
 #[cfg(any(target_os = "linux", test))]
 fn poll(
     ctx: super::worker::ContextState,
-    sockets: Vec<(String, std::net::UdpSocket)>,
+    mut sockets: Vec<(String, std::net::UdpSocket)>,
+    mut pending: Vec<String>,
+    mut open: impl FnMut(&str) -> Result<std::net::UdpSocket>,
     interval: std::time::Duration,
     response_timeout: std::time::Duration,
     mut slew: impl FnMut(i64) -> Result<()>,
@@ -124,6 +138,16 @@ fn poll(
     while !ctx.stopping() {
         let mut samples = Vec::new();
         let mut errors = Vec::new();
+        pending.retain(|host| match open(host) {
+            Ok(socket) => {
+                sockets.push((host.clone(), socket));
+                false
+            }
+            Err(error) => {
+                errors.push(format!("{host}: {error:#}"));
+                true
+            }
+        });
         for (host, socket) in &sockets {
             if ctx.stopping() {
                 break;
@@ -243,6 +267,8 @@ mod tests {
                 poll(
                     ctx,
                     vec![("fixture".into(), client)],
+                    vec![],
+                    |_| anyhow::bail!("unused"),
                     Duration::from_millis(5),
                     Duration::from_millis(100),
                     |requested| {
@@ -291,12 +317,60 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_servers_keep_the_worker_running_and_are_retried_each_poll() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server.local_addr().unwrap()).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut client = Some(client);
+        let mut attempts = 0;
+        let mut worker = Worker::start("ntp".into(), None, json!({}), move || {
+            Ok(Box::new(move |ctx| {
+                poll(
+                    ctx,
+                    vec![],
+                    vec!["late.example.test".into()],
+                    move |_| {
+                        attempts += 1;
+                        if attempts < 3 {
+                            anyhow::bail!("synthetic resolver outage");
+                        }
+                        Ok(client.take().expect("opened once"))
+                    },
+                    Duration::from_millis(5),
+                    Duration::from_millis(100),
+                    |_| Ok(()),
+                )
+            }))
+        })
+        .unwrap();
+        let unavailable = wait_for(&worker, |s| s["sample_status"] == "unavailable");
+        assert_eq!(unavailable["state"], "running");
+        assert!(
+            unavailable["error"]
+                .as_str()
+                .unwrap()
+                .contains("late.example.test: synthetic resolver outage")
+        );
+        respond(&server);
+        let available = wait_for(&worker, |s| s["sample_status"] == "available");
+        assert_eq!(available["server"], "late.example.test");
+        assert!(available.get("error").is_none());
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn missing_samples_shutdown_interrupts_poll_wait() {
         let mut worker = Worker::start("ntp".into(), None, json!({}), || {
             Ok(Box::new(|ctx| {
                 poll(
                     ctx,
                     vec![],
+                    vec![],
+                    |_| anyhow::bail!("unused"),
                     Duration::from_secs(64),
                     Duration::from_secs(3),
                     |_| panic!("no samples must not adjust the clock"),
@@ -325,6 +399,8 @@ mod tests {
                 poll(
                     ctx,
                     vec![("fixture".into(), client)],
+                    vec![],
+                    |_| anyhow::bail!("unused"),
                     Duration::from_millis(5),
                     Duration::from_secs(1),
                     |_| anyhow::bail!("injected clock adjustment failure"),

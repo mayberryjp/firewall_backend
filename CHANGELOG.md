@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- Saving a networking-only change (for example adding a DNS server or changing an MTU)
+  while an appliance service such as NTP, syslog or vnStat is enabled no longer fails
+  with `native service ntp is not healthy ... "state":"stopped"`, followed by a failed
+  rollback and blocked writes. The native apply stops all service workers before changing
+  interfaces, but the services layer treated an empty worker set as already current when
+  the services configuration was unchanged, so nothing restarted them. Workers are now
+  restarted unless exactly the expected set is running. NTP also no longer fails to start
+  when a server name cannot be resolved (for example DNS or the WAN is down): resolution
+  is retried every poll and the row shows `sample_status: "unavailable"` with the error.
+  No API or schema change; recommended bump: patch; baseline unknown. Frontend action: none.
+
 - `upgrade.sh`/`install.sh` journald-forwarding setup no longer aborts (and rolls the
   upgrade back) on a second run: once `rsyslog.service` is masked, its `syslog.service`
   alias reports load state `error`. A logger in that state is now accepted only when
