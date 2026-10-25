@@ -81,6 +81,112 @@ fn config(value: Value) -> Result<Config> {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn native_blackhole_routes_drop_traffic_change_action_rename_rollback_and_restart() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let options = fixture.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let build = |name: &str, action: &str| -> Result<Config> {
+        let config = config(json!({
+            "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,
+                "addresses":["192.0.2.1/24","2001:db8::1/64"]}],
+            "blackhole":{"name":name,"action":action},
+            "routes":[
+                {"enabled":true,"destination":"198.51.100.0/24","interface":name,"table":254,"metric":50},
+                {"enabled":true,"destination":"2001:db8:dead::/48","interface":name,"table":254,"metric":50},
+                {"enabled":true,"destination":"203.0.113.0/24","interface":name,"table":10000,"metric":60},
+                {"enabled":true,"destination":"192.0.2.128/25","interface":"lan0","table":254,"metric":70}
+            ]
+        }))?;
+        config.validate()?;
+        Ok(config)
+    };
+    // The kernel's own verdict when a socket tries to reach each blackholed destination.
+    let verdict = |native: &Native, destination: &str| -> Result<Option<i32>> {
+        let destination: std::net::IpAddr = destination.parse()?;
+        session(native.namespace.clone(), move |_, _| {
+            let socket = std::net::UdpSocket::bind(if destination.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            })?;
+            Ok(socket
+                .connect((destination, 9))
+                .err()
+                .and_then(|error| error.raw_os_error()))
+        })
+    };
+    let installed = |native: &Native, desired: &Config| -> Result<usize> {
+        let network = Network::parse(&desired.operational_value()?)?;
+        let keys = options.keys.clone();
+        session(native.namespace.clone(), move |rt, handle| {
+            let snapshot = rt.block_on(networking::boot_snapshot(handle, &network, &keys))?;
+            Ok(snapshot["routes"].as_array().unwrap().len())
+        })
+    };
+    let blackhole = build("bh0", "blackhole")?;
+    native.apply(&empty, &blackhole)?;
+    assert_eq!(native.observe(&blackhole)?, blackhole);
+    assert_eq!(installed(&native, &blackhole)?, 4);
+    for destination in ["198.51.100.7", "2001:db8:dead::7"] {
+        assert_eq!(
+            verdict(&native, destination)?,
+            Some(libc::EINVAL),
+            "{destination}"
+        );
+    }
+    assert_eq!(verdict(&native, "192.0.2.200")?, None);
+
+    let unreachable = build("bh0", "unreachable")?;
+    native.apply(&blackhole, &unreachable)?;
+    assert_eq!(native.observe(&unreachable)?, unreachable);
+    assert_eq!(verdict(&native, "198.51.100.7")?, Some(libc::EHOSTUNREACH));
+    assert_eq!(
+        verdict(&native, "2001:db8:dead::7")?,
+        Some(libc::EHOSTUNREACH)
+    );
+    let prohibit = build("bh0", "prohibit")?;
+    native.apply(&unreachable, &prohibit)?;
+    assert_eq!(native.observe(&prohibit)?, prohibit);
+    assert_eq!(verdict(&native, "198.51.100.7")?, Some(libc::EACCES));
+    assert_eq!(verdict(&native, "2001:db8:dead::7")?, Some(libc::EACCES));
+
+    // Renaming leaves identical kernel routes and must not be treated as drift.
+    let renamed = build("drop0", "prohibit")?;
+    native.apply(&prohibit, &renamed)?;
+    assert_eq!(native.observe(&renamed)?, renamed);
+    assert_eq!(installed(&native, &renamed)?, 4);
+    assert_eq!(verdict(&native, "198.51.100.7")?, Some(libc::EACCES));
+
+    let mut disabled = renamed.clone();
+    disabled.routes[0].enabled = false;
+    native.apply(&renamed, &disabled)?;
+    assert_eq!(installed(&native, &disabled)?, 3);
+    assert_eq!(verdict(&native, "198.51.100.7")?, Some(libc::ENETUNREACH));
+    native.apply(&disabled, &renamed)?;
+
+    drop(native);
+    let mut native = Native::open(options.clone())?;
+    native.repair(&renamed)?;
+    assert_eq!(native.observe(&renamed)?, renamed);
+    assert_eq!(verdict(&native, "198.51.100.7")?, Some(libc::EACCES));
+
+    let mut failing = build("drop0", "blackhole")?;
+    failing.ntp.enabled = true;
+    failing.ntp.servers = vec!["192.0.2.123".into()];
+    assert!(native.apply(&renamed, &failing).is_err());
+    assert_eq!(native.observe(&renamed)?, renamed);
+    assert_eq!(verdict(&native, "198.51.100.7")?, Some(libc::EACCES));
+
+    native.apply(&renamed, &empty)?;
+    assert_eq!(installed(&native, &empty)?, 0);
+    assert_eq!(verdict(&native, "198.51.100.7")?, Some(libc::ENETUNREACH));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
 fn native_static_route_enabled_toggle_restart_and_rollback() -> Result<()> {
     let fixture = Fixture::new()?;
     let options = fixture.options();

@@ -270,6 +270,17 @@ configuration but are excluded from the operational plan. Toggling reconciles
 only owned routes, including rollback/recovery; inherited static routes start
 enabled. DHCP runtime routes are unchanged.
 
+The optional `blackhole` section names one deviceless drop target. Routes whose
+`interface` equals that name are installed as kernel `blackhole`, `unreachable`
+or `prohibit` routes (per its `action`) with no output device, no gateway and
+universe scope, still protocol 242 in table 254 or 10000–19999. Verification
+maps those route types back to the configured name; IPv6 kernel routes report
+the loopback device, which is accepted. A deviceless route whose type no longer
+matches the configured action is stale: it is removed and reinstalled, while a
+pure rename with the same action leaves the kernel unchanged. A deviceless route
+with a gateway or another device is drift. Foreign deviceless routes and initial
+adoption are unaffected.
+
 Routes use protocol 242 and table 254 (main) or tables 10000–19999. Policy rules
 use priorities 10000–19999 and those same target tables. Outside validated
 first-start inheritance, unowned kernel/DHCP/

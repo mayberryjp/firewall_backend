@@ -261,7 +261,10 @@ and reported in `ignored_fields`). There is no
 Ordinary destination routes accept an `enabled` boolean (omission defaults to true); disabled
 records stay saved but are not installed. Use table 254 (main) for normal traffic.
 An enabled explicit gateway monitor requires a matching enabled route. See the
-[route contract](FRONTEND_SPEC.md#64-routes). Saved routes without the field load
+[route contract](FRONTEND_SPEC.md#64-routes). A single optional `blackhole` section
+(`name`, plus `action` of `blackhole`, `unreachable` or `prohibit`) lets any number
+of routes use that name as their `interface` to drop matching traffic in the
+routing decision; it is a deviceless kernel route, not a link. Saved routes without the field load
 as enabled. Enabled gateway monitors retain backend-managed host-source rules for
 their explicit routing tables. Monitors sharing a source must share a table;
 these internal rules affect all traffic from that exact source, not only probes.

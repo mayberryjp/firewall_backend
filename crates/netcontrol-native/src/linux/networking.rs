@@ -82,6 +82,84 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn deviceless_kernel_route_types_decode_only_as_the_configured_blackhole() -> Result<()> {
+        let names = BTreeMap::from([(1, "lo".to_string()), (7, "test0".to_string())]);
+        let configured = |action: &str| netcontrol_core::BlackholeConfig {
+            name: "bh0".into(),
+            action: action.into(),
+            ..Default::default()
+        };
+        for (family, destination, length, device, kind, action) in [
+            (
+                AddressFamily::Inet,
+                "198.51.100.0",
+                24,
+                None,
+                RouteType::BlackHole,
+                "blackhole",
+            ),
+            (
+                AddressFamily::Inet6,
+                "2001:db8:dead::",
+                48,
+                Some(1),
+                RouteType::Unreachable,
+                "unreachable",
+            ),
+            (
+                AddressFamily::Inet,
+                "203.0.113.0",
+                24,
+                None,
+                RouteType::Prohibit,
+                "prohibit",
+            ),
+        ] {
+            let mut message = RouteMessage::default();
+            message.header.address_family = family;
+            message.header.kind = kind;
+            message.header.scope = RouteScope::Universe;
+            message.header.table = 254;
+            message.header.destination_prefix_length = length;
+            let address = match destination.parse::<IpAddr>()? {
+                IpAddr::V4(ip) => RouteAddress::Inet(ip),
+                IpAddr::V6(ip) => RouteAddress::Inet6(ip),
+            };
+            message.attributes = vec![
+                RouteAttribute::Destination(address),
+                RouteAttribute::Priority(50),
+            ];
+            if let Some(device) = device {
+                message.attributes.push(RouteAttribute::Oif(device));
+            }
+            let route = decode_owned_route(&message, &names, Some(&configured(action)))?;
+            assert_eq!(route.interface, "bh0");
+            assert!(route.gateway.is_empty());
+            assert_eq!(route.metric, 50);
+            let other = decode_owned_route(&message, &names, Some(&configured("blackhole")))?;
+            let expected = if action == "blackhole" {
+                "bh0".to_string()
+            } else {
+                format!("blackhole:{action}")
+            };
+            assert_eq!(other.interface, expected);
+            assert!(decode_route(&message, &names).is_err());
+            let mut wrong_device = message.clone();
+            wrong_device.attributes.push(RouteAttribute::Oif(7));
+            assert!(decode_owned_route(&wrong_device, &names, Some(&configured(action))).is_err());
+            let mut with_gateway = message.clone();
+            with_gateway
+                .attributes
+                .push(RouteAttribute::Gateway(match family {
+                    AddressFamily::Inet => RouteAddress::Inet("192.0.2.1".parse()?),
+                    _ => RouteAddress::Inet6("2001:db8::1".parse()?),
+                }));
+            assert!(decode_owned_route(&with_gateway, &names, Some(&configured(action))).is_err());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -643,8 +721,36 @@ async fn owned_routes(handle: &Handle) -> Result<Vec<RouteMessage>> {
     Ok(owned)
 }
 pub(super) fn decode_route(message: &RouteMessage, names: &BTreeMap<u32, String>) -> Result<Route> {
+    decode_owned_route(message, names, None)
+}
+
+fn blackhole_type(action: &str) -> Result<RouteType> {
+    match action {
+        "blackhole" => Ok(RouteType::BlackHole),
+        "unreachable" => Ok(RouteType::Unreachable),
+        "prohibit" => Ok(RouteType::Prohibit),
+        _ => bail!("unsupported blackhole action"),
+    }
+}
+
+fn blackhole_action(kind: &RouteType) -> Option<&'static str> {
+    match kind {
+        RouteType::BlackHole => Some("blackhole"),
+        RouteType::Unreachable => Some("unreachable"),
+        RouteType::Prohibit => Some("prohibit"),
+        _ => None,
+    }
+}
+
+/// `blackhole` is `Some` only for owned routes, where deviceless kernel route types map to its name.
+pub(super) fn decode_owned_route(
+    message: &RouteMessage,
+    names: &BTreeMap<u32, String>,
+    blackhole: Option<&netcontrol_core::BlackholeConfig>,
+) -> Result<Route> {
+    let action = blackhole.and_then(|_| blackhole_action(&message.header.kind));
     ensure!(
-        message.header.kind == RouteType::Unicast
+        (message.header.kind == RouteType::Unicast || action.is_some())
             && message.header.source_prefix_length == 0
             && message.header.tos == 0
             && message.header.flags.is_empty(),
@@ -671,16 +777,32 @@ pub(super) fn decode_route(message: &RouteMessage, names: &BTreeMap<u32, String>
             _ => bail!("unsupported owned route attribute"),
         }
     }
-    let scope = if destination.is_ipv4() && gateway.is_empty() {
+    let scope = if action.is_some() {
+        RouteScope::Universe
+    } else if destination.is_ipv4() && gateway.is_empty() {
         RouteScope::Link
     } else {
         RouteScope::Universe
     };
     ensure!(message.header.scope == scope, "owned route scope changed");
+    let interface = match action {
+        // IPv6 kernel blackhole routes report the loopback device; IPv4 ones report none.
+        Some(action) => {
+            ensure!(
+                gateway.is_empty() && interface.as_deref().is_none_or(|name| name == "lo"),
+                "unsupported owned blackhole route"
+            );
+            blackhole
+                .filter(|config| config.configured() && config.action == action)
+                .map(|config| config.name.clone())
+                .unwrap_or_else(|| format!("blackhole:{action}"))
+        }
+        None => interface.context("owned route interface missing")?,
+    };
     Ok(Route {
         destination: format!("{destination}/{}", message.header.destination_prefix_length),
         gateway,
-        interface: interface.context("owned route interface missing")?,
+        interface,
         table,
         metric,
     })
@@ -816,7 +938,7 @@ pub async fn boot_snapshot(handle: &Handle, expected: &Network, keys: &Path) -> 
     let routes = owned_routes(handle)
         .await?
         .iter()
-        .map(|r| decode_route(r, &names))
+        .map(|r| decode_owned_route(r, &names, Some(&expected.blackhole)))
         .collect::<Result<Vec<_>>>()?;
     let rules = owned_rules(handle)
         .await?
@@ -834,6 +956,7 @@ pub async fn boot_snapshot(handle: &Handle, expected: &Network, keys: &Path) -> 
     let mut value = serde_json::to_value(netcontrol_core::Config::empty())?;
     value["interfaces"] = serde_json::to_value(actual)?;
     value["routes"] = serde_json::to_value(routes)?;
+    value["blackhole"] = serde_json::to_value(&expected.blackhole)?;
     value["_monitor_policy_rules"] = serde_json::to_value(rules)?;
     Ok(value)
 }
@@ -952,7 +1075,7 @@ pub async fn verify(
     let mut routes = owned_routes(handle)
         .await?
         .iter()
-        .map(|v| decode_route(v, &by_index))
+        .map(|v| decode_owned_route(v, &by_index, Some(&network.blackhole)))
         .collect::<Result<Vec<_>>>()?;
     routes.sort();
     crate::ensure_unchanged(routes == network.routes, "owned route drift")?;
@@ -999,7 +1122,7 @@ pub async fn reconcile(
         .collect();
     let mut present_routes = BTreeSet::new();
     for message in owned_routes(handle).await? {
-        let route = decode_route(&message, &by_index)?;
+        let route = decode_owned_route(&message, &by_index, Some(&after.blackhole))?;
         if after.routes.contains(&route) {
             present_routes.insert(route);
         } else {
@@ -1192,26 +1315,31 @@ pub async fn reconcile(
         if present_routes.contains(route) {
             continue;
         }
-        let index = available
-            .iter()
-            .find(|l| name(l) == route.interface)
-            .context("route interface unavailable")?
-            .header
-            .index;
         let (destination, length) = parse_prefix(&route.destination, true)?;
-        let scope = if destination.is_ipv4() && route.gateway.is_empty() {
-            RouteScope::Link
-        } else {
+        let blackhole = after.blackhole.targets(&route.interface);
+        let scope = if blackhole || !destination.is_ipv4() || !route.gateway.is_empty() {
             RouteScope::Universe
+        } else {
+            RouteScope::Link
         };
-        let request = handle
+        let mut request = handle
             .route()
             .add()
             .table_id(route.table)
             .priority(route.metric)
-            .output_interface(index)
             .protocol(RouteProtocol::Other(PROTOCOL))
             .scope(scope);
+        request = if blackhole {
+            request.kind(blackhole_type(&after.blackhole.action)?)
+        } else {
+            let index = available
+                .iter()
+                .find(|l| name(l) == route.interface)
+                .context("route interface unavailable")?
+                .header
+                .index;
+            request.output_interface(index)
+        };
         match destination {
             IpAddr::V4(ip) => {
                 let mut request = request.v4().destination_prefix(ip, length);

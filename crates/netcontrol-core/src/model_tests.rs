@@ -10,6 +10,65 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn blackhole_section_is_named_once_and_many_routes_may_target_it() {
+    let mut config = candidate();
+    assert!(!config.blackhole.configured());
+    assert_eq!(config.blackhole.action, "blackhole");
+    let route = |destination: &str, metric: i64| {
+        let mut route = config.routes[0].clone();
+        route.destination = destination.into();
+        route.interface = "bh0".into();
+        route.table = 254;
+        route.metric = metric;
+        route
+    };
+    let first = route("198.51.100.0/24", 50);
+    let second = route("2001:db8:dead::/48", 60);
+    let mut unconfigured = config.clone();
+    unconfigured.routes.push(first.clone());
+    assert!(unconfigured.validate().is_err());
+    config.blackhole.name = "bh0".into();
+    config.routes.extend([first, second]);
+    config.validate().unwrap();
+    for action in ["unreachable", "prohibit"] {
+        let mut valid = config.clone();
+        valid.blackhole.action = action.into();
+        valid.validate().unwrap();
+    }
+    let mut invalid = config.clone();
+    invalid.blackhole.action = "drop".into();
+    assert!(invalid.validate().is_err());
+    let mut invalid = config.clone();
+    invalid.routes[1].gateway = "192.0.2.254".into();
+    assert!(invalid.validate().is_err());
+    let mut invalid = config.clone();
+    invalid.blackhole.name = "lan0".into();
+    assert!(invalid.validate().is_err());
+    let mut invalid = config.clone();
+    invalid.blackhole.name = "bad name".into();
+    assert!(invalid.validate().is_err());
+    let mut invalid = config.clone();
+    invalid.ipv6_enabled = false;
+    assert!(invalid.validate().is_err());
+    let operational = config.operational_value().unwrap();
+    assert_eq!(operational["blackhole"]["name"], "bh0");
+    assert_eq!(operational["routes"].as_array().unwrap().len(), 3);
+    config.routes[1].enabled = false;
+    assert_eq!(
+        config.operational_value().unwrap()["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let roundtrip: Config = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+    assert_eq!(roundtrip, config);
+    let mut unknown = serde_json::to_value(&config).unwrap();
+    unknown["blackhole"]["device"] = json!("dummy0");
+    assert!(serde_json::from_value::<Config>(unknown).is_err());
+}
+
+#[test]
 fn mqtt_settings_do_not_change_native_operational_configuration() {
     let before = candidate();
     let mut after = before.clone();

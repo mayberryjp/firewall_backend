@@ -30,6 +30,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub dns: BTreeMap<String, DNSConfig>,
     pub routes: Vec<Route>,
+    pub blackhole: BlackholeConfig,
     pub firewall: Firewall,
     pub softflowd: Vec<SoftflowdConfig>,
     pub kernel: KernelConfig,
@@ -49,10 +50,39 @@ impl Default for Config {
             dhcp_clients: BTreeMap::new(),
             dns: BTreeMap::new(),
             routes: Vec::new(),
+            blackhole: Default::default(),
             firewall: Default::default(),
             softflowd: Vec::new(),
             kernel: Default::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlackholeConfig {
+    #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
+    pub name: String,
+    pub action: String,
+}
+
+impl Default for BlackholeConfig {
+    fn default() -> Self {
+        Self {
+            metadata: Default::default(),
+            name: String::new(),
+            action: "blackhole".into(),
+        }
+    }
+}
+
+impl BlackholeConfig {
+    pub fn configured(&self) -> bool {
+        !self.name.is_empty()
+    }
+    pub fn targets(&self, interface: &str) -> bool {
+        self.configured() && self.name == interface
     }
 }
 
@@ -582,6 +612,7 @@ impl Config {
             values.extend(dns.domains.iter().map(|domain| &domain.metadata));
         }
         values.extend(self.routes.iter().map(|route| &route.metadata));
+        values.push(&self.blackhole.metadata);
         values.extend(self.firewall.rules.iter().map(|rule| &rule.metadata));
         values.extend(
             self.firewall
@@ -959,13 +990,30 @@ impl Config {
                 );
             }
         }
+        let blackhole = &self.blackhole;
+        ensure!(
+            matches!(
+                blackhole.action.as_str(),
+                "blackhole" | "unreachable" | "prohibit"
+            ),
+            "blackhole action must be blackhole, unreachable or prohibit"
+        );
+        ensure!(
+            !blackhole.configured()
+                || (valid_interface_name(&blackhole.name) && !names.contains(&blackhole.name)),
+            "blackhole name must be a valid interface name not used by a managed interface"
+        );
         for r in &self.routes {
             let (a, _) = canonical_prefix(&r.destination, true)?;
             ensure!(
-                names.contains(&r.interface)
+                (names.contains(&r.interface) || blackhole.targets(&r.interface))
                     && (r.table == 254 || (10000..=19999).contains(&r.table))
                     && (1..=2147483647).contains(&r.metric),
-                "route requires managed interface, table 254 or 10000..19999, positive 32-bit metric"
+                "route requires managed interface or the configured blackhole, table 254 or 10000..19999, positive 32-bit metric"
+            );
+            ensure!(
+                !blackhole.targets(&r.interface) || r.gateway.is_empty(),
+                "routes to the blackhole cannot have a gateway"
             );
             if !r.gateway.is_empty() {
                 ensure!(

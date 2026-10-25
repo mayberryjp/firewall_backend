@@ -212,6 +212,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
     let mut b = after.normalized();
     for (p, different) in [
         ("routes.write", a.routes != b.routes),
+        ("routes.write", a.blackhole != b.blackhole),
         ("softflowd.write", a.softflowd != b.softflowd),
         (
             "gateway_monitors.write",

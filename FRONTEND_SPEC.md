@@ -2067,6 +2067,55 @@ Gateway omission means a direct route; never substitute `0.0.0.0`. Managed
 interface options come from the draft, not adopted parents. Explain reserved
 tables and protocol 242 ownership; protocol is not an editable field.
 
+#### Blackhole target
+
+Optional top-level `config.blackhole` defines **one** named drop target that any
+number of routes may use as their `interface`. It is not a device: no link is
+created, and the kernel route is a deviceless `blackhole`, `unreachable` or
+`prohibit` route. Absent or empty `name` means not configured. Normalized
+responses always include the object:
+
+```json
+{"blackhole":{"name":"","action":"blackhole"}}
+```
+
+- `name`: string, default empty. When nonempty it must be a valid interface name
+  (letters/digits/`.`/`_`/`-`, at most 15 characters) and must not equal a managed
+  interface or, natively, an adopted parent. It is the only value besides managed
+  interfaces that `routes[].interface` may take.
+- `action`: `"blackhole"` (default, silently discards), `"unreachable"` (sender gets
+  host unreachable) or `"prohibit"` (sender gets administratively prohibited).
+  One action applies to every route that uses the target.
+- Optional `metadata` with the usual `display_name`/`description` limits.
+
+A route targeting the blackhole must have an empty `gateway`; table 254 or
+10000..19999, positive metric and duplicate-identity rules are unchanged. Routes
+are ordinary static routes: `enabled: false` keeps them saved but uninstalled,
+and both IPv4 and IPv6 destinations are supported (IPv6 requires `ipv6_enabled`).
+Referencing the name while it is empty, unknown or colliding returns `422`; the
+name cannot be removed while a route uses it. Unknown keys in the object are
+dropped and reported like any other configuration key on submit.
+
+Synthetic example inside a complete candidate:
+
+```json
+{"blackhole":{"name":"blackhole0","action":"blackhole"},
+ "routes":[{"destination":"198.51.100.0/24","interface":"blackhole0","table":254,"metric":50}]}
+```
+
+Behavior to explain to operators: matching traffic is dropped during the routing
+decision, before forwarding policy or NAT, including traffic the appliance itself
+tries to send to that destination. A longer-prefix or lower-metric route still
+wins, so a `0.0.0.0/0` blackhole at a high metric acts as a fail-closed fallback.
+Routes in tables 10000..19999 only apply where a routing rule selects that table.
+There are no per-route drop counters, so do not display dropped-packet counts.
+Changing `action` or the name reconciles only owned routes; renaming with an
+unchanged action leaves identical kernel routes and is not drift. Changes
+require `transactions.write` and `routes.write`; confirmation/rollback and
+restore are unchanged. The firewall, NAT, DHCP, DNS and gateway-monitor
+sections still require real managed interfaces and cannot name the blackhole.
+The simulator validates but installs nothing.
+
 ### 6.5 Source-policy routing
 
 User-configurable source-policy routing is unsupported. Remove its table/editor,

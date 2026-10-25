@@ -1546,6 +1546,10 @@ fn all_domain_permissions_are_independently_required() {
             "routes.write",
             json!({"routes":[{"enabled":true,"destination":"0.0.0.0/0","interface":"lan0","table":10000,"metric":1}]}),
         ),
+        (
+            "routes.write",
+            json!({"blackhole":{"name":"blackhole0","action":"unreachable"}}),
+        ),
     ];
     for (permission, v) in cases {
         let after: Config = serde_json::from_value(v).unwrap();

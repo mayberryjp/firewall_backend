@@ -29,6 +29,18 @@
   baseline unknown. Frontend action required; see
   [handoff 2026-10-25-01](docs/frontend-handoffs/2026-10-25.md#2026-10-25-01-azure-dynamic-dns).
 
+- Optional top-level `blackhole` section (`name`, `action` of `blackhole`,
+  `unreachable` or `prohibit`, optional metadata) defining one named drop target
+  that any number of static routes may use as their `interface`. Native hosts
+  install those routes as deviceless kernel blackhole/unreachable/prohibit routes
+  (protocol 242, no gateway), verify and reconcile them like other owned routes,
+  and keep renames with an unchanged action drift-free. The name must be a valid
+  interface name not used by a managed or adopted interface; blackhole routes
+  cannot have a gateway; changes require `routes.write`. Absent section means
+  not configured; no per-route drop counters. Recommended bump: minor; baseline
+  unknown. Frontend action required; see
+  [handoff 2026-10-24-20](docs/frontend-handoffs/2026-10-24.md#2026-10-24-20-blackhole-route-target).
+
 - API-managed Home Assistant MQTT discovery/statistics streaming, default disabled,
   with broker, username, write-only password reference, source interface and
   configurable 60-second interval (10..3600 seconds). Persistent Linux host-bound

@@ -137,6 +137,47 @@ fn static_route_delete_accepts_disabled_record_with_metadata() {
 }
 
 #[test]
+fn blackhole_routes_are_staged_with_ip_route_and_checked_against_the_named_section() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.interface(&mut cli, "lan0");
+    f.ok(
+        &mut cli,
+        "ip route 198.51.100.0/24 blackhole0 direct 254 50",
+    );
+    f.fail(&mut cli, "commit check", "422");
+    f.ok(
+        &mut cli,
+        r#"set /blackhole {"name":"blackhole0","action":"unreachable"}"#,
+    );
+    f.ok(&mut cli, "commit check");
+    f.ok(
+        &mut cli,
+        "ipv6 route 2001:db8:dead::/48 blackhole0 direct 254 50",
+    );
+    f.ok(&mut cli, "commit check");
+    f.ok(
+        &mut cli,
+        "ip route 203.0.113.0/24 blackhole0 192.0.2.254 254 60",
+    );
+    f.fail(&mut cli, "commit check", "gateway");
+    f.ok(
+        &mut cli,
+        "no ip route 203.0.113.0/24 blackhole0 192.0.2.254 254 60",
+    );
+    f.ok(&mut cli, "commit check");
+    let candidate = f.ok(&mut cli, "show candidate-config");
+    assert!(candidate.contains("blackhole0") && candidate.contains("unreachable"));
+    f.ok(
+        &mut cli,
+        "no ip route 198.51.100.0/24 blackhole0 direct 254 50",
+    );
+    f.ok(&mut cli, "commit check");
+    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+}
+
+#[test]
 fn global_ipv6_cli_stages_checks_commits_and_rolls_back() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

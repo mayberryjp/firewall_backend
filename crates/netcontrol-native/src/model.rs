@@ -81,6 +81,8 @@ pub struct Network {
     #[serde(default)]
     pub dns: BTreeMap<String, netcontrol_core::DNSConfig>,
     pub routes: Vec<Route>,
+    #[serde(default)]
+    pub blackhole: netcontrol_core::BlackholeConfig,
     #[serde(default, rename = "_monitor_policy_rules")]
     pub policy_rules: Vec<Rule>,
     #[serde(default)]
@@ -216,6 +218,21 @@ impl Network {
         }
         self.ordered_links()?;
         let mut routes = BTreeSet::new();
+        ensure!(
+            matches!(
+                self.blackhole.action.as_str(),
+                "blackhole" | "unreachable" | "prohibit"
+            ),
+            "blackhole action must be blackhole, unreachable or prohibit"
+        );
+        ensure!(
+            !self.blackhole.configured()
+                || (crate::safe_name(&self.blackhole.name, 15)
+                    && self.blackhole.name != "lo"
+                    && !names.contains(&self.blackhole.name)
+                    && !parents.contains(&self.blackhole.name)),
+            "blackhole name must not match a managed or adopted interface"
+        );
         for route in &self.routes {
             let (destination, _) = parse_prefix(&route.destination, true)?;
             ensure!(
@@ -223,8 +240,14 @@ impl Network {
                 "route table must be main (254) or in owned range 10000..19999"
             );
             ensure!(
-                names.contains(&route.interface) || parents.contains(&route.interface),
-                "route interface must be managed or adopted"
+                names.contains(&route.interface)
+                    || parents.contains(&route.interface)
+                    || self.blackhole.targets(&route.interface),
+                "route interface must be managed, adopted or the configured blackhole"
+            );
+            ensure!(
+                !self.blackhole.targets(&route.interface) || route.gateway.is_empty(),
+                "blackhole routes cannot have a gateway"
             );
             ensure!(
                 routes.insert((&route.destination, route.table, route.metric)),

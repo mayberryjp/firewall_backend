@@ -233,6 +233,8 @@ set /firewall/policy "drop"
 set /ntp/servers/- "time.example.test"
 delete /ntp/servers/0
 set /kernel/namespace/net.ipv4.tcp_congestion_control "cubic"
+set /blackhole {"name":"blackhole0","action":"blackhole"}
+ip route 198.51.100.0/24 blackhole0 direct 254 50
 load candidate {"firewall":{"allow_all_icmp":true,"policy":"accept"}}
 ```
 
