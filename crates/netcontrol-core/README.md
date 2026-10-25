@@ -56,8 +56,13 @@ mismatches, different schemas, scope mismatches, inconsistent active pointers,
 invalid configurations, incomplete/duplicate revision histories, inconsistent
 base snapshots and restoration provenance. Go journals are not parsed or
 converted. Existing data is never silently reset, imported or deleted. An
-incompatible file requires deliberate operator placement of a separate fresh
-Rust state path; the old file must be preserved.
+incompatible file requires explicit operator handling; the old file must be
+preserved. Normal loading never converts it. The separately authorized
+[offline policy-rule conversion](../../docs/BUILD_AND_INSTALL.md#offline-policy-rule-state-conversion)
+can remove only empty retired arrays after checksum/current-model/history
+validation, with a preview, explicit confirmation and exact private backup.
+It refuses active transactions and non-empty archived rules. This is not an
+automatic loader compatibility path or a general migration framework.
 
 A checksum failure is not permission to reset state or recompute its checksum.
 Preserve the original file and inspect the failure. A model-dependent checksum

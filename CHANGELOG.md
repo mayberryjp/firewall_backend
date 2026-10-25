@@ -4,6 +4,16 @@
 
 ### Added
 
+- Explicitly authorized offline `netcontrol-state-convert` for empty retired
+  `policy_rules` fields in saved journals/history and native ownership/adoption
+  snapshots. Preview by default; locked/current-model/history validation,
+  confirmation, durable private originals/staged replacements and manifest before
+  per-file atomic publication. Refuses non-empty rules, corruption and active
+  recovery; no implicit loader/API migration, reset or live networking change.
+  Interrupted multi-file publication requires offline restoration of all originals.
+  Recommended bump: minor for the new operator tool; baseline unknown. The
+  underlying public source-policy removal remains a major contract change.
+
 - Global persisted `ipv6_enabled` policy (default true on installation/factory
   configuration), using confirmed configuration transactions and
   `kernel.namespace.write`. Native enforcement sets/verifies all/default/

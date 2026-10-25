@@ -4,7 +4,7 @@ mod model;
 mod simulator;
 mod store;
 
-pub use engine::{Engine, PERMISSIONS, Reply, Transaction};
+pub use engine::{Engine, PERMISSIONS, Reply, Transaction, validate_offline_state};
 pub use model::*;
 pub use simulator::Simulator;
 

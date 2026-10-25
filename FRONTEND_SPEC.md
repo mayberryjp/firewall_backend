@@ -1602,8 +1602,14 @@ revision configurations no longer serialize the field. CLI `policy-rule`,
 Normal destination routes remain supported with `routes.write`. Use table 254
 (main) for ordinary routing; custom tables remain available for explicitly
 configured gateway-monitor paths, with internal rules as described above.
-No import/restore/persisted-state migration or compatibility path is provided;
-unsupported saved configurations fail explicitly without deleting/resetting data.
+No API import/restore compatibility path or automatic persisted-state migration
+is provided; unsupported saved configurations fail explicitly without deleting
+or resetting data. The separately authorized operator-only
+[offline conversion](docs/BUILD_AND_INSTALL.md#offline-policy-rule-state-conversion)
+can remove empty retired fields from validated stopped-service journals/native
+metadata with preview, confirmation and private backups. It refuses non-empty
+rules (including history), active/recovery state and corruption. There is no HTTP
+conversion endpoint, browser repair action or permissive startup fallback.
 
 ### 6.6 Firewall forwarding
 

@@ -87,6 +87,25 @@ struct Ownership {
     ipv6_original: Option<ipv6::Snapshot>,
 }
 
+pub(super) fn validate_offline_state(ownership: &Value, receipt: Option<&Value>) -> Result<()> {
+    let ownership: Ownership = serde_json::from_value(ownership.clone())?;
+    if let Some(config) = &ownership.committed_config {
+        let config: Config = serde_json::from_value(config.clone())?;
+        config.validate()?;
+    }
+    if let Some(receipt) = receipt {
+        let receipt: adoption::Receipt = serde_json::from_value(receipt.clone())?;
+        ensure!(receipt.complete, "finish native adoption before conversion");
+        ensure!(
+            receipt.scope == ownership.scope,
+            "native adoption scope mismatch"
+        );
+        receipt.config.validate()?;
+        let _: Ownership = serde_json::from_value(receipt.ownership_before)?;
+    }
+    Ok(())
+}
+
 impl Ownership {
     fn handover_originals(
         &self,

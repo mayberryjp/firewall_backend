@@ -1330,6 +1330,16 @@ fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
 #[path = "engine_tests.rs"]
 mod tests;
 
+pub fn validate_offline_state(payload: &[u8]) -> Result<()> {
+    let state: State = serde_json::from_slice(payload).context("invalid converted state")?;
+    validate_state(&state)?;
+    ensure!(
+        state.active_transaction.is_none(),
+        "finish or recover the active transaction with the previous binary before conversion"
+    );
+    Ok(())
+}
+
 fn validate_state(s: &State) -> Result<()> {
     s.desired
         .validate()

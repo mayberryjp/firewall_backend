@@ -51,6 +51,21 @@ mod tunables;
 #[cfg(target_os = "linux")]
 pub use linux::Native;
 
+pub fn validate_offline_native_state(
+    ownership: &serde_json::Value,
+    adoption: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::validate_offline_state(ownership, adoption)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ownership, adoption);
+        anyhow::bail!("native state conversion requires Linux")
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub struct Native;
 

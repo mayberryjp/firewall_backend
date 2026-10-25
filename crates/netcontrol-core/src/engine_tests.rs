@@ -65,6 +65,20 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
 }
 
 #[test]
+fn offline_conversion_validation_checks_history_and_refuses_active_transactions() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    validate_offline_state(&serde_json::to_vec(&engine.state).unwrap()).unwrap();
+    let pending = submit(&mut engine, config());
+    let id = pending.body["id"].as_str().unwrap();
+    assert!(validate_offline_state(&serde_json::to_vec(&engine.state).unwrap()).is_err());
+    confirm(&mut engine, id);
+    validate_offline_state(&serde_json::to_vec(&engine.state).unwrap()).unwrap();
+    engine.state.transactions.clear();
+    assert!(validate_offline_state(&serde_json::to_vec(&engine.state).unwrap()).is_err());
+}
+
+#[test]
 fn global_ipv6_permission_commit_restart_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

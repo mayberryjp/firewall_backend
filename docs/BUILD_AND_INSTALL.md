@@ -189,6 +189,94 @@ sudo systemctl start netcontrold.service
 sudo journalctl -u netcontrold.service -n 50 --no-pager
 ```
 
+## Offline Policy-Rule State Conversion
+
+The explicitly authorized `netcontrol-state-convert` tool removes retired empty
+`policy_rules` arrays from an otherwise valid saved Rust journal and its native
+metadata. This is an operator-run exception, not a normal startup/API/import
+compatibility path. It does not reset configuration, import live networking,
+repair corrupt checksums, stop/start services or change the kernel.
+
+Build the tool from the reviewed current checkout **before** stopping the daemon:
+
+```sh
+CARGO_TARGET_DIR=target/in-place-upgrade cargo +stable build --locked \
+  --target x86_64-unknown-linux-gnu -p netcontrold --bin netcontrol-state-convert
+```
+
+Use a local console or independent OS SSH, never Netcontrol's own SSH listener.
+Review the effective unit/state paths, ensure no manual/self-upgrade worker or
+other state writer is active, then stop the daemon. These are the supplied
+Ubuntu unit's defaults; substitute the effective paths if customized:
+
+```sh
+sudo systemctl stop netcontrold.service
+sudo target/in-place-upgrade/x86_64-unknown-linux-gnu/debug/netcontrol-state-convert \
+  --state /var/lib/netcontrol/native-state.json \
+  --services-state-dir /var/lib/netcontrol/services
+```
+
+No `--apply` means **preview only**: JSON lists exact snapshot locations, removed
+rule counts and affected file paths. It may create adjacent lock files, but does
+not change source state or create a backup bundle. Reports can contain transaction
+IDs/file paths; keep them private. The main journal's original checksum must be
+valid. Inputs and immediate parent directories must be private, owned by the
+invoking user (normally root), and free of symlinks; files cannot be hard-linked.
+Do not change permissions blindly or share state/backup contents.
+
+Conversion refuses active core transactions, native `intent.json`, incomplete
+adoption, scope/configuration mismatches, invalid history/unknown fields, duplicate
+JSON keys and **any non-empty `policy_rules` array**, including historical ones.
+Do not bypass these checks. Review/decommission current source routing with the
+previous binary; non-empty archived rules need a separately reviewed conversion
+plan, not history deletion. View filters/normal firewall policy are unrelated.
+
+After reviewing a fully valid empty-rule preview, use a **new** backup directory:
+
+```sh
+sudo target/in-place-upgrade/x86_64-unknown-linux-gnu/debug/netcontrol-state-convert \
+  --state /var/lib/netcontrol/native-state.json \
+  --services-state-dir /var/lib/netcontrol/services \
+  --apply --backup-dir /var/lib/netcontrol/policy-removal-backup
+```
+
+Type `CONVERT` to confirm; empty/other input cancels. `--apply --yes` is an explicit
+unattended confirmation; never put it on an unreviewed command. Without
+`--backup-dir`, apply chooses a unique sibling directory beside the main journal.
+An existing backup directory is refused rather than reused/overwritten.
+
+The tool holds the normal journal/native locks through confirmation and apply.
+It converts only `desired`, every transaction's `previous`/`candidate`, native
+`ownership.json`'s `committed_config`, and optional `adoption.json`'s `config` and
+`ownership_before.committed_config`. Native operational snapshots are re-encoded
+using the current operational model. Other fields, credentials, service counters,
+Ethernet/IPv6 recovery evidence and key material are not edited. Transaction IDs,
+revision numbers, statuses, provenance and timestamps remain; archived configuration
+payloads are intentionally converted, with exact originals retained in backup.
+
+Before replacing any source file, the private bundle contains `manifest.json`,
+numbered `*.original` byte-for-byte backups and `*.converted` replacements, with
+SHA-256 values and absolute original paths. Files are 0600 and the bundle 0700;
+files and directories are synchronized. Publication uses adjacent staging plus
+atomic rename per file, **not an atomic transaction across all files**. A
+`completed` marker is written only after all replacements have been synchronized.
+
+If conversion errors/is interrupted or the marker is missing, **do not start the
+daemon or rerun upgrade blindly**. Preserve the whole bundle; inspect its manifest
+privately and restore **all** numbered originals to their recorded paths with
+0600 permissions from the stopped/offline state, then use the matching previous
+binary. Never restore only the main journal or recompute hashes to force loading.
+Adjacent `.conversion-*` staging files from interruption are not live state; keep
+them for inspection. Backups are never automatically deleted. There is no automatic
+multi-file rollback or boot recovery in this operator tool.
+
+After successful conversion, keep the bundle and run the ordinary `bash upgrade.sh`
+from this fixed checkout. If systemd warns about changed units, first run
+`sudo systemctl daemon-reload`. Since the service was stopped, explicitly start it
+after deployment with `sudo systemctl start netcontrold.service`, then inspect
+status/journal, API data, saved configuration and connectivity. The tool itself
+does not deploy a binary or prove appliance startup/network health.
+
 ## Conntrack host prerequisites
 
 The Ubuntu fresh installer and full development upgrade load `nf_conntrack`,
