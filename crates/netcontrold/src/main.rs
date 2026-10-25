@@ -93,6 +93,19 @@ struct Options {
     upgrade_worker: bool,
     #[arg(long, hide = true)]
     upgrade_recover: bool,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Create a new WireGuard private key file NAME in --keys, print its public key and exit"
+    )]
+    create_wireguard_key: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "create_wireguard_key",
+        help = "Print the public key of the stored WireGuard private key NAME in --keys and exit"
+    )]
+    wireguard_public_key: Option<String>,
 }
 
 #[tokio::main]
@@ -138,6 +151,15 @@ fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
     }
 }
 async fn run(options: Options) -> Result<()> {
+    if options.create_wireguard_key.is_some() || options.wireguard_public_key.is_some() {
+        let public = match (&options.create_wireguard_key, &options.wireguard_public_key) {
+            (Some(name), _) => netcontrol_native::create_wireguard_key(&options.keys, name)?,
+            (_, Some(name)) => netcontrol_native::wireguard_public_key(&options.keys, name)?,
+            _ => unreachable!(),
+        };
+        println!("{public}");
+        return Ok(());
+    }
     configure_logging(&options)?;
     if options.upgrade_worker || options.upgrade_recover {
         return tokio::task::spawn_blocking(move || {

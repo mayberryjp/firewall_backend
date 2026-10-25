@@ -187,6 +187,11 @@ no dhcp-relay server IPV4
 dhcp-relay enable|disable
 ```
 
+`wireguard key-ref NAME` names a private key file already stored on the appliance
+(it does not take the key itself). Create it with the
+[key creation command](BUILD_AND_INSTALL.md#creating-a-wireguard-private-key),
+which also prints the public key for the peer.
+
 New candidate entries start as administratively down, role LAN, MTU 1500;
 omitted kind is dummy. These are visible CLI creation defaults, not role-based
 network policy. Use `show interfaces discovered` before staging

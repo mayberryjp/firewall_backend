@@ -53,6 +53,31 @@ mod tunables;
 #[cfg(target_os = "linux")]
 pub use linux::Native;
 
+/// Creates a new private WireGuard key file in `keys` without overwriting; returns its public key.
+pub fn create_wireguard_key(keys: &std::path::Path, reference: &str) -> anyhow::Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::create_wireguard_key(keys, reference)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (keys, reference);
+        anyhow::bail!("WireGuard key storage requires Linux")
+    }
+}
+
+pub fn wireguard_public_key(keys: &std::path::Path, reference: &str) -> anyhow::Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::wireguard_public_key(keys, reference)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (keys, reference);
+        anyhow::bail!("WireGuard key storage requires Linux")
+    }
+}
+
 pub fn validate_offline_native_state(
     ownership: &serde_json::Value,
     adoption: Option<&serde_json::Value>,

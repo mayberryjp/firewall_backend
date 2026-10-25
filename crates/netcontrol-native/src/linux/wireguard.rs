@@ -12,11 +12,7 @@ use std::{
 };
 use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
 
-fn private_key(root: &Path, reference: &str) -> Result<Key> {
-    ensure!(
-        crate::safe_name(reference, 64),
-        "invalid private key reference"
-    );
+fn open_root(root: &Path) -> Result<File> {
     let root = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -28,6 +24,87 @@ fn private_key(root: &Path, reference: &str) -> Result<Key> {
             && root_metadata.mode() & 0o022 == 0,
         "untrusted WireGuard key directory"
     );
+    Ok(root)
+}
+
+/// Creates a new private key file that never overwrites; returns its public key.
+pub fn create_key(root: &Path, reference: &str) -> Result<String> {
+    use std::{
+        io::Write, os::fd::FromRawFd, os::unix::fs::DirBuilderExt, os::unix::fs::PermissionsExt,
+    };
+    // Core validation forbids dots in key references; this also keeps temporary names unique.
+    ensure!(
+        crate::safe_name(reference, 64) && !reference.contains('.'),
+        "invalid private key reference: use letters, digits, _ and -, at most 64 characters"
+    );
+    if let Err(error) = std::fs::DirBuilder::new().mode(0o700).create(root) {
+        ensure!(
+            error.kind() == std::io::ErrorKind::AlreadyExists,
+            "create WireGuard key directory: {error}"
+        );
+    }
+    let root = open_root(root)?;
+    let name = std::ffi::CString::new(reference)?;
+    let temporary = std::ffi::CString::new(format!(".{reference}.{}.tmp", std::process::id()))?;
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "create WireGuard key: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut key = Key::generate_private();
+    let public = key.get_public().to_base64();
+    let mut text = format!("{}\n", key.to_base64()).into_bytes();
+    key.0.fill(0);
+    let written = (|| -> Result<()> {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&text)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    text.fill(0);
+    // A hard link publishes the finished file and fails if the name already exists.
+    let published = written.and_then(|()| {
+        let linked = unsafe {
+            libc::linkat(
+                root.as_raw_fd(),
+                temporary.as_ptr(),
+                root.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        };
+        ensure!(
+            linked == 0,
+            "WireGuard key {reference} was not created (it may already exist): {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    });
+    unsafe { libc::unlinkat(root.as_raw_fd(), temporary.as_ptr(), 0) };
+    published?;
+    root.sync_all()?;
+    Ok(public)
+}
+
+pub fn public_key(root: &Path, reference: &str) -> Result<String> {
+    Ok(private_key(root, reference)?.get_public().to_base64())
+}
+
+fn private_key(root: &Path, reference: &str) -> Result<Key> {
+    ensure!(
+        crate::safe_name(reference, 64),
+        "invalid private key reference"
+    );
+    let root = open_root(root)?;
     let filename = std::ffi::CString::new(reference)?;
     let fd = unsafe {
         libc::openat(
@@ -268,6 +345,52 @@ mod tests {
         assert!(private_key(&fixture.0, "alias").is_err());
         fixture.write(&key.to_base64(), 0o644);
         assert!(private_key(&fixture.0, "key").is_err());
+    }
+
+    #[test]
+    fn created_keys_are_private_unique_never_overwritten_and_readable_by_the_daemon() {
+        let fixture = Keys::new();
+        let public = create_key(&fixture.0, "wg-wan").unwrap();
+        let path = fixture.0.join("wg-wan");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let key = private_key(&fixture.0, "wg-wan").unwrap();
+        assert_eq!(key.get_public().to_base64(), public);
+        assert_eq!(public_key(&fixture.0, "wg-wan").unwrap(), public);
+        assert!(key != Key::zero());
+        let before = std::fs::read(&path).unwrap();
+        assert!(create_key(&fixture.0, "wg-wan").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_ne!(create_key(&fixture.0, "wg-lan").unwrap(), public);
+        std::os::unix::fs::symlink("missing", fixture.0.join("link")).unwrap();
+        assert!(create_key(&fixture.0, "link").is_err());
+        for name in ["", "../x", "a b", ".hidden", &"a".repeat(65)] {
+            assert!(create_key(&fixture.0, name).is_err(), "{name:?}");
+        }
+        let mut names: Vec<_> = std::fs::read_dir(&fixture.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["link", "wg-lan", "wg-wan"]);
+        assert!(public_key(&fixture.0, "missing").is_err());
+    }
+
+    #[test]
+    fn key_creation_refuses_untrusted_directories_and_creates_a_missing_private_one() {
+        let fixture = Keys::new();
+        std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(create_key(&fixture.0, "wg").is_err());
+        assert!(std::fs::read_dir(&fixture.0).unwrap().next().is_none());
+        std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let nested = fixture.0.join("new");
+        create_key(&nested, "wg").unwrap();
+        assert_eq!(
+            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

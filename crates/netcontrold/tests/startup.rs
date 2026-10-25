@@ -135,6 +135,64 @@ fn invalid_service_opt_in_environment_fails_before_creating_state() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn wireguard_key_flags_print_only_the_public_key_and_never_overwrite_or_start_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let keys = directory.path().join("keys");
+    let run = |flag: &str, name: &str| {
+        Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+            .current_dir(directory.path())
+            .args([flag, name, "--keys"])
+            .arg(&keys)
+            .output()
+            .unwrap()
+    };
+    let created = run("--create-wireguard-key", "wg-wan");
+    assert!(created.status.success(), "{created:?}");
+    assert!(created.stderr.is_empty());
+    let public = String::from_utf8(created.stdout).unwrap();
+    assert_eq!(public.trim_end().len(), 44);
+    assert!(public.ends_with('\n') && public.matches('\n').count() == 1);
+    let private = std::fs::read_to_string(keys.join("wg-wan")).unwrap();
+    assert!(
+        !public.contains(private.trim_end())
+            && !String::from_utf8_lossy(&created.stderr).contains(private.trim_end())
+    );
+    assert_eq!(
+        std::fs::metadata(keys.join("wg-wan"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let shown = run("--wireguard-public-key", "wg-wan");
+    assert!(shown.status.success());
+    assert_eq!(String::from_utf8(shown.stdout).unwrap(), public);
+    let again = run("--create-wireguard-key", "wg-wan");
+    assert!(!again.status.success() && again.stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(keys.join("wg-wan")).unwrap(),
+        private
+    );
+    let invalid = run("--create-wireguard-key", "../escape");
+    assert!(!invalid.status.success() && invalid.stdout.is_empty());
+    assert!(!run("--wireguard-public-key", "missing").status.success());
+    let both = Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+        .args(["--create-wireguard-key", "a", "--wireguard-public-key", "a"])
+        .output()
+        .unwrap();
+    assert!(!both.status.success());
+    let mut names: Vec<_> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["keys"]);
+}
+
 #[test]
 fn invalid_existing_host_key_and_state_alias_fail_startup_without_reset() {
     let directory = tempfile::tempdir().unwrap();

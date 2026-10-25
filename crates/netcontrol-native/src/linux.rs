@@ -54,6 +54,14 @@ mod wireguard;
 
 pub use networking::Parent;
 
+pub(super) fn create_wireguard_key(root: &Path, reference: &str) -> Result<String> {
+    wireguard::create_key(root, reference)
+}
+
+pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<String> {
+    wireguard::public_key(root, reference)
+}
+
 pub struct Native {
     options: NativeOptions,
     namespace: Arc<File>,
