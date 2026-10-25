@@ -96,6 +96,13 @@ configure_host_logging() (
         case $state in
             not-found) continue ;;
             loaded|masked) ;;
+            error)
+                # An alias of an already masked logger (syslog.service -> rsyslog.service) fails to load but cannot run.
+                [[ $(systemctl is-enabled "$unit" 2>/dev/null || true) == masked ]] || {
+                    printf 'Unsupported logger load state for %s: %s\n' "$unit" "$state" >&2
+                    exit 1
+                }
+                continue ;;
             *) printf 'Unsupported logger load state for %s: %s\n' "$unit" "$state" >&2; exit 1 ;;
         esac
         systemctl mask --now "$unit" || {

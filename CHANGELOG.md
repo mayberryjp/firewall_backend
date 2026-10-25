@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- `upgrade.sh`/`install.sh` journald-forwarding setup no longer aborts (and rolls the
+  upgrade back) on a second run: once `rsyslog.service` is masked, its `syslog.service`
+  alias reports load state `error`. A logger in that state is now accepted only when
+  `systemctl is-enabled` reports it `masked`; any other `error` still fails the
+  deployment. No API or frontend change; recommended bump: none (unreleased scripts).
+
 - Missing/invalid NTP samples no longer stop the worker after three polling
   rounds and consequently fail unrelated configuration reads and transaction
   observation/confirmation. NTP keeps polling with `sample_status: "unavailable"`

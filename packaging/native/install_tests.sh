@@ -165,7 +165,7 @@ for logging_setup in success repeat symlink_file symlink_directory publish_failu
 done
 printf 'Managed journald forwarding and socket-unit persistence, idempotency and safe publication tests passed.\n'
 
-for logging_scenario in stopped repeat missing query_failure mask_failure active_failure still_active unknown_state input_failure restart_failure regular symlink; do
+for logging_scenario in stopped repeat missing query_failure mask_failure active_failure still_active unknown_state masked_alias error_enabled input_failure restart_failure regular symlink; do
     logging_directory="$temporary/logging-$logging_scenario"
     mkdir "$logging_directory"
     printf 'preserve\n' > "$logging_directory/operator"
@@ -184,6 +184,8 @@ for logging_scenario in stopped repeat missing query_failure mask_failure active
                             missing) printf 'not-found\n'; return 4 ;;
                             query_failure) return 1 ;;
                             unknown_state) printf 'error\n' ;;
+                            masked_alias) [[ $2 == syslog.service ]] && printf 'error\n' || printf 'loaded\n' ;;
+                            error_enabled) printf 'error\n' ;;
                             repeat) printf 'masked\n' ;;
                             *) printf 'loaded\n' ;;
                         esac
@@ -195,6 +197,7 @@ for logging_scenario in stopped repeat missing query_failure mask_failure active
                         esac
                     fi ;;
                 mask) [[ $logging_scenario != mask_failure ]] ;;
+                is-enabled) [[ $logging_scenario == masked_alias ]] && printf 'masked\n' || { [[ $logging_scenario == error_enabled ]] && printf 'enabled\n'; return 1; } ;;
                 start) [[ $* == 'start systemd-journald-dev-log.socket' && $logging_scenario != input_failure ]] ;;
                 restart) [[ $* == 'restart systemd-journald.service' && $logging_scenario != restart_failure ]] ;;
                 *) return 1 ;;
@@ -202,17 +205,21 @@ for logging_scenario in stopped repeat missing query_failure mask_failure active
         }
         configure_host_logging "$logging_directory/log" "$logging_directory/unix"
     ); then
-        case $logging_scenario in stopped|repeat|missing) ;; *) exit 1 ;; esac
+        case $logging_scenario in stopped|repeat|missing|masked_alias) ;; *) exit 1 ;; esac
         grep -Fxq 'start systemd-journald-dev-log.socket' "$logging_directory/commands"
         grep -Fxq 'restart systemd-journald.service' "$logging_directory/commands"
     else
-        case $logging_scenario in stopped|repeat|missing) exit 1 ;; esac
+        case $logging_scenario in stopped|repeat|missing|masked_alias) exit 1 ;; esac
     fi
     ! grep -Eq '^(mask|stop).*systemd-journald' "$logging_directory/commands"
     [[ $(< "$logging_directory/operator") == preserve ]]
     if [[ $logging_scenario == regular || $logging_scenario == symlink ]]; then
         [[ -e $logging_directory/log ]]
         ! grep -q '^restart ' "$logging_directory/commands"
+    fi
+    if [[ $logging_scenario == masked_alias ]]; then
+        grep -Fxq 'mask --now rsyslog.service' "$logging_directory/commands"
+        ! grep -Fxq 'mask --now syslog.service' "$logging_directory/commands"
     fi
     if [[ $logging_scenario == stopped || $logging_scenario == repeat ]]; then
         for logging_unit in rsyslog.service syslog-ng.service syslog.service syslogd.service busybox-syslogd.service syslog.socket; do
