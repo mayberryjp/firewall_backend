@@ -237,7 +237,8 @@ verification. Desired addresses are static; managed DHCP lease addresses are
 added only to the effective native view. Production DAD workflows are not
 implemented. Existing addresses on unrelated interfaces are not reconciled.
 
-Static configuration routes require `enabled`; disabled records stay in core
+Static configuration routes default to enabled when `enabled` is omitted;
+explicitly disabled records stay in core
 configuration but are excluded from the operational plan. Toggling reconciles
 only owned routes, including rollback/recovery; inherited static routes start
 enabled. DHCP runtime routes are unchanged.

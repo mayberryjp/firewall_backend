@@ -44,7 +44,19 @@ fn static_route_enabled_controls_operational_projection() {
         .as_object_mut()
         .unwrap()
         .remove("enabled");
-    assert!(serde_json::from_value::<Config>(missing).is_err());
+    let defaulted: Config = serde_json::from_value(missing).unwrap();
+    assert!(defaulted.routes[0].enabled);
+    assert_eq!(
+        serde_json::to_value(&defaulted).unwrap()["routes"][0]["enabled"],
+        true
+    );
+    assert_eq!(
+        defaulted.operational_value().unwrap()["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     config.routes[0].metric = 0;
     assert!(config.validate().is_err());
 }

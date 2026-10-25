@@ -105,7 +105,7 @@ zero values and subsequently failing semantic validation. Required fields:
 | Interface | `name`, `kind`, `role`, `mtu`, `up` |
 | WireGuard / peer | `key_ref`, `listen_port` / `public_key` |
 | VLAN | `parent`, `id` |
-| Route | `enabled`, `destination`, `interface`, `table`, `metric` |
+| Route | `destination`, `interface`, `table`, `metric` |
 | Policy rule | `priority`, `source`, `table` |
 | Firewall/host rule | `action` |
 | Masquerade rule | `family`, `out_interface` |
@@ -1662,9 +1662,11 @@ Table/editor: enabled toggle, destination network, optional gateway, managed
 interface, table, metric. Family badge derives from destination. Include
 text/table/interface/family/enabled filters and a separate delete action.
 
-Every static route requires `enabled: boolean`, with no omission default. Missing,
-null or nonboolean values return `400`. New-route forms should explicitly start
-with `true`. False retains the complete route and metadata in desired/observed
+Static routes accept `enabled: boolean`; omission defaults to `true` in requests
+and saved configurations, including revision records. Canonical responses always
+include the boolean. Explicit null or nonboolean values return `400`. New-route
+forms should explicitly start with `true`; preserve explicit false rather than
+using a truthiness-based default. False retains the complete route and metadata in desired/observed
 configuration, drafts, transactions, revision history and exports, but excludes
 it from native installation. `/api/v1/routes` includes disabled records; it is not
 a raw kernel routing-table dump. DHCP-learned runtime routes do not gain this flag.
@@ -1686,10 +1688,10 @@ package, with normal confirmation/rollback. Changes require `transactions.write`
 and `routes.write`, plus permissions for other changed resources. Reads require
 `state.read`. There is no per-route enable/disable endpoint or new permission.
 Warn about management-connectivity loss before disabling management/default
-routes. Saved configuration and revision records containing routes must include
-the required field; omitted fields fail strict loading, with no automatic
-conversion, reset or compatibility fallback. Coordinate client/backend deployment
-and review saved-state readiness before updating an appliance.
+routes. Saved configuration and revision records that omit the field load with
+routes enabled; explicit false remains disabled. This is ordinary field defaulting,
+not a file-rewrite utility or reset. Other schema/validation requirements remain
+strict. Deploy backend support before offering disabled-route controls.
 
 Gateway omission means a direct route; never substitute `0.0.0.0`. Managed
 interface options come from the draft, not adopted parents. Explain reserved

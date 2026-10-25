@@ -154,15 +154,26 @@ fn static_route_enabled_permission_restart_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
     let mut initial = serde_json::to_value(config()).unwrap();
-    initial["routes"] = json!([{"enabled":true,"destination":"203.0.113.0/24","interface":"lan0","table":10000,"metric":10}]);
+    initial["routes"] =
+        json!([{"destination":"203.0.113.0/24","interface":"lan0","table":10000,"metric":10}]);
+    let reply = request(
+        &mut engine,
+        "POST",
+        "/api/v1/transactions",
+        json!({"base_revision":0,"confirm_timeout_seconds":30,"config":initial.clone()}),
+    );
     let initial: Config = serde_json::from_value(initial).unwrap();
-    let reply = submit(&mut engine, initial.clone());
+    assert!(initial.routes[0].enabled);
     assert_eq!(reply.status, 202, "{}", reply.body);
     assert_eq!(
         confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
         200
     );
     let mut disabled = initial.clone();
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/routes", Value::Null).body[0]["enabled"],
+        true
+    );
     disabled.routes[0].enabled = false;
     let permissions: Vec<_> = all().into_iter().filter(|p| p != "routes.write").collect();
     let body = serde_json::to_vec(
@@ -183,10 +194,7 @@ fn static_route_enabled_permission_restart_and_rollback() {
         403
     );
     let mut invalid = serde_json::to_value(&disabled).unwrap();
-    invalid["routes"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("enabled");
+    invalid["routes"][0]["enabled"] = Value::Null;
     assert_eq!(
         request(
             &mut engine,

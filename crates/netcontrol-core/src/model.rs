@@ -186,6 +186,7 @@ pub struct DNSDomain {
 pub struct Route {
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
+    #[serde(default = "yes")]
     pub enabled: bool,
     pub destination: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
