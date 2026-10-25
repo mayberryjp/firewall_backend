@@ -127,6 +127,72 @@ HttpOnly, SameSite=Strict session cookies. HTTP cookies are not Secure; HTTPS
 cookies are Secure. CORS does not bypass mixed-content, certificate,
 private-network, or network-reachability restrictions.
 
+## Azure Dynamic DNS
+
+The in-process Dynamic DNS client updates **Azure public DNS IPv4 A records**.
+It follows the pfSense model of a monitored WAN interface, relative hostname,
+Azure application ID/secret, zone resource ID and TTL. Unlike pfSense's generic
+username/password labels, the API names the Azure tenant/client fields explicitly.
+AAAA records, private DNS zones, wildcard names, other providers, gateway-group
+failover and custom detection URLs are not supported.
+
+1. Host/delegate your public zone in Azure DNS. Register a single-tenant Entra
+   application; record the tenant ID, application/client ID and **client-secret
+   value** (not its secret ID). Assign its service principal **DNS Zone Contributor**
+   at the DNS zone scope. Keep track of secret expiry and replace it before expiry.
+2. Upload the secret using `POST /api/v1/services/dynamic-dns/secrets`
+   (`dynamic_dns.write`), with `{"client_secret":"synthetic-example-only"}`.
+   Save the returned `secret_ref`; the secret is never returned.
+3. Add an entry to `config.dynamic_dns` in a complete ordinary configuration
+   transaction (`transactions.write` plus `dynamic_dns.write`), then confirm it.
+   Example below is synthetic: replace IDs/reference/zone/interface.
+
+```json
+{"dynamic_dns":[{"name":"azure-wan","enabled":true,"source_interface":"wan0","address_source":"public_ip","tenant_id":"11111111-1111-4111-8111-111111111111","client_id":"22222222-2222-4222-8222-222222222222","secret_ref":"0123456789abcdef0123456789abcdef","zone_resource_id":"/subscriptions/33333333-3333-4333-8333-333333333333/resourceGroups/dns-rg/providers/Microsoft.Network/dnszones/example.com","record_name":"home","ttl_seconds":300,"interval_seconds":60}]}
+```
+
+`record_name` is relative (`home` or `vpn.home`), **not** `home.example.com`;
+use `@` for the zone apex. `address_source: "interface"` uses the selected
+interface's public IPv4 directly. `"public_ip"` queries `https://api.ipify.org`
+through that interface to detect a NAT-translated public IPv4. Public detection
+discloses the egress IP to ipify; CGNAT detection does not make inbound connectivity
+possible. The interface must be up with exactly one usable IPv4 address; missing
+or ambiguous addresses fail explicitly. Non-public results are refused.
+
+Only confirmed settings activate; active transactions/upgrades pause checks.
+Disabling/deleting an entry stops updates but **does not delete the Azure record**.
+Configuration rollback cannot undo a completed/in-flight external DNS write.
+The client checks Azure every interval, skips unchanged IP/TTL, preserves record
+metadata and uses ETag/conditional creation to avoid overwriting concurrent edits.
+It refuses alias or multi-address A record sets. Missing records are created.
+Errors retry after the configured interval; requests are serialized with bounded
+timeouts. DNS TTL/recursive caches still govern when clients observe a change.
+
+Poll `GET /api/v1/services/dynamic-dns/status` (`state.read`) for per-entry state,
+last successful address, last check/update Unix seconds and redacted errors.
+See the [complete frontend contract](FRONTEND_SPEC.md#615-azure-dynamic-dns).
+There is no manual force-update action.
+
+Linux host mode, privileged interface binding, working host DNS/routing and
+outbound HTTPS to ipify (public detection only), `login.microsoftonline.com`
+and `management.azure.com` are required. All HTTPS certificates/hostnames are
+verified; redirects and proxies are disabled. Sockets bind both source IPv4 and
+interface without another-WAN fallback; DNS lookups still use the host resolver.
+Simulator reports simulated without network I/O; namespace lab mode rejects entries.
+Use HTTPS/a trusted management channel for secret upload.
+
+Back up `<state>.dynamic-dns` together with configuration/history (default
+`/var/lib/netcontrol/native-state.json.dynamic-dns`). These daemon-owned,
+owner-only secret files are **plaintext at rest**, not encrypted. At most 256
+immutable secrets are retained, including discarded uploads; no read/delete or
+automatic pruning API exists because old revisions may reference them.
+
+References consulted:
+[pfSense Dynamic DNS client settings](https://docs.netgate.com/pfsense/en/latest/services/dyndns/client.html),
+[pfSense Azure setup walkthrough](https://micoolpaul.com/2022/07/20/configuring-pfsense-dynamic-dns-with-azure-dns/),
+[Microsoft client-credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow),
+and [Azure DNS record-set REST API](https://learn.microsoft.com/en-us/rest/api/dns/record-sets/create-or-update?view=rest-dns-2018-05-01).
+
 ## Home Assistant MQTT Statistics
 
 Optional streaming is API-managed. Upload a broker password with
@@ -189,7 +255,8 @@ units, filesystem exclusions, rate calculations and frontend requirements.
 ### Routing scope
 
 User-configurable source-policy routing is unsupported. Omit `policy_rules`
-from configuration; even an empty array is rejected. There is no
+from configuration; it has no effect (a submitted `policy_rules` key is dropped
+and reported in `ignored_fields`). There is no
 `/api/v1/policy-rules` endpoint, `policy.write` grant or `policy-rule` CLI command.
 Ordinary destination routes accept an `enabled` boolean (omission defaults to true); disabled
 records stay saved but are not installed. Use table 254 (main) for normal traffic.

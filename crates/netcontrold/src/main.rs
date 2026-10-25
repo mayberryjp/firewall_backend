@@ -342,6 +342,21 @@ async fn run(options: Options) -> Result<()> {
     };
     let mqtt = netcontrold::mqtt::Manager::open(&mqtt_root, engine.clone(), mqtt_mode)?;
     App::attach_mqtt(&mut app, mqtt.clone())?;
+    let dynamic_dns_mode = if mqtt_mode == netcontrold::mqtt::Mode::Simulated {
+        netcontrold::dynamic_dns::Mode::Simulated
+    } else if mqtt_mode == netcontrold::mqtt::Mode::Native {
+        netcontrold::dynamic_dns::Mode::Native
+    } else {
+        netcontrold::dynamic_dns::Mode::Unsupported
+    };
+    let dynamic_dns = netcontrold::dynamic_dns::Manager::open(
+        &appended(&options.state, ".dynamic-dns"),
+        engine.clone(),
+        dynamic_dns_mode,
+    )?;
+    App::attach_dynamic_dns(&mut app, dynamic_dns.clone())?;
+    let (dynamic_dns_stop, dynamic_dns_receiver) = tokio::sync::watch::channel(false);
+    let dynamic_dns_task = tokio::spawn(dynamic_dns.run(dynamic_dns_receiver));
     let (mqtt_stop, mqtt_receiver) = tokio::sync::watch::channel(false);
     let mqtt_task = tokio::spawn(mqtt.run(mqtt_receiver));
     let handle = axum_server::Handle::new();
@@ -443,8 +458,12 @@ async fn run(options: Options) -> Result<()> {
     };
     let _ = stop_tx.send(true);
     let _ = mqtt_stop.send(true);
+    let _ = dynamic_dns_stop.send(true);
     signals.abort();
     mqtt_task.await.context("MQTT worker shutdown failed")?;
+    dynamic_dns_task
+        .await
+        .context("Dynamic DNS worker shutdown failed")??;
     let tick_result = ticker.await.context("deadline ticker task");
     let shutdown_result = engine
         .lock()

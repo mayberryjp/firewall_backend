@@ -23,6 +23,7 @@ pub const PERMISSIONS: &[&str] = &[
     "syslog.write",
     "vnstat.write",
     "mqtt.write",
+    "dynamic_dns.write",
     "kernel.namespace.write",
     "kernel.host.write",
     "system.upgrade",
@@ -133,6 +134,72 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> ApiResult<T> {
     }
     serde_json::from_slice(body).map_err(|e| ApiError::new(400, format!("invalid JSON: {e}")))
 }
+fn pointer_token(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+/// Drops unknown keys from a request value and returns their JSON Pointers; every known field stays fully validated.
+fn prune_unknown<T: serde::de::DeserializeOwned>(
+    value: &mut Value,
+    prefix: &str,
+) -> ApiResult<Vec<String>> {
+    let mut ignored = Vec::new();
+    loop {
+        let error = match serde_path_to_error::deserialize::<_, T>(&*value) {
+            Ok(_) => return Ok(ignored),
+            Err(error) => error,
+        };
+        let message = error.inner().to_string();
+        let mut segments = Vec::new();
+        for segment in error.path().iter() {
+            match segment {
+                serde_path_to_error::Segment::Map { key } => segments.push(key.clone()),
+                serde_path_to_error::Segment::Seq { index } => segments.push(index.to_string()),
+                _ => segments.clear(),
+            }
+        }
+        let unknown = message.starts_with("unknown field `");
+        let Some(key) = segments.pop().filter(|_| unknown) else {
+            return Err(ApiError::new(
+                400,
+                format!("invalid JSON at {prefix}{}: {message}", error.path()),
+            ));
+        };
+        let mut container = &mut *value;
+        for segment in &segments {
+            let next = match container {
+                Value::Object(map) => map.get_mut(segment),
+                Value::Array(items) => segment.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
+                _ => None,
+            };
+            container = next.ok_or_else(|| ApiError::new(400, "invalid JSON request"))?;
+        }
+        let removed = container
+            .as_object_mut()
+            .is_some_and(|map| map.remove(&key).is_some());
+        if !removed || ignored.len() >= 256 {
+            return Err(ApiError::new(
+                400,
+                "invalid JSON request: too many or unremovable unknown fields",
+            ));
+        }
+        let pointer: String = segments
+            .iter()
+            .chain(std::iter::once(&key))
+            .map(|segment| format!("/{}", pointer_token(segment)))
+            .collect();
+        ignored.push(format!("{prefix}{pointer}"));
+    }
+}
+fn parse_submit(body: &[u8]) -> ApiResult<(SubmitRequest, Vec<String>)> {
+    let mut request: Value = parse(body)?;
+    let ignored = match request.get_mut("config") {
+        Some(config) => prune_unknown::<Config>(config, "/config")?,
+        None => Vec::new(),
+    };
+    let request = serde_json::from_value(request)
+        .map_err(|e| ApiError::new(400, format!("invalid JSON: {e}")))?;
+    Ok((request, ignored))
+}
 fn require(permissions: &[String], p: &str) -> ApiResult<()> {
     if permissions.iter().any(|s| s == p) {
         Ok(())
@@ -154,6 +221,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
         ("mqtt.write", a.mqtt != b.mqtt),
+        ("dynamic_dns.write", a.dynamic_dns != b.dynamic_dns),
         ("kernel.namespace.write", a.ipv6_enabled != b.ipv6_enabled),
         (
             "kernel.namespace.write",
@@ -197,6 +265,7 @@ pub struct Engine {
     closed: bool,
     maintenance: bool,
     mqtt_passwords: Option<BTreeSet<String>>,
+    dynamic_dns_secrets: Option<BTreeSet<String>>,
     #[cfg(test)]
     now: Option<DateTime<Utc>>,
 }
@@ -281,6 +350,7 @@ impl Engine {
             closed: false,
             maintenance: false,
             mqtt_passwords: None,
+            dynamic_dns_secrets: None,
             #[cfg(test)]
             now: None,
         };
@@ -544,14 +614,16 @@ impl Engine {
         }
         require(permissions, "transactions.write")?;
         if path == "/api/v1/transactions" {
-            let r: SubmitRequest = parse(body)?;
+            let (r, ignored) = parse_submit(body)?;
             self.check_revision(r.base_revision)?;
             authorize(permissions, &self.state.desired, &r.config)?;
             let t = self.submit(actor, r, None)?;
+            let mut reply_body = value(&t)?;
+            reply_body["ignored_fields"] = json!(ignored);
             return Ok(Reply {
                 status: 202,
                 location: Some(format!("/api/v1/transactions/{}", t.id)),
-                body: value(t)?,
+                body: reply_body,
             });
         }
         if let Some(rest) = path.strip_prefix("/api/v1/revisions/") {
@@ -703,6 +775,10 @@ impl Engine {
         self.mqtt_passwords = references;
     }
 
+    pub fn configure_dynamic_dns(&mut self, references: Option<BTreeSet<String>>) {
+        self.dynamic_dns_secrets = references;
+    }
+
     pub fn factory_reset(&mut self, config: Config) -> Result<Transaction> {
         ensure!(!self.closed, "engine is shut down");
         let request = SubmitRequest {
@@ -740,6 +816,18 @@ impl Engine {
             return Err(ApiError::new(422, "description must not exceed 1024 bytes"));
         }
         r.config.validate().map_err(|e| ApiError::new(422, e))?;
+        for entry in &r.config.dynamic_dns {
+            if !self
+                .dynamic_dns_secrets
+                .as_ref()
+                .is_some_and(|refs| refs.contains(&entry.secret_ref))
+            {
+                return Err(ApiError::new(
+                    422,
+                    "Dynamic DNS backend or secret reference is unavailable",
+                ));
+            }
+        }
         if r.config.mqtt.enabled && self.mqtt_passwords.is_none() {
             return Err(ApiError::new(
                 422,

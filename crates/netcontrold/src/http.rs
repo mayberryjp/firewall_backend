@@ -93,6 +93,7 @@ pub struct App {
     attempts: Mutex<(Instant, usize)>,
     updates: Option<crate::updates::Manager>,
     mqtt: Option<Arc<crate::mqtt::Manager>>,
+    dynamic_dns: Option<Arc<crate::dynamic_dns::Manager>>,
 }
 impl App {
     pub fn new(engine: Arc<Mutex<Engine>>, auth: Authentication, tls: bool) -> Arc<Self> {
@@ -103,6 +104,7 @@ impl App {
             attempts: Mutex::new((Instant::now(), 0)),
             updates: None,
             mqtt: None,
+            dynamic_dns: None,
         })
     }
     pub fn with_updates(
@@ -134,6 +136,15 @@ impl App {
         Arc::get_mut(app)
             .context("application is already shared")?
             .mqtt = Some(mqtt);
+        Ok(())
+    }
+    pub fn attach_dynamic_dns(
+        app: &mut Arc<Self>,
+        manager: Arc<crate::dynamic_dns::Manager>,
+    ) -> Result<()> {
+        Arc::get_mut(app)
+            .context("application is already shared")?
+            .dynamic_dns = Some(manager);
         Ok(())
     }
     pub fn authenticate_api_key(&self, token: &str) -> Result<Option<Credential>> {
@@ -561,6 +572,62 @@ fn api(
             Ok(()) => (),
             Err(_) => return fail(503, "upgrade state unavailable", true),
         }
+    }
+    if matches!(
+        path,
+        "/api/v1/services/dynamic-dns/status" | "/api/v1/services/dynamic-dns/secrets"
+    ) {
+        let upload = path.ends_with("/secrets");
+        let permission = if upload {
+            "dynamic_dns.write"
+        } else {
+            "state.read"
+        };
+        if !credential.permissions.iter().any(|p| p == permission) {
+            return fail(403, "insufficient Dynamic DNS permission", true);
+        }
+        if method != if upload { "POST" } else { "GET" } {
+            return fail(405, "unsupported Dynamic DNS method", true);
+        }
+        if !query.is_empty() {
+            return fail(
+                400,
+                "Dynamic DNS endpoint accepts no query parameters",
+                true,
+            );
+        }
+        let Some(manager) = &app.dynamic_dns else {
+            return fail(503, "Dynamic DNS manager unavailable", true);
+        };
+        if !upload {
+            return match manager.status() {
+                Ok(status) => response(200, status),
+                Err(_) => fail(503, "Dynamic DNS status unavailable", true),
+            };
+        }
+        if engine.configuration_busy() {
+            return fail(409, "configuration transaction or upgrade is active", true);
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SecretRequest {
+            client_secret: String,
+        }
+        let Ok(input) = serde_json::from_slice::<SecretRequest>(&body) else {
+            return fail(400, "expected JSON object with client_secret string", true);
+        };
+        let secret = zeroize::Zeroizing::new(input.client_secret);
+        if let Err(error) = crate::dynamic_dns::validate_secret(&secret) {
+            return fail(400, &error.to_string(), true);
+        }
+        return match manager.create_secret(&mut engine, &secret) {
+            Ok(reference) => response(201, json!({"secret_ref":reference})),
+            Err(_) => fail(
+                503,
+                "Dynamic DNS secret could not be stored; check private storage and its 256-secret limit",
+                true,
+            ),
+        };
     }
     if matches!(
         path,

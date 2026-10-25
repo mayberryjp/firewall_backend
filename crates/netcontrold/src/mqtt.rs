@@ -1,98 +1,19 @@
+use crate::private_store::{identifier, private_file, read_private, valid_id, write_new_private};
 use anyhow::{Context, Result, ensure};
 use netcontrol_core::{Engine, MQTTConfig};
-use rand::RngCore;
 use rumqttc::{AsyncClient, Event, EventLoop, LastWill, MqttOptions, Packet, QoS, Transport};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, VecDeque},
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
 use zeroize::Zeroizing;
-
-fn identifier() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
-fn valid_id(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn private_file(path: &Path, create: bool) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if create {
-        options.create_new(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        let file = options.open(path)?;
-        let metadata = file.metadata()?;
-        ensure!(
-            metadata.is_file()
-                && metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o077 == 0
-                && metadata.nlink() == 1,
-            "MQTT private file must be daemon-owned, owner-only and not linked"
-        );
-        Ok(file)
-    }
-    #[cfg(not(unix))]
-    {
-        if !create {
-            let metadata = fs::symlink_metadata(path)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "invalid MQTT private file"
-            );
-        }
-        Ok(options.open(path)?)
-    }
-}
-
-fn read_private(path: &Path) -> Result<Vec<u8>> {
-    let file = private_file(path, false)?;
-    ensure!(
-        file.metadata()?.len() <= 1 << 20,
-        "MQTT private file exceeds limit"
-    );
-    let mut bytes = Vec::new();
-    file.take((1 << 20) + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 1 << 20, "MQTT private file exceeds limit");
-    Ok(bytes)
-}
-
-fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    ensure!(!path.try_exists()?, "MQTT private file already exists");
-    let parent = path.parent().context("MQTT private file has no parent")?;
-    let pending = parent.join(format!("{}.pending", identifier()));
-    let result = (|| {
-        let mut file = private_file(&pending, true)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&pending, path)?;
-        #[cfg(unix)]
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(pending);
-    }
-    result
-}
 
 pub struct Secrets {
     root: PathBuf,

@@ -24,7 +24,8 @@ and canonical scalar/vector values, service endpoints/timeouts/limits, and
 gateway monitoring address/routing/timing dependencies.
 
 User-configurable source-policy routing is unsupported: `policy_rules` is an
-unknown field (including empty arrays/null), `/api/v1/policy-rules` is absent,
+unknown field (dropped and reported when submitted through the API, including
+empty arrays/null; rejected when loading saved state), `/api/v1/policy-rules` is absent,
 and `policy.write` is not a permission. Native gateway monitors derive internal
 host-source rules for explicit monitors; enabled explicit monitors sharing a
 source must use the same table. `mode: "dhcp"` requires a DHCP-configured managed

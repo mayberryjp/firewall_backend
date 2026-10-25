@@ -90,7 +90,9 @@ The backend is a Rust-only workspace. There is no Go executable, state importer,
 protocol-daemon wrapper, or compatibility endpoint. Packages use the signed
 `.ncpkg` format and native package tool, not APK/abuild.
 
-Request JSON rejects unknown fields. Non-optional fields, arrays, and maps reject
+Request JSON rejects unknown fields in the envelope, but `POST /api/v1/transactions`
+drops unknown keys anywhere inside `config` and reports them (see
+[Unknown configuration fields](#unknown-configuration-fields)). Non-optional fields, arrays, and maps reject
 explicit `null`; omitted defaultable collections become empty. Optional
 `wireguard`, `vlan`, and `firewall.policies` may be null/omitted. Measurement
 nullability in responses is separate from request validation.
@@ -154,6 +156,37 @@ removed. The backend log source is `<services-state-dir>/backend.log`; syslog TL
 uses system CA trust. See the [daemon contract](crates/netcontrold/README.md)
 and [installation guide](docs/BUILD_AND_INSTALL.md) for current deployment flags.
 
+### Unknown configuration fields
+
+`POST /api/v1/transactions` prunes unknown keys at any depth inside `config`
+(objects inside arrays included), then validates what remains exactly as before.
+The `202` body is the usual transaction plus an always-present array:
+
+```json
+{"id":"0123456789abcdef0123456789abcdef","status":"pending_confirmation","ignored_fields":["/config/future_option","/config/interfaces/0/preferred_new_option"]}
+```
+
+(Abbreviated; the real body also carries the full transaction.) Entries are
+RFC 6901 JSON Pointers into the submitted request (`~0`/`~1` escaped, zero-based
+indexes), in discovery order, at most 256; more fails with `400`. Dropped keys are
+absent from `candidate`, saved state, history and the native backend, so
+`GET /api/v1/transactions/{id}` does not list them later. An empty array means
+nothing was dropped.
+
+Only unknown keys are tolerated. Wrong types, `null` for non-optional fields,
+missing required fields, unknown keys in the request envelope
+(`base_revision`, `confirm_timeout_seconds`, `description`, `config`), trailing
+JSON, oversized bodies and semantic validation failures still return `400`/`422`.
+`POST /api/v1/revisions/{revision}/restore` is unchanged and its response has no
+`ignored_fields`. Saved journal/history, native ownership, credentials and signed
+packages still reject unknown fields.
+
+A dropped key is a silent no-op for the field you meant: a misspelled
+`firewall.allow_all_icmp` or an inline secret such as `mqtt.password` is ignored,
+not refused. Show `ignored_fields` to the operator after every submit, treat a
+nonempty list as a warning, and do not claim a setting was applied unless it
+appears in `candidate`.
+
 ### 1.4 Descriptive Object Metadata
 
 The following resource objects accept optional `metadata` containing optional
@@ -175,6 +208,7 @@ configuration, not a separate annotation endpoint.
 | NTP / syslog / vnStat settings | `ntp.metadata`, `syslog.metadata`, `vnstat.metadata` |
 | Syslog destination | `syslog.servers[].metadata` |
 | Flow exporter / gateway monitor | `softflowd[].metadata`, `gateway_monitors[].metadata` |
+| Azure Dynamic DNS entry | `dynamic_dns[].metadata` |
 
 VLAN and WireGuard interface labels belong on the containing interface, not on
 the nested VLAN tag/key-settings objects. Container objects (`config`, `firewall`,
@@ -553,6 +587,7 @@ Configuration changes additionally require permissions for every changed area:
 | Whole-appliance syslog/remote destinations | `syslog.write` |
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
 | MQTT streaming configuration | `mqtt.write` |
+| Azure Dynamic DNS configuration and secret upload | `dynamic_dns.write` |
 
 Creating/removing a WireGuard interface typically needs both interface and
 WireGuard permissions. Confirm/rollback requires the permissions for the original
@@ -1506,6 +1541,141 @@ Publisher and deployment contract:
   Verify actual Home Assistant ingestion and trusted/untrusted TLS broker behavior
   on deployment; local protocol fixtures do not prove these integrations.
 
+### 6.1.5 Azure Dynamic DNS
+
+Implement an Azure public DNS IPv4 A-record settings screen in the shared
+configuration draft. This is a new backend capability, not a pfSense-compatible
+wire API. Only Azure public DNS is supported; no AAAA, wildcard, private DNS,
+other providers, custom detector URLs, gateway groups or force-update endpoint.
+
+`config.dynamic_dns` is an optional array, default `[]`, maximum 32 entries.
+Canonical state/history/transaction responses include the array. Entries have
+these **non-null, required** fields (only metadata has a default):
+
+| Field | Type and Validation |
+| --- | --- |
+| `name` | Unique string, 1..64 ASCII letters/digits/underscore/hyphen; stable UI identity. |
+| `enabled` | Boolean; disabling retains configuration and the Azure record. |
+| `source_interface` | Valid Linux interface-name string; enabled entries require an up managed interface. |
+| `address_source` | `"interface"` (direct public IPv4) or `"public_ip"` (NAT-aware IPv4 from fixed HTTPS ipify endpoint). |
+| `tenant_id`, `client_id` | Azure tenant and application/client UUID strings, each 36 characters including hyphens. |
+| `secret_ref` | Exactly 32 lowercase hexadecimal characters returned by secret upload; must exist locally even when disabled. No inline secret. |
+| `zone_resource_id` | `/subscriptions/{UUID}/resourceGroups/{group}/providers/Microsoft.Network/dnszones/{zone}`; exact segment names, public zone only. Group 1..90 ASCII alphanumerics/`_.-()`, no trailing dot; zone lowercase DNS name with a dot, max 253 bytes, labels 1..63. |
+| `record_name` | `@` for apex or lowercase relative DNS name with 1..63-byte alphanumeric/hyphen labels (no leading/trailing hyphen). No wildcard, trailing dot or FQDN equal to/ending with the zone; combined FQDN max 253 bytes. |
+| `ttl_seconds` | Integer seconds, inclusive 30..86400. |
+| `interval_seconds` | Integer seconds, inclusive 60..86400; no implicit interval/TTL defaults. |
+| `metadata` | Optional standard `display_name`/`description` object; defaults empty; section 1.4 limits apply. |
+
+Duplicate target A records are rejected (zone resource ID compared
+case-insensitively, relative record name compared exactly), including disabled
+entries. Other fields remain validated while disabled; interface existence/up is
+required only when enabled. Wrong known types, nulls, missing entry fields and
+invalid enum values return `400`; semantic bounds, missing secret references and
+unsupported namespace-mode entries return `422`. Ordinary transaction `config`
+unknown-field pruning/`ignored_fields` still applies (section 1.3), including
+accidental inline `client_secret`; uploads and persisted data remain strict.
+Never intentionally send an inline secret in a transaction.
+
+Changes use existing `POST /api/v1/transactions` and
+`POST /api/v1/transactions/{id}/confirm` or `/rollback`, with
+`transactions.write`, `dynamic_dns.write` and any other changed-resource grants.
+Existing `202` submit, `200` confirm/rollback, revision conflicts and restore
+permissions remain unchanged. `GET /api/v1/state`, transaction/revision reads and
+`POST /api/v1/revisions/{revision}/restore` carry references/settings, not secrets.
+Native ownership projections exclude daemon-only Dynamic DNS settings.
+
+New API-key-authenticated endpoints, with no query parameters:
+
+| Method and Path | Permission | Success |
+| --- | --- | --- |
+| `POST /api/v1/services/dynamic-dns/secrets` | `dynamic_dns.write` | `201 {"secret_ref":"0123456789abcdef0123456789abcdef"}` |
+| `GET /api/v1/services/dynamic-dns/status` | `state.read` | `200` status below |
+
+Strict upload body: `{"client_secret":"synthetic-example-only"}`, 1..4096 UTF-8
+bytes without NUL, no additional keys. Replace by uploading a new immutable secret
+and putting its reference in the shared draft. Invalid body/query `400`, invalid
+key `401`, insufficient permission `403`, active transaction/recovery/upgrade
+upload `409`, wrong method `405`, unavailable storage/manager or exhausted
+256-secret store `503`. Standard API error envelope and CORS apply. There is no
+secret read/list/delete API; discarded uploads consume capacity. Clear plaintext
+on upload completion/error/dismiss; never log it, export it or persist it in drafts.
+
+Synthetic configuration fragment (not a complete transaction):
+
+```json
+{"dynamic_dns":[{"name":"azure-wan","enabled":true,"source_interface":"wan0","address_source":"public_ip","tenant_id":"11111111-1111-4111-8111-111111111111","client_id":"22222222-2222-4222-8222-222222222222","secret_ref":"0123456789abcdef0123456789abcdef","zone_resource_id":"/subscriptions/33333333-3333-4333-8333-333333333333/resourceGroups/dns-rg/providers/Microsoft.Network/dnszones/example.com","record_name":"home","ttl_seconds":300,"interval_seconds":60}]}
+```
+
+Synthetic status:
+
+```json
+{"entries":[{"name":"azure-wan","state":"current","address":"8.8.4.4","last_checked_at_unix":1792890000,"last_updated_at_unix":1792890000,"error":null}]}
+```
+
+Entries are sorted by name and represent confirmed settings after worker
+observation (brief startup/configuration lag is possible). Join to the draft by
+name without treating draft changes as active. `state` is `waiting`, `disabled`,
+`paused`, `checking`, `current`, `error`, `simulated` or `unavailable`.
+`address` is a nullable IPv4 string, the last successfully reconciled address;
+timestamps are nullable integer UTC Unix seconds. `last_checked_at_unix` updates
+on success or failure; `last_updated_at_unix` only after a successful Azure PUT
+response confirms the requested IP/TTL. A GET finding the record already current
+does not advance the update timestamp. Last address/timestamps may survive errors
+or pauses; settings replacement resets that entry's status. `error` is a nullable
+redacted string with stage/HTTP status, never upstream bodies/credentials/tokens.
+`current` means Azure control-plane state, **not** recursive DNS propagation.
+Poll every 5..10 seconds only while visible.
+
+Frontend tasks: add types and list/editor with explicit per-entry enable,
+interface selector, source-mode choice, tenant/client IDs, zone resource ID,
+relative hostname/apex, TTL/interval and metadata; use masked replacement-secret
+input. Upload first, save only reference, preserve entries in full-config
+transactions/restores, display validation errors and unknown-field warnings.
+Show per-entry errors/last-known timestamps, distinguish simulated/paused from
+current, warn that disabling/deleting never removes DNS records and rollback
+cannot undo external writes. Explain public-IP detection's third-party disclosure,
+CGNAT/inbound limitations and DNS TTL/propagation.
+
+Deployment/operator requirements:
+
+- Linux host mode and privileged source-interface binding. Simulator has no
+  external I/O; namespace lab mode rejects entries. The selected interface must
+  have exactly one usable IPv4 (not loopback/link-local/unspecified), including
+  DHCP-acquired addresses. Missing/ambiguous/down interfaces fail explicitly.
+  Resulting published addresses must be public, not private, CGNAT, documentation,
+  benchmarking, link-local, loopback, multicast or reserved ranges.
+- `public_ip` uses `https://api.ipify.org` (64-byte bounded plain IPv4 response).
+  Azure authentication uses `https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token`
+  with client credentials and `https://management.azure.com/.default` scope.
+  ARM uses `{zone_resource_id}/A/{record_name}?api-version=2018-05-01` under
+  `https://management.azure.com`. Public Azure cloud only.
+- Verified TLS, no insecure bypass, redirects or proxies. All HTTP sockets bind
+  the selected interface and IPv4 without another-WAN fallback; host-resolver DNS
+  lookups are not interface-bound. Require working host DNS/routing/outbound HTTPS.
+  Connect timeout five seconds, each request total timeout 15 seconds, Azure
+  bodies bounded at 64 KiB. Checks are serialized and retried no sooner than the
+  configured interval after completion; DNS changes are polling-based, not immediate.
+- Assign the app service principal DNS Zone Contributor at the public DNS zone
+  scope; enter client-secret **value**, not secret ID, and rotate before expiry.
+  Records can be absent (created conditionally) or a singleton/empty A record set.
+  Alias/multi-address sets are refused. Each check reads Azure, avoids unchanged
+  IP/TTL writes, preserves metadata and uses If-Match/If-None-Match. Concurrent
+  edits (`412`), throttling (`429`), expired secrets (`401`), permissions (`403`)
+  and other failures surface as per-entry errors, then retry next interval.
+- Only confirmed settings run; pending transaction/maintenance pauses checks and
+  cancels work on the next one-second observation. Shutdown cancels requests and
+  joins the worker. An already transmitted Azure PUT can still complete; no
+  external DNS rollback, deletion or record restoration is attempted.
+- Preserve `<state>.dynamic-dns` alongside journal backups (default
+  `/var/lib/netcontrol/native-state.json.dynamic-dns`). Secrets are immutable
+  owner-only plaintext files, not encrypted; no pruning while revisions may use
+  them. Rebuilt backend and coordinated frontend deployment are required; do not
+  reset state/credentials to accommodate the new fields.
+- Local fixtures verify protocol and error behavior; live Azure TLS/RBAC, actual
+  WAN/DHCP/NAT changes, recursive DNS propagation and appliance reboot remain
+  deployment acceptance checks. See [operator setup](README.md#azure-dynamic-dns)
+  and [handoff](docs/frontend-handoffs/2026-10-25.md#2026-10-25-01-azure-dynamic-dns).
+
 ### 6.2 Managed interfaces and VLANs
 
 Table columns: name, kind, WAN/LAN role, administrative up/down, MTU, addresses, VLAN parent/ID
@@ -2365,10 +2535,12 @@ identified as frontend presets and never applied silently to existing records.
 - All networking `/api/v1` requests: `Authorization: Bearer <token>`.
 - JSON-body POST requests: `Content-Type: application/json`.
 - Responses are JSON with `Cache-Control: no-store`.
-- JSON-body requests have a 1 MiB limit; unknown fields/trailing JSON values fail.
+- JSON-body requests have a 1 MiB limit; unknown envelope fields/trailing JSON values fail.
+  Unknown keys inside a submitted `config` are dropped and listed instead.
   Measure the complete serialized UTF-8 request, not only the config.
 - GET success and lifecycle/reconcile POST success are `200`; submit/restore
-  success are `202` with `Location` and a transaction body.
+  success are `202` with `Location` and a transaction body. Submit also returns
+  `ignored_fields` (see below).
 - No PUT/PATCH/DELETE, websocket, SSE, batch-read, dry-run, or validation endpoint.
 - Reads can invoke live observation. Fetch `/state` once for aggregate data rather
   than issuing every resource GET on each refresh.
@@ -2491,6 +2663,7 @@ interface Config {
   ntp: NTPConfig;
   syslog: SyslogConfig;
   vnstat: VNStatConfig;
+  dynamic_dns: DynamicDNSConfig[];
   interfaces: ManagedInterface[];
   dhcp_clients?: Record<string, DHCPClientConfig>;
   dns?: Record<string, DNSConfig>;
@@ -2498,6 +2671,21 @@ interface Config {
   firewall: Firewall;
   softflowd: SoftflowdConfig[];
   gateway_monitors: GatewayMonitor[];
+}
+
+interface DynamicDNSConfig {
+  name: string;
+  enabled: boolean;
+  source_interface: string;
+  address_source: "interface" | "public_ip";
+  tenant_id: string;
+  client_id: string;
+  secret_ref: string;
+  zone_resource_id: string;
+  record_name: string;
+  ttl_seconds: number;
+  interval_seconds: number;
+  metadata?: { display_name: string; description: string };
 }
 
 interface NTPConfig { enabled: boolean; servers: string[] }

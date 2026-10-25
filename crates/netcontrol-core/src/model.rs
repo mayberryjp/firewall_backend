@@ -22,6 +22,7 @@ pub struct Config {
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
     pub mqtt: MQTTConfig,
+    pub dynamic_dns: Vec<crate::DynamicDNSConfig>,
     pub gateway_monitors: Vec<GatewayMonitor>,
     pub interfaces: Vec<Interface>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -42,6 +43,7 @@ impl Default for Config {
             syslog: Default::default(),
             vnstat: Default::default(),
             mqtt: Default::default(),
+            dynamic_dns: Vec::new(),
             gateway_monitors: Vec::new(),
             interfaces: Vec::new(),
             dhcp_clients: BTreeMap::new(),
@@ -605,6 +607,7 @@ impl Config {
             }
         }
         values.extend(self.softflowd.iter().map(|exporter| &exporter.metadata));
+        values.extend(self.dynamic_dns.iter().map(|entry| &entry.metadata));
         values.extend(
             self.gateway_monitors
                 .iter()
@@ -637,6 +640,7 @@ impl Config {
         }
         let mut value = serde_json::to_value(self)?;
         value.as_object_mut().unwrap().remove("mqtt");
+        value.as_object_mut().unwrap().remove("dynamic_dns");
         strip(&mut value);
         if let Some(routes) = value["routes"].as_array_mut() {
             routes.retain(|route| route["enabled"] == true);
@@ -648,6 +652,7 @@ impl Config {
         Self::default()
     }
     pub fn normalize(&mut self) {
+        self.dynamic_dns.sort_by(|a, b| a.name.cmp(&b.name));
         self.ntp.servers.sort();
         self.syslog
             .servers
@@ -706,6 +711,7 @@ impl Config {
         c
     }
     pub fn validate(&self) -> Result<()> {
+        crate::dynamic_dns::validate(self)?;
         let mqtt = &self.mqtt;
         ensure!(
             (10..=3600).contains(&mqtt.interval_seconds)

@@ -2,7 +2,32 @@
 
 ## Unreleased
 
+### Changed
+
+- `POST /api/v1/transactions` now drops unknown keys anywhere inside `config`
+  instead of returning `400`, and lists each dropped key as an RFC 6901 pointer in
+  a new `ignored_fields` array on the `202` response (always present, possibly
+  empty). Known fields keep full type/value/semantic validation; the request
+  envelope, revision restore, saved journal/history, native ownership, credentials
+  and packages still reject unknown fields. Dropped keys never reach the saved
+  configuration, transaction record or native backend. This relaxes the
+  greenfield strict-contract policy by explicit user request for compatibility
+  with newer/older clients; a mistyped security-relevant key is now ignored rather
+  than refused, so callers must inspect `ignored_fields`. Inline secrets such as
+  `mqtt.password` are dropped like any other unknown key. Recommended bump: minor;
+  baseline unknown. Frontend action required; see
+  [handoff 2026-10-24-19](docs/frontend-handoffs/2026-10-24.md#2026-10-24-19-unknown-configuration-fields-are-dropped-and-reported).
+
 ### Added
+
+- Azure public DNS IPv4 Dynamic DNS with per-entry WAN interface monitoring or
+  NAT-aware HTTPS public-IP detection, service-principal authentication,
+  write-only private secret references and authenticated upload/status APIs.
+  Confirmed transactional settings only; verified TLS/source binding, conditional
+  A-record updates, metadata preservation, explicit errors and no alias/multi-address
+  replacement. Simulator performs no network I/O. Recommended bump: minor;
+  baseline unknown. Frontend action required; see
+  [handoff 2026-10-25-01](docs/frontend-handoffs/2026-10-25.md#2026-10-25-01-azure-dynamic-dns).
 
 - API-managed Home Assistant MQTT discovery/statistics streaming, default disabled,
   with broker, username, write-only password reference, source interface and

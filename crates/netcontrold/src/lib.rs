@@ -1,6 +1,8 @@
 pub mod cli;
+pub mod dynamic_dns;
 pub mod http;
 pub mod identity;
 pub mod mqtt;
+mod private_store;
 pub mod ssh;
 pub mod updates;

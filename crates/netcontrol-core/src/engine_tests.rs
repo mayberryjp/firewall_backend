@@ -65,6 +65,64 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
 }
 
 #[test]
+fn dynamic_dns_permissions_references_confirmation_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let entry = crate::dynamic_dns::tests::entry();
+    let mut candidate = config();
+    let mut entry = entry;
+    entry.source_interface = "lan0".into();
+    candidate.dynamic_dns.push(entry.clone());
+    assert_eq!(submit(&mut engine, candidate.clone()).status, 422);
+    engine.configure_dynamic_dns(Some(BTreeSet::new()));
+    assert_eq!(submit(&mut engine, candidate.clone()).status, 422);
+    engine.configure_dynamic_dns(Some(BTreeSet::from([entry.secret_ref.clone()])));
+    let mut before = candidate.clone();
+    before.dynamic_dns.clear();
+    let permissions: Vec<_> = all()
+        .into_iter()
+        .filter(|p| p != "dynamic_dns.write")
+        .collect();
+    assert_eq!(
+        authorize(&permissions, &before, &candidate)
+            .unwrap_err()
+            .status,
+        403
+    );
+    assert!(authorize(&all(), &before, &candidate).is_ok());
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    assert!(engine.saved_configuration().dynamic_dns.is_empty());
+    let id = pending.body["id"].as_str().unwrap();
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert!(engine.saved_configuration().dynamic_dns.is_empty());
+    let pending = submit(&mut engine, candidate.clone());
+    let id = pending.body["id"].as_str().unwrap();
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    assert_eq!(
+        engine.saved_configuration().dynamic_dns,
+        candidate.dynamic_dns
+    );
+    let saved = serde_json::to_string(&engine.state).unwrap();
+    assert!(!saved.contains("client_secret"));
+    drop(engine);
+    let engine = fixture.engine();
+    assert_eq!(
+        engine.saved_configuration().dynamic_dns,
+        candidate.dynamic_dns
+    );
+}
+
+#[test]
 fn offline_conversion_validation_checks_history_and_refuses_active_transactions() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
@@ -1632,7 +1690,7 @@ fn unsupported_flow_filters_and_v5_sampling_fail_validation_before_backend_apply
 }
 
 #[test]
-fn source_policy_api_removed_and_configuration_rejected_without_mutation() {
+fn source_policy_api_removed_and_configuration_field_ignored_without_mutation() {
     let f = Fixture::new();
     let mut e = f.engine();
     assert!(!PERMISSIONS.contains(&"policy.write"));
@@ -1654,19 +1712,109 @@ fn source_policy_api_removed_and_configuration_rejected_without_mutation() {
             json!({"base_revision":0,"confirm_timeout_seconds":30,
                 "config":{"policy_rules":rules}}),
         );
-        assert_eq!(reply.status, 400, "{}", reply.body);
-        assert!(
-            reply.body["error"]
-                .as_str()
-                .unwrap()
-                .contains("policy_rules")
+        assert_eq!(reply.status, 202, "{}", reply.body);
+        assert_eq!(
+            reply.body["ignored_fields"],
+            json!(["/config/policy_rules"])
         );
-        assert!(e.state.transactions.is_empty());
+        assert!(reply.body["candidate"].get("policy_rules").is_none());
+        let id = reply.body["id"].as_str().unwrap().to_owned();
+        let rolled_back = request(
+            &mut e,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null,
+        );
+        assert_eq!(rolled_back.status, 200, "{}", rolled_back.body);
         assert_eq!(e.state.revision, 0);
     }
     let state = request(&mut e, "GET", "/api/v1/state", Value::Null);
     for field in ["desired", "observed"] {
         assert!(state.body[field].get("policy_rules").is_none());
+    }
+}
+
+#[test]
+fn unknown_configuration_fields_are_dropped_and_reported_but_known_fields_stay_strict() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let body = json!({"base_revision":0,"confirm_timeout_seconds":30,"config":{
+        "future_top_level":{"a":1},
+        "mqtt":{"enabled":false,"mqtt":"same-name-as-parent","extra/slash":1},
+        "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,
+            "addresses":["192.0.2.1/24"],"preferred_new_option":true}]}});
+    let reply = request(&mut e, "POST", "/api/v1/transactions", body);
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let mut ignored: Vec<_> = reply.body["ignored_fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap().to_owned())
+        .collect();
+    ignored.sort();
+    assert_eq!(
+        ignored,
+        [
+            "/config/future_top_level",
+            "/config/interfaces/0/preferred_new_option",
+            "/config/mqtt/extra~1slash",
+            "/config/mqtt/mqtt",
+        ]
+    );
+    assert_eq!(reply.body["candidate"]["interfaces"][0]["name"], "lan0");
+    let id = reply.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(confirm(&mut e, &id).status, 200);
+    let state = request(&mut e, "GET", "/api/v1/state", Value::Null);
+    assert!(state.body["desired"].get("future_top_level").is_none());
+    assert!(
+        state.body["desired"]["interfaces"][0]
+            .get("preferred_new_option")
+            .is_none()
+    );
+    let clean = request(
+        &mut e,
+        "POST",
+        "/api/v1/transactions",
+        json!({"base_revision":1,"confirm_timeout_seconds":30,"config":state.body["desired"]}),
+    );
+    assert_eq!(clean.status, 202, "{}", clean.body);
+    assert_eq!(clean.body["ignored_fields"], json!([]));
+    assert_eq!(
+        request(
+            &mut e,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                clean.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+
+    for config in [
+        json!({"mqtt":{"interval_seconds":"sixty"}}),
+        json!({"interfaces":[{"name":"lan0","unknown":1}]}),
+        json!({"ipv6_enabled":null}),
+        json!(null),
+    ] {
+        let reply = request(
+            &mut e,
+            "POST",
+            "/api/v1/transactions",
+            json!({"base_revision":1,"confirm_timeout_seconds":30,"config":config}),
+        );
+        assert_eq!(reply.status, 400, "{config}: {}", reply.body);
+    }
+    for body in [
+        json!({"base_revision":1,"confirm_timeout_seconds":30,"config":{},"envelope_extra":1}),
+        json!({"base_revision":1,"config":{}}),
+    ] {
+        assert_eq!(
+            request(&mut e, "POST", "/api/v1/transactions", body).status,
+            400
+        );
     }
 }
 
