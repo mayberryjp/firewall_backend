@@ -81,6 +81,49 @@ impl Fixture {
 }
 
 #[test]
+fn static_route_delete_accepts_disabled_record_with_metadata() {
+    let f = Fixture::new(PERMISSIONS);
+    let config = json!({
+        "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
+        "routes":[{"metadata":{"display_name":"Spare route"},"enabled":false,"destination":"203.0.113.0/24","interface":"lan0","table":10000,"metric":10}]
+    });
+    {
+        let mut engine = f.app.engine.lock().unwrap();
+        let reply = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "test",
+            &f.principal.permissions,
+            &serde_json::to_vec(
+                &json!({"base_revision":0,"confirm_timeout_seconds":30,"config":config}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(reply.status, 202, "{}", reply.body);
+        let reply = engine.request(
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/confirm",
+                reply.body["id"].as_str().unwrap()
+            ),
+            "",
+            "test",
+            &f.principal.permissions,
+            &[],
+        );
+        assert_eq!(reply.status, 200);
+    }
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "no ip route 203.0.113.0/24 lan0 direct 10000 10");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(f.request("/api/v1/routes"), json!([]));
+}
+
+#[test]
 fn global_ipv6_cli_stages_checks_commits_and_rolls_back() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();
@@ -361,6 +404,7 @@ fn ergonomic_interfaces_routes_policies_and_services_preserve_complete_config() 
     assert!(config.get("policy_rules").is_none());
     assert_eq!(config["interfaces"].as_array().unwrap().len(), 2);
     assert_eq!(config["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(config["routes"][0]["enabled"], true);
     assert_eq!(config["firewall"]["policy"], "drop");
     assert_eq!(config["syslog"]["enabled"], true);
     assert_eq!(config["vnstat"]["enabled"], true);

@@ -237,6 +237,11 @@ verification. Desired addresses are static; managed DHCP lease addresses are
 added only to the effective native view. Production DAD workflows are not
 implemented. Existing addresses on unrelated interfaces are not reconciled.
 
+Static configuration routes require `enabled`; disabled records stay in core
+configuration but are excluded from the operational plan. Toggling reconciles
+only owned routes, including rollback/recovery; inherited static routes start
+enabled. DHCP runtime routes are unchanged.
+
 Routes use protocol 242 and table 254 (main) or tables 10000–19999. Policy rules
 use priorities 10000–19999 and those same target tables. Outside validated
 first-start inheritance, unowned kernel/DHCP/

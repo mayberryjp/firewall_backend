@@ -147,6 +147,11 @@ kernel host|namespace KEY VALUE
 no kernel host|namespace KEY
 ```
 
+Route-add commands explicitly stage `enabled: true`. Route deletion matches the
+specified path/table/metric regardless of its enabled flag or metadata, so a
+disabled route remains deletable. Route enabled toggles use the complete
+configuration transaction API; there is no dedicated CLI toggle command.
+
 `ipv6 enable|disable` stages the top-level `ipv6_enabled` policy (default true).
 It requires `kernel.namespace.write` when applied, in addition to transaction
 permission. Disabling requires removing conflicting IPv6 configuration in the

@@ -16,7 +16,7 @@
       }
     ],
     "routes": [
-      {"metadata": {"display_name": "Flow collector route"}, "destination": "198.51.100.50/32", "gateway": "192.0.2.1", "interface": "uplink.100", "table": 254, "metric": 100}
+      {"metadata": {"display_name": "Flow collector route"}, "enabled": true, "destination": "198.51.100.50/32", "gateway": "192.0.2.1", "interface": "uplink.100", "table": 254, "metric": 100}
     ],
     "firewall": {"allow_all_icmp": true, "policy": "accept", "rules": [], "nat": {"masquerade": []}},
     "softflowd": [

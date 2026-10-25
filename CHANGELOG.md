@@ -4,6 +4,16 @@
 
 ### Added
 
+- Required static-route `enabled` boolean. Disabled routes remain validated and
+  saved in configuration/history but are excluded from native route plans;
+  enabling/disabling uses ordinary confirmed transactions and owned-route
+  reconciliation. Explicit gateway monitors require enabled matching routes.
+  Initial host adoption and CLI route creation explicitly enable static routes;
+  CLI deletion also handles disabled records. Missing/null/nonboolean fields are
+  rejected, with no implicit saved-state conversion. Recommended bump: major for
+  the breaking request/persisted schema; baseline unknown. Frontend action required;
+  see [handoff 2026-10-24-15](docs/frontend-handoffs/2026-10-24.md#2026-10-24-15-static-route-enabled-state).
+
 - DHCPv4 gateway monitors with explicit `mode: "dhcp"`, selected managed interface
   and target, without pinned lease source/gateway/table or static route prerequisites.
   Enabled monitors save before acquisition and report waiting/Unknown; native

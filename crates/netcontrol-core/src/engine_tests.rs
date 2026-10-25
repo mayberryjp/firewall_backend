@@ -150,6 +150,86 @@ fn dhcp_gateway_monitor_saves_without_static_address_route_or_lease() {
 }
 
 #[test]
+fn static_route_enabled_permission_restart_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut initial = serde_json::to_value(config()).unwrap();
+    initial["routes"] = json!([{"enabled":true,"destination":"203.0.113.0/24","interface":"lan0","table":10000,"metric":10}]);
+    let initial: Config = serde_json::from_value(initial).unwrap();
+    let reply = submit(&mut engine, initial.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let mut disabled = initial.clone();
+    disabled.routes[0].enabled = false;
+    let permissions: Vec<_> = all().into_iter().filter(|p| p != "routes.write").collect();
+    let body = serde_json::to_vec(
+        &json!({"base_revision":1,"confirm_timeout_seconds":30,"config":disabled}),
+    )
+    .unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "limited",
+                &permissions,
+                &body
+            )
+            .status,
+        403
+    );
+    let mut invalid = serde_json::to_value(&disabled).unwrap();
+    invalid["routes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("enabled");
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            "/api/v1/transactions",
+            json!({"base_revision":1,"confirm_timeout_seconds":30,"config":invalid})
+        )
+        .status,
+        400
+    );
+    let reply = submit(&mut engine, disabled.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/routes", Value::Null).body[0]["enabled"],
+        false
+    );
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(disabled.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(engine.saved_configuration(), &disabled);
+    let reply = submit(&mut engine, initial);
+    assert_eq!(reply.status, 202);
+    let rollback = request(
+        &mut engine,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            reply.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200);
+    assert_eq!(engine.saved_configuration(), &disabled);
+}
+
+#[test]
 fn global_ipv6_permission_commit_restart_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
@@ -1397,7 +1477,7 @@ fn all_domain_permissions_are_independently_required() {
         ),
         (
             "routes.write",
-            json!({"routes":[{"destination":"0.0.0.0/0","interface":"lan0","table":10000,"metric":1}]}),
+            json!({"routes":[{"enabled":true,"destination":"0.0.0.0/0","interface":"lan0","table":10000,"metric":1}]}),
         ),
     ];
     for (permission, v) in cases {

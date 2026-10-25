@@ -826,12 +826,16 @@ fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
             metric,
         ] => {
             check_family(family, destination)?;
-            let route = json!({"destination":destination,"interface":interface,"gateway":if *gateway=="direct" {""} else {gateway},
+            let route = json!({"enabled":true,"destination":destination,"interface":interface,"gateway":if *gateway=="direct" {""} else {gateway},
                 "table":number(table)?,"metric":number(metric)?});
             let route =
                 serde_json::to_value(serde_json::from_value::<netcontrol_core::Route>(route)?)?;
             if words[0] == "no" {
-                remove_where(array(config, "routes")?, |v| v == &route)?;
+                remove_where(array(config, "routes")?, |v| {
+                    ["destination", "interface", "gateway", "table", "metric"]
+                        .iter()
+                        .all(|field| v[field] == route[field])
+                })?;
             } else {
                 push_unique(array(config, "routes")?, route)?;
             }

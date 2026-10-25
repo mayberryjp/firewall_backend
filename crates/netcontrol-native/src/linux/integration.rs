@@ -81,6 +81,56 @@ fn config(value: Value) -> Result<Config> {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn native_static_route_enabled_toggle_restart_and_rollback() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let options = fixture.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let active = config(json!({
+        "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,
+            "addresses":["192.0.2.1/24","2001:db8::1/64"]}],
+        "routes":[
+            {"enabled":true,"destination":"203.0.113.0/24","interface":"lan0","table":10000,"metric":10},
+            {"enabled":true,"destination":"2001:db8:10::/64","interface":"lan0","table":10001,"metric":10}
+        ]
+    }))?;
+    active.validate()?;
+    let installed = |native: &Native, desired: &Config| -> Result<usize> {
+        let network = Network::parse(&desired.operational_value()?)?;
+        let keys = options.keys.clone();
+        session(native.namespace.clone(), move |rt, handle| {
+            let snapshot = rt.block_on(networking::boot_snapshot(handle, &network, &keys))?;
+            Ok(snapshot["routes"].as_array().unwrap().len())
+        })
+    };
+    let mut disabled = active.clone();
+    for route in &mut disabled.routes {
+        route.enabled = false;
+    }
+    native.apply(&empty, &disabled)?;
+    assert_eq!(installed(&native, &disabled)?, 0);
+    assert_eq!(native.observe(&disabled)?, disabled);
+    native.apply(&disabled, &active)?;
+    assert_eq!(installed(&native, &active)?, 2);
+    native.apply(&active, &disabled)?;
+    assert_eq!(installed(&native, &disabled)?, 0);
+    drop(native);
+    let mut native = Native::open(options.clone())?;
+    native.repair(&disabled)?;
+    assert_eq!(native.observe(&disabled)?, disabled);
+    assert_eq!(installed(&native, &disabled)?, 0);
+    native.apply(&disabled, &active)?;
+    assert_eq!(installed(&native, &active)?, 2);
+    native.apply(&active, &disabled)?;
+    assert_eq!(native.observe(&disabled)?, disabled);
+    assert_eq!(installed(&native, &disabled)?, 0);
+    native.apply(&disabled, &empty)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
 fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Result<()> {
     let fixture = Fixture::new()?;
     let mut native = Native::open(fixture.options())?;
@@ -189,7 +239,7 @@ fn global_ipv6_managed_addresses_routes_and_interrupted_disable_recover() -> Res
     let dual = config(json!({
         "interfaces":[{"name":"dual0","kind":"dummy","role":"lan","mtu":1500,"up":true,
             "addresses":["192.0.2.1/24","2001:db8::1/64"]}],
-        "routes":[{"destination":"2001:db8:10::/64","interface":"dual0","table":10000,"metric":10}]
+        "routes":[{"enabled":true,"destination":"2001:db8:10::/64","interface":"dual0","table":10000,"metric":10}]
     }))?;
     native.apply(&empty, &dual)?;
     let mut disabled = dual.clone();
@@ -617,9 +667,9 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
         {"name":"wg0","kind":"wireguard","role":"lan","mtu":1380,"up":true,"addresses":["2001:db8:200::2/64"],"wireguard":{"key_ref":"wg-key","listen_port":51820,"peers":[]},"dhcp_relay":{"enabled":false,"servers":[]}}
     ]);
     value["routes"] = json!([
-        {"destination":"203.0.113.0/24","interface":"trunk0","gateway":"192.0.2.1","table":10000,"metric":10},
-        {"destination":"2001:db8:300::/64","interface":"wg0","table":10001,"metric":10},
-        {"destination":"2001:db8:100::1/128","interface":"vlan100","table":10002,"metric":10}
+        {"enabled":true,"destination":"203.0.113.0/24","interface":"trunk0","gateway":"192.0.2.1","table":10000,"metric":10},
+        {"enabled":true,"destination":"2001:db8:300::/64","interface":"wg0","table":10001,"metric":10},
+        {"enabled":true,"destination":"2001:db8:100::1/128","interface":"vlan100","table":10002,"metric":10}
     ]);
     value["gateway_monitors"] = json!([
         {"name":"wan-v4","enabled":true,"interface":"trunk0","source_address":"192.0.2.2",

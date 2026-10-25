@@ -4,9 +4,81 @@ use serde_json::{Value, json};
 fn candidate() -> Config {
     serde_json::from_value(json!({
         "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
-        "routes":[{"destination":"192.0.2.0/24","interface":"lan0","table":10000,"metric":100}],
+        "routes":[{"enabled":true,"destination":"192.0.2.0/24","interface":"lan0","table":10000,"metric":100}],
         "firewall":{"policy":"drop","rules":[{"source":"192.0.2.0/24","action":"accept"}]}
     })).expect("valid fixture")
+}
+
+#[test]
+fn static_route_enabled_controls_operational_projection() {
+    let mut config = candidate();
+    config.validate().unwrap();
+    assert_eq!(
+        config.operational_value().unwrap()["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    config.routes[0].enabled = false;
+    config.validate().unwrap();
+    let saved = serde_json::to_value(&config).unwrap();
+    assert_eq!(saved["routes"][0]["enabled"], false);
+    assert_eq!(
+        serde_json::from_value::<Config>(saved.clone()).unwrap(),
+        config
+    );
+    assert!(
+        config.operational_value().unwrap()["routes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for invalid in [json!(null), json!("false"), json!(0)] {
+        let mut value = saved.clone();
+        value["routes"][0]["enabled"] = invalid;
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
+    let mut missing = saved;
+    missing["routes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("enabled");
+    assert!(serde_json::from_value::<Config>(missing).is_err());
+    config.routes[0].metric = 0;
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn static_route_disabled_cannot_support_enabled_gateway_monitor() {
+    let example: Value =
+        serde_json::from_str(include_str!("../../../examples/gateway-monitoring.json")).unwrap();
+    let mut config: Config = serde_json::from_value(example["config"].clone()).unwrap();
+    config.normalize();
+    config.validate().unwrap();
+    config.routes[0].enabled = false;
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("enabled explicit matching route")
+    );
+    let table = config.routes[0].table;
+    for monitor in &mut config.gateway_monitors {
+        if monitor.routing_table == table {
+            monitor.enabled = false;
+        }
+    }
+    config.validate().unwrap();
+    config.routes.push(config.routes[0].clone());
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate route")
+    );
 }
 
 #[test]

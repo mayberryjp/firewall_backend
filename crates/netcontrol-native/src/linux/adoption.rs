@@ -564,9 +564,9 @@ pub async fn capture(
                     .routes
                     .push(route);
             } else {
-                config
-                    .routes
-                    .push(serde_json::from_value(serde_json::to_value(route)?)?);
+                let mut value = serde_json::to_value(route)?;
+                value["enabled"] = serde_json::json!(true);
+                config.routes.push(serde_json::from_value(value)?);
             }
             let mut raw = vec![0; message.buffer_len()];
             message.emit(&mut raw);

@@ -28,6 +28,7 @@
     ],
     "routes": [
       {
+        "enabled": true,
         "destination": "0.0.0.0/0",
         "gateway": "192.0.2.1",
         "interface": "wan",
@@ -35,6 +36,7 @@
         "metric": 100
       },
       {
+        "enabled": true,
         "destination": "10.9.0.0/24",
         "interface": "wg0",
         "table": 254,

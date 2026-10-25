@@ -105,7 +105,7 @@ zero values and subsequently failing semantic validation. Required fields:
 | Interface | `name`, `kind`, `role`, `mtu`, `up` |
 | WireGuard / peer | `key_ref`, `listen_port` / `public_key` |
 | VLAN | `parent`, `id` |
-| Route | `destination`, `interface`, `table`, `metric` |
+| Route | `enabled`, `destination`, `interface`, `table`, `metric` |
 | Policy rule | `priority`, `source`, `table` |
 | Firewall/host rule | `action` |
 | Masquerade rule | `family`, `out_interface` |
@@ -1046,7 +1046,7 @@ canonical and same-family in explicit mode; reject hostnames, zones, mapped IPv6
 multicast, and unspecified addresses. Source must be configured on an up
 managed interface, cannot be link-local or equal the gateway/target. Private/ULA
 sources are valid. IPv6 gateway/target can be link-local; interface supplies
-the scope. Enabled monitors require a matching explicit route into table 254 or
+the scope. Enabled monitors require a matching enabled explicit route into table 254 or
 10000..19999. The backend manages internal source-policy rules for enabled monitor
 source addresses only (`/32` IPv4, `/128` IPv6); these are not editable or exposed
 as configuration. Enabled monitors sharing a source must use the same routing
@@ -1658,9 +1658,38 @@ owned-configuration drift.
 
 ### 6.4 Routes
 
-Table/editor: destination network, optional gateway, managed interface, table,
-metric. Family badge derives from destination. Include text/table/interface/family
-filters and a delete action.
+Table/editor: enabled toggle, destination network, optional gateway, managed
+interface, table, metric. Family badge derives from destination. Include
+text/table/interface/family/enabled filters and a separate delete action.
+
+Every static route requires `enabled: boolean`, with no omission default. Missing,
+null or nonboolean values return `400`. New-route forms should explicitly start
+with `true`. False retains the complete route and metadata in desired/observed
+configuration, drafts, transactions, revision history and exports, but excludes
+it from native installation. `/api/v1/routes` includes disabled records; it is not
+a raw kernel routing-table dump. DHCP-learned runtime routes do not gain this flag.
+Disabling an installed route removes only that owned static route; re-enabling
+installs it. Rollback/recovery uses the same route selection. Editing fields of a
+disabled route does not install it. Initial host adoption records inherited
+static routes with `enabled: true`.
+
+Disabled routes still require valid canonical prefixes, matching gateway family,
+a managed interface, table 254 or 10000..19999, and a positive 32-bit metric.
+Duplicate `(table, destination, metric)` identities remain invalid across both
+states; enabled is not part of identity. IPv6 policy still validates disabled
+routes. Enabled explicit gateway monitors require a matching enabled route;
+disabling their only matching route without disabling/changing the monitor
+returns `422`. DHCP-mode monitors still do not require static routes.
+
+Stage toggles in the shared draft and apply a complete `POST /api/v1/transactions`
+package, with normal confirmation/rollback. Changes require `transactions.write`
+and `routes.write`, plus permissions for other changed resources. Reads require
+`state.read`. There is no per-route enable/disable endpoint or new permission.
+Warn about management-connectivity loss before disabling management/default
+routes. Saved configuration and revision records containing routes must include
+the required field; omitted fields fail strict loading, with no automatic
+conversion, reset or compatibility fallback. Coordinate client/backend deployment
+and review saved-state readiness before updating an appliance.
 
 Gateway omission means a direct route; never substitute `0.0.0.0`. Managed
 interface options come from the draft, not adopted parents. Explain reserved
@@ -2404,6 +2433,7 @@ interface DHCPClientRuntime {
 }
 
 interface Route {
+  enabled: boolean;
   destination: string;
   gateway?: string;
   interface: string;

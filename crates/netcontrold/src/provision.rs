@@ -311,7 +311,7 @@ mod tests {
         serde_json::from_value(json!({"interfaces": [
             {"name":"wan0","kind":"ethernet","role":"unassigned","mtu":1500,"up":true,"addresses":["198.51.100.2/24"]},
             {"name":"lan0","kind":"ethernet","role":"unassigned","mtu":1500,"up":false,"addresses":[]}
-        ],"routes":[{"destination":"0.0.0.0/0","gateway":"198.51.100.1","interface":"wan0","table":254,"metric":100}]})).unwrap()
+        ],"routes":[{"enabled":true,"destination":"0.0.0.0/0","gateway":"198.51.100.1","interface":"wan0","table":254,"metric":100}]})).unwrap()
     }
     #[test]
     fn factory_reset_discards_custom_network_configuration() {

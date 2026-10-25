@@ -157,7 +157,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
         {"name":"nic100","kind":"vlan","role":"lan","mtu":1300,"up":true,
             "addresses":["198.18.1.1/24"],"vlan":{"parent":"nic0","id":100},"dhcp_relay":{"enabled":false,"servers":[]}}
     ]);
-    value["routes"] = json!([{"destination":"0.0.0.0/0","gateway":"198.51.100.1","interface":"nic0","table":254,"metric":200}]);
+    value["routes"] = json!([{"enabled":true,"destination":"0.0.0.0/0","gateway":"198.51.100.1","interface":"nic0","table":254,"metric":200}]);
     let desired: Config = serde_json::from_value(value.clone())?;
 
     let mut collision = serde_json::to_value(&empty)?;
@@ -168,8 +168,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             .is_err()
     );
     let mut conflict = value.clone();
-    conflict["routes"] =
-        json!([{"destination":"10.0.0.0/8","interface":"nic0","table":254,"metric":7}]);
+    conflict["routes"] = json!([{"enabled":true,"destination":"10.0.0.0/8","interface":"nic0","table":254,"metric":7}]);
     assert!(
         native
             .apply(&empty, &serde_json::from_value(conflict)?)

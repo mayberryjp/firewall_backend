@@ -24,8 +24,8 @@
     ],
     "dhcp_clients": {"wan1": {}},
     "routes": [
-      {"destination": "192.0.2.1/32", "interface": "wan0", "table": 10000, "metric": 100},
-      {"destination": "2001:db8::1/128", "interface": "wan0", "table": 10001, "metric": 100}
+      {"enabled": true, "destination": "192.0.2.1/32", "interface": "wan0", "table": 10000, "metric": 100},
+      {"enabled": true, "destination": "2001:db8::1/128", "interface": "wan0", "table": 10001, "metric": 100}
     ],
     "gateway_monitors": [
       {

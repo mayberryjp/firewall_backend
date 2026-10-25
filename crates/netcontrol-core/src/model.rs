@@ -186,6 +186,7 @@ pub struct DNSDomain {
 pub struct Route {
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
+    pub enabled: bool,
     pub destination: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gateway: String,
@@ -582,6 +583,9 @@ impl Config {
         }
         let mut value = serde_json::to_value(self)?;
         strip(&mut value);
+        if let Some(routes) = value["routes"].as_array_mut() {
+            routes.retain(|route| route["enabled"] == true);
+        }
         Ok(value)
     }
 
@@ -1183,11 +1187,12 @@ impl Config {
                     "monitor source must belong to up managed interface"
                 );
                 ensure!(
-                    self.routes.iter().any(|r| r.interface == m.interface
+                    self.routes.iter().any(|r| r.enabled
+                        && r.interface == m.interface
                         && r.table == m.routing_table
                         && contains(&r.destination, t)
                         && (r.gateway == m.gateway || (g == t && r.gateway.is_empty()))),
-                    "monitor requires explicit matching route"
+                    "monitor requires enabled explicit matching route"
                 );
             }
         }
