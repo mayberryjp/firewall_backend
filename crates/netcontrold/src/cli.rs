@@ -15,7 +15,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   configure terminal                  Edit a private candidate of the committed revision
   show running-config                 Committed configuration, independent of observation
   show candidate-config / compare     Show the private candidate / its changes
-  show state / runtime / interfaces / routes / policy-rules / firewall / kernel
+  show state / runtime / interfaces / routes / firewall / kernel
   show interfaces discovered          Read-only inventory, including unmanaged host NICs
   show transactions / transaction ID / revisions / revision NUMBER
   show statistics [interfaces|protocols|gateways|vnstat|vnstat/host|vnstat/managed]
@@ -32,7 +32,6 @@ Configuration commands:
   ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
   ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
   no ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
-  policy-rule PRIORITY SOURCE TABLE / no policy-rule PRIORITY
   firewall policy accept|drop / firewall allow-all-icmp enable|disable
   firewall rule SOURCE|any DESTINATION|any accept|drop / no firewall rule INDEX
   firewall host JSON / firewall interface-policy JSON
@@ -486,7 +485,6 @@ impl CliSession {
             ["interfaces"] => "/api/v1/interfaces".to_owned(),
             ["interfaces", "discovered"] => "/api/v1/interfaces/discovered".to_owned(),
             ["routes"] => "/api/v1/routes".to_owned(),
-            ["policy-rules"] => "/api/v1/policy-rules".to_owned(),
             ["firewall"] => "/api/v1/firewall/rules".to_owned(),
             ["kernel"] => "/api/v1/kernel/tunables".to_owned(),
             ["transactions"] => "/api/v1/transactions".to_owned(),
@@ -837,18 +835,6 @@ fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
             } else {
                 push_unique(array(config, "routes")?, route)?;
             }
-        }
-        ["policy-rule", priority, source, table] => push_unique(
-            array(config, "policy_rules")?,
-            json!({
-                "priority":number(priority)?,"source":source,"table":number(table)?
-            }),
-        )?,
-        ["no", "policy-rule", priority] => {
-            let priority = number(priority)?;
-            remove_where(array(config, "policy_rules")?, |v| {
-                v["priority"] == priority
-            })?;
         }
         ["firewall", "policy", policy] if matches!(*policy, "accept" | "drop") => {
             config["firewall"]["policy"] = json!(policy)

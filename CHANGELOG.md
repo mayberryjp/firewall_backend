@@ -157,6 +157,14 @@
 
 ### Fixed
 
+- State checksum verification hashes the saved JSON payload before current-model
+  decoding, instead of reserializing typed state. Model field ordering/defaults
+  (including `ipv6_enabled`) no longer falsely report valid journals as corrupt.
+  Writes hash/publish a single serialization; corruption, unknown fields and
+  incompatible state still fail without reset, migration or checksum repair.
+  Added field-order/default/tamper regressions. No HTTP/frontend contract change.
+  Recommended bump: patch; baseline unknown.
+
 - Native DHCP lease application installs direct/connected routes before routes
   through a gateway. Previously canonical route sorting put the default route
   first while the leased address used `NOPREFIXROUTE`, so a fresh lease could
@@ -378,6 +386,17 @@
   is rejected. This is not an old-state migration.
 
 ### Removed
+
+- User-configurable source-policy routing: configuration `policy_rules`
+  (including empty/null values), `/api/v1/policy-rules`, `policy.write`, and CLI
+  policy-rule/show commands. Normal destination routes remain supported;
+  gateway monitors derive internal host-source rules with deterministic priorities,
+  rejecting conflicting tables for a shared source. Native apply/drift/rollback/
+  restart and private reboot snapshots retain monitor routing. Probe FIB checks
+  now request the actual policy-selected table. Recommended bump: major for the
+  breaking API/configuration/permission/CLI contract; baseline unknown.
+  No migration or state reset. Frontend action required; see
+  [handoff 2026-10-24-10](docs/frontend-handoffs/2026-10-24.md#2026-10-24-10-remove-user-configurable-source-policy-routing).
 
 - All Go sources/tests and module manifests, the old Alpine APK/abuild packaging,
   and external dnsmasq/chronyd/syslog-ng/vnstatd/softflowd supervision.

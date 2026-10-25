@@ -9,7 +9,7 @@ Backend calls are synchronous; callers must serialize access to `Engine`.
 ## Current configuration contract
 
 Configuration JSON retains the current networking field names: `ntp`, `syslog`,
-`vnstat`, `gateway_monitors`, `interfaces`, `routes`, `policy_rules`, `firewall`,
+`vnstat`, `gateway_monitors`, `interfaces`, `routes`, `firewall`,
 `softflowd`, and `kernel`. Every feature configuration has a typed serde model
 with `deny_unknown_fields`. Interface `role` is required and must be `wan` or
 `lan`. `firewall.allow_all_icmp` defaults to `true` when omitted; explicit JSON
@@ -18,10 +18,16 @@ is canonical except where firewall policy evaluation depends on rule order.
 
 Validation covers canonical numeric addresses/networks/endpoints, interface
 identities and MTU, WireGuard keys/ports/peers, VLAN parent cycles and identities,
-DHCP relay bindings, managed routes and policy tables, NAT address families,
+DHCP relay bindings, managed routes and routing tables, NAT address families,
 host/ingress firewall policies and expansion/metadata limits, kernel allowlists
 and canonical scalar/vector values, service endpoints/timeouts/limits, and
 gateway monitoring address/routing/timing dependencies.
+
+User-configurable source-policy routing is unsupported: `policy_rules` is an
+unknown field (including empty arrays/null), `/api/v1/policy-rules` is absent,
+and `policy.write` is not a permission. Native gateway monitors derive internal
+host-source rules; enabled monitors sharing a source must use the same table.
+Ordinary destination routing remains available, normally through table 254.
 
 ## Persistent state and recovery
 
@@ -37,9 +43,13 @@ The state file is a JSON envelope with exactly these fields:
 
 The illustrated empty `state` is not a valid journal; its actual typed payload
 contains `scope`, `revision`, `desired`, `active_transaction`, `initialized_at`
-and `transactions`. SHA-256 covers the compact serde serialization of that typed
-payload, not arbitrary input whitespace. It detects corruption, not an attacker
-able to rewrite the journal and its checksum.
+and `transactions`. SHA-256 covers the exact JSON bytes of the saved `state`
+value. The writer serializes that value once as compact JSON, then hashes and
+publishes the same payload. Loading verifies those bytes before decoding current
+Rust types, so field ordering/default expansion cannot fabricate corruption.
+Changing whitespace within the saved value changes its checksum; envelope
+whitespace outside that value is not covered. This detects corruption, not an
+attacker able to rewrite the journal and its checksum.
 
 The journal rejects unknown fields, malformed/truncated/empty files, checksum
 mismatches, different schemas, scope mismatches, inconsistent active pointers,
@@ -48,6 +58,13 @@ base snapshots and restoration provenance. Go journals are not parsed or
 converted. Existing data is never silently reset, imported or deleted. An
 incompatible file requires deliberate operator placement of a separate fresh
 Rust state path; the old file must be preserved.
+
+A checksum failure is not permission to reset state or recompute its checksum.
+Preserve the original file and inspect the failure. A model-dependent checksum
+bug could previously reject valid bytes after adding fields such as
+`ipv6_enabled`; the corrected loader checks stored bytes without rewriting the
+file. It still rejects actual corruption and incompatible current payloads,
+without migration, repair fallback or live-network configuration import.
 
 An adjacent `.lock` file uses an exclusive process lock. State/lock paths must
 be regular files rather than symbolic links. Publication uses a unique adjacent

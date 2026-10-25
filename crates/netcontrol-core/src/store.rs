@@ -86,7 +86,7 @@ impl Store {
             fail_after: std::cell::Cell::new(None),
         })
     }
-    pub fn load<T: serde::de::DeserializeOwned + Serialize>(&self) -> Result<Option<T>> {
+    pub fn load<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
         let mut f = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -99,19 +99,22 @@ impl Store {
             !bytes.is_empty(),
             "state is empty/corrupt; refusing to initialize over existing data"
         );
-        let envelope: Envelope<T> = serde_json::from_slice(&bytes)
-            .context("invalid/incompatible Rust state; Go journals are not accepted")?;
+        let envelope: Envelope<Box<serde_json::value::RawValue>> =
+            serde_json::from_slice(&bytes)
+                .context("invalid/incompatible Rust state; Go journals are not accepted")?;
         ensure!(
             envelope.schema == SCHEMA,
             "incompatible state schema {:?}; no automatic conversion",
             envelope.schema
         );
-        let hash = hex::encode(Sha256::digest(serde_json::to_vec(&envelope.state)?));
+        let hash = hex::encode(Sha256::digest(envelope.state.get().as_bytes()));
         ensure!(
             hash == envelope.sha256,
             "state checksum mismatch; refusing corrupt data"
         );
-        Ok(Some(envelope.state))
+        let state = serde_json::from_str(envelope.state.get())
+            .context("invalid/incompatible Rust state payload")?;
+        Ok(Some(state))
     }
     pub fn save<T: Serialize>(&self, state: &T) -> Result<()> {
         #[cfg(test)]
@@ -122,7 +125,8 @@ impl Store {
             }
             self.fail_after.set(Some(left - 1));
         }
-        let hash = hex::encode(Sha256::digest(serde_json::to_vec(state)?));
+        let state = serde_json::value::to_raw_value(state)?;
+        let hash = hex::encode(Sha256::digest(state.get().as_bytes()));
         let envelope = Envelope {
             schema: SCHEMA.into(),
             sha256: hash,
@@ -223,6 +227,93 @@ fn retry_windows_publication(
                 attempt += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksum_verification_uses_saved_payload_not_current_field_order() {
+        #[derive(Serialize)]
+        struct WrittenState {
+            label: String,
+            count: u32,
+        }
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct ReadState {
+            count: u32,
+            label: String,
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "netcontrol-checksum-{:032x}",
+            rand::random::<u128>()
+        ));
+        let path = directory.join("state.json");
+        let store = Store::open(&path).unwrap();
+        store
+            .save(&WrittenState {
+                label: "synthetic".into(),
+                count: 7,
+            })
+            .unwrap();
+        let saved = fs::read(&path).unwrap();
+        let loaded = store.load::<ReadState>();
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            loaded.unwrap(),
+            Some(ReadState {
+                count: 7,
+                label: "synthetic".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn checksum_validation_precedes_defaults_and_rejects_tampered_or_unknown_state() {
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CurrentState {
+            desired: crate::Config,
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "netcontrol-checksum-model-{:032x}",
+            rand::random::<u128>()
+        ));
+        let path = directory.join("state.json");
+        let store = Store::open(&path).unwrap();
+        store.save(&serde_json::json!({"desired": {}})).unwrap();
+        let saved = fs::read(&path).unwrap();
+        let loaded = store.load::<CurrentState>();
+        assert_eq!(fs::read(&path).unwrap(), saved);
+
+        let mut envelope: Envelope<Box<serde_json::value::RawValue>> =
+            serde_json::from_slice(&saved).unwrap();
+        envelope.state = serde_json::value::to_raw_value(
+            &serde_json::json!({"desired": {"ipv6_enabled": false}}),
+        )
+        .unwrap();
+        let tampered = serde_json::to_vec(&envelope).unwrap();
+        fs::write(&path, &tampered).unwrap();
+        let corruption = store.load::<CurrentState>().unwrap_err().to_string();
+        assert_eq!(fs::read(&path).unwrap(), tampered);
+
+        store
+            .save(&serde_json::json!({"desired": {"unexpected_field": true}}))
+            .unwrap();
+        let invalid = fs::read(&path).unwrap();
+        let incompatible = store.load::<CurrentState>().unwrap_err().to_string();
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(loaded.unwrap().unwrap().desired.ipv6_enabled);
+        assert!(corruption.contains("checksum mismatch"));
+        assert!(incompatible.contains("invalid/incompatible Rust state payload"));
     }
 }
 

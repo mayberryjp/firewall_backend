@@ -29,7 +29,6 @@
       }
     ],
     "routes": [],
-    "policy_rules": [],
     "firewall": {
       "allow_all_icmp": true,
       "policy": "drop",

@@ -510,7 +510,9 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
         .mode(0o600)
         .open(fixture.options().keys.join("wg-key"))?;
     key.write_all(wireguard_control::Key([1u8; 32]).to_base64().as_bytes())?;
-    let mut native = Native::open(fixture.options())?;
+    let mut options = fixture.options();
+    options.gateway_monitoring = true;
+    let mut native = Native::open(options.clone())?;
     let empty = Config::empty();
     native.repair(&empty)?;
     let mut value = serde_json::to_value(&empty)?;
@@ -521,20 +523,47 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
     ]);
     value["routes"] = json!([
         {"destination":"203.0.113.0/24","interface":"trunk0","gateway":"192.0.2.1","table":10000,"metric":10},
-        {"destination":"2001:db8:300::/64","interface":"wg0","table":10001,"metric":10}
+        {"destination":"2001:db8:300::/64","interface":"wg0","table":10001,"metric":10},
+        {"destination":"2001:db8:100::1/128","interface":"vlan100","table":10002,"metric":10}
     ]);
-    value["policy_rules"] = json!([
-        {"source":"192.0.2.0/24","table":10000,"priority":10000},
-        {"source":"::/0","table":10001,"priority":10001}
+    value["gateway_monitors"] = json!([
+        {"name":"wan-v4","enabled":true,"interface":"trunk0","source_address":"192.0.2.2",
+         "gateway":"192.0.2.1","target":"203.0.113.1","routing_table":10000},
+        {"name":"wan-v6","enabled":true,"interface":"vlan100","source_address":"2001:db8:100::2",
+         "gateway":"2001:db8:100::1","target":"2001:db8:100::1","routing_table":10002}
     ]);
     value["kernel"]["namespace"] = json!({"net.ipv4.tcp_syncookies":"1"});
     value["firewall"] = json!({"policy":"drop","allow_all_icmp":true,"rules":[{"source":"192.0.2.0/24","action":"accept"},{"action":"drop"}],"nat":{"masquerade":[{"family":"ipv4","source":"198.51.100.0/24","out_interface":"trunk0"},{"family":"ipv6","source":"2001:db8:100::/64","out_interface":"wg0"}]}});
-    let after = config(value)?;
+    let mut after = config(value)?;
+    after.normalize();
+    after.validate()?;
     native.apply(&empty, &after)?;
     assert_eq!(
         serde_json::to_value(native.observe(&after)?)?,
         serde_json::to_value(&after)?
     );
+    let plan = after.operational_value()?;
+    let keys = options.keys.clone();
+    let snapshot = session(native.namespace.clone(), move |rt, handle| {
+        rt.block_on(networking::boot_snapshot(
+            handle,
+            &Network::parse(&plan)?,
+            &keys,
+        ))
+    })?;
+    assert!(snapshot.get("policy_rules").is_none());
+    assert_eq!(
+        Network::parse(&snapshot)?.policy_rules,
+        Network::parse(&after.operational_value()?)?.policy_rules
+    );
+    let mut disabled = after.clone();
+    for monitor in &mut disabled.gateway_monitors {
+        monitor.enabled = false;
+    }
+    native.apply(&after, &disabled)?;
+    native.observe(&disabled)?;
+    native.apply(&disabled, &after)?;
+    native.observe(&after)?;
     let scope = native.scope()?;
     let runtime = native.runtime(&after)?;
     assert_eq!(runtime["wireguard"][0]["listen_port"], 51820);
@@ -549,8 +578,9 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
     assert_eq!(statistics["interface"]["name"], "trunk0");
     assert!(statistics["interface"]["counters"]["rx_bytes"].is_string());
     drop(native);
-    let mut native = Native::open(fixture.options())?;
+    let mut native = Native::open(options)?;
     assert_eq!(native.scope()?, scope);
+    native.repair(&after)?;
     native.observe(&after)?;
     native.apply(&after, &empty)?;
     native.observe(&empty)?;

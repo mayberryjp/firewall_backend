@@ -14,7 +14,6 @@ pub const PERMISSIONS: &[&str] = &[
     "transactions.write",
     "interfaces.write",
     "routes.write",
-    "policy.write",
     "firewall.write",
     "nat.write",
     "wireguard.write",
@@ -145,7 +144,6 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
     let mut b = after.normalized();
     for (p, different) in [
         ("routes.write", a.routes != b.routes),
-        ("policy.write", a.policy_rules != b.policy_rules),
         ("softflowd.write", a.softflowd != b.softflowd),
         (
             "gateway_monitors.write",
@@ -1125,7 +1123,6 @@ impl Engine {
             "/api/v1/services/syslog",
             "/api/v1/services/vnstat",
             "/api/v1/routes",
-            "/api/v1/policy-rules",
             "/api/v1/firewall/rules",
             "/api/v1/firewall/hosts",
             "/api/v1/firewall/interface-policies",
@@ -1164,7 +1161,6 @@ impl Engine {
                     .collect::<Vec<_>>(),
             ),
             "/api/v1/routes" => value(observed.routes),
-            "/api/v1/policy-rules" => value(observed.policy_rules),
             "/api/v1/gateway-monitors" => value(observed.gateway_monitors),
             "/api/v1/services/softflowd" => value(observed.softflowd),
             "/api/v1/services/ntp" => value(observed.ntp),

@@ -262,6 +262,15 @@ suppression values mean disabled suppression and are accepted as default
 metadata; active suppression and other attributes remain rejected. A rejection
 includes the offending netlink rule and happens before ownership handover.
 
+User-configurable source-policy rules are not supported. Enabled gateway monitors
+derive deduplicated `/32` IPv4 or `/128` IPv6 source rules, sorted by numeric source
+address with priorities starting at 10000. Monitors sharing a source must share
+its table. All traffic with that exact source is subject to the lookup.
+Rules remain part of native drift detection, apply/removal, rollback and restart
+reconciliation, but are absent from public configuration and API responses.
+Private reboot snapshots preserve the observed rule subset in
+`_monitor_policy_rules`; that field is rejected by the public configuration model.
+
 The firewall owns only `inet/netcontrol`. Each update atomically replaces its
 table, chains and ordered rules in one batch. It implements ordered forwarding
 rules, host/interface policy expansion (4096 compiled-rule limit), established/

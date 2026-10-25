@@ -156,7 +156,6 @@ pub(crate) struct Config {
     pub softflowd: Vec<Flow>,
     pub gateway_monitors: Vec<Gateway>,
     pub routes: Vec<Value>,
-    pub rules: Vec<Value>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -169,7 +168,6 @@ impl Default for Config {
             softflowd: Vec::new(),
             gateway_monitors: Vec::new(),
             routes: Vec::new(),
-            rules: Vec::new(),
         }
     }
 }
@@ -389,6 +387,7 @@ impl Config {
             "at most 64 gateway monitors"
         );
         let mut seen = BTreeSet::new();
+        let mut source_tables = std::collections::BTreeMap::new();
         for m in &c.gateway_monitors {
             ensure!(
                 name(&m.name, 32) && seen.insert(&m.name) && interface(&m.interface),
@@ -425,6 +424,12 @@ impl Config {
             );
             if m.enabled {
                 ensure!(
+                    source_tables
+                        .insert(src, m.routing_table)
+                        .is_none_or(|table| table == m.routing_table),
+                    "enabled gateway monitors sharing a source address must use the same routing table"
+                );
+                ensure!(
                     c.interfaces.iter().any(|i| i.name == m.interface
                         && i.up
                         && i.addresses
@@ -440,13 +445,6 @@ impl Config {
                             || (dst == gw && r["gateway"].as_str().unwrap_or("").is_empty()))),
                     "gateway requires matching explicit route"
                 );
-                ensure!(
-                    c.rules
-                        .iter()
-                        .any(|r| r["table"].as_u64() == Some(m.routing_table as u64)
-                            && r["source"].as_str().is_some_and(|p| contains(p, src))),
-                    "gateway requires matching source rule"
-                );
             }
         }
         Ok(c)
@@ -456,6 +454,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gateway_monitor_uses_internal_routing_not_public_rules() {
+        let example: Value =
+            serde_json::from_str(include_str!("../../../examples/gateway-monitoring.json"))
+                .unwrap();
+        let mut value = example["config"].clone();
+        Config::parse(&value).unwrap();
+        let mut duplicate = value["gateway_monitors"][0].clone();
+        duplicate["name"] = serde_json::json!("second-probe");
+        value["gateway_monitors"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        Config::parse(&value).unwrap();
+        let mut route = value["routes"][0].clone();
+        route["table"] = serde_json::json!(10002);
+        value["routes"].as_array_mut().unwrap().push(route);
+        value["gateway_monitors"][2]["routing_table"] = serde_json::json!(10002);
+        assert!(
+            Config::parse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("same routing table")
+        );
+        value["gateway_monitors"][2]["enabled"] = serde_json::json!(false);
+        Config::parse(&value).unwrap();
+    }
+
     use serde_json::json;
     #[test]
     fn ethernet_relay_and_main_table_gateway_are_supported() {

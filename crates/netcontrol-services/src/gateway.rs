@@ -259,7 +259,8 @@ fn path(config: &super::config::Gateway, index: u32) -> Result<()> {
     };
     p[17] = if src.is_ipv4() { 32 } else { 128 };
     p[18] = p[17];
-    p[24..28].copy_from_slice(&0x2000u32.to_ne_bytes());
+    // Request the policy-selected table as well as the matching FIB route.
+    p[24..28].copy_from_slice(&(0x1000u32 | 0x2000).to_ne_bytes());
     let bytes = |ip: IpAddr| match ip {
         IpAddr::V4(v) => v.octets().to_vec(),
         IpAddr::V6(v) => v.octets().to_vec(),
@@ -341,7 +342,8 @@ fn path(config: &super::config::Gateway, index: u32) -> Result<()> {
             table == config.routing_table
                 && interface == index
                 && (gateway == Some(expected) || (dst == expected && gateway.is_none())),
-            "effective gateway route no longer matches configured table/interface/next-hop"
+            "effective gateway route no longer matches configured table/interface/next-hop: observed table {table}, interface {interface}, gateway {gateway:?}; expected table {}, interface {index}, gateway {expected}",
+            config.routing_table
         );
         return Ok(());
     }

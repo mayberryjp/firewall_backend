@@ -33,7 +33,7 @@ Support:
 
 - Managed dummy, VLAN, and kernel WireGuard interfaces and IP addresses.
 - Read-only adopted parent inventory.
-- Unicast routes and source-policy routing.
+- Unicast routes; source-policy routing is not user-configurable.
 - Ordered forward-chain source/destination accept/drop rules and default policy.
 - Named IP-based outbound host policies, ingress-interface rule overrides,
   optional managed egress-interface matches, TCP/UDP destination ports, and
@@ -167,7 +167,7 @@ configuration, not a separate annotation endpoint.
 | DHCP relay | `interfaces[].dhcp_relay.metadata` |
 | DHCP client | `dhcp_clients[interface].metadata` |
 | DNS settings / domain | `dns[interface].metadata`, `dns[interface].domains[].metadata` |
-| Route / source-policy rule | `routes[].metadata`, `policy_rules[].metadata` |
+| Route | `routes[].metadata` |
 | Ordered firewall rule / masquerade rule | `firewall.rules[].metadata`, `firewall.nat.masquerade[].metadata` |
 | Firewall host / outbound host rule | `firewall.policies.hosts[].metadata`, `firewall.policies.hosts[].rules[].metadata` |
 | Interface policy / rule | `firewall.policies.interfaces[].metadata`, `firewall.policies.interfaces[].rules[].metadata` |
@@ -212,7 +212,7 @@ Valid interface example (technical identity is still `eno1`):
   workflows. Metadata-only edits require `transactions.write` and the same
   resource write permissions as functional changes: `interfaces.write` for
   interface/relay/client/DNS metadata; `wireguard.write` for peer metadata;
-  `routes.write`, `policy.write`, `nat.write`, `firewall.write`, `ntp.write`,
+  `routes.write`, `nat.write`, `firewall.write`, `ntp.write`,
   `syslog.write`, `vnstat.write`, `softflowd.write`, `gateway_monitors.write`
   for the corresponding objects. No new permission or HTTP method/path is added.
 - Native operational configuration excludes these annotations. Metadata-only
@@ -262,7 +262,6 @@ routes, not backend endpoints.
 | `/interfaces/:name` | Interface detail and staged editor |
 | `/parents` | Read-only adopted parent inventory |
 | `/routes` | Routes |
-| `/policy-rules` | Source-policy rules |
 | `/firewall` | Host inventory/outbound policies, ingress overrides, global default, or explicit legacy ordered-rule view |
 | `/nat` | Masquerade rules |
 | `/wireguard` | WireGuard-focused interface/peer view |
@@ -545,7 +544,6 @@ Configuration changes additionally require permissions for every changed area:
 | Interface/address/VLAN fields, roles, DHCP relay/client settings, resolver maps | `interfaces.write` |
 | WireGuard settings and removal of a WireGuard interface | `wireguard.write` |
 | Routes | `routes.write` |
-| Source-policy rules | `policy.write` |
 | Filter policy/rules | `firewall.write` |
 | Masquerading | `nat.write` |
 | softflowd configuration | `softflowd.write` |
@@ -1047,9 +1045,17 @@ canonical and same-family; reject hostnames, zones, mapped IPv6, loopback,
 multicast, and unspecified addresses. Source must be configured on an up
 managed interface, cannot be link-local or equal the gateway/target. Private/ULA
 sources are valid. IPv6 gateway/target can be link-local; interface supplies
-the scope. Enabled monitors require matching explicit route and source-policy
-rule into table 254 or 10000..19999. Disabled monitors need not retain those network
-references. Never silently add routes, rules, or firewall exceptions.
+the scope. Enabled monitors require a matching explicit route into table 254 or
+10000..19999. The backend manages internal source-policy rules for enabled monitor
+source addresses only (`/32` IPv4, `/128` IPv6); these are not editable or exposed
+as configuration. Enabled monitors sharing a source must use the same routing
+table (`422` otherwise). Rules are deduplicated and deterministically assigned
+priorities starting at 10000; disabling/removing monitors reconciles their rules
+through normal transaction/rollback/recovery. These source matches also affect
+other traffic using that exact source address, not just probe packets.
+Disabled monitors need not retain network references. Never silently add routes
+or firewall exceptions. Changing monitors requires `gateway_monitors.write`;
+there is no separate policy permission.
 
 Gateway timing fields use these inclusive bounds (milliseconds except percent):
 
@@ -1585,10 +1591,19 @@ tables and protocol 242 ownership; protocol is not an editable field.
 
 ### 6.5 Source-policy routing
 
-Table/editor: priority, canonical source network, lookup table. Sort/display by
-ascending numeric priority. Explain that this is source-prefix table lookup,
-not arbitrary Linux policy-rule selectors. Multiple rules may use the same table;
-only priorities must be unique.
+User-configurable source-policy routing is unsupported. Remove its table/editor,
+navigation, client type and permission controls. `GET /api/v1/policy-rules`
+returns `404`; `policy.write` is not a supported permission. Configuration must
+omit `policy_rules` entirely, including empty arrays or null; unknown-field
+submissions return `400` rather than being ignored. State, transactions and
+revision configurations no longer serialize the field. CLI `policy-rule`,
+`no policy-rule` and `show policy-rules` are unsupported.
+
+Normal destination routes remain supported with `routes.write`. Use table 254
+(main) for ordinary routing; custom tables remain available for explicitly
+configured gateway-monitor paths, with internal rules as described above.
+No import/restore/persisted-state migration or compatibility path is provided;
+unsupported saved configurations fail explicitly without deleting/resetting data.
 
 ### 6.6 Firewall forwarding
 
@@ -2061,7 +2076,6 @@ Paths below are relative to `/api/v1`.
 | GET | `/vlans` | Observed VLAN `Interface[]` |
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |
 | GET | `/routes` | Observed `Route[]` |
-| GET | `/policy-rules` | Observed `PolicyRule[]` |
 | GET | `/firewall/rules` | Entire observed `Firewall`, including policy and NAT |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
@@ -2114,7 +2128,6 @@ Complete empty package, useful as a schema illustration, **not a safe default**:
   "config": {
     "interfaces": [],
     "routes": [],
-    "policy_rules": [],
     "firewall": {
       "policy": "accept",
       "rules": [],
@@ -2168,7 +2181,6 @@ interface Config {
   dhcp_clients?: Record<string, DHCPClientConfig>;
   dns?: Record<string, DNSConfig>;
   routes: Route[];
-  policy_rules: PolicyRule[];
   firewall: Firewall;
   softflowd: SoftflowdConfig[];
   gateway_monitors: GatewayMonitor[];
@@ -2306,12 +2318,6 @@ interface Route {
   interface: string;
   table: number;
   metric: number;
-}
-
-interface PolicyRule {
-  priority: number;
-  source: string;
-  table: number;
 }
 
 interface Firewall {

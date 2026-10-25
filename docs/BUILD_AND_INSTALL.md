@@ -157,6 +157,26 @@ does not undo those changes or guarantee an older binary can load that state.
 Review persisted-contract changes and take protected, consistent backups before
 deploying them. No backward-compatibility or automatic state reset is provided.
 
+### Startup reports a state checksum mismatch
+
+Preserve the saved state and a protected, consistent backup; do not delete it,
+recalculate its checksum, run factory reset or import live NIC settings to make
+an upgrade start. A bug in the loader verified checksums after decoding into
+current Rust types. New fields such as `ipv6_enabled` could therefore change
+the bytes being checked and falsely reject an unchanged journal. The corrected
+loader verifies the saved JSON payload before typed decoding and does not write
+the file during verification. Rebuild from source containing this fix before
+retrying the ordinary upgrade. Actual checksum corruption and incompatible
+payloads still fail explicitly; this is not automatic state repair/conversion.
+
+Repeated `IFLA_INET6_CONF` warnings about 236 versus 240 bytes come from the
+older netlink decoder encountering extra kernel data; they are separate from
+the fatal state checksum error. This fix does not upgrade or silence that
+dependency. If systemd reports changed units/drop-ins, run
+`sudo systemctl daemon-reload` before retrying. Check
+`sudo systemctl status netcontrold.service --no-pager` and its journal after
+binary recovery; a restoration message alone does not prove service health.
+
 For manual binary recovery from the local console (state compatibility still
 must be checked), set `installed` to the exact destination printed by the script.
 The following example uses the repository installer's default destination:

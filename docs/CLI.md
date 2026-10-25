@@ -124,8 +124,6 @@ ipv6 enable|disable
 ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 no ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
-policy-rule PRIORITY SOURCE TABLE
-no policy-rule PRIORITY
 firewall policy accept|drop
 firewall allow-all-icmp enable|disable
 firewall rule SOURCE|any DESTINATION|any accept|drop
@@ -156,6 +154,11 @@ same candidate; use IPv4 management and independently verify connectivity before
 confirmation. It affects loopback/unmanaged interfaces in the managed namespace,
 not only addresses configured through the CLI. See the
 [global IPv6 contract](../FRONTEND_SPEC.md#global-ipv6-policy).
+
+Source-policy routing is not user-configurable: `policy-rule`, `no policy-rule`
+and `show policy-rules` are unsupported. JSON candidate imports must omit
+`policy_rules`, even when empty. Ordinary routes remain editable (normally table
+254); gateway monitors manage their exact-source lookup rules internally.
 
 Interface editors include:
 
@@ -253,7 +256,6 @@ show runtime
 show interfaces
 show interfaces discovered
 show routes
-show policy-rules
 show firewall
 show kernel
 show statistics

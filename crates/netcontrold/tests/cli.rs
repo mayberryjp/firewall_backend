@@ -337,7 +337,12 @@ fn ergonomic_interfaces_routes_policies_and_services_preserve_complete_config() 
         &mut cli,
         "no ip route 198.51.100.0/24 uplink.10 direct 10001 20",
     );
-    f.ok(&mut cli, "policy-rule 10000 192.0.2.0/24 10000");
+    assert!(
+        f.command(&mut cli, "policy-rule 10000 192.0.2.0/24 10000")
+            .failed
+    );
+    assert!(f.command(&mut cli, "no policy-rule 10000").failed);
+    assert!(f.command(&mut cli, "show policy-rules").failed);
     f.ok(&mut cli, "firewall policy drop");
     f.ok(&mut cli, "firewall allow-all-icmp disable");
     f.ok(&mut cli, "firewall rule 192.0.2.0/24 any accept");
@@ -353,6 +358,7 @@ fn ergonomic_interfaces_routes_policies_and_services_preserve_complete_config() 
     f.ok(&mut cli, "commit confirmed 30");
     f.ok(&mut cli, "confirm");
     let config = &f.request("/api/v1/state")["desired"];
+    assert!(config.get("policy_rules").is_none());
     assert_eq!(config["interfaces"].as_array().unwrap().len(), 2);
     assert_eq!(config["routes"].as_array().unwrap().len(), 1);
     assert_eq!(config["firewall"]["policy"], "drop");

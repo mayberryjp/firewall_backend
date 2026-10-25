@@ -129,6 +129,17 @@ private-network, or network-reachability restrictions.
 
 ## Configuration workflow
 
+### Routing scope
+
+User-configurable source-policy routing is unsupported. Omit `policy_rules`
+from configuration; even an empty array is rejected. There is no
+`/api/v1/policy-rules` endpoint, `policy.write` grant or `policy-rule` CLI command.
+Ordinary destination routes remain supported; use table 254 (main) for normal
+traffic. Enabled gateway monitors retain backend-managed host-source rules for
+their explicit routing tables. Monitors sharing a source must share a table;
+these internal rules affect all traffic from that exact source, not only probes.
+See [the routing contract](FRONTEND_SPEC.md#65-source-policy-routing).
+
 ### Global IPv6 policy
 
 The top-level `ipv6_enabled` boolean defaults to `true`, including fresh

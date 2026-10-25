@@ -18,10 +18,6 @@
       {"destination": "192.0.2.1/32", "interface": "wan0", "table": 10000, "metric": 100},
       {"destination": "2001:db8::1/128", "interface": "wan0", "table": 10001, "metric": 100}
     ],
-    "policy_rules": [
-      {"source": "192.0.2.2/32", "table": 10000, "priority": 10000},
-      {"source": "2001:db8::2/128", "table": 10001, "priority": 10001}
-    ],
     "gateway_monitors": [
       {
         "name": "wan1-v4",

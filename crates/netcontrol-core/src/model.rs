@@ -28,7 +28,6 @@ pub struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub dns: BTreeMap<String, DNSConfig>,
     pub routes: Vec<Route>,
-    pub policy_rules: Vec<Rule>,
     pub firewall: Firewall,
     pub softflowd: Vec<SoftflowdConfig>,
     pub kernel: KernelConfig,
@@ -46,7 +45,6 @@ impl Default for Config {
             dhcp_clients: BTreeMap::new(),
             dns: BTreeMap::new(),
             routes: Vec::new(),
-            policy_rules: Vec::new(),
             firewall: Default::default(),
             softflowd: Vec::new(),
             kernel: Default::default(),
@@ -194,15 +192,6 @@ pub struct Route {
     pub interface: String,
     pub table: i64,
     pub metric: i64,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Rule {
-    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
-    pub metadata: ObjectMetadata,
-    pub priority: i64,
-    pub source: String,
-    pub table: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -513,7 +502,6 @@ impl Config {
             values.extend(dns.domains.iter().map(|domain| &domain.metadata));
         }
         values.extend(self.routes.iter().map(|route| &route.metadata));
-        values.extend(self.policy_rules.iter().map(|rule| &rule.metadata));
         values.extend(self.firewall.rules.iter().map(|rule| &rule.metadata));
         values.extend(
             self.firewall
@@ -604,7 +592,6 @@ impl Config {
         self.interfaces.sort_by(|a, b| a.name.cmp(&b.name));
         self.routes
             .sort_by_key(|r| format!("{}/{}/{}", r.table, r.destination, r.metric));
-        self.policy_rules.sort_by_key(|r| r.priority);
         if let Some(p) = &mut self.firewall.policies {
             p.hosts.sort_by(|a, b| a.id.cmp(&b.id));
             p.interfaces.sort_by(|a, b| a.interface.cmp(&b.interface));
@@ -864,16 +851,6 @@ impl Config {
                 "duplicate route table/destination/metric"
             );
         }
-        let mut priorities = BTreeSet::new();
-        for r in &self.policy_rules {
-            canonical_prefix(&r.source, true)?;
-            ensure!(
-                (r.table == 254 || (10000..=19999).contains(&r.table))
-                    && (10000..=19999).contains(&r.priority)
-                    && priorities.insert(r.priority),
-                "policy rules require unique priorities in 10000..19999 and table 254 or 10000..19999"
-            );
-        }
         ensure!(
             action(&self.firewall.policy),
             "firewall policy must be accept or drop"
@@ -986,7 +963,6 @@ impl Config {
             prefixes.push(&route.destination);
             literals.push(&route.gateway);
         }
-        prefixes.extend(self.policy_rules.iter().map(|r| r.source.as_str()));
         for rule in &self.firewall.rules {
             prefixes.extend([rule.source.as_str(), rule.destination.as_str()]);
         }
@@ -1102,6 +1078,7 @@ impl Config {
             "at most 64 gateway monitors"
         );
         let mut names = BTreeSet::new();
+        let mut source_tables = BTreeMap::new();
         for original in &self.gateway_monitors {
             let mut m = original.clone();
             m.normalize();
@@ -1148,6 +1125,12 @@ impl Config {
             );
             if m.enabled {
                 ensure!(
+                    source_tables
+                        .insert(s, m.routing_table)
+                        .is_none_or(|table| table == m.routing_table),
+                    "enabled gateway monitors sharing a source address must use the same routing table"
+                );
+                ensure!(
                     self.interfaces.iter().any(|l| l.name == m.interface
                         && l.up
                         && l.addresses
@@ -1159,12 +1142,8 @@ impl Config {
                     self.routes.iter().any(|r| r.interface == m.interface
                         && r.table == m.routing_table
                         && contains(&r.destination, t)
-                        && (r.gateway == m.gateway || (g == t && r.gateway.is_empty())))
-                        && self
-                            .policy_rules
-                            .iter()
-                            .any(|r| r.table == m.routing_table && contains(&r.source, s)),
-                    "monitor requires explicit matching route and source-policy rule"
+                        && (r.gateway == m.gateway || (g == t && r.gateway.is_empty()))),
+                    "monitor requires explicit matching route"
                 );
             }
         }

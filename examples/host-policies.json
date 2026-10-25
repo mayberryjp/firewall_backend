@@ -8,10 +8,7 @@
       {"name": "wan", "kind": "dummy", "role": "wan", "mtu": 1500, "up": true, "addresses": ["198.51.100.2/24"]}
     ],
     "routes": [
-      {"destination": "0.0.0.0/0", "gateway": "198.51.100.1", "interface": "wan", "table": 10000, "metric": 100}
-    ],
-    "policy_rules": [
-      {"priority": 10000, "source": "192.0.2.0/24", "table": 10000}
+      {"destination": "0.0.0.0/0", "gateway": "198.51.100.1", "interface": "wan", "table": 254, "metric": 100}
     ],
     "firewall": {
       "allow_all_icmp": true,

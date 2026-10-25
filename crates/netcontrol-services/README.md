@@ -115,6 +115,11 @@ These are worker states, not external daemon states; there is no `pid` field.
   that timeout; explicit `expint: 0` scans each bounded capture poll.
 * **Gateway monitoring:** native raw ICMPv4/v6, bound source and interface,
   with explicit routing table 254 (main) or 10000–19999;
+  the native backend derives internal host-source rules before starting workers.
+  Enabled monitors sharing a source must share a table. The service layer
+  validates explicit routes without requiring a public policy-rule collection;
+  callers remain responsible for operational routing. Route lookups request
+  the actual policy-selected table as well as the matching FIB route, with
   effective rtnetlink table/interface/next-hop validation before each probe,
   nonce/id/sequence checks, rolling loss/RTT/stddev/percentiles/consecutive RTT
   variation, warmup, and failure/recovery holds. Missing/late/duplicate replies

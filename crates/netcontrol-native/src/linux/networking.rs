@@ -834,7 +834,7 @@ pub async fn boot_snapshot(handle: &Handle, expected: &Network, keys: &Path) -> 
     let mut value = serde_json::to_value(netcontrol_core::Config::empty())?;
     value["interfaces"] = serde_json::to_value(actual)?;
     value["routes"] = serde_json::to_value(routes)?;
-    value["policy_rules"] = serde_json::to_value(rules)?;
+    value["_monitor_policy_rules"] = serde_json::to_value(rules)?;
     Ok(value)
 }
 

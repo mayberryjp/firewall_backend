@@ -81,7 +81,10 @@ pub struct Network {
     #[serde(default)]
     pub dns: BTreeMap<String, netcontrol_core::DNSConfig>,
     pub routes: Vec<Route>,
+    #[serde(default, rename = "_monitor_policy_rules")]
     pub policy_rules: Vec<Rule>,
+    #[serde(default)]
+    pub gateway_monitors: Vec<netcontrol_core::GatewayMonitor>,
     pub firewall: Value,
     #[serde(default)]
     pub kernel: Kernel,
@@ -93,8 +96,38 @@ fn ipv6_default() -> bool {
 
 impl Network {
     pub fn parse(value: &Value) -> Result<Self> {
+        ensure!(
+            value.get("policy_rules").is_none(),
+            "user-configurable source-policy rules are not supported"
+        );
         let mut n: Self =
             serde_json::from_value(value.clone()).context("native network configuration")?;
+        // Only private reboot snapshots supply observed rules instead of deriving them.
+        if value.get("_monitor_policy_rules").is_none() {
+            let mut sources = BTreeMap::new();
+            for monitor in n.gateway_monitors.iter().filter(|monitor| monitor.enabled) {
+                let source: IpAddr = monitor
+                    .source_address
+                    .parse()
+                    .context("invalid gateway monitor source address")?;
+                let table = u32::try_from(monitor.routing_table)
+                    .context("invalid gateway monitor routing table")?;
+                ensure!(
+                    sources
+                        .insert(source, table)
+                        .is_none_or(|previous| previous == table),
+                    "enabled gateway monitors sharing a source address must use the same routing table"
+                );
+            }
+            ensure!(sources.len() <= 64, "at most 64 gateway monitor sources");
+            for (index, (source, table)) in sources.into_iter().enumerate() {
+                n.policy_rules.push(Rule {
+                    source: format!("{source}/{}", if source.is_ipv4() { 32 } else { 128 }),
+                    priority: 10000 + u32::try_from(index)?,
+                    table,
+                });
+            }
+        }
         n.interfaces.sort_by(|a, b| a.name.cmp(&b.name));
         for link in &mut n.interfaces {
             link.addresses.sort();
@@ -286,7 +319,6 @@ mod tests {
                 {"name":"lan100","kind":"vlan","role":"lan","mtu":1400,"up":false,"addresses":[],"vlan":{"parent":"nic0","id":100}}
             ],
             "routes":[{"destination":"0.0.0.0/0","gateway":"192.0.2.1","interface":"nic0","table":254,"metric":100}],
-            "policy_rules":[{"source":"192.0.2.0/24","table":254,"priority":10000}],
             "firewall":{}
         });
         Network::parse(&value)
@@ -353,7 +385,7 @@ mod tests {
     }
     #[test]
     fn no_unsupported_kind_succeeds() {
-        let value = serde_json::json!({"interfaces":[{"name":"wg0","kind":"bridge","role":"lan","mtu":1420,"up":true,"addresses":[]}],"routes":[],"policy_rules":[],"firewall":{}});
+        let value = serde_json::json!({"interfaces":[{"name":"wg0","kind":"bridge","role":"lan","mtu":1420,"up":true,"addresses":[]}],"routes":[],"firewall":{}});
         assert!(
             Network::parse(&value)
                 .unwrap()
@@ -365,7 +397,7 @@ mod tests {
     }
     #[test]
     fn read_only_parent_is_not_managed() {
-        let value = serde_json::json!({"interfaces":[{"name":"eth0","kind":"dummy","role":"wan","mtu":1500,"up":true,"addresses":[]}],"routes":[],"policy_rules":[],"firewall":{}});
+        let value = serde_json::json!({"interfaces":[{"name":"eth0","kind":"dummy","role":"wan","mtu":1500,"up":true,"addresses":[]}],"routes":[],"firewall":{}});
         assert!(
             Network::parse(&value)
                 .unwrap()
@@ -381,7 +413,6 @@ mod tests {
                 {"name":"lan100","kind":"vlan","role":"lan","mtu":1400,"up":false,"addresses":[],"vlan":{"parent":"trunk0","id":100},"dhcp_relay":{"enabled":false,"servers":["198.51.100.10"]}}
             ],
             "routes":[{"destination":"203.0.113.0/24","gateway":"192.0.2.1","interface":"trunk0","table":10000,"metric":10}],
-            "policy_rules":[{"source":"192.0.2.0/24","table":10000,"priority":10000}],
             "firewall":{"policy":"accept","allow_all_icmp":true,"rules":[],"nat":{"masquerade":[]}},
             "kernel":{"namespace":{"net.ipv4.tcp_syncookies":"1"},"host":{}}
         });
@@ -396,5 +427,69 @@ mod tests {
         let route: Route =
             serde_json::from_value(serde_json::to_value(&network.routes[0]).unwrap()).unwrap();
         assert_eq!(route, network.routes[0]);
+    }
+
+    #[test]
+    fn monitor_rules_are_internal_deterministic_host_routes() {
+        let example: Value =
+            serde_json::from_str(include_str!("../../../examples/gateway-monitoring.json"))
+                .unwrap();
+        let mut value = example["config"].clone();
+        let network = Network::parse(&value).unwrap();
+        assert_eq!(
+            network.policy_rules,
+            vec![
+                Rule {
+                    source: "192.0.2.2/32".into(),
+                    priority: 10000,
+                    table: 10000
+                },
+                Rule {
+                    source: "2001:db8::2/128".into(),
+                    priority: 10001,
+                    table: 10001
+                },
+            ]
+        );
+        value["gateway_monitors"].as_array_mut().unwrap().reverse();
+        assert_eq!(
+            Network::parse(&value).unwrap().policy_rules,
+            network.policy_rules
+        );
+        let mut duplicate = value["gateway_monitors"][0].clone();
+        duplicate["name"] = serde_json::json!("duplicate");
+        value["gateway_monitors"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert_eq!(
+            Network::parse(&value).unwrap().policy_rules,
+            network.policy_rules
+        );
+        value["gateway_monitors"][2]["routing_table"] = serde_json::json!(10002);
+        assert!(Network::parse(&value).is_err());
+        value["gateway_monitors"][2]["enabled"] = serde_json::json!(false);
+        assert_eq!(
+            Network::parse(&value).unwrap().policy_rules,
+            network.policy_rules
+        );
+        for monitor in value["gateway_monitors"].as_array_mut().unwrap() {
+            monitor["enabled"] = serde_json::json!(false);
+        }
+        assert!(Network::parse(&value).unwrap().policy_rules.is_empty());
+        value["policy_rules"] = serde_json::json!([]);
+        assert!(Network::parse(&value).is_err());
+    }
+
+    #[test]
+    fn private_boot_snapshot_keeps_observed_rule_subset() {
+        let value = serde_json::json!({
+            "interfaces":[], "routes":[], "firewall":{},
+            "_monitor_policy_rules":[{"source":"192.0.2.2/32","priority":10000,"table":10000}]
+        });
+        let network = Network::parse(&value).unwrap();
+        assert_eq!(network.policy_rules.len(), 1);
+        assert_eq!(network.policy_rules[0].source, "192.0.2.2/32");
+        assert!(serde_json::from_value::<netcontrol_core::Config>(value).is_err());
     }
 }

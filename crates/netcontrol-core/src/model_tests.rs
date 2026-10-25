@@ -5,7 +5,6 @@ fn candidate() -> Config {
     serde_json::from_value(json!({
         "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
         "routes":[{"destination":"192.0.2.0/24","interface":"lan0","table":10000,"metric":100}],
-        "policy_rules":[{"source":"192.0.2.0/24","priority":10000,"table":10000}],
         "firewall":{"policy":"drop","rules":[{"source":"192.0.2.0/24","action":"accept"}]}
     })).expect("valid fixture")
 }
@@ -34,9 +33,6 @@ fn global_ipv6_defaults_and_conflicting_configuration() {
     cases.push(value);
     let mut value = serde_json::to_value(&ipv4).unwrap();
     value["routes"][0]["destination"] = json!("2001:db8:1::/64");
-    cases.push(value);
-    let mut value = serde_json::to_value(&ipv4).unwrap();
-    value["policy_rules"][0]["source"] = json!("::/0");
     cases.push(value);
     let mut value = serde_json::to_value(&ipv4).unwrap();
     value["dns"] = json!({"lan0":{"servers":["::1"],"domains":[]}});
@@ -134,15 +130,11 @@ fn host_ethernet_and_main_table_routes_validate_without_relaxing_reserved_values
         servers: vec!["192.0.2.2".into()],
     };
     config.routes[0].table = 254;
-    config.policy_rules[0].table = 254;
     config.validate().unwrap();
     for table in [0, 1, 253, 255, 9999, 20000] {
         let mut invalid = config.clone();
         invalid.routes[0].table = table;
         assert!(invalid.validate().is_err(), "route table {table}");
-        let mut invalid = config.clone();
-        invalid.policy_rules[0].table = table;
-        assert!(invalid.validate().is_err(), "policy table {table}");
     }
     let mut invalid = config.clone();
     invalid.interfaces[0].kind = "bridge".into();
@@ -209,7 +201,6 @@ fn unknown_fields_rejected_at_every_feature_boundary() {
         "/interfaces/0",
         "/interfaces/0/dhcp_relay",
         "/routes/0",
-        "/policy_rules/0",
     ] {
         let mut changed = c.clone();
         let target = if path == "/" {
@@ -305,7 +296,6 @@ fn interface_route_rule_and_nat_validation_edges() {
         ("/routes/0/interface", json!("unknown")),
         ("/routes/0/metric", json!(2147483648i64)),
         ("/routes/0/gateway", json!("2001:db8::1")),
-        ("/policy_rules/0/priority", json!(9999)),
         ("/firewall/policy", json!("reject")),
         ("/firewall/rules/0/action", json!("reject")),
         ("/firewall/rules/0/destination", json!("2001:db8::/32")),
@@ -324,9 +314,6 @@ fn interface_route_rule_and_nat_validation_edges() {
     }
     let mut c = candidate();
     c.routes.push(c.routes[0].clone());
-    assert!(c.validate().is_err());
-    let mut c = candidate();
-    c.policy_rules.push(c.policy_rules[0].clone());
     assert!(c.validate().is_err());
     let mut c = candidate();
     c.interfaces.push(c.interfaces[0].clone());
@@ -683,7 +670,7 @@ fn monitor_defaults_normalize_and_enabled_cross_references_are_required() {
     let mut c: Config = serde_json::from_value(v["config"].clone()).unwrap();
     c.normalize();
     c.validate().unwrap();
-    for change in 0..8 {
+    for change in 0..7 {
         let mut bad = c.clone();
         match change {
             0 => bad.gateway_monitors[0].routing_table = 254,
@@ -692,7 +679,6 @@ fn monitor_defaults_normalize_and_enabled_cross_references_are_required() {
             3 => bad.gateway_monitors[0].window_ms = 999,
             4 => bad.gateway_monitors[0].loss_timeout_ms = 60000,
             5 => bad.interfaces[0].up = false,
-            6 => bad.policy_rules.clear(),
             _ => bad.routes.clear(),
         }
         assert!(bad.validate().is_err(), "case {change}");
@@ -701,11 +687,79 @@ fn monitor_defaults_normalize_and_enabled_cross_references_are_required() {
         monitor.enabled = false;
     }
     c.routes.clear();
-    c.policy_rules.clear();
     c.validate().unwrap();
     c.gateway_monitors[0].probe_interval_ms = 0;
     c.normalize();
     assert_eq!(c.gateway_monitors[0].probe_interval_ms, 1000);
+}
+#[test]
+fn source_policy_configuration_is_rejected_even_when_empty() {
+    for rules in [
+        json!([]),
+        json!(null),
+        json!([{
+            "source":"192.0.2.0/24","priority":10000,"table":10000
+        }]),
+    ] {
+        let error = serde_json::from_value::<Config>(json!({"policy_rules":rules}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `policy_rules`"), "{error}");
+    }
+    assert!(
+        serde_json::to_value(Config::empty())
+            .unwrap()
+            .get("policy_rules")
+            .is_none()
+    );
+    assert!(serde_json::from_value::<Config>(json!({"_monitor_policy_rules":[]})).is_err());
+}
+
+#[test]
+fn current_examples_without_source_policy_validate() {
+    for raw in [
+        include_str!("../../../examples/appliance-services.json"),
+        include_str!("../../../examples/dhcp-relay.json"),
+        include_str!("../../../examples/gateway-monitoring.json"),
+        include_str!("../../../examples/host-policies.json"),
+        include_str!("../../../examples/kernel-mixed-conservative.json"),
+        include_str!("../../../examples/migration.json"),
+        include_str!("../../../examples/vlan-softflowd.json"),
+    ] {
+        let example: Value = serde_json::from_str(raw).unwrap();
+        assert!(example["config"].get("policy_rules").is_none());
+        let mut config: Config = serde_json::from_value(example["config"].clone()).unwrap();
+        config.normalize();
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::from_value::<Config>(serde_json::to_value(&config).unwrap()).unwrap(),
+            config
+        );
+    }
+}
+
+#[test]
+fn enabled_monitors_sharing_a_source_require_the_same_table() {
+    let v: Value =
+        serde_json::from_str(include_str!("../../../examples/gateway-monitoring.json")).unwrap();
+    let mut c: Config = serde_json::from_value(v["config"].clone()).unwrap();
+    c.normalize();
+    let mut duplicate = c.gateway_monitors[0].clone();
+    duplicate.name = "second-probe".into();
+    c.gateway_monitors.push(duplicate);
+    c.validate().unwrap();
+    let mut route = c.routes[0].clone();
+    route.table = 10002;
+    c.routes.push(route);
+    c.gateway_monitors.last_mut().unwrap().routing_table = 10002;
+    assert!(
+        c.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("same routing table")
+    );
+    c.gateway_monitors.last_mut().unwrap().enabled = false;
+    c.validate().unwrap();
 }
 #[test]
 fn softflowd_all_fields_and_timeout_limits_are_validated() {

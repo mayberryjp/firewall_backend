@@ -31,26 +31,14 @@
         "destination": "0.0.0.0/0",
         "gateway": "192.0.2.1",
         "interface": "wan",
-        "table": 10000,
+        "table": 254,
         "metric": 100
       },
       {
         "destination": "10.9.0.0/24",
         "interface": "wg0",
-        "table": 10001,
+        "table": 254,
         "metric": 100
-      }
-    ],
-    "policy_rules": [
-      {
-        "priority": 10000,
-        "source": "192.0.2.0/24",
-        "table": 10000
-      },
-      {
-        "priority": 10001,
-        "source": "10.8.0.0/24",
-        "table": 10001
       }
     ],
     "firewall": {

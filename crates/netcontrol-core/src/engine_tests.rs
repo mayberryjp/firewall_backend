@@ -1277,10 +1277,6 @@ fn all_domain_permissions_are_independently_required() {
             "routes.write",
             json!({"routes":[{"destination":"0.0.0.0/0","interface":"lan0","table":10000,"metric":1}]}),
         ),
-        (
-            "policy.write",
-            json!({"policy_rules":[{"priority":10000,"source":"0.0.0.0/0","table":10000}]}),
-        ),
     ];
     for (permission, v) in cases {
         let after: Config = serde_json::from_value(v).unwrap();
@@ -1425,6 +1421,92 @@ fn unsupported_flow_filters_and_v5_sampling_fail_validation_before_backend_apply
 }
 
 #[test]
+fn source_policy_api_removed_and_configuration_rejected_without_mutation() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    assert!(!PERMISSIONS.contains(&"policy.write"));
+    for (method, status) in [("GET", 404), ("POST", 404), ("DELETE", 405)] {
+        let reply = request(&mut e, method, "/api/v1/policy-rules", Value::Null);
+        assert_eq!(reply.status, status, "{}", reply.body);
+    }
+    for rules in [
+        json!([]),
+        json!(null),
+        json!([{
+            "source":"192.0.2.0/24","table":10000,"priority":10000
+        }]),
+    ] {
+        let reply = request(
+            &mut e,
+            "POST",
+            "/api/v1/transactions",
+            json!({"base_revision":0,"confirm_timeout_seconds":30,
+                "config":{"policy_rules":rules}}),
+        );
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert!(
+            reply.body["error"]
+                .as_str()
+                .unwrap()
+                .contains("policy_rules")
+        );
+        assert!(e.state.transactions.is_empty());
+        assert_eq!(e.state.revision, 0);
+    }
+    let state = request(&mut e, "GET", "/api/v1/state", Value::Null);
+    for field in ["desired", "observed"] {
+        assert!(state.body[field].get("policy_rules").is_none());
+    }
+}
+
+#[test]
+fn gateway_monitors_without_public_rules_commit_restart_and_rollback() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let example: Value =
+        serde_json::from_str(include_str!("../../../examples/gateway-monitoring.json")).unwrap();
+    let mut config: Config = serde_json::from_value(example["config"].clone()).unwrap();
+    config.interfaces[0].kind = "dummy".into();
+    config.interfaces[0].vlan = None;
+    let allowed: Vec<_> = all()
+        .into_iter()
+        .filter(|p| p != "gateway_monitors.write")
+        .collect();
+    assert_eq!(
+        authorize(&allowed, &Config::empty(), &config)
+            .unwrap_err()
+            .status,
+        403
+    );
+    let reply = submit(&mut e, config.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut e, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(e);
+    let mut e = Engine::open(
+        &f.path(),
+        Box::new(Simulator::with_config(config.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(e.saved_configuration(), &config.normalized());
+    let reply = submit(&mut e, Config::empty());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let rollback = request(
+        &mut e,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            reply.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200, "{}", rollback.body);
+    assert_eq!(e.saved_configuration(), &config.normalized());
+}
+
+#[test]
 fn read_routes_runtime_statistics_and_reconcile_contract() {
     let f = Fixture::new();
     let mut e = f.engine();
@@ -1438,7 +1520,6 @@ fn read_routes_runtime_statistics_and_reconcile_contract() {
         "services/syslog",
         "services/vnstat",
         "routes",
-        "policy-rules",
         "firewall/rules",
         "firewall/hosts",
         "firewall/interface-policies",
