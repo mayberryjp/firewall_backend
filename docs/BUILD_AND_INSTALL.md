@@ -881,6 +881,49 @@ disposable Linux host, validate packet forwarding, rollback, management
 reachability, DHCP and collector behavior before enabling unattended native
 startup. Cross-compilation is not that acceptance test.
 
+### Enabling Gateway Monitoring on an Installed Appliance
+
+The shipped systemd unit leaves optional service/probe opt-ins disabled. Both
+`--allow-host-services` and `--gateway-monitoring` are required for enabled
+gateway monitors in host appliance mode, including DHCP monitors. `--appliance`
+does not imply either flag. The host-services flag also permits other native
+services when explicitly configured; review those settings before opting in.
+
+Inspect the actual startup flags with:
+
+```sh
+systemctl show netcontrold -p ExecStart --no-pager
+```
+
+For the unmodified shipped unit, use `sudo systemctl edit netcontrold` to add:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/netcontrold --backend linux --appliance --listen ${NETCONTROL_LISTEN} --state /var/lib/netcontrol/native-state.json --credential-db /var/lib/netcontrol/credentials.json --keys /etc/netcontrol/keys --services-state-dir /var/lib/netcontrol/services --allow-host-services --gateway-monitoring
+```
+
+If the unit is customized, preserve its existing arguments and add only the two
+opt-ins. Use independent OS SSH/console access; restarting the daemon interrupts
+its API and embedded SSH sessions. Do not restart during an active configuration
+transaction or upgrade. Then run:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart netcontrold
+systemctl show netcontrold -p ExecStart --no-pager
+systemctl status netcontrold --no-pager
+```
+
+Verify management connectivity and current state, refresh the draft's base
+revision, then resubmit and confirm the monitor change. Do not reset state or
+add a static probe route for DHCP mode. Missing opt-ins reject the transaction
+before native network mutation; the error is still `500` with rollback status.
+The current backend preserves underlying apply/rollback causes in the response
+and saved transaction. A historical error containing only
+`native apply failed; previous configuration restored` does not identify the
+original cause; it cannot be reconstructed from that message alone.
+
 ## Automatic Physical Interface Inheritance
 
 This unreleased implementation needs Linux build and console-assisted runtime

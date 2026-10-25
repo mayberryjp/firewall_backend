@@ -485,6 +485,7 @@ struct Faults {
     state: Config,
     initial_count: usize,
     fail_applies: usize,
+    contextual_apply_error: bool,
     apply_count: usize,
     fail_observe: bool,
     typed_network_drift: bool,
@@ -575,6 +576,10 @@ impl Backend for FaultBackend {
         f.state = after.clone();
         if f.fail_applies > 0 {
             f.fail_applies -= 1;
+            if f.contextual_apply_error {
+                return Err(anyhow::anyhow!("injected partial apply error")
+                    .context("native apply failed; previous configuration restored"));
+            }
             bail!("injected partial apply error");
         }
         if f.post_apply_drift {
@@ -1072,6 +1077,38 @@ fn apply_failure_rolls_back_and_returns_transaction() {
     assert_eq!(r.body["transaction"]["status"], "rolled_back");
     assert_eq!(faults.lock().unwrap().state, Config::empty());
     assert!(e.active().is_none());
+}
+#[test]
+fn contextual_apply_failure_preserves_cause_in_response_and_durable_transaction() {
+    for fail_applies in [1, 2] {
+        let f = Fixture::new();
+        let (mut e, faults) = faulty(&f);
+        {
+            let mut faults = faults.lock().unwrap();
+            faults.fail_applies = fail_applies;
+            faults.contextual_apply_error = true;
+        }
+        let r = submit(&mut e, config());
+        assert_eq!(r.status, 500);
+        let status = if fail_applies == 1 {
+            "rolled_back"
+        } else {
+            "recovery_failed"
+        };
+        assert_eq!(r.body["transaction"]["status"], status);
+        let cause =
+            "native apply failed; previous configuration restored: injected partial apply error";
+        for error in [&r.body["error"], &r.body["transaction"]["error"]] {
+            assert!(error.as_str().unwrap().contains(cause), "{error}");
+            if fail_applies == 2 {
+                assert_eq!(error.as_str().unwrap().matches(cause).count(), 2);
+            }
+        }
+        let saved: State = e.store.load().unwrap().unwrap();
+        let id = r.body["transaction"]["id"].as_str().unwrap();
+        assert_eq!(saved.transactions[id].error, r.body["transaction"]["error"]);
+        assert_eq!(saved.transactions[id].status, status);
+    }
 }
 #[test]
 fn failed_recovery_blocks_writes_and_manual_retry_succeeds() {

@@ -799,11 +799,11 @@ impl Engine {
             Ok(())
         })();
         if let Err(e) = applied {
-            let recovery = self.rollback(&id, &format!("apply failed: {e}"));
+            let recovery = self.rollback(&id, &format!("apply failed: {e:#}"));
             let t = self.state.transactions.get(&id).cloned().unwrap_or(t);
             return Err(internal_error(match recovery {
-                Ok(()) => format!("apply failed: {e}"),
-                Err(r) => format!("apply failed: {e}; {r}"),
+                Ok(()) => format!("apply failed: {e:#}"),
+                Err(r) => format!("apply failed: {e:#}; {r:#}"),
             })
             .transaction(t));
         }
@@ -907,7 +907,7 @@ impl Engine {
             let mut next = self.state.clone();
             if let Some(active) = next.transactions.get_mut(id) {
                 active.status = "recovery_failed".into();
-                active.error = format!("{reason}; rollback: {e}");
+                active.error = format!("{reason}; rollback: {e:#}");
             }
             self.persist(next).context("persist failed recovery")?;
             return Err(e.context("rollback failed; writes blocked"));

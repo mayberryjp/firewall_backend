@@ -1182,12 +1182,20 @@ confirmation and all enabled-service permissions; it uses stored settings,
 does not apply the draft, and does not create a revision. Health/worker failure
 does not mutate configured enabled or create modeled drift by itself.
 
-Operator prerequisite: Linux `-gateway-monitoring`, raw ICMP/namespace privileges,
+Operator prerequisite: Linux `--gateway-monitoring` and, in host appliance mode,
+`--allow-host-services`, raw ICMP/namespace privileges,
 correct routes/rules/return paths, and ICMP/ICMPv6 permission through other
 firewalls. The API cannot install packages, grant capabilities, or set that flag.
 DHCP mode additionally needs native route/rule/socket-mark administration and
 free private table/priority/mark ranges above. Deploy the backend before enabling the new frontend
 mode. Use the [explicit dual-stack plus DHCP example](examples/gateway-monitoring.json).
+The shipped systemd service does not enable these opt-ins. Missing opt-ins reject
+enabled monitors before native networking changes; transaction errors remain `500`
+with the transaction and rollback outcome, now retaining the underlying error
+chain in both `error` and `transaction.error`. Display the full message, not just
+the outer native rollback context. Do not automatically retry, disable the monitor,
+or add routes to work around an operator prerequisite. See
+[operator setup](docs/BUILD_AND_INSTALL.md#enabling-gateway-monitoring-on-an-installed-appliance).
 
 ### 6.1.3 Appliance NTP, syslog, and vnStat
 

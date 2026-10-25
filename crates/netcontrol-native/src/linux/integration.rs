@@ -387,7 +387,6 @@ fn native_dhcp_gateway_waiting_apply_rollback_reopen_and_recovery() -> Result<()
         })
     })?;
     let mut options = fixture.options();
-    options.gateway_monitoring = true;
     let mut native = Native::open(options.clone())?;
     let empty = Config::empty();
     native.repair(&empty)?;
@@ -397,6 +396,25 @@ fn native_dhcp_gateway_waiting_apply_rollback_reopen_and_recovery() -> Result<()
     )?;
     desired.normalize();
     desired.validate()?;
+    let ownership_before = fs::read(native.state.join("ownership.json"))?;
+    let error = native.apply(&empty, &desired).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("explicit allow_gateway_monitoring"),
+        "{error:#}"
+    );
+    assert!(!native.state.join("intent.json").exists());
+    assert_eq!(
+        fs::read(native.state.join("ownership.json"))?,
+        ownership_before
+    );
+    native.apply(&desired, &empty)?;
+    native.observe(&empty)?;
+    drop(native);
+    options.gateway_monitoring = true;
+    let mut native = Native::open(options.clone())?;
+    native.repair(&empty)?;
     native.apply(&empty, &desired)?;
     native.observe(&desired)?;
     let runtime = native.runtime(&desired)?;

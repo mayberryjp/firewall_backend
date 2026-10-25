@@ -1080,6 +1080,7 @@ impl Backend for Native {
         self.recover()?;
         let before = before.operational_value()?;
         let after = after.operational_value()?;
+        self.services.validate(&after)?;
         self.preflight(&before)?;
         self.preflight(&after)?;
         let mut ownership = self.ownership()?;

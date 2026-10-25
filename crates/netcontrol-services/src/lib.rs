@@ -144,6 +144,9 @@ impl Services {
             managed_namespace,
         })
     }
+    pub fn validate(&self, value: &Value) -> Result<()> {
+        self.preflight(&Config::parse(value)?)
+    }
     fn preflight(&self, c: &Config) -> Result<()> {
         #[cfg(target_os = "linux")]
         let isolated_namespace = {
@@ -509,6 +512,49 @@ impl Drop for Services {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gateway_validation_requires_both_host_opt_ins_without_starting_workers() {
+        let value = json!({
+            "interfaces":[{"name":"wan0","kind":"ethernet","up":true}],
+            "dhcp_clients":{"wan0":{}},
+            "gateway_monitors":[{"name":"wan","mode":"dhcp","enabled":true,
+                "interface":"wan0","target":"203.0.113.1"}]
+        });
+        for (allow_host_services, allow_gateway_monitoring, expected) in [
+            (false, false, Some("explicit allow_host_services")),
+            (true, false, Some("explicit allow_gateway_monitoring")),
+            (true, true, None),
+        ] {
+            let directory = std::env::current_dir().unwrap().join(format!(
+                "services-gateway-validation-{}",
+                rand::random::<u64>()
+            ));
+            let services = Services::new(ServiceOptions {
+                namespace: None,
+                state_directory: directory.clone(),
+                allow_host_services,
+                allow_gateway_monitoring,
+            })
+            .unwrap();
+            let before = services.status();
+            match expected {
+                Some(message) => assert!(
+                    services
+                        .validate(&value)
+                        .unwrap_err()
+                        .to_string()
+                        .contains(message)
+                ),
+                None => services.validate(&value).unwrap(),
+            }
+            assert_eq!(services.status(), before);
+            assert!(services.workers.is_empty());
+            drop(services);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn same_namespace_handle_does_not_bypass_host_service_opt_in() {

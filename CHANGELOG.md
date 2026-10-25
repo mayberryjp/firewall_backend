@@ -178,6 +178,15 @@
 
 ### Fixed
 
+- Gateway-monitor apply failures now preserve the underlying apply and rollback
+  error chains in HTTP errors and durable transaction records. Native service
+  configuration/opt-ins are validated before stopping workers or changing
+  networking. Host monitoring requires both `--allow-host-services` and
+  `--gateway-monitoring`; shipped defaults remain explicit opt-in. Added
+  [operator setup](docs/BUILD_AND_INSTALL.md#enabling-gateway-monitoring-on-an-installed-appliance).
+  Recommended bump: patch; baseline unknown. Optional frontend troubleshooting
+  guidance: [handoff 2026-10-24-13](docs/frontend-handoffs/2026-10-24.md#2026-10-24-13-gateway-monitor-prerequisites-and-apply-errors).
+
 - CI metadata fixtures distinguish string-valued host records from the kernel
   `host` map, avoiding unsupported metadata injection without relaxing schemas.
   Empty native host startup checks its no-firewall guard before bootstrap,
