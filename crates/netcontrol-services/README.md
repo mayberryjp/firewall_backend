@@ -92,8 +92,15 @@ These are worker states, not external daemon states; there is no `pid` field.
 * **NetFlow:** AF_PACKET Ethernet/VLAN capture and NetFlow v1/v5/v9/IPFIX UDP export,
   bounded flow capacity, configured sampling, idle/protocol/flag/maxlife/export
   timeouts, and shutdown flushing. Excludes its collector traffic to avoid
-  export feedback. Packet drops are fatal/incomplete statistics, not silently
-  accepted. Versions 1 and 5 represent IPv4; v9 and IPFIX represent IPv4 and IPv6,
+  export feedback. AF_PACKET capture drops do not stop the worker or export.
+  Runtime reports cumulative `dropped_packets` as an exact decimal string and
+  `statistics_complete: false` after any observed drop; flow totals may undercount
+  traffic. Both reset on worker restart (initially `"0"` and `true`); loss remains
+  recorded across later loss-free polls and shutdown. Counters cover socket drops
+  before application filtering/sampling and are read at the configured export-scan
+  interval. Capture/statistics socket errors and export failures remain fatal.
+  Running does not verify collector delivery or loss-free capture.
+  Versions 1 and 5 represent IPv4; v9 and IPFIX represent IPv4 and IPv6,
   with template IDs 256/257 refreshed in every export packet, 64-bit counters,
   protocol/ports/flags/TOS/timestamps, and sampling interval/algorithm elements.
   Version 9 sequence counts packets; IPFIX sequence counts data records, and

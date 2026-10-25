@@ -2375,6 +2375,23 @@ Display runtime states:
 Missing runtime data means Unknown, not Disabled. Keep top-level runtime error
 visible even if individual rows appear healthy.
 
+Native AF_PACKET packet drops no longer stop export or fail service verification
+by themselves. Runtime/status rows expose `dropped_packets` (exact unsigned decimal
+string) and `statistics_complete` (boolean). Enabled native workers initialize
+these to `"0"` and `true`; each export-scan poll accumulates socket drops and any
+observed loss makes statistics incomplete until worker restart. Shutdown retains
+the values. These are socket drops before application filtering/sampling, not a
+count of lost flow records. Capture/statistics socket errors and export failures
+still produce `state: "error"` and can fail confirmation.
+
+Show an inline warning naming the instance and exact dropped-packet count when
+`statistics_complete === false`; explain that flow totals may undercount traffic
+while export can continue. Do not convert the decimal counter through JavaScript
+`Number`. Absent fields (disabled, simulated or unavailable rows) mean unknown,
+not zero/complete. Do not label a running worker as loss-free or delivery-verified.
+No automatic retry, reconciliation or transaction replay is warranted by this
+warning; the existing unknown-write recovery rules still apply.
+
 **Reconcile services** is a separate explicitly confirmed runtime action. It sends
 a bodyless POST using stored committed/pending configuration, not the draft.
 Explain that it affects managed services collectively, may lose flow caches, does
@@ -3049,6 +3066,8 @@ interface SoftflowdStatus {
   state: string;
   started_at?: Timestamp;
   error?: string;
+  dropped_packets?: string; // Exact cumulative AF_PACKET drops since worker start.
+  statistics_complete?: boolean; // False remains sticky after an observed drop.
 }
 
 interface RuntimeState {

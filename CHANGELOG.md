@@ -4,6 +4,14 @@
 
 ### Changed
 
+- Native NetFlow/IPFIX capture continues exporting after AF_PACKET packet drops
+  instead of stopping the worker and rejecting confirmation solely for capture
+  loss. Runtime/status rows report exact cumulative `dropped_packets` and a sticky
+  `statistics_complete: false`; real socket/export failures remain errors.
+  Recommended bump: minor for the explicit runtime contract and behavior change;
+  baseline unknown, Unreleased. Frontend warning required; see
+  [handoff 2026-10-25-05](docs/frontend-handoffs/2026-10-25.md#2026-10-25-05-native-flow-capture-loss-reporting).
+
 - `POST /api/v1/transactions` now drops unknown keys anywhere inside `config`
   instead of returning `400`, and lists each dropped key as an RFC 6901 pointer in
   a new `ignored_fields` array on the `202` response (always present, possibly

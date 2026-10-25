@@ -211,7 +211,10 @@ fn native_af_packet_drops_report_incomplete_statistics_and_keep_exporting() {
         )?;
         let mut buffer = [0; 2048];
         let n = collector.recv(&mut buffer)?;
-        ensure!(n >= 72 && buffer[..2] == 5u16.to_be_bytes(), "missing export after capture loss");
+        ensure!(
+            n >= 72 && buffer[..2] == 5u16.to_be_bytes(),
+            "missing export after capture loss"
+        );
         let start = Instant::now();
         while worker.snapshot()["statistics_complete"] != false
             && start.elapsed() < Duration::from_secs(3)
@@ -223,7 +226,10 @@ fn native_af_packet_drops_report_incomplete_statistics_and_keep_exporting() {
             .as_str()
             .context("missing exact capture-drop counter")?
             .parse()?;
-        ensure!(dropped > 0, "capture-drop fixture did not overflow the socket");
+        ensure!(
+            dropped > 0,
+            "capture-drop fixture did not overflow the socket"
+        );
         ensure!(
             first["state"] == "running" && first["statistics_complete"] == false,
             "capture loss stopped the worker or was hidden: {first}"
@@ -232,14 +238,26 @@ fn native_af_packet_drops_report_incomplete_statistics_and_keep_exporting() {
         let sender = UdpSocket::bind("127.0.0.1:25004")?;
         sender.send_to(b"after-loss", target.local_addr()?)?;
         let n = collector.recv(&mut buffer)?;
-        ensure!(n >= 72 && buffer[..2] == 5u16.to_be_bytes(), "export did not continue");
+        ensure!(
+            n >= 72 && buffer[..2] == 5u16.to_be_bytes(),
+            "export did not continue"
+        );
         worker.shutdown()?;
         let final_status = worker.snapshot();
         ensure!(
             final_status["state"] == "stopped"
                 && final_status["statistics_complete"] == false
-                && final_status["dropped_packets"].as_str().context("missing drops")?.parse::<u64>()? >= dropped
-                && final_status["exported_flows"].as_u64() > first["exported_flows"].as_u64()
+                && final_status["dropped_packets"]
+                    .as_str()
+                    .context("missing drops")?
+                    .parse::<u64>()?
+                    >= dropped
+                && final_status["exported_flows"]
+                    .as_u64()
+                    .context("missing final exports")?
+                    > first["exported_flows"]
+                        .as_u64()
+                        .context("missing initial exports")?
                 && final_status.get("error").is_none(),
             "loss accounting, continued export or shutdown failed: {final_status}"
         );
@@ -293,6 +311,11 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                 "invalid native NetFlow export"
             );
             ensure!(buffer[2..4] != [0, 0], "empty native flow export");
+            let status = worker.snapshot();
+            ensure!(
+                status["dropped_packets"] == "0" && status["statistics_complete"] == true,
+                "fresh loss-free exporter did not reset capture statistics: {status}"
+            );
             worker.shutdown()?;
             ensure!(
                 worker.snapshot()["state"] == "stopped",
