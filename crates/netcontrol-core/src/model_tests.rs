@@ -10,6 +10,30 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn mqtt_settings_do_not_change_native_operational_configuration() {
+    let before = candidate();
+    let mut after = before.clone();
+    after.mqtt.enabled = true;
+    after.mqtt.endpoint = "mqtts://broker.example.test".into();
+    after.mqtt.username = "synthetic-user".into();
+    after.mqtt.source_interface = "lan0".into();
+    after.mqtt.interval_seconds = 120;
+    after.validate().unwrap();
+    assert_ne!(before, after);
+    assert!(serde_json::to_value(&after).unwrap().get("mqtt").is_some());
+    assert!(after.operational_value().unwrap().get("mqtt").is_none());
+    assert_eq!(
+        before.operational_value().unwrap(),
+        after.operational_value().unwrap()
+    );
+    after.interfaces[0].mtu = 1400;
+    assert_ne!(
+        before.operational_value().unwrap(),
+        after.operational_value().unwrap()
+    );
+}
+
+#[test]
 fn mqtt_configuration_defaults_validation_and_no_inline_password() {
     let mut config = candidate();
     assert!(!config.mqtt.enabled);

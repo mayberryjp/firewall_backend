@@ -200,6 +200,25 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     assert_eq!(managed["index"], baseline["index"]);
     assert_eq!(managed["mac"], baseline["mac"]);
     assert_eq!(native.ownership()?.ethernet_originals["nic0"].mtu, 1450);
+    let ownership_path = native.state.join("ownership.json");
+    let unchanged_ownership = fs::read(&ownership_path)?;
+    let mut mqtt_desired = desired.clone();
+    mqtt_desired.mqtt.enabled = true;
+    mqtt_desired.mqtt.endpoint = "mqtts://broker.example.test".into();
+    mqtt_desired.mqtt.source_interface = "nic0".into();
+    mqtt_desired.validate()?;
+    native.apply(&desired, &mqtt_desired)?;
+    native.observe(&mqtt_desired)?;
+    assert_eq!(fs::read(&ownership_path)?, unchanged_ownership);
+    assert!(!native.state.join("intent.json").exists());
+    let mut recorded = native.ownership()?;
+    recorded.committed_config = Some(serde_json::to_value(&mqtt_desired)?);
+    native.save_ownership(&recorded)?;
+    assert_eq!(
+        native.ownership()?.committed_config,
+        Some(desired.operational_value()?)
+    );
+    native.repair(&desired)?;
     session(namespace.clone(), |rt, handle| {
         rt.block_on(async {
             let links: Vec<_> = handle.link().get().execute().try_collect().await?;
@@ -251,9 +270,21 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     // Restore the committed candidate through the explicit reboot path, not a drift bypass.
     let mut ownership = native.ownership()?;
     ownership.boot = "synthetic-previous-boot".into();
+    let mut committed = serde_json::to_value(&desired)?;
+    committed.as_object_mut().unwrap().remove("mqtt");
+    ownership.committed_config = Some(committed);
     native.save_ownership(&ownership)?;
     drop(native);
     let mut native = Native::open(options.clone())?;
+    let mut conflicting = desired.clone();
+    conflicting.interfaces[0].mtu = 1390;
+    assert!(
+        native
+            .repair(&conflicting)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match durable native ownership")
+    );
     native.repair(&desired)?;
     native.observe(&desired)?;
     assert_eq!(native.scope()?, scope);
@@ -285,7 +316,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
         native.observe(&desired)?;
         assert_eq!(
             native.ownership()?.committed_config,
-            Some(serde_json::to_value(&desired)?)
+            Some(desired.operational_value()?)
         );
     }
 

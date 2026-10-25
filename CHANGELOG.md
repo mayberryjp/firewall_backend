@@ -209,6 +209,14 @@
 
 ### Fixed
 
+- Native startup/reboot ownership comparison now projects recorded configurations
+  through the same strict typed operational representation as current candidates.
+  Daemon-owned MQTT settings are excluded from native networking/service plans,
+  avoiding false durable-ownership mismatches from irrelevant serialized fields
+  and native mutations/restarts for MQTT-only edits. Network mismatch/unknown-field
+  guards remain; no state reset, adoption bypass or migration. Recommended bump:
+  patch; baseline unknown. No API/schema/frontend change.
+
 - Gateway-monitor apply failures now preserve the underlying apply and rollback
   error chains in HTTP errors and durable transaction records. Native service
   configuration/opt-ins are validated before stopping workers or changing

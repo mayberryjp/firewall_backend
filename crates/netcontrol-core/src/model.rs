@@ -636,6 +636,7 @@ impl Config {
             }
         }
         let mut value = serde_json::to_value(self)?;
+        value.as_object_mut().unwrap().remove("mqtt");
         strip(&mut value);
         if let Some(routes) = value["routes"].as_array_mut() {
             routes.retain(|route| route["enabled"] == true);

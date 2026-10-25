@@ -431,7 +431,11 @@ impl Native {
         if !path.try_exists()? {
             return Ok(Ownership::default());
         }
-        read_json(&path)
+        let mut ownership: Ownership = read_json(&path)?;
+        if let Some(config) = &mut ownership.committed_config {
+            *config = serde_json::from_value::<Config>(config.clone())?.operational_value()?;
+        }
+        Ok(ownership)
     }
 
     fn save_ownership(&self, state: &Ownership) -> Result<()> {
@@ -971,7 +975,8 @@ impl Backend for Native {
                 ownership
                     .committed_config
                     .as_ref()
-                    .is_none_or(|value| serde_json::to_value(Config::empty())
+                    .is_none_or(|value| Config::empty()
+                        .operational_value()
                         .is_ok_and(|empty| *value == empty)),
                 "configured native state exists without its initial core journal; state is not reset"
             );
@@ -1098,7 +1103,7 @@ impl Backend for Native {
                 .collect();
             let recorded_target = ownership.committed_config.as_ref() == Some(&after)
                 || (ownership.committed_config.is_none()
-                    && after == serde_json::to_value(Config::empty())?);
+                    && after == Config::empty().operational_value()?);
             if recorded_target && ownership.managed_interfaces == after_names {
                 match self.verify(&after) {
                     Ok(()) => {

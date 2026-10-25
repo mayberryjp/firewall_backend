@@ -222,6 +222,23 @@ foreign firewall tables, conflicting routes and unsupported kernel state still
 fail explicitly. Explicit factory reset uses the same snapshot/intent machinery
 to apply a replacement configuration selected by the local operator.
 
+Native committed-configuration comparisons use the current typed operational
+projection on both sides, not raw persisted JSON versus newly serialized defaults.
+Daemon-owned `mqtt` settings and descriptive metadata do not describe native
+network ownership; they remain in the core journal/API but are excluded from
+native plans. MQTT-only edits therefore verify without native mutation, intent
+publication or native service restarts. Reading ownership does not rewrite its
+file. Unknown configuration fields remain rejected and substantive network
+differences still fail the startup/reboot ownership guard.
+
+If startup reports `reboot configuration does not match durable native ownership`,
+do not delete the core journal, native ownership or recovery intents, reset the
+appliance, or adopt its live configuration to bypass the check. Deploy the corrected
+daemon through the normal upgrade path. Repeated `IFLA_INET6_CONF` size warnings
+are distinct from this fatal comparison; inspect the final startup error if the
+failure persists. Appliance-specific configuration/kernel differences still need
+diagnosis rather than an automatic overwrite.
+
 Top-level `dhcp_clients` and `dns` maps participate in core transactions and
 interface authorization. DHCP addresses and routes are separate live lease
 state, guarded by a shared lock during native verify/reconcile. DHCP routes use
