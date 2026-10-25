@@ -533,8 +533,9 @@ revoke it; use device key management (or operator edits/restart in legacy mode).
 ### 4.3 Authorization
 
 All reads require `state.read`. POST actions require `transactions.write`, except
-the per-interface DHCP retry action (`interfaces.write`) and software upgrade
-submission (`system.upgrade`). Device-account API keys have all permissions,
+the per-interface DHCP retry action (`interfaces.write`), MQTT password upload
+(`mqtt.write`) and software upgrade submission (`system.upgrade`). Device-account
+API keys have all permissions,
 including upgrade authority when the operator explicitly enables self-upgrade;
 scoped credential files must grant `system.upgrade` explicitly.
 Configuration changes additionally require permissions for every changed area:
@@ -551,6 +552,7 @@ Configuration changes additionally require permissions for every changed area:
 | NTP server/client settings | `ntp.write` |
 | Whole-appliance syslog/remote destinations | `syslog.write` |
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
+| MQTT streaming configuration | `mqtt.write` |
 
 Creating/removing a WireGuard interface typically needs both interface and
 WireGuard permissions. Confirm/rollback requires the permissions for the original
