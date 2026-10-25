@@ -124,14 +124,14 @@ upgrade_binary() (
 
 deploy_upgrade() {
     local binary=$1 destination=$2 installer=$3
-    root_command bash -c 'source "$1"; configure_conntrack' bash "$installer" || return 1
+    root_command bash -c 'source "$1"; configure_conntrack && configure_appliance_services && systemctl daemon-reload' bash "$installer" || return 1
     printf 'Restarting the firewall daemon; use a local console or independent OS SSH session.\n'
     upgrade_binary "$binary" "$destination"
 }
 
 main() {
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash upgrade.sh [--build-only]\nBuilds the current checkout on Ubuntu amd64 and replaces/restarts an installed netcontrold service. The daemon applies its saved configuration, not live interface settings. No initial provisioning, factory reset, git pull, prerequisite installation or boot enablement.\n'
+        printf 'Usage: bash upgrade.sh [--build-only]\nBuilds the current checkout on Ubuntu amd64 and replaces/restarts an installed netcontrold service. Full upgrade automatically configures host-service/gateway-monitoring permissions without replacing custom startup arguments; build-only changes no service settings. The daemon applies its saved configuration, not live interface settings. No initial provisioning, factory reset, git pull, prerequisite installation or boot enablement.\n'
         return
     fi
     [[ $# -eq 0 || $# -eq 1 && $1 == --build-only ]] || { printf 'Use --help for usage.\n' >&2; return 1; }

@@ -63,9 +63,9 @@ struct Options {
     adopt_parents: Vec<String>,
     #[arg(long)]
     allow_host_tunables: bool,
-    #[arg(long)]
+    #[arg(long, env = "NETCONTROL_ALLOW_HOST_SERVICES")]
     allow_host_services: bool,
-    #[arg(long = "gateway-monitoring")]
+    #[arg(long = "gateway-monitoring", env = "NETCONTROL_GATEWAY_MONITORING")]
     allow_gateway_monitoring: bool,
     #[arg(long, default_value = "/var/lib/netcontrol/services")]
     services_state_dir: PathBuf,

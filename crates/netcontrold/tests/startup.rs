@@ -68,6 +68,8 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
         };
         let mut child = Daemon(
             Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+                .env("NETCONTROL_ALLOW_HOST_SERVICES", "true")
+                .env("NETCONTROL_GATEWAY_MONITORING", "true")
                 .args([
                     "--listen",
                     &http.to_string(),
@@ -107,6 +109,29 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
         } else {
             public_identity = Some(data);
         }
+    }
+}
+
+#[test]
+fn invalid_service_opt_in_environment_fails_before_creating_state() {
+    for variable in [
+        "NETCONTROL_ALLOW_HOST_SERVICES",
+        "NETCONTROL_GATEWAY_MONITORING",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state.json");
+        let output = Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+            .env_remove("NETCONTROL_ALLOW_HOST_SERVICES")
+            .env_remove("NETCONTROL_GATEWAY_MONITORING")
+            .env(variable, "invalid")
+            .arg("--state")
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("invalid value"), "{error}");
+        assert!(!state.exists());
     }
 }
 

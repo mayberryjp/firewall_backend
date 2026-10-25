@@ -1182,14 +1182,22 @@ confirmation and all enabled-service permissions; it uses stored settings,
 does not apply the draft, and does not create a revision. Health/worker failure
 does not mutate configured enabled or create modeled drift by itself.
 
-Operator prerequisite: Linux `--gateway-monitoring` and, in host appliance mode,
-`--allow-host-services`, raw ICMP/namespace privileges,
+Operator prerequisite: Linux gateway monitoring and host-service opt-ins
+(`--gateway-monitoring` / `NETCONTROL_GATEWAY_MONITORING=true` and, in host
+appliance mode, `--allow-host-services` / `NETCONTROL_ALLOW_HOST_SERVICES=true`),
+raw ICMP/namespace privileges,
 correct routes/rules/return paths, and ICMP/ICMPv6 permission through other
 firewalls. The API cannot install packages, grant capabilities, or set that flag.
 DHCP mode additionally needs native route/rule/socket-mark administration and
 free private table/priority/mark ranges above. Deploy the backend before enabling the new frontend
 mode. Use the [explicit dual-stack plus DHCP example](examples/gateway-monitoring.json).
-The shipped systemd service does not enable these opt-ins. Missing opt-ins reject
+The current install and full upgrade scripts automatically persist both opt-ins
+in `netcontrold.service.d/50-netcontrol-appliance-services.conf` using the
+environment settings, without replacing customized `ExecStart` arguments.
+`--build-only` does not alter service settings. Direct/manual deployments still
+need the flags or environment settings; absent settings default to false and
+invalid boolean environment values fail startup. These permissions do not enable
+disabled services or add monitor configuration. Missing opt-ins reject
 enabled monitors before native networking changes; transaction errors remain `500`
 with the transaction and rollback outcome, now retaining the underlying error
 chain in both `error` and `transaction.error`. Display the full message, not just
@@ -1258,12 +1266,13 @@ and requires permissions for all enabled services. It never applies a draft.
 Preserve drafts on 403/409/422/500; expose validation/runtime errors. Existing
 401/403/404/405 and transaction revision/recovery behavior applies.
 
-Operator prerequisites are not API settings: explicit `--allow-host-services`,
+Operator prerequisites are not API settings: `--allow-host-services` or
+`NETCONTROL_ALLOW_HOST_SERVICES=true` (set by current install/full upgrade scripts),
 namespace/host capabilities, exclusive host-service ownership, an arranged backend log source, trust bundle,
 host DNS/routing, and stopping competing clock/logging services. No packages,
 arbitrary commands, OpenRC service management, or host-network edits are exposed.
-Host clock/logging/statistics retain explicit opt-ins even when native networking
-uses the host namespace. Host-network management does not implicitly authorize
+Direct/manual host clock/logging/statistics deployments retain explicit opt-ins
+even when native networking uses the host namespace. Host-network management alone does not authorize
 clock adjustment or take ownership from competing services.
 
 Settings persist through transactions/revisions/restart; traffic histories survive

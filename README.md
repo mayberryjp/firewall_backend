@@ -143,8 +143,9 @@ source/gateway/table. They follow only that interface's active lease, wait with
 Unknown health before acquisition, and never fall back to another WAN. Private
 interface-scoped paths are runtime-owned, not editable routes. Explicit IPv4/IPv6
 monitors are unchanged. See the [monitor contract](FRONTEND_SPEC.md#612-gateway-health-and-rtt-variation).
-Host appliance monitoring requires both `--allow-host-services` and
-`--gateway-monitoring`; the shipped unit does not enable them. See
+Host appliance monitoring requires host-service and gateway-probe permission.
+The install and upgrade scripts enable both automatically through a managed
+systemd environment drop-in, preserving customized startup arguments. See
 [installed-appliance setup](docs/BUILD_AND_INSTALL.md#enabling-gateway-monitoring-on-an-installed-appliance).
 See [the routing contract](FRONTEND_SPEC.md#65-source-policy-routing).
 

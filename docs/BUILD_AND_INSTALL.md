@@ -51,6 +51,10 @@ Ubuntu amd64 firewall and replaces/restarts an installed `netcontrold.service`.
 A missing service is an explicit error; use the fresh installer for provisioning.
 Loaded services retain their unit and executable path. The script discovers that path from systemd's
 effective `ExecStart` instead of assuming a fixed installation directory.
+Full installation/upgrade also enables native host services and gateway probes
+through the managed systemd environment drop-in described
+[below](#enabling-gateway-monitoring-on-an-installed-appliance), without rewriting
+the base unit or custom startup arguments. Build-only runs do not change it.
 Exactly one direct, absolute executable named `netcontrold` is required;
 wrappers, missing/ambiguous commands and symlink executables are rejected.
 The destination may be absent on first installation. Masked/broken services,
@@ -118,10 +122,11 @@ checks leave the running daemon untouched. A checkout-local lock rejects
 concurrent invocations; do not run other installers or upgrades, including
 from another checkout, at the same time.
 
-Full deployment runs the installer's shared conntrack setup as root after the
-build and service-path check, before staging/replacing/stopping the daemon.
+Full deployment runs the installer's shared conntrack and appliance-service
+permission setup, then reloads systemd as root after the build and service-path
+check, before staging/replacing/stopping the daemon.
 Keep `install.sh` beside `upgrade.sh` from the same reviewed checkout.
-`--build-only` performs no conntrack setup or host changes. See
+`--build-only` performs no conntrack/service setup or host changes. See
 [conntrack host prerequisites](#conntrack-host-prerequisites) for persistence,
 failure limitations and accounting behavior.
 
@@ -883,38 +888,49 @@ startup. Cross-compilation is not that acceptance test.
 
 ### Enabling Gateway Monitoring on an Installed Appliance
 
-The shipped systemd unit leaves optional service/probe opt-ins disabled. Both
-`--allow-host-services` and `--gateway-monitoring` are required for enabled
-gateway monitors in host appliance mode, including DHCP monitors. `--appliance`
-does not imply either flag. The host-services flag also permits other native
-services when explicitly configured; review those settings before opting in.
-
-Inspect the actual startup flags with:
-
-```sh
-systemctl show netcontrold -p ExecStart --no-pager
-```
-
-For the unmodified shipped unit, use `sudo systemctl edit netcontrold` to add:
+The current `install.sh` and full `upgrade.sh` automatically enable both required
+permissions for host appliance gateway monitors, including DHCP mode. They write
+the managed file
+`/etc/systemd/system/netcontrold.service.d/50-netcontrol-appliance-services.conf`:
 
 ```ini
 [Service]
-ExecStart=
-ExecStart=/usr/local/sbin/netcontrold --backend linux --appliance --listen ${NETCONTROL_LISTEN} --state /var/lib/netcontrol/native-state.json --credential-db /var/lib/netcontrol/credentials.json --keys /etc/netcontrol/keys --services-state-dir /var/lib/netcontrol/services --allow-host-services --gateway-monitoring
+Environment=NETCONTROL_ALLOW_HOST_SERVICES=true
+Environment=NETCONTROL_GATEWAY_MONITORING=true
 ```
 
-If the unit is customized, preserve its existing arguments and add only the two
-opt-ins. Use independent OS SSH/console access; restarting the daemon interrupts
-its API and embedded SSH sessions. Do not restart during an active configuration
-transaction or upgrade. Then run:
+The environment variables are equivalent to `--allow-host-services` and
+`--gateway-monitoring`. Absent settings default to false; malformed boolean values
+fail daemon argument parsing before state is created. The installer rejects
+artifacts without these current environment settings in `--help`.
+`--appliance` itself does not imply either permission.
+
+The scripts reload systemd before starting the daemon. The upgrade keeps the
+existing base unit, executable path, arguments and unrelated drop-ins; only its
+managed environment file is replaced atomically. Symlink/non-regular managed
+paths are refused. Setup or reload failure aborts before binary deployment.
+Like conntrack prerequisites, this managed permission configuration persists
+if a subsequent binary deployment fails; binary recovery does not undo it.
+Explicit operator environment overrides can still change the effective settings.
+`--build-only` does not install the drop-in, reload systemd or restart anything.
+
+Host-service permission also permits other native services **when enabled in
+saved configuration**. It does not turn on NTP/syslog/traffic workers, add
+monitors or change firewall/routing configuration by itself. Review saved service
+settings and competing host-service ownership before deployment.
+
+For an existing installed appliance, run the current checkout's normal upgrade
+from independent OS SSH/console access; no manual unit edit is needed:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl restart netcontrold
-systemctl show netcontrold -p ExecStart --no-pager
+bash upgrade.sh
+systemctl show netcontrold -p Environment -p ExecStart --no-pager
 systemctl status netcontrold --no-pager
 ```
 
+Restart interrupts API/embedded SSH sessions; do not deploy during an active
+configuration transaction or upgrade. Direct/manual daemon deployments outside
+these scripts must supply the two flags or equivalent environment variables.
 Verify management connectivity and current state, refresh the draft's base
 revision, then resubmit and confirm the monitor change. Do not reset state or
 add a static probe route for DHCP mode. Missing opt-ins reject the transaction

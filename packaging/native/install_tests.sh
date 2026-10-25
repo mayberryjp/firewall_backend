@@ -79,6 +79,64 @@ for conntrack_scenario in success repeat module_failure write_failure read_failu
 done
 printf 'Conntrack live settings, boot persistence and prerequisite-failure tests passed (mocked kernel commands).\n'
 
+for service_scenario in success repeat directory_failure chmod_failure publish_failure symlink_file symlink_directory file_directory nonregular_target; do
+    service_directory="$temporary/service-opt-ins-$service_scenario"
+    mkdir -p "$service_directory/drop-ins"
+    printf 'custom unit\n' > "$service_directory/unit"
+    printf '[Service]\nEnvironment=CUSTOM_SETTING=preserved\n' > "$service_directory/drop-ins/99-custom.conf"
+    service_target="$service_directory/drop-ins/50-netcontrol-appliance-services.conf"
+    printf 'previous managed settings\n' > "$service_target"
+    case $service_scenario in
+        symlink_file)
+            rm "$service_target"
+            ln -s 99-custom.conf "$service_target" ;;
+        symlink_directory)
+            mv "$service_directory/drop-ins" "$service_directory/original"
+            ln -s original "$service_directory/drop-ins" ;;
+        file_directory)
+            rm "$service_target"
+            rm "$service_directory/drop-ins/99-custom.conf"
+            rmdir "$service_directory/drop-ins"
+            printf 'not a directory\n' > "$service_directory/drop-ins" ;;
+        nonregular_target)
+            rm "$service_target"
+            mkdir "$service_target" ;;
+    esac
+    if (
+        install() {
+            [[ $service_scenario != directory_failure ]] || return 1
+            local -a arguments=()
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    -o|-g) shift 2 ;;
+                    *) arguments+=("$1"); shift ;;
+                esac
+            done
+            command install "${arguments[@]}"
+        }
+        chmod() { [[ $service_scenario != chmod_failure ]] && command chmod "$@"; }
+        mv() { [[ $service_scenario != publish_failure ]] && command mv "$@"; }
+        configure_appliance_services "$service_directory/drop-ins" || exit 1
+        if [[ $service_scenario == repeat ]]; then
+            configure_appliance_services "$service_directory/drop-ins" || exit 1
+        fi
+    ); then
+        [[ $service_scenario == success || $service_scenario == repeat ]] || exit 1
+        [[ $(< "$service_target") == $'[Service]\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true' ]]
+    else
+        [[ $service_scenario != success && $service_scenario != repeat ]] || exit 1
+        if [[ $service_scenario == *_failure ]]; then
+            [[ $(< "$service_target") == 'previous managed settings' ]]
+        fi
+    fi
+    [[ $(< "$service_directory/unit") == 'custom unit' ]]
+    if [[ $service_scenario != file_directory ]]; then
+        [[ $(< "$service_directory/drop-ins/99-custom.conf") == $'[Service]\nEnvironment=CUSTOM_SETTING=preserved' ]]
+        [[ -z $(find "$service_directory/drop-ins" -name '.appliance-services.*' -print) ]]
+    fi
+done
+printf 'Appliance service opt-ins, repeat setup, custom-setting preservation and publication failure tests passed.\n'
+
 ports_fixture="$temporary/ports"
 mkdir -p "$ports_fixture"
 for port_fixture_name in eno10 eno2 eno1 wlan0 lo tun0; do
@@ -133,19 +191,36 @@ for scenario in valid unauthenticated api_failure unsuccessful missing_artifact 
     fi
 done
 
+(
 trace=''
 check_systemd_unit() { return 0; }
 install() { trace="$trace install $*;"; }
 systemctl() { trace="$trace systemctl $*;"; }
+configure_appliance_services() { trace+=' appliance-services;'; }
 install_systemd_service
 [[ $trace == *'install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys;'* ]]
 [[ $trace == *'install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service;'* ]]
 [[ $trace == *'systemctl daemon-reload;'* ]]
+[[ $trace == *'appliance-services; systemctl daemon-reload;'* ]]
 [[ $trace != *'systemctl start'* && $trace != *'systemctl enable'* ]]
 trace=''
 check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
+for failure_stage in service_setup reload; do
+    trace=''
+    check_systemd_unit() { return 0; }
+    configure_appliance_services() { trace+=' appliance-services;'; [[ $failure_stage != service_setup ]]; }
+    systemctl() { trace+=" systemctl $*;"; return 1; }
+    if install_systemd_service; then exit 1; fi
+    [[ $trace == *'appliance-services;'* ]]
+    if [[ $failure_stage == service_setup ]]; then
+        [[ $trace != *'systemctl daemon-reload;'* ]]
+    else
+        [[ $trace == *'systemctl daemon-reload;'* ]]
+    fi
+done
+)
 printf 'Prebuilt download verification and service-installation tests passed (mocked GitHub/system commands).\n'
 
 for provision_scenario in success config_failure env_failure reload_failure start_failure http_failure forwarding_failure; do
@@ -213,7 +288,7 @@ for deployment_scenario in success setup_failure deploy_failure; do
         deployment_trace=''
         root_command() {
             [[ $# -eq 5 && $1 == bash && $2 == -c &&
-                $3 == 'source "$1"; configure_conntrack' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
+                $3 == 'source "$1"; configure_conntrack && configure_appliance_services && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
             deployment_trace+='setup;'
             [[ $deployment_scenario != setup_failure ]]
         }
@@ -234,7 +309,43 @@ for deployment_scenario in success setup_failure deploy_failure; do
         fi
     )
 done
-printf 'Upgrade configures conntrack before replacement and aborts on setup failure (mocked commands).\n'
+printf 'Upgrade configures conntrack and appliance services/reloads systemd before replacement; setup failures abort (mocked commands).\n'
+
+cat > "$temporary/setup-fixture.sh" <<'EOF'
+configure_conntrack() {
+    printf 'conntrack\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != conntrack_failure ]]
+}
+configure_appliance_services() {
+    printf 'services\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != services_failure ]]
+}
+systemctl() {
+    [[ $* == daemon-reload ]] || return 1
+    printf 'reload\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != reload_failure ]]
+}
+EOF
+for setup_scenario in success conntrack_failure services_failure reload_failure; do
+    (
+        export SETUP_SCENARIO=$setup_scenario SETUP_TRACE="$temporary/setup-$setup_scenario.trace"
+        root_command() { "$@"; }
+        upgrade_binary() { printf 'deploy\n' >> "$SETUP_TRACE"; }
+        if deploy_upgrade new-binary installed-binary "$temporary/setup-fixture.sh"; then
+            [[ $setup_scenario == success ]] || exit 1
+        else
+            [[ $setup_scenario != success ]] || exit 1
+        fi
+        case $setup_scenario in
+            success) expected=$'conntrack\nservices\nreload\ndeploy' ;;
+            conntrack_failure) expected=conntrack ;;
+            services_failure) expected=$'conntrack\nservices' ;;
+            reload_failure) expected=$'conntrack\nservices\nreload' ;;
+        esac
+        [[ $(< "$SETUP_TRACE") == "$expected" ]]
+    )
+done
+printf 'Upgrade aborts before deployment on conntrack, service setup or systemd reload failure.\n'
 
 for scenario in missing loaded unmanaged conflicting masked install_failure reload_failure; do
     destination="$temporary/setup-$scenario"
@@ -288,7 +399,7 @@ for scenario in success fail_stage fail_restart fail_health first_install fail_f
         root_command() {
             printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"
             case $1 in
-                bash) [[ $3 == '\''source "$1"; configure_conntrack'\'' ]] ;;
+                bash) [[ $3 == '\''source "$1"; configure_conntrack && configure_appliance_services && systemctl daemon-reload'\'' ]] ;;
                 install)
                     [[ $UPGRADE_TEST_SCENARIO != fail_stage ]] || return 1
                     command cp -- "${@: -2}"

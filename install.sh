@@ -38,6 +38,24 @@ configure_conntrack() (
     printf 'Conntrack accounting and checksum validation enabled and configured for boot. Existing connections may still lack counters.\n'
 )
 
+configure_appliance_services() (
+    set -euo pipefail
+    local directory=${1:-/etc/systemd/system/netcontrold.service.d}
+    local destination="$directory/50-netcontrol-appliance-services.conf" staged=''
+    [[ ! -L $directory && ( ! -e $directory || -d $directory ) &&
+       ! -L $destination && ( ! -e $destination || -f $destination ) ]] || {
+        printf 'Refusing non-regular appliance service configuration: %s\n' "$destination" >&2
+        exit 1
+    }
+    install -d -o root -g root -m 0755 "$directory" || exit 1
+    staged=$(mktemp "$directory/.appliance-services.XXXXXX") || exit 1
+    trap '[[ -z $staged ]] || rm -f -- "$staged"' EXIT
+    printf '[Service]\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\n' > "$staged" || exit 1
+    chmod 0644 "$staged" || exit 1
+    mv -fT -- "$staged" "$destination" || exit 1
+    printf 'Appliance host services and gateway monitoring enabled for the next daemon start; configured services remain controlled by saved configuration.\n'
+)
+
 check_systemd_unit() {
     local unit=netcontrold.service
     local destination=/etc/systemd/system/netcontrold.service
@@ -49,9 +67,10 @@ check_systemd_unit() {
 
 install_systemd_service() {
     check_systemd_unit || return 1
-    install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys
-    install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service
-    systemctl daemon-reload
+    install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys || return 1
+    install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service || return 1
+    configure_appliance_services || return 1
+    systemctl daemon-reload || return 1
 }
 
 select_appliance_ports() {
@@ -128,7 +147,7 @@ download_prebuilt() {
 main() {
     local run_id='' wan='' lan='' lan_address=192.168.0.1/24 path ports
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash install.sh --run-id SUCCESSFUL_BUILD_RUN_ID [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24]\nDefaults: first physical Ethernet port (natural name order) is DHCP WAN, second is LAN; LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
+        printf 'Usage: bash install.sh --run-id SUCCESSFUL_BUILD_RUN_ID [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24]\nDefaults: first physical Ethernet port (natural name order) is DHCP WAN, second is LAN; LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions; saved configuration controls which services run. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
         return
     fi
     while [[ $# -gt 0 ]]; do
@@ -181,17 +200,20 @@ main() {
         printf 'Stop the running netcontrold before installing; networking will not be stopped automatically.\n' >&2
         return 1
     fi
-    local work cleanup
+    local work cleanup help
     work=$(mktemp -d)
     printf -v cleanup 'rm -rf -- %q' "$work"
     trap "$cleanup" EXIT
     download_prebuilt "$run_id" "$work"
     cd "$work"
     chmod 0755 netcontrold
-    ./netcontrold --help | grep -- --provision-wan >/dev/null || {
-        printf 'Artifact lacks appliance provisioning. Build the reviewed current source; no older-contract fallback is provided.\n' >&2
+    help=$(./netcontrold --help) || return 1
+    if ! grep -q -- --provision-wan <<< "$help" ||
+       ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
+       ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help"; then
+        printf 'Artifact lacks current appliance provisioning/service opt-ins. Build the reviewed current source; no older-contract fallback is provided.\n' >&2
         return 1
-    }
+    fi
     check_systemd_unit
     configure_conntrack || return 1
     install -d -m 0755 /usr/local/sbin
