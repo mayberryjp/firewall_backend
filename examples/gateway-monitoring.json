@@ -1,7 +1,7 @@
 {
   "base_revision": 0,
   "confirm_timeout_seconds": 120,
-  "description": "Monitor IPv4 and IPv6 next-hop health on an adopted VLAN trunk",
+  "description": "Explicit dual-stack VLAN monitors and an automatic DHCPv4 monitor on a second WAN",
   "config": {
     "interfaces": [
       {
@@ -12,8 +12,17 @@
         "up": true,
         "addresses": ["192.0.2.2/24", "2001:db8::2/64"],
         "vlan": {"parent": "uplink", "id": 100}
+      },
+      {
+        "name": "wan1",
+        "kind": "ethernet",
+        "role": "wan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": []
       }
     ],
+    "dhcp_clients": {"wan1": {}},
     "routes": [
       {"destination": "192.0.2.1/32", "interface": "wan0", "table": 10000, "metric": 100},
       {"destination": "2001:db8::1/128", "interface": "wan0", "table": 10001, "metric": 100}
@@ -39,6 +48,13 @@
         "gateway": "2001:db8::1",
         "target": "2001:db8::1",
         "routing_table": 10001
+      },
+      {
+        "name": "wan2-dhcp",
+        "enabled": true,
+        "mode": "dhcp",
+        "interface": "wan1",
+        "target": "1.1.1.1"
       }
     ],
     "firewall": {

@@ -26,7 +26,11 @@ gateway monitoring address/routing/timing dependencies.
 User-configurable source-policy routing is unsupported: `policy_rules` is an
 unknown field (including empty arrays/null), `/api/v1/policy-rules` is absent,
 and `policy.write` is not a permission. Native gateway monitors derive internal
-host-source rules; enabled monitors sharing a source must use the same table.
+host-source rules for explicit monitors; enabled explicit monitors sharing a
+source must use the same table. `mode: "dhcp"` requires a DHCP-configured managed
+interface and IPv4 target, omits source/gateway/table, and can be saved enabled
+before lease acquisition without static addresses/routes. Native runtime follows
+only that interface's active lease; waiting/unavailable is Unknown, not Down.
 Ordinary destination routing remains available, normally through table 254.
 
 ## Persistent state and recovery

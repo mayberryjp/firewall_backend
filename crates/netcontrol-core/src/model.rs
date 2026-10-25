@@ -353,6 +353,20 @@ pub struct KernelConfig {
     pub namespace: BTreeMap<String, String>,
     pub host: BTreeMap<String, String>,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayMode {
+    #[default]
+    Explicit,
+    Dhcp,
+}
+
+impl GatewayMode {
+    fn is_explicit(&self) -> bool {
+        *self == Self::Explicit
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayMonitor {
@@ -361,9 +375,14 @@ pub struct GatewayMonitor {
     pub name: String,
     pub enabled: bool,
     pub interface: String,
+    #[serde(default, skip_serializing_if = "GatewayMode::is_explicit")]
+    pub mode: GatewayMode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gateway: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub routing_table: i64,
     #[serde(default)]
     pub probe_interval_ms: i64,
@@ -381,6 +400,10 @@ pub struct GatewayMonitor {
     pub failure_hold_ms: i64,
     #[serde(default)]
     pub recovery_hold_ms: i64,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 pub fn valid_interface_name(s: &str) -> bool {
@@ -1088,23 +1111,42 @@ impl Config {
                     && valid_interface_name(&m.interface),
                 "invalid or duplicate gateway monitor name/interface"
             );
-            let s = canonical_ip(&m.source_address)?;
-            let g = canonical_ip(&m.gateway)?;
             let t = canonical_ip(&m.target)?;
-            let remote = |a: IpAddr| {
-                global_unicast(a) || matches!(a,IpAddr::V6(v) if v.segments()[0]&0xffc0==0xfe80)
-            };
-            ensure!(
-                global_unicast(s)
-                    && remote(g)
-                    && remote(t)
-                    && s.is_ipv4() == g.is_ipv4()
-                    && s.is_ipv4() == t.is_ipv4()
-                    && s != g
-                    && s != t
-                    && (m.routing_table == 254 || (10000..=19999).contains(&m.routing_table)),
-                "invalid gateway monitor addresses/table"
-            );
+            if m.mode == GatewayMode::Dhcp {
+                ensure!(
+                    m.source_address.is_empty() && m.gateway.is_empty() && m.routing_table == 0,
+                    "DHCP monitors require automatic source/gateway/table; omit explicit fields"
+                );
+                ensure!(
+                    t.is_ipv4() && global_unicast(t),
+                    "DHCP monitors require an IPv4 unicast target"
+                );
+                ensure!(
+                    self.dhcp_clients.contains_key(&m.interface)
+                        && self
+                            .interfaces
+                            .iter()
+                            .any(|link| link.name == m.interface && (!m.enabled || link.up)),
+                    "DHCP monitor requires a DHCP-configured managed interface (up when enabled)"
+                );
+            } else {
+                let s = canonical_ip(&m.source_address)?;
+                let g = canonical_ip(&m.gateway)?;
+                let remote = |a: IpAddr| {
+                    global_unicast(a) || matches!(a,IpAddr::V6(v) if v.segments()[0]&0xffc0==0xfe80)
+                };
+                ensure!(
+                    global_unicast(s)
+                        && remote(g)
+                        && remote(t)
+                        && s.is_ipv4() == g.is_ipv4()
+                        && s.is_ipv4() == t.is_ipv4()
+                        && s != g
+                        && s != t
+                        && (m.routing_table == 254 || (10000..=19999).contains(&m.routing_table)),
+                    "invalid gateway monitor addresses/table"
+                );
+            }
             ensure!(
                 (100..=60000).contains(&m.probe_interval_ms)
                     && (100..=60000).contains(&m.loss_timeout_ms)
@@ -1123,7 +1165,9 @@ impl Config {
                     && (100..=60000).contains(&m.recovery_hold_ms),
                 "invalid monitor thresholds/holds"
             );
-            if m.enabled {
+            if m.enabled && m.mode == GatewayMode::Explicit {
+                let s = canonical_ip(&m.source_address)?;
+                let g = canonical_ip(&m.gateway)?;
                 ensure!(
                     source_tables
                         .insert(s, m.routing_table)

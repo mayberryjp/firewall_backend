@@ -4,6 +4,17 @@
 
 ### Added
 
+- DHCPv4 gateway monitors with explicit `mode: "dhcp"`, selected managed interface
+  and target, without pinned lease source/gateway/table or static route prerequisites.
+  Enabled monitors save before acquisition and report waiting/Unknown; native
+  probes follow selected-interface lease paths, retain windows on identical
+  renewals, rebind on changes and stop on expiry without cross-WAN fallback.
+  Tagged private routes/rules reconcile on disable/delete/rollback/recovery/restart.
+  Adds runtime capability discovery, resolved path/reason fields and IPv4-only
+  DHCP mode; existing explicit IPv4/IPv6 monitors remain unchanged. Recommended
+  bump: minor; baseline unknown. Frontend action required; see
+  [handoff 2026-10-24-12](docs/frontend-handoffs/2026-10-24.md#2026-10-24-12-dhcp-interface-gateway-monitors).
+
 - Explicitly authorized offline `netcontrol-state-convert` for empty retired
   `policy_rules` fields in saved journals/history and native ownership/adoption
   snapshots. Preview by default; locked/current-model/history validation,

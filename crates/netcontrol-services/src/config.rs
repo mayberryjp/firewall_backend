@@ -103,10 +103,17 @@ pub(crate) struct Gateway {
     pub name: String,
     pub enabled: bool,
     pub interface: String,
+    #[serde(default = "explicit_mode")]
+    pub mode: String,
+    #[serde(default)]
     pub source_address: String,
+    #[serde(default)]
     pub gateway: String,
     pub target: String,
+    #[serde(default)]
     pub routing_table: u32,
+    #[serde(skip)]
+    pub routing_mark: Option<u32>,
     #[serde(default = "probe_interval")]
     pub probe_interval_ms: u64,
     #[serde(default = "loss_timeout")]
@@ -123,6 +130,9 @@ pub(crate) struct Gateway {
     pub failure_hold_ms: u64,
     #[serde(default = "recovery_hold")]
     pub recovery_hold_ms: u64,
+}
+fn explicit_mode() -> String {
+    "explicit".into()
 }
 fn probe_interval() -> u64 {
     1000
@@ -393,17 +403,38 @@ impl Config {
                 name(&m.name, 32) && seen.insert(&m.name) && interface(&m.interface),
                 "invalid gateway name/interface"
             );
-            let src = address(&m.source_address, false)?;
-            let gw = address(&m.gateway, true)?;
             let dst = address(&m.target, true)?;
             ensure!(
-                src.is_ipv4() == gw.is_ipv4()
-                    && src.is_ipv4() == dst.is_ipv4()
-                    && src != gw
-                    && src != dst
-                    && (m.routing_table == 254 || (10000..=19999).contains(&m.routing_table)),
-                "invalid gateway family/source/table"
+                matches!(m.mode.as_str(), "explicit" | "dhcp"),
+                "invalid gateway mode"
             );
+            if m.mode == "dhcp" {
+                ensure!(
+                    m.source_address.is_empty()
+                        && m.gateway.is_empty()
+                        && m.routing_table == 0
+                        && dst.is_ipv4(),
+                    "DHCP gateway fields must be automatic and target IPv4"
+                );
+                ensure!(
+                    v["dhcp_clients"].get(&m.interface).is_some()
+                        && c.interfaces
+                            .iter()
+                            .any(|link| link.name == m.interface && (!m.enabled || link.up)),
+                    "DHCP monitor requires a DHCP interface"
+                );
+            } else {
+                let src = address(&m.source_address, false)?;
+                let gw = address(&m.gateway, true)?;
+                ensure!(
+                    src.is_ipv4() == gw.is_ipv4()
+                        && src.is_ipv4() == dst.is_ipv4()
+                        && src != gw
+                        && src != dst
+                        && (m.routing_table == 254 || (10000..=19999).contains(&m.routing_table)),
+                    "invalid gateway family/source/table"
+                );
+            }
             ensure!(
                 (100..=60000).contains(&m.probe_interval_ms)
                     && (100..=60000).contains(&m.loss_timeout_ms)
@@ -422,7 +453,9 @@ impl Config {
                     && (100..=60000).contains(&m.recovery_hold_ms),
                 "invalid gateway thresholds"
             );
-            if m.enabled {
+            if m.enabled && m.mode == "explicit" {
+                let src = address(&m.source_address, false)?;
+                let gw = address(&m.gateway, true)?;
                 ensure!(
                     source_tables
                         .insert(src, m.routing_table)
@@ -461,7 +494,13 @@ mod tests {
                 .unwrap();
         let mut value = example["config"].clone();
         Config::parse(&value).unwrap();
-        let mut duplicate = value["gateway_monitors"][0].clone();
+        let mut duplicate = value["gateway_monitors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|monitor| monitor["mode"] != "dhcp")
+            .unwrap()
+            .clone();
         duplicate["name"] = serde_json::json!("second-probe");
         value["gateway_monitors"]
             .as_array_mut()
@@ -471,14 +510,15 @@ mod tests {
         let mut route = value["routes"][0].clone();
         route["table"] = serde_json::json!(10002);
         value["routes"].as_array_mut().unwrap().push(route);
-        value["gateway_monitors"][2]["routing_table"] = serde_json::json!(10002);
+        let duplicate_index = value["gateway_monitors"].as_array().unwrap().len() - 1;
+        value["gateway_monitors"][duplicate_index]["routing_table"] = serde_json::json!(10002);
         assert!(
             Config::parse(&value)
                 .unwrap_err()
                 .to_string()
                 .contains("same routing table")
         );
-        value["gateway_monitors"][2]["enabled"] = serde_json::json!(false);
+        value["gateway_monitors"][duplicate_index]["enabled"] = serde_json::json!(false);
         Config::parse(&value).unwrap();
     }
 

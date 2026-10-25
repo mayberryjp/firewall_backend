@@ -138,6 +138,11 @@ Ordinary destination routes remain supported; use table 254 (main) for normal
 traffic. Enabled gateway monitors retain backend-managed host-source rules for
 their explicit routing tables. Monitors sharing a source must share a table;
 these internal rules affect all traffic from that exact source, not only probes.
+DHCPv4 monitors instead use `mode: "dhcp"`, interface and target without pinned
+source/gateway/table. They follow only that interface's active lease, wait with
+Unknown health before acquisition, and never fall back to another WAN. Private
+interface-scoped paths are runtime-owned, not editable routes. Explicit IPv4/IPv6
+monitors are unchanged. See the [monitor contract](FRONTEND_SPEC.md#612-gateway-health-and-rtt-variation).
 See [the routing contract](FRONTEND_SPEC.md#65-source-policy-routing).
 
 ### Global IPv6 policy

@@ -267,7 +267,10 @@ fn path(config: &super::config::Gateway, index: u32) -> Result<()> {
     };
     attr(&mut p, 1, &bytes(dst));
     attr(&mut p, 2, &bytes(src));
-    if matches!(dst,IpAddr::V6(v) if v.is_unicast_link_local()) {
+    if let Some(mark) = config.routing_mark {
+        attr(&mut p, 16, &mark.to_ne_bytes());
+    }
+    if config.mode == "dhcp" || matches!(dst,IpAddr::V6(v) if v.is_unicast_link_local()) {
         attr(&mut p, 4, &index.to_ne_bytes());
     }
     let len = p.len() as u32;
@@ -315,7 +318,9 @@ fn path(config: &super::config::Gateway, index: u32) -> Result<()> {
         );
         ensure!(
             u16::from_ne_bytes(p[4..6].try_into()?) == 24,
-            "route lookup rejected"
+            "route lookup rejected: message type {}, kernel error {}",
+            u16::from_ne_bytes(p[4..6].try_into()?),
+            i32::from_ne_bytes(p[16..20].try_into()?)
         );
         ensure!(p[23] == 1, "route is not unicast");
         let mut table = p[20] as u32;
@@ -373,6 +378,9 @@ pub(crate) fn prepare(
         },
     )?;
     l::bind_device(fd.as_raw_fd(), &config.interface)?;
+    if let Some(mark) = config.routing_mark {
+        l::option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK, &mark)?;
+    }
     l::bind(fd.as_raw_fd(), SocketAddr::new(src, 0), index)?;
     let id = rand::random::<u16>();
     let nonce = rand::random::<[u8; 16]>();

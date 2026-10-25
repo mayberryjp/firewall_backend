@@ -41,6 +41,7 @@ mod firewall {
 }
 mod adoption;
 mod dhcp_client;
+mod dhcp_monitors;
 #[cfg(all(test, feature = "nftables"))]
 mod host_integration;
 #[cfg(all(test, feature = "nftables"))]
@@ -61,6 +62,7 @@ pub struct Native {
     parents: BTreeMap<String, Parent>,
     services: Services,
     dhcp: dhcp_client::Manager,
+    dhcp_monitors: dhcp_monitors::Manager,
     state: PathBuf,
     _lock: File,
     host_namespace: Option<Arc<File>>,
@@ -308,8 +310,11 @@ impl Native {
             allow_host_services: options.allow_host_services,
             allow_gateway_monitoring: options.gateway_monitoring,
         })?;
+        let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
+        let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
-            dhcp: dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode),
+            dhcp,
+            dhcp_monitors,
             options,
             namespace,
             namespace_path: path,
@@ -370,6 +375,55 @@ impl Native {
             "boot/namespace identity changed",
         )?;
         Ok(())
+    }
+
+    fn stop_services(&mut self) -> Result<()> {
+        self.dhcp_monitors.shutdown()?;
+        self.services.shutdown()
+    }
+
+    fn repair_services(&mut self, config: &Value) -> Result<()> {
+        self.dhcp_monitors.shutdown()?;
+        self.services.repair(config)?;
+        self.dhcp_monitors.configure(config)
+    }
+
+    fn gateway_statistics(&self, path: &str) -> Result<Value> {
+        let mut value = self
+            .services
+            .statistics("/api/v1/statistics/gateways", "")?;
+        self.dhcp_monitors.merge(&mut value["gateways"])?;
+        let rows = value["gateways"]
+            .as_array()
+            .context("gateway statistics missing")?;
+        if let Some(name) = path.strip_prefix("/api/v1/statistics/gateways/") {
+            let monitor = rows
+                .iter()
+                .find(|row| row["name"] == name)
+                .context("gateway monitor not found")?
+                .clone();
+            value["sample"]["status"] = json!(if monitor["sample_status"] == "available"
+                || monitor["sample_status"] == "disabled"
+            {
+                "available"
+            } else {
+                "partial"
+            });
+            value.as_object_mut().unwrap().remove("gateways");
+            value["monitor"] = monitor;
+        } else {
+            value["sample"]["status"] =
+                json!(if rows
+                    .iter()
+                    .all(|row| row["sample_status"] == "available"
+                        || row["sample_status"] == "disabled")
+                {
+                    "available"
+                } else {
+                    "partial"
+                });
+        }
+        Ok(value)
     }
 
     fn ownership(&self) -> Result<Ownership> {
@@ -442,7 +496,7 @@ impl Native {
             .as_array()
             .context("gateway_monitors missing")?
         {
-            if enabled(monitor) {
+            if enabled(monitor) && monitor["mode"] != "dhcp" {
                 running(
                     "gateway_monitors",
                     "name",
@@ -733,7 +787,7 @@ impl Native {
         ownership
             .ethernet_originals
             .extend(intent.ethernet_originals);
-        self.services.shutdown()?;
+        self.stop_services()?;
         self.dhcp.configure(&intent.before)?;
         self.network_apply(
             &intent.after,
@@ -766,7 +820,7 @@ impl Native {
         } else {
             ownership.firewall_config = Some(Network::parse(&intent.before)?.firewall);
         }
-        self.services.repair(&intent.before)?;
+        self.repair_services(&intent.before)?;
         self.save_ownership(&ownership)?;
         remove_durable(&path)
     }
@@ -858,10 +912,10 @@ impl Native {
         target.namespace.extend(desired.kernel.namespace);
         target.host.extend(desired.kernel.host);
         let result = (|| -> Result<()> {
-            self.services.shutdown()?;
+            self.stop_services()?;
             self.dhcp.configure(after)?;
             self.network_apply(&before, after, target, &mut ownership)?;
-            self.services.repair(after)?;
+            self.repair_services(after)?;
             ownership.firewall_config = Some(Network::parse(after)?.firewall);
             ownership.managed_interfaces = Network::parse(after)?
                 .interfaces
@@ -1047,7 +1101,7 @@ impl Backend for Native {
             if recorded_target && ownership.managed_interfaces == after_names {
                 match self.verify(&after) {
                     Ok(()) => {
-                        self.services.repair(&after)?;
+                        self.repair_services(&after)?;
                         return Ok(());
                     }
                     Err(error)
@@ -1125,7 +1179,7 @@ impl Backend for Native {
         write_json(&self.state.join("intent.json"), &intent)?;
         // Stop services before interface changes; their manager must restore prior workers on failure.
         let operation = (|| -> Result<()> {
-            self.services.shutdown()?;
+            self.stop_services()?;
             self.dhcp.configure(&after)?;
             self.network_apply(&before, &after, kernel_target, &mut ownership)?;
             ownership.firewall_config = Some(Network::parse(&after)?.firewall);
@@ -1140,6 +1194,7 @@ impl Backend for Native {
             ownership.committed_config = Some(after.clone());
             ownership.boot = self.boot.clone();
             self.services.apply(&before, &after)?;
+            self.dhcp_monitors.configure(&after)?;
             self.log("native networking and services converged")?;
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))
@@ -1196,6 +1251,7 @@ impl Backend for Native {
             rt.block_on(networking::parent_status(handle, &parents))
         })?;
         let mut value = self.services.status();
+        self.dhcp_monitors.merge(&mut value["gateway_monitors"])?;
         if !value.is_object() {
             value = json!({"services":value});
         }
@@ -1269,6 +1325,14 @@ impl Backend for Native {
             "statistics endpoints do not accept query parameters"
         );
         self.check_scope()?;
+        if path == "/api/v1/statistics/gateways" || path.starts_with("/api/v1/statistics/gateways/")
+        {
+            return crate::statistics::service_response(
+                path,
+                self.gateway_statistics(path)?,
+                &self.identity,
+            );
+        }
         if !matches!(
             path,
             "/api/v1/statistics" | "/api/v1/statistics/interfaces" | "/api/v1/statistics/protocols"
@@ -1292,9 +1356,7 @@ impl Backend for Native {
             ))
         })?;
         if all {
-            let gateways = self
-                .services
-                .statistics("/api/v1/statistics/gateways", "")?;
+            let gateways = self.gateway_statistics("/api/v1/statistics/gateways")?;
             value["gateways"] = gateways["gateways"].clone();
             if gateways["sample"]["status"] == "partial" {
                 value["sample"]["status"] = json!("partial");
@@ -1310,6 +1372,7 @@ impl Backend for Native {
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::check_ethernet(handle, &originals))
         })?;
+        self.dhcp_monitors.shutdown()?;
         self.dhcp.configure(&value)?;
         let ownership = self.ownership()?;
         if self.options.namespace.is_empty()
@@ -1342,7 +1405,7 @@ impl Backend for Native {
             && ownership.firewall_fingerprint.is_none()
             && config == &Config::empty()
         {
-            self.services.repair(&value)?;
+            self.repair_services(&value)?;
             return Ok(self.services.status());
         }
         if ownership.firewall_fingerprint.is_none() {
@@ -1366,7 +1429,7 @@ impl Backend for Native {
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))?;
         }
-        self.services.repair(&value)?;
+        self.repair_services(&value)?;
         let adoption_path = self.state.join("adoption.json");
         if adoption_path.try_exists()? {
             let mut receipt: adoption::Receipt = read_json(&adoption_path)?;
@@ -1381,6 +1444,7 @@ impl Backend for Native {
 
 impl Drop for Native {
     fn drop(&mut self) {
+        let _ = self.dhcp_monitors.shutdown();
         let _ = self.dhcp.shutdown();
         let _ = self.services.shutdown();
     }

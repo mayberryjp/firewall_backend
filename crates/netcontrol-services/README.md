@@ -123,7 +123,15 @@ These are worker states, not external daemon states; there is no `pid` field.
   effective rtnetlink table/interface/next-hop validation before each probe,
   nonce/id/sequence checks, rolling loss/RTT/stddev/percentiles/consecutive RTT
   variation, warmup, and failure/recovery holds. Missing/late/duplicate replies
-  are not successes. No route mutation or automatic failover.
+  are not successes. No configured-route mutation or automatic failover.
+  `mode: "explicit"` is the default. DHCPv4 mode omits pinned source/gateway/table;
+  this manager reports waiting/Unknown until the native lease coordinator supplies
+  a binding. The coordinator uses public `GatewayProbe` to reuse the same ICMP
+  engine and shutdown/snapshot lifecycle without restarting unrelated services.
+  DHCP FIB checks include the bound output interface and private per-probe socket
+  mark, matching native private rules without collisions between same-WAN monitors.
+  Runtime rows expose mode/interface, nullable resolved
+  source/gateway/table and waiting/error reason; no lease is copied into settings.
 
 DNS is resolved natively through `/etc/hosts` and bounded UDP A/AAAA requests to
 at most two `/etc/resolv.conf` nameservers. It deliberately rejects truncated or

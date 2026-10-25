@@ -372,6 +372,83 @@ fn native_connection_delete_targets_one_entry_then_flushes_only_its_namespace() 
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_dhcp_gateway_waiting_apply_rollback_reopen_and_recovery() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let namespace = Arc::new(File::open(&fixture.namespace)?);
+    session(namespace, |runtime, handle| {
+        runtime.block_on(async {
+            handle
+                .link()
+                .add()
+                .veth("wan0".into(), "peer0".into())
+                .execute()
+                .await?;
+            Ok(())
+        })
+    })?;
+    let mut options = fixture.options();
+    options.gateway_monitoring = true;
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let mut desired = config(
+        json!({"interfaces":[{"name":"wan0","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],
+        "dhcp_clients":{"wan0":{}},"gateway_monitors":[{"name":"wan","mode":"dhcp","enabled":true,"interface":"wan0","target":"1.1.1.1"}]}),
+    )?;
+    desired.normalize();
+    desired.validate()?;
+    native.apply(&empty, &desired)?;
+    native.observe(&desired)?;
+    let runtime = native.runtime(&desired)?;
+    assert_eq!(runtime["gateway_monitors"][0]["health"], "unknown");
+    assert_eq!(runtime["gateway_monitors"][0]["process_state"], "waiting");
+    assert_eq!(
+        native.statistics(&desired, "/api/v1/statistics/gateways/wan", "")?["monitor"]["health"],
+        "unknown"
+    );
+    let mut disabled = desired.clone();
+    disabled.gateway_monitors[0].enabled = false;
+    native.apply(&desired, &disabled)?;
+    assert_eq!(
+        native.runtime(&disabled)?["gateway_monitors"][0]["process_state"],
+        "disabled"
+    );
+    native.apply(&disabled, &desired)?;
+    drop(native);
+    let mut native = Native::open(options.clone())?;
+    native.repair(&desired)?;
+    native.observe(&desired)?;
+    let mut deleted = desired.clone();
+    deleted.gateway_monitors.clear();
+    let before = desired.operational_value()?;
+    let after = deleted.operational_value()?;
+    let intent = Intent {
+        scope: native.identity.clone(),
+        before: before.clone(),
+        after: after.clone(),
+        kernel_before: native.capture_kernel(&before, &after)?,
+        ownership_before: native.ownership()?,
+        ethernet_before: BTreeMap::new(),
+        ethernet_originals: native.ownership()?.ethernet_originals,
+        ipv6_before: native.capture_ipv6(&before)?,
+    };
+    write_json(&native.state.join("intent.json"), &intent)?;
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.repair(&desired)?;
+    assert!(!native.state.join("intent.json").exists());
+    assert_eq!(
+        native.runtime(&desired)?["gateway_monitors"][0]["process_state"],
+        "waiting"
+    );
+    native.apply(&desired, &deleted)?;
+    assert_eq!(native.runtime(&deleted)?["gateway_monitors"], json!([]));
+    native.apply(&deleted, &empty)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
 fn native_dhcp_installs_connected_route_before_default_gateway() -> Result<()> {
     use futures_util::TryStreamExt;
     use netlink_packet_route::{

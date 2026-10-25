@@ -1082,7 +1082,9 @@ impl Engine {
                 return Err(ApiError::new(404, "endpoint not found"));
             }
             let config = self.expected();
-            let runtime = self.backend.runtime(&config).map_err(service_error)?;
+            let mut runtime = self.backend.runtime(&config).map_err(service_error)?;
+            runtime["capabilities"]["gateway_monitor_modes"] = json!(["explicit", "dhcp"]);
+            runtime["capabilities"]["dhcp_gateway_monitor_address_families"] = json!(["ipv4"]);
             let error = runtime.get("error").cloned().unwrap_or(json!(""));
             return match (path, service_status) {
                 ("/api/v1/runtime", _) => Ok(runtime),

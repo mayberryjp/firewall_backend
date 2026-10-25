@@ -262,7 +262,7 @@ suppression values mean disabled suppression and are accepted as default
 metadata; active suppression and other attributes remain rejected. A rejection
 includes the offending netlink rule and happens before ownership handover.
 
-User-configurable source-policy rules are not supported. Enabled gateway monitors
+User-configurable source-policy rules are not supported. Enabled explicit gateway monitors
 derive deduplicated `/32` IPv4 or `/128` IPv6 source rules, sorted by numeric source
 address with priorities starting at 10000. Monitors sharing a source must share
 its table. All traffic with that exact source is subject to the lookup.
@@ -270,6 +270,23 @@ Rules remain part of native drift detection, apply/removal, rollback and restart
 reconciliation, but are absent from public configuration and API responses.
 Private reboot snapshots preserve the observed rule subset in
 `_monitor_policy_rules`; that field is rejected by the public configuration model.
+
+DHCPv4 monitors (`mode: "dhcp"`) persist interface/target/settings, never lease
+addresses or gateways. The in-process coordinator resolves a valid matching lease
+on that interface, using longest destination prefix then metric, with no cross-WAN
+fallback. Before a lease, probes wait with Unknown health; unusable paths are
+unavailable/Unknown. A changed binding joins the old worker before clearing paths
+and starting a new window; identical renewal preserves measurements. Lease updates
+and monitor reconciliation share the DHCP state mutex. A 100 ms poll follows
+completed lease changes; bounded kernel/worker operations add processing time.
+
+Private tables/socket marks 20000..20063 and mark-plus-source-plus-output-interface
+rules with priorities 9000..9063 are tagged protocol 244. Connected routes precede gateway routes; a
+terminal unreachable default prevents fall-through. Foreign entries are not
+overwritten. Reserved tagged paths are cleaned/rebuilt at configuration/recovery;
+disable/delete/rollback/shutdown joins probes before path removal. Marks separate
+multiple same-interface monitors, including identical targets, without redirecting
+unmarked application traffic. No new public source-policy support, DHCPv6 or WAN failover.
 
 The firewall owns only `inet/netcontrol`. Each update atomically replaces its
 table, chains and ordered rules in one batch. It implements ordered forwarding

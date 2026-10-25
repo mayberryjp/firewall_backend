@@ -20,6 +20,34 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf};
 use worker::Worker;
 
+pub struct GatewayProbe {
+    worker: Worker,
+}
+
+impl GatewayProbe {
+    #[cfg(target_os = "linux")]
+    pub fn start(value: &Value, namespace: std::sync::Arc<std::fs::File>) -> Result<Self> {
+        let mut config: config::Gateway = serde_json::from_value(value.clone())?;
+        config.routing_mark = (config.mode == "dhcp").then_some(config.routing_table);
+        let name = config.name.clone();
+        let worker = Worker::start(
+            format!("dhcp-gateway:{name}"),
+            Some(namespace),
+            json!({"name":name}),
+            move || gateway::prepare(config),
+        )?;
+        Ok(Self { worker })
+    }
+
+    pub fn snapshot(&self) -> Value {
+        self.worker.snapshot()
+    }
+
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.worker.shutdown()
+    }
+}
+
 pub struct ServiceOptions {
     pub namespace: Option<PathBuf>,
     pub state_directory: PathBuf,
@@ -235,7 +263,11 @@ impl Services {
                 let config = f.clone();
                 self.insert(&format!("flow:{}",f.name),managed.clone(),                                json!({"name":f.name,"scope":"managed","export_version":f.export_version,"address_family":if !ipv6_enabled || [1,5].contains(&f.export_version){"ipv4"}else{"dual"},"fragments":"excluded","capture_filter":f.capture_filter,"sampling_rate":f.sampling_rate,"sampling_metadata":f.export_version!=1}),move||flow::prepare(config,ipv6_enabled))?;
             }
-            for m in c.gateway_monitors.iter().filter(|m| m.enabled) {
+            for m in c
+                .gateway_monitors
+                .iter()
+                .filter(|m| m.enabled && m.mode == "explicit")
+            {
                 let config = m.clone();
                 self.insert(
                     &format!("gateway:{}", m.name),
@@ -345,6 +377,17 @@ impl Services {
             stats["process_state"]=row["state"].clone();
             if row["state"]=="error" {stats["sample_status"]=json!("unavailable");stats["health"]=json!("unknown");stats["error"]=row["error"].clone();}
             else if row["state"]=="stopped"||row["state"]=="disabled"{stats["sample_status"]=row["state"].clone();stats["health"]=json!("unknown");}
+            stats["mode"]=json!(m.mode);
+            stats["interface"]=json!(m.interface);
+            stats["resolved_source_address"]=if m.enabled && m.mode=="explicit" {json!(m.source_address)} else {Value::Null};
+            stats["resolved_gateway"]=if m.enabled && m.mode=="explicit" {json!(m.gateway)} else {Value::Null};
+            stats["resolved_routing_table"]=if m.enabled && m.mode=="explicit" {json!(m.routing_table)} else {Value::Null};
+            stats["reason"]=Value::Null;
+            if m.enabled && m.mode=="dhcp" {
+                stats["process_state"]=json!("waiting");
+                stats["sample_status"]=json!("waiting_for_dhcp");
+                stats["reason"]=json!("waiting for DHCP lease");
+            }
             stats
         }).collect();
         let mut result = json!({"appliance_services":appliance,"dhcp_relay":relays,"softflowd":flows,"gateway_monitors":gateways});

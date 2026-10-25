@@ -32,6 +32,11 @@ impl Simulator {
 pub(crate) fn gateway_samples(config: &Config) -> Vec<Value> {
     config.gateway_monitors.iter().map(|m|json!({
         "name":m.name,"process_state":if m.enabled{"simulated"}else{"disabled"},
+        "mode":m.mode,"interface":m.interface,
+        "resolved_source_address":if m.enabled && m.mode==crate::GatewayMode::Explicit {json!(m.source_address)}else{Value::Null},
+        "resolved_gateway":if m.enabled && m.mode==crate::GatewayMode::Explicit {json!(m.gateway)}else{Value::Null},
+        "resolved_routing_table":if m.enabled && m.mode==crate::GatewayMode::Explicit {json!(m.routing_table)}else{Value::Null},
+        "reason":if m.enabled && m.mode==crate::GatewayMode::Dhcp {json!("DHCP leases are not simulated")}else{Value::Null},
         "sample_status":if m.enabled{"simulated"}else{"disabled"},"health":"unknown",
         "started_at":null,"collected_at":null,"health_changed_at":null,"last_success_at":null,
         "sent":0,"received":0,"lost":0,"pending":0,"variation_pairs":0,

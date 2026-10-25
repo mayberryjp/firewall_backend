@@ -79,6 +79,77 @@ fn offline_conversion_validation_checks_history_and_refuses_active_transactions(
 }
 
 #[test]
+fn dhcp_gateway_monitor_saves_without_static_address_route_or_lease() {
+    let value = json!({"interfaces":[{"name":"wan0","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],
+        "dhcp_clients":{"wan0":{}},"gateway_monitors":[{"name":"wan","enabled":true,"mode":"dhcp","interface":"wan0","target":"1.1.1.1"}]});
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    config.validate().unwrap();
+    let normalized = config.normalized();
+    let serialized = serde_json::to_value(&normalized).unwrap();
+    assert!(
+        serialized["gateway_monitors"][0]
+            .get("source_address")
+            .is_none()
+    );
+    assert!(serialized["gateway_monitors"][0].get("gateway").is_none());
+    assert!(
+        serialized["gateway_monitors"][0]
+            .get("routing_table")
+            .is_none()
+    );
+    let mut ipv4_only = normalized.clone();
+    ipv4_only.ipv6_enabled = false;
+    ipv4_only.validate().unwrap();
+    for (field, invalid) in [
+        ("source_address", json!("192.0.2.2")),
+        ("gateway", json!("192.0.2.1")),
+        ("routing_table", json!(254)),
+        ("target", json!("2001:db8::1")),
+        ("mode", json!("automatic")),
+    ] {
+        let mut bad = value.clone();
+        bad["gateway_monitors"][0][field] = invalid;
+        assert!(
+            serde_json::from_value::<Config>(bad).map_or(true, |config| config.validate().is_err())
+        );
+    }
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let reply = submit(&mut engine, normalized.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let id = reply.body["id"].as_str().unwrap();
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    let runtime = request(&mut engine, "GET", "/api/v1/runtime", Value::Null);
+    assert_eq!(runtime.status, 200);
+    assert_eq!(
+        runtime.body["capabilities"]["gateway_monitor_modes"],
+        json!(["explicit", "dhcp"])
+    );
+    assert_eq!(runtime.body["gateway_monitors"][0]["mode"], "dhcp");
+    assert_eq!(runtime.body["gateway_monitors"][0]["health"], "unknown");
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(normalized.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(engine.saved_configuration(), &normalized);
+    let mut deleted = normalized.clone();
+    deleted.gateway_monitors.clear();
+    let reply = submit(&mut engine, deleted);
+    assert_eq!(reply.status, 202);
+    let id = reply.body["id"].as_str().unwrap();
+    let rollback = request(
+        &mut engine,
+        "POST",
+        &format!("/api/v1/transactions/{id}/rollback"),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200);
+    assert_eq!(engine.saved_configuration(), &normalized);
+}
+
+#[test]
 fn global_ipv6_permission_commit_restart_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

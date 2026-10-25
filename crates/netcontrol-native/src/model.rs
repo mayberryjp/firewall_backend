@@ -105,7 +105,9 @@ impl Network {
         // Only private reboot snapshots supply observed rules instead of deriving them.
         if value.get("_monitor_policy_rules").is_none() {
             let mut sources = BTreeMap::new();
-            for monitor in n.gateway_monitors.iter().filter(|monitor| monitor.enabled) {
+            for monitor in n.gateway_monitors.iter().filter(|monitor| {
+                monitor.enabled && monitor.mode == netcontrol_core::GatewayMode::Explicit
+            }) {
                 let source: IpAddr = monitor
                     .source_address
                     .parse()
@@ -456,7 +458,13 @@ mod tests {
             Network::parse(&value).unwrap().policy_rules,
             network.policy_rules
         );
-        let mut duplicate = value["gateway_monitors"][0].clone();
+        let mut duplicate = value["gateway_monitors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|monitor| monitor["mode"] != "dhcp")
+            .unwrap()
+            .clone();
         duplicate["name"] = serde_json::json!("duplicate");
         value["gateway_monitors"]
             .as_array_mut()
@@ -466,9 +474,10 @@ mod tests {
             Network::parse(&value).unwrap().policy_rules,
             network.policy_rules
         );
-        value["gateway_monitors"][2]["routing_table"] = serde_json::json!(10002);
+        let duplicate_index = value["gateway_monitors"].as_array().unwrap().len() - 1;
+        value["gateway_monitors"][duplicate_index]["routing_table"] = serde_json::json!(10002);
         assert!(Network::parse(&value).is_err());
-        value["gateway_monitors"][2]["enabled"] = serde_json::json!(false);
+        value["gateway_monitors"][duplicate_index]["enabled"] = serde_json::json!(false);
         assert_eq!(
             Network::parse(&value).unwrap().policy_rules,
             network.policy_rules

@@ -113,7 +113,7 @@ zero values and subsequently failing semantic validation. Required fields:
 | Ingress policy | `interface` |
 | Syslog destination | `host`, `port`, `transport` |
 | Flow exporter | All configuration fields except `capture_filter`, `timeouts`, `metadata` |
-| Gateway monitor | Identity/enabled/interface/address/table fields; timing fields remain defaultable |
+| Gateway monitor | Identity/enabled/interface/target; explicit mode also needs source/gateway/table; timing fields remain defaultable |
 
 `firewall.allow_all_icmp` defaults to true only when omitted; explicit null is
 `400`. An omitted firewall/policy defaults to `"accept"`. Invalid semantic values
@@ -1032,16 +1032,17 @@ never automatically flush to obtain counters or apply a firewall rule change.
 ### 6.1.2 Gateway health and RTT variation
 
 Native IPv4/IPv6 ICMP monitoring is available, without dpinger. No automatic
-failover, route changes, Prometheus endpoint, or persistent metric history is
+failover, configured forwarding-route changes, Prometheus endpoint, or persistent metric history is
 implemented. Gateways are independent named resources in `config.gateway_monitors`.
 Edit them in the shared draft and submit a complete transaction, never through
 service repair. Disabled monitors retain their validated settings.
 
-Editor fields: name, enabled, managed interface, explicit source address,
-gateway, target, routing table, and all timing/threshold fields in the type
-below. Do not infer path from WAN/LAN role. Names are unique/case-sensitive,
+Editor fields: name, enabled, mode, managed interface, target, and timing/threshold
+fields. `mode` is `explicit` (default when omitted) or `dhcp`. Explicit mode also
+requires source address, gateway and routing table. Canonical output omits
+`mode` for explicit monitors. Do not infer mode/path from WAN/LAN role. Names are unique/case-sensitive,
 1..32 `[a-zA-Z0-9_-]` characters, maximum 64 monitors. Numeric addresses must be
-canonical and same-family; reject hostnames, zones, mapped IPv6, loopback,
+canonical and same-family in explicit mode; reject hostnames, zones, mapped IPv6, loopback,
 multicast, and unspecified addresses. Source must be configured on an up
 managed interface, cannot be link-local or equal the gateway/target. Private/ULA
 sources are valid. IPv6 gateway/target can be link-local; interface supplies
@@ -1053,9 +1054,52 @@ table (`422` otherwise). Rules are deduplicated and deterministically assigned
 priorities starting at 10000; disabling/removing monitors reconciles their rules
 through normal transaction/rollback/recovery. These source matches also affect
 other traffic using that exact source address, not just probe packets.
-Disabled monitors need not retain network references. Never silently add routes
+Disabled explicit monitors need not retain network references. Never silently add configured routes
 or firewall exceptions. Changing monitors requires `gateway_monitors.write`;
 there is no separate policy permission.
+
+**DHCP/Automatic IPv4 mode:** persist `mode: "dhcp"`, the selected managed
+interface, target and monitor settings only. The interface must have a
+`dhcp_clients` entry, and must be up when the monitor is enabled; this reference
+is required even for disabled DHCP monitors. No static address, configured route
+or active lease is required to save/confirm an enabled monitor. Omit
+`source_address`, `gateway` and `routing_table`: empty strings/zero also normalize
+to omission, but nonempty/nonzero explicit fields return `422`. Null/type/unknown
+mode errors return `400`. IPv6 targets in DHCP mode return `422`; DHCPv6 is not
+supported. Existing explicit IPv4/IPv6 behavior and timing defaults are unchanged.
+
+Synthetic monitor object (inside a complete configuration transaction):
+
+```json
+{"name":"wan-health","enabled":true,"mode":"dhcp","interface":"wan1","target":"1.1.1.1"}
+```
+
+Never copy a lease's source/gateway/table into the draft, history or export.
+The backend resolves only the selected interface's valid, matching DHCPv4 lease.
+It chooses the target's longest-prefix lease route, then lowest metric; conflicting
+equal-ranked next hops are unavailable. There is no other-interface/default-route
+fallback. Same-path renewal, DNS/server/lifetime changes preserve the window;
+source/gateway/selected-route changes stop/join and rebind the probe, restarting
+warmup. Expiry/removal stops probing; acquisition/reacquisition resumes it
+automatically, without a configuration revision. A 100 ms coordinator poll follows
+completed lease updates; kernel operations/worker startup add bounded processing
+time, so this is not a strict 100 ms end-to-end guarantee.
+
+Native DHCP paths use private IPv4 tables/socket marks 20000..20063 and exact
+mark-plus-source-plus-output-interface rules at priorities 9000..9063, tagged protocol 244. A terminal
+unreachable route prevents lookup fall-through. These are owned runtime state,
+not public routes/rules or automatic WAN failover. Multiple monitors on one
+interface, including identical targets, have independent marked paths/windows;
+unmarked application traffic is unaffected by these DHCP rules. Foreign entries are not
+overwritten; conflicts report unavailable/Unknown. Disable/delete, transaction
+rollback, repair/restart and recovery reconcile workers and tagged paths.
+
+Discover support with authenticated `GET /api/v1/runtime` (`state.read`):
+`capabilities.gateway_monitor_modes` is `["explicit","dhcp"]`, and
+`capabilities.dhcp_gateway_monitor_address_families` is `["ipv4"]`. If these
+signals are absent or omit DHCP/IPv4, do not offer DHCP mode or test support with
+a write. Capability means schema support, not operator opt-in, privileges or a
+current lease. No version endpoint or fallback contract is introduced.
 
 Gateway timing fields use these inclusive bounds (milliseconds except percent):
 
@@ -1082,7 +1126,7 @@ serialization, revision history, rollback, and restore.
 Show three independent status columns:
 
 - `process_state`: native worker lifecycle, not an external process/PID.
-- `sample_status`: disabled/simulated/warming_up/available/stale/unavailable.
+- `sample_status`: disabled/simulated/warming_up/available/stale/unavailable/waiting_for_dhcp.
 - `health`: unknown/up/degraded/down.
 
 Socket/path failure is unavailable/unknown, **not** gateway down. Do not use
@@ -1094,6 +1138,20 @@ failure hold, improvement for recovery hold; initial Up also uses recovery hold.
 Default window is 30 seconds, failure hold 3 seconds, recovery hold 5 seconds,
 degraded thresholds 20% loss / 150 ms average RTT. Explain that rolling-window
 effects add to hold time. ICMP reachability is not proof of application health.
+
+Rows always include `mode`, `interface`, `resolved_source_address: string|null`,
+`resolved_gateway: string|null`, `resolved_routing_table: number|null`, and
+`reason: string|null`. These are runtime values, not editable configuration.
+Before/after a valid lease, enabled DHCP monitors report `process_state: "waiting"`,
+`sample_status: "waiting_for_dhcp"`, `health: "unknown"`, null resolved values and
+reason `"waiting for DHCP lease"`. An active lease with no usable target route,
+ambiguous route or probe/path setup failure reports `error`/`unavailable`/Unknown
+with a diagnostic reason, not remote Down. Render waiting and unavailable
+reasons even when HTTP is `200`; reason text is diagnostic, not an enum.
+Resolved gateway is null for a direct DHCP route; resolved source/table remain
+present when probing. Disabled rows have null resolved values/reason. Simulator
+DHCP rows stay simulated/Unknown with null resolved values and an explanatory
+reason; no lease or measured success is fabricated.
 
 Display loss percentage; sent/received/lost/pending window counts; min/max/mean,
 population RTT standard deviation, nearest-rank p50/p95; last success and
@@ -1127,7 +1185,9 @@ does not mutate configured enabled or create modeled drift by itself.
 Operator prerequisite: Linux `-gateway-monitoring`, raw ICMP/namespace privileges,
 correct routes/rules/return paths, and ICMP/ICMPv6 permission through other
 firewalls. The API cannot install packages, grant capabilities, or set that flag.
-Use the [complete dual-stack example](examples/gateway-monitoring.json).
+DHCP mode additionally needs native route/rule/socket-mark administration and
+free private table/priority/mark ranges above. Deploy the backend before enabling the new frontend
+mode. Use the [explicit dual-stack plus DHCP example](examples/gateway-monitoring.json).
 
 ### 6.1.3 Appliance NTP, syslog, and vnStat
 
@@ -2213,14 +2273,11 @@ interface ApplianceServiceStatus {
   collected_at?: Timestamp;
 }
 
-interface GatewayMonitor {
+interface GatewayMonitorSettings {
   name: string;
   enabled: boolean;
   interface: string;
-  source_address: string;
-  gateway: string;
   target: string;
-  routing_table: number;
   probe_interval_ms: number;
   loss_timeout_ms: number;
   window_ms: number;
@@ -2231,10 +2288,21 @@ interface GatewayMonitor {
   recovery_hold_ms: number;
 }
 
+type GatewayMonitor = GatewayMonitorSettings & (
+  | { mode?: "explicit"; source_address: string; gateway: string; routing_table: number }
+  | { mode: "dhcp"; source_address?: never; gateway?: never; routing_table?: never }
+);
+
 interface GatewayMonitorStatistics {
   name: string;
-  process_state: "disabled" | "simulated" | "running" | "error" | "stopped";
-  sample_status: "disabled" | "simulated" | "stopped" | "warming_up" | "available" | "unavailable";
+  mode: "explicit" | "dhcp";
+  interface: string;
+  resolved_source_address: string | null;
+  resolved_gateway: string | null;
+  resolved_routing_table: number | null;
+  reason: string | null;
+  process_state: "disabled" | "simulated" | "running" | "error" | "stopped" | "waiting";
+  sample_status: "disabled" | "simulated" | "stopped" | "warming_up" | "available" | "unavailable" | "waiting_for_dhcp";
   health: "unknown" | "up" | "degraded" | "down";
   started_at: Timestamp | null;
   collected_at: Timestamp | null;
@@ -2435,6 +2503,10 @@ interface SoftflowdStatus {
 }
 
 interface RuntimeState {
+  capabilities: {
+    gateway_monitor_modes: ("explicit" | "dhcp")[];
+    dhcp_gateway_monitor_address_families: "ipv4"[];
+  };
   dhcp_clients?: DHCPClientRuntime;
   appliance_services: ApplianceServiceStatus[];
   parent_interfaces: ParentInterface[];
