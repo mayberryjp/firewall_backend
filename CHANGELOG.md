@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- A DNS server added to an interface that already used a DHCP-provided server was listed
+  first in systemd-resolved but never used: resolved keeps its previously selected server
+  while that server stays in the list. Publishing per-interface DNS now reads the link's
+  current list and selected server from resolved and, when they do not match the wanted
+  order, clears the link's servers once before setting the list so the first configured
+  server is selected. An unreadable resolved state falls back to the previous plain update.
+  Lease DNS servers are still appended after configured ones. The D-Bus read path is
+  unverified against a real systemd-resolved; the decision logic is unit tested. No API,
+  schema or frontend change; recommended bump: patch; baseline unknown.
+
 - Saving a networking-only change (for example adding a DNS server or changing an MTU)
   while an appliance service such as NTP, syslog or vnStat is enabled no longer fails
   with `native service ntp is not healthy ... "state":"stopped"`, followed by a failed
@@ -96,6 +106,16 @@
   [handoff 2026-10-24-19](docs/frontend-handoffs/2026-10-24.md#2026-10-24-19-unknown-configuration-fields-are-dropped-and-reported).
 
 ### Added
+
+- `dns[interface].override_dhcp_dns` (boolean, default **true**): when true and the
+  interface has at least one configured DNS server, DNS servers learned from its DHCP lease
+  are discarded and only the configured servers are published to systemd-resolved. False
+  keeps the earlier behavior (configured servers first, then lease servers). Without
+  configured servers the lease servers are kept. DHCP search domains are unchanged.
+  Interfaces adopted from an existing host configuration are imported with false. The
+  default changes behavior for existing entries that have servers. Recommended bump:
+  minor; baseline unknown. Frontend action required; see
+  [handoff 2026-10-25-12](docs/frontend-handoffs/2026-10-25.md#2026-10-25-12-override-dhcp-dns-servers).
 
 - Host name and time zone settings: `config.system` (`hostname`, `timezone`; empty =
   unmanaged, the default and always present in configuration responses), a new

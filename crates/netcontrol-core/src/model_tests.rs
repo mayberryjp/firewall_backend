@@ -169,6 +169,33 @@ fn system_settings_default_unmanaged_validate_and_stay_out_of_native_configurati
 }
 
 #[test]
+fn dns_override_of_dhcp_servers_defaults_on_and_round_trips() {
+    let mut config = candidate();
+    config.dns.insert(
+        "lan0".into(),
+        serde_json::from_value(json!({"servers":["192.0.2.53"]})).unwrap(),
+    );
+    assert!(config.dns["lan0"].override_dhcp_dns);
+    assert_eq!(DNSConfig::default().servers, Vec::<String>::new());
+    assert!(DNSConfig::default().override_dhcp_dns);
+    config.validate().unwrap();
+    let value = serde_json::to_value(&config).unwrap();
+    assert_eq!(value["dns"]["lan0"]["override_dhcp_dns"], true);
+    config.dns.get_mut("lan0").unwrap().override_dhcp_dns = false;
+    let value = serde_json::to_value(&config).unwrap();
+    assert_eq!(value["dns"]["lan0"]["override_dhcp_dns"], false);
+    let restored: Config = serde_json::from_value(value).unwrap();
+    assert_eq!(restored, config);
+    assert_eq!(
+        restored.operational_value().unwrap()["dns"]["lan0"]["override_dhcp_dns"],
+        false
+    );
+    for invalid in [json!(null), json!("no"), json!(0)] {
+        assert!(serde_json::from_value::<DNSConfig>(json!({"override_dhcp_dns":invalid})).is_err());
+    }
+}
+
+#[test]
 fn mqtt_configuration_defaults_validation_and_no_inline_password() {
     let mut config = candidate();
     assert!(!config.mqtt.enabled);

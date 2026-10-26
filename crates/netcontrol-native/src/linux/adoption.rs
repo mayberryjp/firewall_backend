@@ -66,7 +66,40 @@ fn networkd(indices: Vec<u32>) -> Result<()> {
     })
 }
 
-pub fn set_dns(index: u32, configured: &DNSConfig, lease: Option<&Lease>) -> Result<()> {
+type DnsServer = (i32, Vec<u8>);
+
+/// resolved keeps using the server it last selected while that server stays in the list, so
+/// reordering alone leaves a DHCP-provided server in use ahead of a newly configured one.
+fn dns_reset_needed(current: &[DnsServer], selected: &DnsServer, wanted: &[DnsServer]) -> bool {
+    current != wanted
+        || (!selected.1.is_empty() && wanted.first().is_some_and(|first| first != selected))
+}
+
+fn dns_state(
+    connection: &zbus::blocking::Connection,
+    index: u32,
+) -> Result<(Vec<DnsServer>, DnsServer)> {
+    let manager = zbus::blocking::Proxy::new(
+        connection,
+        "org.freedesktop.resolve1",
+        "/org/freedesktop/resolve1",
+        "org.freedesktop.resolve1.Manager",
+    )?;
+    let path: zbus::zvariant::OwnedObjectPath = manager.call("GetLink", &(index as i32,))?;
+    let link = zbus::blocking::Proxy::new(
+        connection,
+        "org.freedesktop.resolve1",
+        path.as_str().to_owned(),
+        "org.freedesktop.resolve1.Link",
+    )?;
+    Ok((
+        link.get_property("DNS")?,
+        link.get_property("CurrentDNSServer")?,
+    ))
+}
+
+/// Configured servers first; DHCP-learned servers follow unless the configuration overrides them.
+fn dns_servers(configured: &DNSConfig, lease_dns: &[Ipv4Addr]) -> Result<Vec<DnsServer>> {
     let mut servers = Vec::new();
     for server in &configured.servers {
         let address: std::net::IpAddr = server.parse()?;
@@ -75,18 +108,29 @@ pub fn set_dns(index: u32, configured: &DNSConfig, lease: Option<&Lease>) -> Res
             std::net::IpAddr::V6(address) => (libc::AF_INET6, address.octets().to_vec()),
         });
     }
+    // With nothing configured there is nothing to override with, so DHCP servers are kept.
+    if !(configured.override_dhcp_dns && !configured.servers.is_empty()) {
+        for server in lease_dns {
+            let server = (libc::AF_INET, server.octets().to_vec());
+            if !servers.contains(&server) {
+                servers.push(server);
+            }
+        }
+    }
+    Ok(servers)
+}
+
+pub fn set_dns(index: u32, configured: &DNSConfig, lease: Option<&Lease>) -> Result<()> {
+    let servers = dns_servers(
+        configured,
+        lease.map_or(&[][..], |lease| lease.dns.as_slice()),
+    )?;
     let mut domains: Vec<(String, bool)> = configured
         .domains
         .iter()
         .map(|domain| (domain.name.clone(), domain.route_only))
         .collect();
     if let Some(lease) = lease {
-        for server in &lease.dns {
-            let server = (libc::AF_INET, server.octets().to_vec());
-            if !servers.contains(&server) {
-                servers.push(server);
-            }
-        }
         if !lease.domain.is_empty()
             && lease.client.use_domains != "no"
             && !domains.iter().any(|(domain, _)| domain == &lease.domain)
@@ -101,6 +145,16 @@ pub fn set_dns(index: u32, configured: &DNSConfig, lease: Option<&Lease>) -> Res
             "/org/freedesktop/resolve1",
             "org.freedesktop.resolve1.Manager",
         )?;
+        // An unreadable state falls back to a plain update, as before.
+        let reset = dns_state(&connection, index).is_ok_and(|(current, selected)| {
+            !current.is_empty()
+                && !servers.is_empty()
+                && dns_reset_needed(&current, &selected, &servers)
+        });
+        if reset {
+            // Dropping every server clears the remembered current server, so the first wanted one is used.
+            let _: () = proxy.call("SetLinkDNS", &(index as i32, Vec::<DnsServer>::new()))?;
+        }
         let _: () = proxy.call("SetLinkDNS", &(index as i32, servers))?;
         let _: () = proxy.call("SetLinkDomains", &(index as i32, domains))?;
         Ok(())
@@ -367,6 +421,8 @@ pub async fn capture(
                         route_only: domain.starts_with('~'),
                     })
                     .collect(),
+                // Inherited hosts used DHCP DNS together with their static servers; keep that.
+                override_dhcp_dns: false,
             };
             if !dns.servers.is_empty() || !dns.domains.is_empty() {
                 config.dns.insert(parent.name.clone(), dns);
@@ -766,4 +822,84 @@ fn current_indices(originals: &BTreeMap<String, EthernetSnapshot>) -> Result<Vec
                 .map_err(anyhow::Error::from)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod dns_tests {
+    use super::{DNSConfig, DnsServer, dns_reset_needed, dns_servers};
+    use std::net::Ipv4Addr;
+
+    fn configured(servers: &[&str], override_dhcp_dns: bool) -> DNSConfig {
+        DNSConfig {
+            servers: servers.iter().map(|server| (*server).into()).collect(),
+            override_dhcp_dns,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dhcp_dns_is_dropped_only_when_overriding_with_configured_servers() {
+        let lease = ["208.76.152.1", "208.76.152.9"].map(|s| s.parse::<Ipv4Addr>().unwrap());
+        let octets = |address: &str| {
+            (
+                libc::AF_INET,
+                address.parse::<Ipv4Addr>().unwrap().octets().to_vec(),
+            )
+        };
+        // Default: configured servers only.
+        assert!(DNSConfig::default().override_dhcp_dns);
+        assert_eq!(
+            dns_servers(&configured(&["192.168.4.4"], true), &lease).unwrap(),
+            [octets("192.168.4.4")]
+        );
+        // Opting out keeps the previous behavior: configured first, then lease servers, no duplicates.
+        assert_eq!(
+            dns_servers(&configured(&["192.168.4.4", "208.76.152.9"], false), &lease).unwrap(),
+            [
+                octets("192.168.4.4"),
+                octets("208.76.152.9"),
+                octets("208.76.152.1")
+            ]
+        );
+        // Nothing configured: the lease servers are still the only source of DNS.
+        assert_eq!(
+            dns_servers(&configured(&[], true), &lease).unwrap(),
+            [octets("208.76.152.1"), octets("208.76.152.9")]
+        );
+        assert!(dns_servers(&configured(&[], true), &[]).unwrap().is_empty());
+        // IPv6 literals are published too.
+        let both = dns_servers(&configured(&["2001:db8::53"], true), &lease).unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].0, libc::AF_INET6);
+        assert!(dns_servers(&configured(&["not-an-address"], true), &[]).is_err());
+    }
+
+    fn server(last: u8) -> DnsServer {
+        (libc::AF_INET, vec![192, 0, 2, last])
+    }
+
+    #[test]
+    fn a_stale_current_server_forces_a_reset_even_when_the_list_is_unchanged() {
+        let (ours, lease) = (server(1), server(2));
+        let wanted = vec![ours.clone(), lease.clone()];
+        let unset = (0, Vec::new());
+        // Nothing selected yet, or the first wanted server already selected: leave resolved alone.
+        assert!(!dns_reset_needed(&wanted, &unset, &wanted));
+        assert!(!dns_reset_needed(&wanted, &ours, &wanted));
+        // The DHCP server stays selected after the configured one was added in front of it.
+        assert!(dns_reset_needed(&wanted, &lease, &wanted));
+        // A different list always needs the update.
+        assert!(dns_reset_needed(
+            std::slice::from_ref(&lease),
+            &lease,
+            &wanted
+        ));
+        assert!(dns_reset_needed(
+            &wanted,
+            &ours,
+            std::slice::from_ref(&ours)
+        ));
+        // Clearing every server never forces a reset on its own selection.
+        assert!(!dns_reset_needed(&[], &unset, &[]));
+    }
 }

@@ -300,13 +300,26 @@ impl Default for DHCPClientConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DNSConfig {
     #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
     pub servers: Vec<String>,
     pub domains: Vec<DNSDomain>,
+    /// Drop DNS servers learned from DHCP while at least one server is configured here.
+    pub override_dhcp_dns: bool,
+}
+
+impl Default for DNSConfig {
+    fn default() -> Self {
+        Self {
+            metadata: Default::default(),
+            servers: Vec::new(),
+            domains: Vec::new(),
+            override_dhcp_dns: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

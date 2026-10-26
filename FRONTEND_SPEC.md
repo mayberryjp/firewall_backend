@@ -1987,6 +1987,17 @@ a client. DHCP-supplied MTU must fit 1280..65535.
 IPv4/IPv6 unicast or loopback literals, no zones/ports/TLS names) and
 `domains: { name: string, route_only: boolean }[]` (up to 32 unique canonical
 domains, with both domain fields required). Routing-only `.` is allowed.
+`override_dhcp_dns` is a boolean, **default `true`** (omitted means `true`; null and
+non-booleans are rejected), always present in responses. When true and `servers` is
+non-empty, DNS servers learned from the interface's DHCP lease are discarded and
+only the configured servers are published to systemd-resolved for that interface.
+When false, the lease servers are appended after the configured ones. With no
+configured servers, the lease servers are always kept (there is nothing to override
+them with). The setting does not affect DHCP search domains, which stay controlled by
+`dhcp_clients[].use_domains`. Configured servers are published first; the daemon also
+resets resolved's remembered current server so a newly configured server is actually
+selected. Interfaces adopted from an existing host configuration are imported with
+`override_dhcp_dns: false`, preserving their earlier merged behavior.
 DNS publication requires native host mode and running systemd-resolved; lab
 namespaces cannot change the host resolver. These are client resolver settings,
 not a DNS server or a hostname-to-address zone editor.
@@ -3108,6 +3119,7 @@ interface DHCPClientConfig {
 interface DNSConfig {
   servers: string[];
   domains: { name: string; route_only: boolean }[];
+  override_dhcp_dns: boolean; // default true; see section 6.2 DNS settings
 }
 
 interface DHCPClientRuntime {
