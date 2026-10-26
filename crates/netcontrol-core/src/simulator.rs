@@ -138,6 +138,14 @@ impl Backend for Simulator {
             .map(|s| json!({"name":s.name,"state":if s.enabled{"simulated"}else{"disabled"}}))
             .collect();
         let relays:Vec<_>=config.interfaces.iter().map(|l|json!({"interface":l.name,"state":if l.dhcp_relay.enabled{"simulated"}else{"disabled"}})).collect();
+        appliance.push(config.mdns.status(
+            config,
+            if config.mdns.enabled {
+                "simulated"
+            } else {
+                "disabled"
+            },
+        ));
         Ok(
             json!({"appliance_services":appliance,"gateway_monitors":gateway_samples(config),"dhcp_relay":relays,"parent_interfaces":[],"softflowd":softflowd,
             "ipv6":{"enabled":config.ipv6_enabled,"status":"simulated","disable_ipv6":null,"drift":null},

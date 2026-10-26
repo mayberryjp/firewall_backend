@@ -11,6 +11,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs"]
 
 [dependencies]
 anyhow.workspace = true
+netcontrol-core = { path = "../netcontrol-core" }
 serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true

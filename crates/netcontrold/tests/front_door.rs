@@ -97,6 +97,119 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn mdns_http_contract_authentication_permissions_queries_and_repair() {
+    use netcontrold::http::Credential;
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.json"),
+        Box::new(Simulator::new()),
+    )
+    .unwrap();
+    let app = router(App::new(
+        Arc::new(Mutex::new(engine)),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+            Credential {
+                name: "operator".into(),
+                token_sha256: netcontrold::identity::digest("operator"),
+                permissions: netcontrol_core::PERMISSIONS
+                    .iter()
+                    .map(|permission| (*permission).into())
+                    .collect(),
+            },
+            Credential {
+                name: "writer".into(),
+                token_sha256: netcontrold::identity::digest("writer"),
+                permissions: vec!["mdns.write".into()],
+            },
+        ]),
+        false,
+    ));
+    for (method, path, token, body, expected) in [
+        ("GET", "/api/v1/services/mdns", "", "", 401),
+        ("GET", "/api/v1/services/mdns/status", "writer", "", 403),
+        ("GET", "/api/v1/services/mdns?unused=1", "reader", "", 400),
+        (
+            "GET",
+            "/api/v1/services/mdns/status?unused=1",
+            "reader",
+            "",
+            400,
+        ),
+        ("POST", "/api/v1/services/mdns/reconcile", "reader", "", 403),
+        (
+            "POST",
+            "/api/v1/services/mdns/reconcile?unused=1",
+            "operator",
+            "",
+            400,
+        ),
+        (
+            "POST",
+            "/api/v1/services/mdns/reconcile",
+            "operator",
+            "{}",
+            400,
+        ),
+        ("GET", "/api/v1/services/mdns", "reader", "", 200),
+        ("GET", "/api/v1/services/mdns/status", "reader", "", 200),
+        (
+            "POST",
+            "/api/v1/services/mdns/reconcile",
+            "operator",
+            "",
+            200,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("origin", "http://dashboard.test")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected, "{method} {path}");
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        if expected != 200 {
+            assert!(value["error"].is_string(), "{value}");
+        } else if method == "GET" && path.ends_with("/status") {
+            let rows = value["instances"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["name"], "mdns");
+            assert_eq!(rows[0]["state"], "disabled");
+            assert_eq!(rows[0]["received_packets"], "0");
+            assert!(rows[0]["receive_drops"].is_null());
+            assert_eq!(rows[0]["statistics_complete"], false);
+            assert_eq!(value["error"], "");
+        } else if method == "GET" {
+            let config: netcontrol_core::MDNSConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(config, netcontrol_core::MDNSConfig::default());
+        } else {
+            assert!(
+                value["appliance_services"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["name"] == "mdns")
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn host_health_http_authentication_permissions_and_cors() {
     use netcontrold::http::Credential;
     let directory = tempfile::tempdir().unwrap();

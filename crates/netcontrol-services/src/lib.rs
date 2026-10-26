@@ -9,6 +9,7 @@ mod gateway;
 mod integration;
 #[cfg(target_os = "linux")]
 mod linux;
+mod mdns;
 mod ntp;
 mod resolve;
 mod syslog;
@@ -155,6 +156,29 @@ impl Services {
     pub fn validate(&self, value: &Value) -> Result<()> {
         self.preflight(&Config::parse(value)?)
     }
+    pub fn verify_mdns(&self, value: &Value) -> Result<()> {
+        let expected = Config::parse(value)?;
+        ensure!(
+            expected.mdns == self.config.mdns
+                && expected.mdns_interfaces == self.config.mdns_interfaces
+                && (!expected.mdns.enabled || expected.ipv6_enabled == self.config.ipv6_enabled),
+            "native mDNS operational configuration does not match applied settings"
+        );
+        if expected.mdns.enabled {
+            ensure!(
+                self.workers
+                    .get("mdns")
+                    .is_some_and(|worker| worker.snapshot()["state"] == "running"),
+                "native mDNS worker is not running"
+            );
+        } else {
+            ensure!(
+                !self.workers.contains_key("mdns"),
+                "disabled mDNS still has an owned worker"
+            );
+        }
+        Ok(())
+    }
     fn preflight(&self, c: &Config) -> Result<()> {
         #[cfg(target_os = "linux")]
         let isolated_namespace = {
@@ -174,6 +198,7 @@ impl Services {
             isolated_namespace
                 || self.options.allow_host_services
                 || !(c.interfaces.iter().any(|i| i.dhcp_relay.enabled)
+                    || c.mdns.enabled
                     || c.softflowd.iter().any(|f| f.enabled)
                     || c.gateway_monitors.iter().any(|g| g.enabled)),
             "managed services without an isolated namespace require explicit allow_host_services opt-in"
@@ -192,6 +217,7 @@ impl Services {
         #[cfg(not(target_os = "linux"))]
         ensure!(
             !c.ntp.enabled
+                && !c.mdns.enabled
                 && !c.syslog.enabled
                 && !c.vnstat.enabled
                 && !c.interfaces.iter().any(|i| i.dhcp_relay.enabled)
@@ -277,6 +303,14 @@ impl Services {
                 .filter(|i| i.dhcp_relay.enabled)
                 .cloned()
                 .collect();
+            if c.mdns.enabled {
+                let mut config = c.mdns.clone();
+                config.publishing.aaaa_on_ipv4 &= c.ipv6_enabled;
+                let interfaces = c.mdns_interfaces.clone();
+                self.insert("mdns", managed.clone(), c.mdns_status.clone(), move || {
+                    mdns::prepare(config, interfaces)
+                })?;
+            }
             if !relays.is_empty() {
                 self.insert(
                     "dhcp-relay",
@@ -357,7 +391,7 @@ impl Services {
     }
     pub fn status(&self) -> Value {
         let c = &self.config;
-        let appliance = vec![
+        let mut appliance = vec![
             self.row("ntp", c.ntp.enabled, json!({"name":"ntp","scope":"host"})),
             self.row(
                 "syslog",
@@ -375,6 +409,21 @@ impl Services {
                 json!({"name":"vnstat-managed","scope":"managed"}),
             ),
         ];
+        let mut base = c.mdns_status.clone();
+        if base.is_null() {
+            let config = netcontrol_core::Config::default();
+            base = config.mdns.status(&config, "disabled");
+        }
+        appliance.push(if let Some(worker) = self.workers.get("mdns") {
+            worker.snapshot()
+        } else {
+            base["state"] = json!(if c.mdns.enabled {
+                "stopped"
+            } else {
+                "disabled"
+            });
+            base
+        });
         let relays: Vec<_> = c
             .interfaces
             .iter()
@@ -507,6 +556,9 @@ impl Services {
 }
 fn expected_workers(c: &Config) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
+    if c.mdns.enabled {
+        keys.insert("mdns".to_owned());
+    }
     if c.ntp.enabled {
         keys.insert("ntp".to_owned());
     }

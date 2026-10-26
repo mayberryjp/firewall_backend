@@ -50,10 +50,10 @@ configure_appliance_services() (
     install -d -o root -g root -m 0755 "$directory" || exit 1
     staged=$(mktemp "$directory/.appliance-services.XXXXXX") || exit 1
     trap '[[ -z $staged ]] || rm -f -- "$staged"' EXIT
-    printf '[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\n\n[Service]\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\n' > "$staged" || exit 1
+    printf '[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\n\n[Service]\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222\n' > "$staged" || exit 1
     chmod 0644 "$staged" || exit 1
     mv -fT -- "$staged" "$destination" || exit 1
-    printf 'Appliance host services and gateway monitoring enabled for the next daemon start; configured services remain controlled by saved configuration.\n'
+    printf 'Appliance host services, gateway monitoring and embedded configuration SSH (TCP 2222) enabled for the next daemon start; configured protocol services remain controlled by saved configuration. Restrict management access with the host-input firewall.\n'
 )
 
 configure_logging_units() (
@@ -299,8 +299,9 @@ main() {
     help=$(./netcontrold --help) || return 1
     if ! grep -q -- --provision-wan <<< "$help" ||
        ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
-       ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help"; then
-        printf 'Artifact lacks current appliance provisioning/service opt-ins. Build the reviewed current source; no older-contract fallback is provided.\n' >&2
+       ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help" ||
+       ! grep -q NETCONTROL_SSH_LISTEN <<< "$help"; then
+        printf 'Artifact lacks current appliance provisioning/service/SSH environment support. Build the reviewed current source; no older-contract fallback is provided.\n' >&2
         return 1
     fi
     check_systemd_unit
@@ -309,7 +310,7 @@ main() {
     install -m 0755 netcontrold /usr/local/sbin/netcontrold
     install_systemd_service
     provision_appliance /usr/local/sbin/netcontrold "$wan" "$lan" "$lan_address"
-    printf 'Provisioned IPv4 firewall: LAN %s (%s), WAN %s, LAN-to-WAN forwarding and masquerade. Service enabled at boot.\nManagement: http://%s:8080/ (complete onboarding from LAN). LAN clients need addresses in this subnet and this appliance as gateway; no DHCP/DNS server was installed.\nLogs: journalctl -u netcontrold -f\n' "$lan" "$lan_address" "$wan" "${lan_address%/*}"
+    printf 'Provisioned IPv4 firewall: LAN %s (%s), WAN %s, LAN-to-WAN forwarding and masquerade. Service enabled at boot.\nManagement: http://%s:8080/ (complete onboarding from LAN).\nConfiguration SSH: TCP 2222, username apikey, password is an API key generated after onboarding; no OS shell or separate sshd.\nLAN clients need addresses in this subnet and this appliance as gateway; no DHCP/DNS server was installed.\nLogs: journalctl -u netcontrold -f\n' "$lan" "$lan_address" "$wan" "${lan_address%/*}"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

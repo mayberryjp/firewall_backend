@@ -40,6 +40,8 @@ Configuration commands:
   firewall host JSON / firewall interface-policy JSON
   nat masquerade ipv4|ipv6 INTERFACE [SOURCE] / no nat masquerade INDEX
   ntp server HOST / no ntp server HOST / ntp enable|disable
+  mdns JSON / no mdns                 Replace/reset native discovery candidate
+  show mdns / show mdns status        Committed settings / applied worker
   syslog server HOST PORT udp|tcp|tls / no syslog server INDEX / syslog enable|disable
   vnstat enable|disable
   exporter JSON / no exporter NAME / gateway-monitor JSON / no gateway-monitor NAME
@@ -300,6 +302,7 @@ impl CliSession {
                             | "dhcp-relay"
                             | "gateway-monitoring"
                             | "ntp"
+                            | "mdns"
                             | "syslog"
                             | "vnstat"
                     ),
@@ -485,6 +488,8 @@ impl CliSession {
         let path = match words {
             ["state"] => "/api/v1/state".to_owned(),
             ["runtime"] => "/api/v1/runtime".to_owned(),
+            ["mdns"] => "/api/v1/services/mdns".to_owned(),
+            ["mdns", "status"] => "/api/v1/services/mdns/status".to_owned(),
             ["interfaces"] => "/api/v1/interfaces".to_owned(),
             ["interfaces", "discovered"] => "/api/v1/interfaces/discovered".to_owned(),
             ["routes"] => "/api/v1/routes".to_owned(),
@@ -804,6 +809,14 @@ fn check_family(family: &str, prefix: &str) -> Result<()> {
 
 fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
     match words {
+        ["mdns", ..] => {
+            let mdns: netcontrol_core::MDNSConfig =
+                serde_json::from_str(command_input(line, "mdns").context("mDNS JSON required")?)?;
+            config["mdns"] = serde_json::to_value(mdns)?;
+        }
+        ["no", "mdns"] => {
+            config["mdns"] = serde_json::to_value(netcontrol_core::MDNSConfig::default())?
+        }
         ["ipv6", value @ ("enable" | "disable")] => {
             config["ipv6_enabled"] = json!(*value == "enable");
         }

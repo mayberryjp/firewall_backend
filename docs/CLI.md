@@ -7,7 +7,9 @@ operating-system shell.
 
 ## Enable and connect
 
-SSH is opt-in and independent of the existing HTTP listener:
+SSH is independent of the HTTP listener. Ubuntu `install.sh` and full
+`upgrade.sh` enable the in-process server by default on `0.0.0.0:2222` through
+`NETCONTROL_SSH_LISTEN`. A manual daemon invocation remains opt-in:
 
 ```sh
 netcontrold --backend simulator \
@@ -22,6 +24,14 @@ For OpenRC, add the two SSH arguments to `netcontrold_args` in
 or separate SSH service is required. Native mode manages the same host network
 namespace as the management listener unless an isolated lab namespace is
 explicitly selected. Changing a management NIC can interrupt API/SSH access.
+
+`--ssh-listen` takes precedence over `NETCONTROL_SSH_LISTEN`. Full Ubuntu
+upgrades preserve custom startup arguments; `--build-only` changes no service
+settings. To override/disable the script-managed default, see
+[deployment overrides](BUILD_AND_INSTALL.md#optional-configuration-ssh-server).
+The scripts do not create firewall permits: restrict TCP 2222 to trusted
+management networks. The fresh appliance input policy already blocks new WAN
+connections, but an existing appliance's current policy must be reviewed.
 
 If `--ssh-host-key` is omitted, its path is `<state>.ssh-key`. The daemon creates
 an Ed25519 host key once and reuses it. Existing invalid/insecure host-key data

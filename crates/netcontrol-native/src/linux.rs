@@ -451,6 +451,7 @@ impl Native {
     }
 
     fn verify_services(&self, config: &Value) -> Result<()> {
+        self.services.verify_mdns(config)?;
         let status = self.services.status();
         let enabled = |v: &Value| v["enabled"].as_bool().unwrap_or(false);
         let running = |group: &str, key: &str, name: &str| -> Result<()> {
@@ -470,6 +471,7 @@ impl Native {
             Ok(())
         };
         for (field, names) in [
+            ("mdns", &["mdns"][..]),
             ("ntp", &["ntp"][..]),
             ("syslog", &["syslog"][..]),
             ("vnstat", &["vnstat-host", "vnstat-managed"][..]),
@@ -1256,6 +1258,14 @@ impl Backend for Native {
         let before = before.operational_value()?;
         let after = after.operational_value()?;
         self.reconcile_after_boot(&after, self.ownership()?, Some(&before))
+    }
+
+    fn mdns_status(&mut self, _config: &Config) -> Result<Value> {
+        let status = self.services.status();
+        Ok(json!({"instances":status["appliance_services"].as_array()
+            .context("native service statuses missing")?.iter()
+            .filter(|row|row["name"]=="mdns").collect::<Vec<_>>(),
+            "error":status.get("error").cloned().unwrap_or(json!(""))}))
     }
 
     fn runtime(&mut self, config: &Config) -> Result<Value> {

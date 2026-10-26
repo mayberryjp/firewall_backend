@@ -2085,6 +2085,119 @@ fn read_routes_runtime_statistics_and_reconcile_contract() {
     );
 }
 #[test]
+fn latest_revision_tracks_commits_not_provisional_changes_and_survives_restart() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let path = "/api/v1/revisions/latest";
+    let initial = request(&mut e, "GET", path, Value::Null);
+    assert_eq!(initial.status, 200, "{}", initial.body);
+    assert_eq!(
+        initial.body,
+        request(&mut e, "GET", "/api/v1/revisions/0", Value::Null).body
+    );
+    assert_eq!(initial.body["revision"], 0);
+    assert_eq!(initial.body["current"], true);
+    assert_eq!(initial.body["config"], json!(Config::empty()));
+
+    let applied = submit(&mut e, config());
+    assert_eq!(applied.status, 202, "{}", applied.body);
+    let id = applied.body["id"].as_str().unwrap();
+    assert_eq!(request(&mut e, "GET", path, Value::Null).body, initial.body);
+    assert_eq!(confirm(&mut e, id).status, 200);
+    let committed = request(&mut e, "GET", path, Value::Null);
+    assert_eq!(committed.status, 200, "{}", committed.body);
+    assert_eq!(
+        committed.body,
+        request(&mut e, "GET", "/api/v1/revisions/1", Value::Null).body
+    );
+    assert_eq!(committed.body["revision"], 1);
+    assert_eq!(committed.body["current"], true);
+    assert_eq!(committed.body["config"], json!(config().normalized()));
+
+    let pending = submit(&mut e, Config::empty());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    assert_eq!(
+        request(&mut e, "GET", path, Value::Null).body,
+        committed.body
+    );
+    let rollback = request(
+        &mut e,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            pending.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200, "{}", rollback.body);
+    assert_eq!(
+        request(&mut e, "GET", path, Value::Null).body,
+        committed.body
+    );
+
+    let restored = request(
+        &mut e,
+        "POST",
+        "/api/v1/revisions/0/restore",
+        json!({"base_revision":1,"confirm_timeout_seconds":30}),
+    );
+    assert_eq!(restored.status, 202, "{}", restored.body);
+    assert_eq!(
+        request(&mut e, "GET", path, Value::Null).body,
+        committed.body
+    );
+    assert_eq!(
+        confirm(&mut e, restored.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let latest = request(&mut e, "GET", path, Value::Null);
+    assert_eq!(latest.status, 200, "{}", latest.body);
+    assert_eq!(latest.body["revision"], 2);
+    assert_eq!(latest.body["restored_from_revision"], 0);
+    assert_eq!(latest.body["config"], initial.body["config"]);
+    drop(e);
+    let mut e = f.engine();
+    assert_eq!(request(&mut e, "GET", path, Value::Null).body, latest.body);
+}
+
+#[test]
+fn latest_revision_is_authorized_readonly_and_independent_of_observation() {
+    let f = Fixture::new();
+    let (mut e, faults) = faulty(&f);
+    let applied = submit(&mut e, config());
+    assert_eq!(applied.status, 202, "{}", applied.body);
+    assert_eq!(
+        confirm(&mut e, applied.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let expected = request(&mut e, "GET", "/api/v1/revisions/1", Value::Null).body;
+    let saved = fs::read(f.path()).unwrap();
+    faults.lock().unwrap().fail_observe = true;
+    let path = "/api/v1/revisions/latest";
+    let reader = vec!["state.read".into()];
+    assert_eq!(e.request("GET", path, "", "", &reader, &[]).status, 401);
+    assert_eq!(e.request("GET", path, "", "reader", &[], &[]).status, 403);
+    for query in ["limit=1", "before_revision=1", "unknown=1", "limit="] {
+        let reply = e.request("GET", path, query, "reader", &reader, &[]);
+        assert_eq!(reply.status, 400, "{query}: {}", reply.body);
+        assert!(reply.body["error"].is_string());
+    }
+    let latest = e.request("GET", path, "", "reader", &reader, &[]);
+    assert_eq!(latest.status, 200, "{}", latest.body);
+    assert_eq!(latest.body, expected);
+    assert_eq!(
+        request(&mut e, "GET", "/api/v1/state", Value::Null).status,
+        503
+    );
+    assert_eq!(fs::read(f.path()).unwrap(), saved);
+    assert_eq!(faults.lock().unwrap().apply_count, 1);
+    assert_eq!(
+        request(&mut e, "GET", "/api/v1/revisions/latest/extra", Value::Null).status,
+        404
+    );
+}
+
+#[test]
 fn revision_pagination_and_strict_queries() {
     let f = Fixture::new();
     let mut e = f.engine();

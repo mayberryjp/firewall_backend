@@ -453,10 +453,35 @@ or start routing. Discovery does not take ownership of every interface.
 Do not delete configuration, credentials or history to work around startup
 failures. Preserve console access while changing host management networking.
 
+## Native mDNS discovery across LANs
+
+The in-process Rust mDNS/DNS-SD worker reflects discovery across explicitly
+selected managed Ethernet/VLAN LAN interfaces, with service/provider filters,
+IPv4/IPv6 controls and opt-in appliance publishing. It defaults **disabled**.
+No Avahi daemon, external helper, D-Bus service or general multicast router is
+used. Enable through the normal full-configuration/confirmed transaction flow;
+`mdns.write` is required.
+
+Read committed settings at `GET /api/v1/services/mdns` and applied worker state
+at `GET /api/v1/services/mdns/status`. Bodyless
+`POST /api/v1/services/mdns/reconcile` uses the existing all-service repair
+permissions. Restrictive host-input policy needs explicit UDP 5353 permits;
+the worker opens no firewall holes. Discovery does not grant access to a
+printer/casting service, make IPv6 link-local addresses routable, or forward
+SSDP/media traffic. Use only one active reflector per connected domain.
+
+See the [current frontend contract](FRONTEND_SPEC.md#617-native-mdns--dns-sd),
+[build and qualification spec](docs/MDNS_SPEC.md) and
+[synthetic example](examples/mdns.json). The example is not a safe replacement
+for an existing appliance's complete configuration. Namespace wire tests do
+not establish device interoperability, production load or reboot acceptance.
+
 ## Configuration CLI over SSH
 
 The daemon includes a Cisco-inspired CLI and an in-process Rust SSH server.
-Enable it explicitly; it does not require or launch a system `sshd`:
+Ubuntu `install.sh` and full `upgrade.sh` runs enable it by default on
+`0.0.0.0:2222`; no separate system `sshd` is required or launched. For a manual
+daemon invocation, enable it explicitly:
 
 ```sh
 netcontrold --state state.json --credential-db credentials.json \
@@ -467,7 +492,12 @@ ssh -p 2222 apikey@192.0.2.10
 Use the literal username `apikey` and your existing **API key** at the password
 prompt. Account passwords are not networking credentials. The persistent
 Ed25519 host key defaults to `<state>.ssh-key`; preserve it and verify the host
-fingerprint. SSH is disabled unless `--ssh-listen` is provided.
+fingerprint. Manual invocations remain disabled unless `--ssh-listen` or
+`NETCONTROL_SSH_LISTEN` is provided; the explicit flag takes precedence.
+Review host-input firewall exposure before upgrading: the script does not
+add firewall exceptions, and wildcard binding must not expose management to WAN.
+See [deployment overrides](docs/BUILD_AND_INSTALL.md#optional-configuration-ssh-server)
+for a custom address or explicit disable.
 
 Use `enable`, `configure terminal`, interface/global configuration commands,
 `compare`, and `commit check`. `commit confirmed 60` applies the private

@@ -158,6 +158,11 @@ fn recovery_hold() -> u64 {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct Config {
+    pub mdns: netcontrol_core::MDNSConfig,
+    #[serde(skip)]
+    pub mdns_interfaces: Vec<String>,
+    #[serde(skip)]
+    pub mdns_status: Value,
     pub ipv6_enabled: bool,
     pub ntp: Ntp,
     pub syslog: Syslog,
@@ -170,6 +175,9 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            mdns: Default::default(),
+            mdns_interfaces: Vec::new(),
+            mdns_status: Value::Null,
             ipv6_enabled: true,
             ntp: Ntp::default(),
             syslog: Syslog::default(),
@@ -283,7 +291,19 @@ impl Interface {
 impl Config {
     pub(crate) fn parse(v: &Value) -> Result<Self> {
         ensure!(v.is_object(), "service configuration must be an object");
-        let c: Self = serde_json::from_value(v.clone()).context("service configuration")?;
+        let mut c: Self = serde_json::from_value(v.clone()).context("service configuration")?;
+        if v.get("mdns").is_some() {
+            let config: netcontrol_core::Config = serde_json::from_value(serde_json::json!({
+                "mdns":v["mdns"], "interfaces":v.get("interfaces").cloned().unwrap_or_else(||serde_json::json!([])),
+                "ipv6_enabled":c.ipv6_enabled,
+                "system":v.get("system").cloned().unwrap_or_else(||serde_json::json!({}))
+            }))
+                .context("mDNS operational configuration")?;
+            config.mdns.validate(&config)?;
+            c.mdns_interfaces = config.mdns.effective_interfaces(&config);
+            c.mdns_status = config.mdns.status(&config, "disabled");
+            c.mdns.ipv6 &= c.ipv6_enabled;
+        }
         ensure!(
             c.ntp.servers.len() <= 8 && (!c.ntp.enabled || !c.ntp.servers.is_empty()),
             "NTP requires 1..8 servers when enabled"

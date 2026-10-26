@@ -58,6 +58,12 @@ through the managed systemd environment drop-in described
 [below](#enabling-gateway-monitoring-on-an-installed-appliance), without rewriting
 the base unit or custom startup arguments. Build-only runs do not change it.
 They also [configure journald forwarding](#host-logging-ownership) for native syslog.
+Full install/upgrade enables the embedded configuration SSH listener on
+`0.0.0.0:2222` through `NETCONTROL_SSH_LISTEN`; no second process or OpenSSH
+package is started. Explicit `--ssh-listen` arguments take precedence. Review
+current host-input firewall reachability before upgrading; the script does not
+open ports or change saved input policy. See
+[SSH overrides](#optional-configuration-ssh-server) for custom binding or disable.
 Exactly one direct, absolute executable named `netcontrold` is required;
 wrappers, missing/ambiguous commands and symlink executables are rejected.
 The destination may be absent on first installation. Masked/broken services,
@@ -643,8 +649,11 @@ journald logging, restart on failure and a 60-second shutdown allowance.
 It does not isolate the network namespace: native operations must reach the
 host networking. The unit selects `--appliance` and the LAN-address management
 listener from `/etc/netcontrol/appliance.env` (default `192.168.0.1:8080`).
-Host services, API tunables, gateway monitoring and configuration
-SSH remain disabled unless explicitly added to `ExecStart`.
+The bare unit does not enable API tunables. Install/full upgrade writes the
+managed service drop-in that enables host-service/gateway opt-ins and embedded
+configuration SSH on TCP 2222 without changing `ExecStart`. Actual protocol
+workers remain controlled by saved configuration; SSH uses the existing
+API-key authentication and device setup gate.
 
 Persistent paths match the manual Ubuntu startup command:
 `/var/lib/netcontrol/native-state.json`, `/var/lib/netcontrol/credentials.json`
@@ -1298,13 +1307,80 @@ The script serializes its own apply runs, not other package managers. It is not
 automatically invoked by any deployment script. Preview and mocked tests do not
 prove the live Ubuntu package plan, bootloader or post-reboot connectivity.
 
+## Native mDNS discovery
+
+Native mDNS/DNS-SD is an in-process Rust service, disabled in saved defaults.
+No Avahi/D-Bus package, daemon or service-unit activation is required. It works
+in the managed Linux namespace and uses the existing host-service opt-in in
+host mode (Ubuntu install/full upgrade supplies it).
+
+Configure `mdns` through a full confirmed transaction with `mdns.write`, selecting
+up managed Ethernet/VLAN LAN interfaces and the needed address families. Keep
+one active reflector per connected discovery domain; resolve other local UDP
+5353 responders before enabling. The service rejects conflicting ownership;
+it does not kill competitors or change systemd-resolved.
+
+Restrictive host-input policies need explicit ingress UDP destination port
+5353 permits. Current rules cannot narrow these permits to the mDNS multicast
+destination; the worker validates packet destination/source/hop metadata.
+Discovery does not permit unicast service connections or route IPv6 link-local
+addresses. No firewall, NAT, IGMP/MLD routing or forwarding sysctl is changed.
+OpenRC is supported for this worker independently of syslog's systemd-only
+socket activation.
+
+Read committed config at `/api/v1/services/mdns`; read applied lifecycle/loss
+warnings at `/api/v1/services/mdns/status`, even after worker failure. Never
+confuse local readiness with successful device discovery. Before production,
+validate actual VLAN/nftables/IPv6 membership paths, devices, packet rates,
+restart/reboot and management connectivity. See the
+[contract](../FRONTEND_SPEC.md#617-native-mdns--dns-sd),
+[build/qualification spec](MDNS_SPEC.md) and
+[synthetic example](../examples/mdns.json), not a ready-to-apply replacement
+configuration.
+
 ## Optional configuration SSH server
 
-Add `--ssh-listen 0.0.0.0:2222` to `netcontrold_args` to enable the daemon's
-native SSH interpreter; add `--ssh-host-key /var/lib/netcontrol/ssh-host-key`
+Ubuntu `install.sh` and full `upgrade.sh` now enable the daemon's **in-process**
+configuration SSH server by default using
+`Environment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222` in the managed
+`50-netcontrol-appliance-services.conf` drop-in. This is not a separate SSH
+daemon process, system shell, SFTP server or supervised `sshd`.
+`upgrade.sh --build-only` does not change this configuration.
+
+For manual/OpenRC deployments, add `--ssh-listen 0.0.0.0:2222` to
+`netcontrold_args` to enable the daemon's native SSH interpreter; add
+`--ssh-host-key /var/lib/netcontrol/ssh-host-key`
 to select a persistent private Ed25519 host-key file explicitly. Otherwise the
 key defaults to `<state>.ssh-key`. Keep this key stable and owner-only; invalid
 existing data fails startup rather than being regenerated.
+
+To customize the script-managed listener, add a root-owned
+`NETCONTROL_SSH_LISTEN=192.0.2.1:2222` line to `/etc/netcontrol/appliance.env`,
+substituting a real management address. Environment-file values override the
+managed default; explicit `--ssh-listen` arguments override both. Do not edit
+the generated `50-netcontrol-appliance-services.conf`, which full upgrades
+refresh.
+
+To disable the environment-provided listener, use an operator-owned systemd
+drop-in (for example `systemctl edit netcontrold`) containing:
+
+```ini
+[Service]
+UnsetEnvironment=NETCONTROL_SSH_LISTEN
+```
+
+Also remove any explicit `--ssh-listen` argument from your custom `ExecStart`.
+An empty or invalid address is an error, not an off switch. Then reload systemd
+and restart from an independent OS SSH session/local console; both API and
+embedded SSH sessions are interrupted. Operator-owned drop-ins survive full
+upgrades. The bare daemon remains off when neither flag nor environment value
+is provided.
+
+Review host-input policy before enabling or upgrading: binding to `0.0.0.0`
+includes WAN addresses. Fresh provisioning blocks new WAN input, but upgrading
+preserves the saved firewall and adds no SSH permit or protective deny. A port
+collision or insecure host-key file causes startup failure, not a silent
+fallback to disabled SSH. No operating-system SSH service is changed.
 
 Connect with `ssh -p 2222 apikey@<appliance-IP>`, using an existing API key at the
 password prompt after completing website onboarding. Scoped auth-file keys work

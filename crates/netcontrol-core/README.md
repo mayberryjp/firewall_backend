@@ -9,7 +9,7 @@ Backend calls are synchronous; callers must serialize access to `Engine`.
 ## Current configuration contract
 
 Configuration JSON retains the current networking field names: `ntp`, `syslog`,
-`vnstat`, `gateway_monitors`, `interfaces`, `routes`, `firewall`,
+`vnstat`, `mdns`, `gateway_monitors`, `interfaces`, `routes`, `firewall`,
 `softflowd`, and `kernel`. Every feature configuration has a typed serde model
 with `deny_unknown_fields`. Interface `role` is required and must be `wan` or
 `lan`. `firewall.allow_all_icmp` defaults to `true` when omitted; explicit JSON
@@ -33,6 +33,24 @@ interface and IPv4 target, omits source/gateway/table, and can be saved enabled
 before lease acquisition without static addresses/routes. Native runtime follows
 only that interface's active lease; waiting/unavailable is Unknown, not Down.
 Ordinary destination routing remains available, normally through table 254.
+
+`mdns` always serializes, defaults disabled, and uses the shared
+`MDNSConfig`/`MDNSReflection`/`MDNSPublishing` types. It validates managed LAN
+allow/deny membership (32 entries/effective links), 64 canonical local
+service/subtype/provider filters, effective address families and coherent
+publishing options even when disabled. Active reflection needs two eligible
+links; publishing alone needs one. Metadata is operationally stripped;
+publishing hostname fallback is explicitly derived from `system.hostname`.
+Global IPv6 disable suppresses transport/AAAA without changing preferences.
+`mdns.write` covers every mDNS edit, including metadata, restores and all
+aggregate service-repair entry points when enabled. Reads use `state.read`:
+`GET /api/v1/services/mdns` returns committed configuration without observation;
+`GET /api/v1/services/mdns/status` returns the applied singleton status envelope.
+Both reject query parameters. Bodyless
+`POST /api/v1/services/mdns/reconcile` uses existing aggregate repair permissions
+and creates no revision; query/body input is rejected. Candidate edits remain
+full confirmed transactions. Simulator status says `simulated`, with zero
+decimal-string counters and no claimed packets/membership.
 
 ## Persistent state and recovery
 

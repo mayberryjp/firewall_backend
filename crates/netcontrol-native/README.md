@@ -53,6 +53,23 @@ without the C/header toolchain: TLS requests then fail explicitly and
 `Native::open` always fails because nftables is essential. It is **not** a
 functional networking build or a permissive firewall fallback.
 
+## Native mDNS
+
+Native mDNS is a managed in-process UDP worker, not forwarding or an Avahi
+wrapper. Apply stops/joins it before network changes and restores the previous
+service set on failed startup. Verification checks its effective operational
+configuration and running worker; a network-only apply must restart stopped
+workers even when service settings are unchanged. Explicit repair, rollback
+and boot reapply use the same lifecycle. Dedicated mDNS status reads the owned
+worker snapshot directly, without requiring healthy network observation.
+See [protocol and ownership boundaries](../netcontrol-services/README.md#implemented-services-and-boundaries).
+No implicit nftables accept is inserted: local UDP destination port 5353 input
+on selected LANs and independent unicast service permissions remain operator
+responsibilities. Host-input rules currently cannot narrow the permit to only
+the mDNS multicast destination; the worker enforces group/source/hop admission.
+Actual VLAN, restrictive nftables/IPv6 MLD and appliance/reboot qualification
+remain separate from the isolated veth fixtures.
+
 ## Global IPv6 policy
 
 The persisted top-level `ipv6_enabled` switch defaults to true. Native startup

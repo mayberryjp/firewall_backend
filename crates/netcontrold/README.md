@@ -63,6 +63,18 @@ identical to API transactions. Neither disconnect nor normal session exit
 confirms an applied transaction. No system shell, SFTP or forwarding is exposed.
 The [CLI guide](../../docs/CLI.md) defines commands and operator setup.
 
+## Native discovery CLI
+
+Configuration mode accepts `mdns JSON` (typed replacement) and `no mdns`
+(disabled defaults). `show mdns` reads the complete committed object;
+`show mdns status` reads the applied worker, including provisional configuration.
+`reconcile services mdns` explicitly repairs the saved/applied service set,
+requiring `mdns.write` and the permissions for every other enabled service.
+There is no live-write bypass: JSON-pointer edits, commit check/confirmed
+commit, confirmation, rollback and revision restore use the shared engine.
+Reads require `state.read`; mDNS edits, including metadata-only changes,
+require `mdns.write`. No management SSH or SFTP service is published by mDNS.
+
 ## Device identity schema
 
 The default identity path is `<state>.credentials.json`. `--credential-db` may

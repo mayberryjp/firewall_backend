@@ -1001,7 +1001,10 @@ fn policy_references_ports_expansion_and_family() {
 #[test]
 fn all_current_example_feature_schemas_validate() {
     fn annotate(value: &mut Value, path: &str, paths: &mut Vec<String>) {
-        if path == "/mqtt" || path == "/system" {
+        if matches!(
+            path,
+            "/mqtt" | "/system" | "/mdns/reflection" | "/mdns/publishing"
+        ) {
             return;
         }
         match value {
@@ -1044,6 +1047,7 @@ fn all_current_example_feature_schemas_validate() {
         include_str!("../../../examples/host-policies.json"),
         include_str!("../../../examples/kernel-mixed-conservative.json"),
         include_str!("../../../examples/migration.json"),
+        include_str!("../../../examples/mdns.json"),
         include_str!("../../../examples/vlan-softflowd.json"),
     ] {
         let v: Value = serde_json::from_str(raw).unwrap();

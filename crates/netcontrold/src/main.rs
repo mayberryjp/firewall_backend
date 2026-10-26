@@ -75,6 +75,7 @@ struct Options {
     tls_key: Option<PathBuf>,
     #[arg(
         long,
+        env = "NETCONTROL_SSH_LISTEN",
         help = "Enable the in-process configuration SSH server, for example 0.0.0.0:2222"
     )]
     ssh_listen: Option<String>,

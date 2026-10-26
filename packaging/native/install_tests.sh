@@ -122,7 +122,7 @@ for service_scenario in success repeat directory_failure chmod_failure publish_f
         fi
     ); then
         [[ $service_scenario == success || $service_scenario == repeat ]] || exit 1
-        [[ $(< "$service_target") == $'[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\n\n[Service]\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true' ]]
+        [[ $(< "$service_target") == $'[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\n\n[Service]\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222' ]]
     else
         [[ $service_scenario != success && $service_scenario != repeat ]] || exit 1
         if [[ $service_scenario == *_failure ]]; then

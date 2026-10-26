@@ -1,0 +1,51 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 30,
+  "description": "Synthetic managed-LAN printer discovery example; adapt interfaces and firewall before applying",
+  "config": {
+    "interfaces": [
+      {
+        "name": "lan10",
+        "kind": "ethernet",
+        "role": "lan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": ["192.0.2.1/24"]
+      },
+      {
+        "name": "lan20",
+        "kind": "ethernet",
+        "role": "lan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": ["198.51.100.1/24"]
+      }
+    ],
+    "mdns": {
+      "enabled": true,
+      "metadata": {
+        "display_name": "Printer discovery",
+        "description": "Discovery only; unicast printer access needs separate firewall policy"
+      },
+      "interface_mode": "allow",
+      "interfaces": ["lan10", "lan20"],
+      "ipv4": true,
+      "ipv6": false,
+      "reflection": {
+        "enabled": true,
+        "filters": ["_ipp._tcp.local."]
+      },
+      "publishing": {
+        "enabled": false,
+        "hostname": "",
+        "domain": "local.",
+        "addresses": false,
+        "hinfo": false,
+        "workstation": false,
+        "browse_domain": false,
+        "aaaa_on_ipv4": false,
+        "a_on_ipv6": false
+      }
+    }
+  }
+}

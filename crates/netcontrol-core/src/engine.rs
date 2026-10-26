@@ -21,6 +21,7 @@ pub const PERMISSIONS: &[&str] = &[
     "softflowd.write",
     "gateway_monitors.write",
     "ntp.write",
+    "mdns.write",
     "syslog.write",
     "vnstat.write",
     "mqtt.write",
@@ -221,6 +222,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
             a.gateway_monitors != b.gateway_monitors,
         ),
         ("ntp.write", a.ntp != b.ntp),
+        ("mdns.write", a.mdns != b.mdns),
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
         ("mqtt.write", a.mqtt != b.mqtt),
@@ -703,7 +705,14 @@ impl Engine {
             .strip_prefix("/api/v1/services/")
             .and_then(|p| p.strip_suffix("/reconcile"))
         {
+            if service == "mdns" && (!query.is_empty() || !body.is_empty()) {
+                return Err(ApiError::new(
+                    400,
+                    "service repair does not accept query parameters or a body",
+                ));
+            }
             let permission = match service {
+                "mdns" => "mdns.write",
                 "softflowd" => "softflowd.write",
                 "dhcp-relay" => "interfaces.write",
                 "gateway-monitoring" => "gateway_monitors.write",
@@ -716,6 +725,7 @@ impl Engine {
             require(permissions, permission)?;
             let expected = self.expected();
             for (p, enabled) in [
+                ("mdns.write", expected.mdns.enabled),
                 ("ntp.write", expected.ntp.enabled),
                 ("syslog.write", expected.syslog.enabled),
                 ("vnstat.write", expected.vnstat.enabled),
@@ -1169,7 +1179,17 @@ impl Engine {
             if n.contains('/') {
                 return Err(ApiError::new(404, "endpoint not found"));
             }
-            let n = parse_revision(n)?;
+            let n = if n == "latest" {
+                if !query.is_empty() {
+                    return Err(ApiError::new(
+                        400,
+                        "latest revision does not accept query parameters",
+                    ));
+                }
+                self.state.revision
+            } else {
+                parse_revision(n)?
+            };
             let config = self.revision_config(n)?;
             let mut metadata = self.revision_metadata(n)?;
             metadata["config"] = value(config)?;
@@ -1213,6 +1233,18 @@ impl Engine {
                 }
             });
         }
+        if path == "/api/v1/services/mdns/status" {
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "mDNS status does not accept query parameters",
+                ));
+            }
+            return self
+                .backend
+                .mdns_status(&self.expected())
+                .map_err(service_error);
+        }
         let service_status = path
             .strip_prefix("/api/v1/services/")
             .and_then(|s| s.strip_suffix("/status"));
@@ -1223,6 +1255,7 @@ impl Engine {
             if service_status.is_some_and(|s| {
                 ![
                     "ntp",
+                    "mdns",
                     "syslog",
                     "vnstat",
                     "softflowd",
@@ -1266,6 +1299,15 @@ impl Engine {
                 }
                 _ => Err(ApiError::new(404, "endpoint not found")),
             };
+        }
+        if path == "/api/v1/services/mdns" {
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "mDNS configuration does not accept query parameters",
+                ));
+            }
+            return value(&self.state.desired.mdns);
         }
         let known = [
             "/api/v1/state",

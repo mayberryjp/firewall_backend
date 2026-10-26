@@ -81,6 +81,41 @@ impl Fixture {
 }
 
 #[test]
+fn mdns_candidate_show_status_repair_and_permission() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli,r#"set /interfaces [{"name":"lan1","kind":"ethernet","role":"lan","mtu":1500,"up":true},{"name":"lan2","kind":"ethernet","role":"lan","mtu":1500,"up":true}]"#);
+    f.ok(&mut cli,r#"mdns {"enabled":true,"interfaces":["lan1","lan2"],"ipv6":false,"reflection":{"enabled":true,"filters":["_IPP._tcp.local."]}}"#);
+    f.ok(&mut cli, "commit check");
+    let committed: Value = serde_json::from_str(&f.ok(&mut cli, "show mdns")).unwrap();
+    assert_eq!(committed["enabled"], false);
+    f.ok(&mut cli, "commit confirmed 30");
+    let status: Value = serde_json::from_str(&f.ok(&mut cli, "show mdns status")).unwrap();
+    assert_eq!(status["instances"][0]["state"], "simulated");
+    f.ok(&mut cli, "confirm");
+    let committed: Value = serde_json::from_str(&f.ok(&mut cli, "show mdns")).unwrap();
+    assert_eq!(
+        committed["reflection"]["filters"],
+        json!(["_ipp._tcp.local."])
+    );
+    f.ok(&mut cli, "reconcile services mdns");
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "no mdns");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(f.request("/api/v1/services/mdns")["enabled"], false);
+    let limited = Fixture::new(&["state.read", "transactions.write", "interfaces.write"]);
+    let mut cli = CliSession::new();
+    limited.configure(&mut cli);
+    limited.ok(
+        &mut cli,
+        r#"mdns {"metadata":{"display_name":"Discovery"}}"#,
+    );
+    limited.fail(&mut cli, "commit confirmed 30", "mdns.write");
+}
+
+#[test]
 fn host_health_cli_uses_readonly_statistics_route() {
     let fixture = Fixture::new(&["state.read"]);
     let mut cli = CliSession::new();

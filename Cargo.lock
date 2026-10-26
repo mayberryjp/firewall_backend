@@ -1900,6 +1900,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "libc",
+ "netcontrol-core",
  "rand 0.8.8",
  "rustls",
  "rustls-native-certs",

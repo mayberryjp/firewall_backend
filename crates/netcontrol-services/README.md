@@ -1,7 +1,8 @@
 # Native service workers
 
 `netcontrol-services` owns Rust threads and sockets, not child processes. Its
-public API accepts complete configuration JSON independently of `netcontrol-core`.
+public API accepts complete operational configuration JSON and reuses the core
+mDNS types and validation.
 Unknown service fields, invalid values, unsupported modes, missing privileges,
 conflicting ownership, and incompatible stored records are errors.
 
@@ -36,6 +37,72 @@ use the existing `process_state`, `sample_status`, and health/statistics fields.
 These are worker states, not external daemon states; there is no `pid` field.
 
 ## Implemented services and boundaries
+
+* **mDNS/DNS-SD:** one managed singleton, disabled by default, with same-family
+  reflection between 2..32 explicitly eligible, up managed Ethernet/VLAN LANs.
+  Allow/deny selection never discovers unmanaged links or includes WAN. IPv4
+  `224.0.0.251` and IPv6 `ff02::fb` use per-interface, device-bound UDP/5353
+  sockets, packet-info/hop-limit admission, local-source egress and hop limit
+  255. IPv4 disables `IP_MULTICAST_ALL`; IPv6 sockets are IPv6-only. Host mode
+  needs `allow_host_services`; no external daemon, systemd socket activation,
+  firewall accepts, forward permits, NAT or family translation is installed.
+  Operators must allow local input UDP/5353 on participating links and service
+  connectivity separately. Use one reflector per connected reflection domain.
+  A namespace-scoped abstract socket locks cooperative ownership and procfs
+  inspection rejects existing UDP/5353 receivers, including reusable sockets;
+  operators resolve competing receivers themselves.
+  A bounded Rust DNS codec decodes compression and reconstructs all sections.
+  Supported RRs are A, NS, CNAME, PTR, HINFO, TXT, AAAA, SRV, DNAME and NSEC.
+  Other types reject the complete datagram and increment
+  `unsupported_record_drops`, never pass through unsafe opaque compression.
+  Filtered service/subtype/provider discovery tracks only admitted instance and
+  provider dependencies per ingress/family, rebuilds mixed packets, supports
+  enumeration, and expires associations within 120 seconds. Filtering is
+  unauthenticated discovery policy, not service authorization; provider
+  addresses needed by allowed services are necessarily disclosed.
+  Reflection clears QU, preserves record TTL/cache-flush/known answers and
+  handles TTL-zero goodbyes. Outstanding queries bound direct-unicast admission;
+  five-second legacy request mappings reconstruct the original ID/questions,
+  clear cache-flush and cap answer TTL to ten seconds.
+  Optional publishing probes configured identities before readiness, fails
+  visibly on hostname conflict instead of renaming, announces/refreshes and
+  responds to queries with known-answer suppression, QU/legacy handling and
+  goodbye records. TC known-answer continuations collect for 450 ms.
+  Address, opt-in Linux/CPU HINFO, `_workstation._tcp` (conventional port 9)
+  and browse-domain records are real publications; SSH/SFTP and arbitrary
+  services are not advertised. Explicit hostname or configured system hostname
+  is used, never ambient hostname; cosmetic system domain is irrelevant.
+  Global IPv6 disable suppresses IPv6 transport and AAAA publication, preserving
+  saved preferences. Cross-family flags only select published record types.
+  Link/address snapshots are checked every second, not by netlink subscription.
+  Address replacement prepares replacement sockets and reprobes publications;
+  missing/down/replaced required links fail the worker rather than silently
+  shrinking membership. Readiness is not proof of network delivery.
+  Runtime `appliance_services` includes the singleton `mdns` row. Its counters
+  are decimal strings, reset at worker start. Linux `SO_RXQ_OVFL` accounts
+  socket receive loss; unavailable accounting, descriptor replacement or
+  truncated ancillary data makes `receive_drops: null`. Statistics are
+  incomplete after known receive/queue/rate/oversize loss or unavailable
+  accounting. Disabled/simulator samples do not claim measured completeness.
+  Fixed limits are 9,000 input bytes, 512 questions/RRs, 8,192 transmission
+  fingerprints plus a separate bounded ingress-loop guard, 8,192 aggregate
+  dependency associations, 1,024 aggregate outstanding requesters, and per
+  interface/family ingress/egress buckets of 200 packets/s with burst 400.
+  Work is synchronous and batched (maximum 256 datagrams/2 MiB); pending
+  publication continuations are also bounded to 2 MiB. Output uses at most
+  1,232 bytes, reduced for actual interface MTU. RR-boundary splitting and TC
+  query known-answer continuations are supported; a single RR or question
+  section that cannot fit is dropped/counted rather than byte-truncated.
+  A publisher probe RRset that cannot fit one egress datagram rejects startup
+  explicitly, rather than claiming successful partial identity probing.
+  Polling waits 10 ms and normal shutdown is tested below one second.
+  See [synthetic configuration](../../examples/mdns.json). Isolated privileged
+  veth/namespace tests cover actual IPv4/IPv6 source/port/hop/fanout, filtering,
+  legacy replies, publishing, ownership, rollback/restart/repair and shutdown:
+  `NETCONTROL_INTEGRATION=1 cargo test -p netcontrol-services --locked native_mdns -- --ignored`.
+  VLAN-tag/nftables/MLD acceptance, 10,000-packet/s reference-host load,
+  device/browser/Avahi interoperability and boot/appliance qualification remain
+  separate, unverified acceptance gates. Do not infer them from these fixtures.
 
 * **DHCPv4:** one exclusive UDP/67 socket with receive/send `IP_PKTINFO`,
   supported on explicitly managed up Ethernet, dummy or VLAN interfaces;

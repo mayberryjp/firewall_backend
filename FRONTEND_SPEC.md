@@ -47,6 +47,8 @@ Support:
 - Explicit opt-in host-clock NTP and whole-appliance remote syslog workers,
   using host networking; dual host/managed-namespace native traffic accounting with persistent
   separate databases, all-interface discovery, status and repair.
+- Native mDNS/DNS-SD reflection across selected managed LANs, service/provider
+  filters, optional appliance publishing, status and repair (section 6.1.7).
 - Complete-package transactions, confirmation, rollback, and recovery.
 - Committed configuration history, comparison, export, and historical restore.
 - Read-only namespace interface counters and IP/TCP/UDP/ICMP protocol statistics,
@@ -207,6 +209,7 @@ configuration, not a separate annotation endpoint.
 | Interface policy / rule | `firewall.policies.interfaces[].metadata`, `firewall.policies.interfaces[].rules[].metadata` |
 | Input interface policy / rule | `firewall.input.interfaces[].metadata`, `firewall.input.interfaces[].rules[].metadata` |
 | NTP / syslog / vnStat settings | `ntp.metadata`, `syslog.metadata`, `vnstat.metadata` |
+| mDNS settings | `mdns.metadata` |
 | Syslog destination | `syslog.servers[].metadata` |
 | Flow exporter / gateway monitor | `softflowd[].metadata`, `gateway_monitors[].metadata` |
 | Azure Dynamic DNS entry | `dynamic_dns[].metadata` |
@@ -248,7 +251,7 @@ Valid interface example (technical identity is still `eno1`):
   resource write permissions as functional changes: `interfaces.write` for
   interface/relay/client/DNS metadata; `wireguard.write` for peer metadata;
   `routes.write`, `nat.write`, `firewall.write`, `ntp.write`,
-  `syslog.write`, `vnstat.write`, `softflowd.write`, `gateway_monitors.write`
+  `syslog.write`, `vnstat.write`, `mdns.write`, `softflowd.write`, `gateway_monitors.write`
   for the corresponding objects. No new permission or HTTP method/path is added.
 - Native operational configuration excludes these annotations. Metadata-only
   applies verify the existing configuration but do not take the native network
@@ -264,6 +267,20 @@ Valid interface example (technical identity is still `eno1`):
   labels. Blank labels fall back to the existing name/ID/prefix/key. Sort/search
   may include labels without changing backend object identity or rule ordering.
   Render all annotation text as text, never raw HTML.
+
+### 1.5 Native mDNS implementation status
+
+The [native mDNS / DNS-SD build specification](docs/MDNS_SPEC.md) now has an
+unreleased Rust implementation: reflection, service/provider filters, family
+controls and optional appliance publishing. The current contract is in section
+6.1.7. No Avahi daemon, external process or D-Bus service is used.
+
+General multicast routing, SSDP, media forwarding, automatic service-port
+firewall permits and CARP integration remain unsupported. Discovery does not
+make a service reachable. Native namespace fixtures are not complete
+VLAN/nftables/MLD, device interoperability, load, reboot or appliance acceptance.
+The earlier planning item is superseded by
+[implementation handoff 2026-10-25-17](docs/frontend-handoffs/2026-10-25.md#2026-10-25-17-native-mdns-implementation).
 
 ## 2. Product and interaction principles
 
@@ -585,6 +602,7 @@ Configuration changes additionally require permissions for every changed area:
 | softflowd configuration | `softflowd.write` |
 | Gateway monitor configuration | `gateway_monitors.write` |
 | NTP server/client settings | `ntp.write` |
+| mDNS reflection/publishing and metadata | `mdns.write` |
 | Whole-appliance syslog/remote destinations | `syslog.write` |
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
 | MQTT streaming configuration | `mqtt.write` |
@@ -605,7 +623,7 @@ when any gateway monitor is enabled. Authorization uses the
 current committed/pending configuration under the engine lock, not the draft.
 
 This shared-service permission rule also includes enabled NTP (`ntp.write`),
-syslog (`syslog.write`), and vnStat (`vnstat.write`) on **all six** service repair
+syslog (`syslog.write`), vnStat (`vnstat.write`) and mDNS (`mdns.write`) on **all seven** service repair
 endpoints. Each new endpoint additionally requires its own service write
 permission even when disabled. See section 6.1.3 for host-wide effects.
 
@@ -617,9 +635,12 @@ another appropriately authorized operator may need to confirm or recover.
 
 ### 4.4 Transactional SSH configuration CLI
 
-Operators may also enable the daemon's in-process SSH server with `--ssh-listen`
-and optional `--ssh-host-key` (default `<state>.ssh-key`). It is disabled by
-default; it is not a system shell or an HTTP endpoint. The literal SSH username
+Ubuntu `install.sh` and full `upgrade.sh` enable the daemon's in-process SSH
+server by default on `0.0.0.0:2222` through `NETCONTROL_SSH_LISTEN`. Manual
+invocations remain disabled unless that variable or `--ssh-listen` is supplied;
+an explicit flag takes precedence. Optional `--ssh-host-key` defaults to
+`<state>.ssh-key`. Build-only upgrades change no service settings. This is not a
+second daemon, system shell or HTTP endpoint. The literal SSH username
 is `apikey` and its password is the existing API key, with the same permissions,
 device setup gate, immediate managed-key revocation and fail-closed identity
 health. SSH never makes account passwords authorize networking operations.
@@ -646,6 +667,11 @@ transaction conflicts, preserve drafts and uncertain-write recovery. No frontend
 client or UI changes are required to use SSH; optional operator help may link
 to the [CLI guide](docs/CLI.md). Host management access, key fingerprint trust,
 namespace provisioning and exposure are operator responsibilities.
+Upgrade preserves saved host-input policy and adds no port permits or WAN
+protection: operators must review management reachability. Address overrides
+and explicit disable are documented in the
+[deployment guide](docs/BUILD_AND_INSTALL.md#optional-configuration-ssh-server).
+Host-key or bind failures remain startup errors, not silent SSH disablement.
 
 ### 4.5 Signed Ubuntu Self-Upgrade
 
@@ -1377,7 +1403,8 @@ Per service in `ntp`, `syslog`, `vnstat`:
 | POST | `/api/v1/services/{service}/reconcile` | No body, `RuntimeState`; all enabled services |
 
 `RuntimeState.appliance_services` always contains `ntp`, `syslog`, `vnstat-host`,
-`vnstat-managed` rows; service-specific status filters to one/two instances.
+`vnstat-managed` and `mdns` rows; service-specific status filters to its instances.
+The `mdns` row has the separate typed shape in section 6.1.7.
 Render lifecycle state, scope, optional start time, optional active traffic-history
 database directory and errors. Native workers use `disabled`, `running`, `error`,
 or `stopped`; simulator rows are `simulated`. Preserve unknown states rather than
@@ -1867,6 +1894,181 @@ hostname option, or a configuration tool) fighting the daemon. Local fixtures co
 this logic, but the real hostname and time zone behavior on an appliance is a
 deployment acceptance check. See the
 [handoff](docs/frontend-handoffs/2026-10-25.md#2026-10-25-10-host-name-and-time-zone).
+
+### 6.1.7 Native mDNS / DNS-SD
+
+Provide a **Services > mDNS / Discovery** editor using the shared full-config
+draft, not independent immediate saves. The in-process Rust service is disabled
+by default. It reflects discovery between eligible links; it is not an Avahi
+process, a DNS resolver, SSDP relay, IGMP/MLD router or multicast media proxy.
+
+```ts
+interface MDNSConfig {
+  enabled: boolean; // false
+  metadata?: ObjectMetadata;
+  interface_mode: "allow" | "deny"; // allow
+  interfaces: string[]; // [], unique, at most 32
+  ipv4: boolean; // true
+  ipv6: boolean; // true
+  reflection: { enabled: boolean; filters: string[] }; // false, []
+  publishing: {
+    enabled: boolean; // false
+    hostname: string; // ""; use configured system.hostname when publishing
+    domain: string; // "local."
+    addresses: boolean; hinfo: boolean; workstation: boolean;
+    browse_domain: boolean; aaaa_on_ipv4: boolean; a_on_ipv6: boolean;
+    // All publication flags default false.
+  };
+}
+
+type MDNSCounterName =
+  | "received_packets" | "transmitted_packets" | "received_bytes"
+  | "transmitted_bytes" | "malformed_packets" | "hop_limit_drops"
+  | "policy_drops" | "duplicate_drops" | "rate_limit_drops"
+  | "queue_drops" | "oversize_drops" | "unsupported_record_drops" | "send_errors";
+
+interface MDNSStatus extends Record<MDNSCounterName, string> {
+  name: "mdns";
+  scope: "managed";
+  enabled: boolean;
+  state: "disabled" | "simulated" | "running" | "stopped" | "error";
+  started_at: Timestamp | null;
+  collected_at: Timestamp | null;
+  error: string | null;
+  effective_interfaces: string[];
+  effective_families: ("ipv4" | "ipv6")[];
+  reflection_enabled: boolean;
+  publishing_enabled: boolean;
+  receive_drops: string | null;
+  statistics_complete: boolean;
+  warnings: string[];
+  limits: Record<string, number>; // Exact fixed keys/bounds listed below.
+}
+```
+
+`config.mdns` is always present in serialized configuration. Preserve it,
+including metadata and disabled preferences, in drafts/import/export/history.
+This feature uses the current transaction unknown-field/`ignored_fields`
+contract; do not silently dismiss server warnings.
+
+Membership/validation (`422` semantic errors):
+
+- Eligible links are configured, administratively up `ethernet`/`vlan`
+  interfaces with role `lan`. WAN, unassigned, unmanaged, loopback, WireGuard
+  and dummy links never participate. Allow entries must be eligible; deny
+  entries must identify configured Ethernet/VLAN links (excluding WAN is
+  allowed but redundant). Names must be unique and references valid even
+  while disabled.
+- Allow mode selects only listed links; empty never means all. Deny mode
+  selects eligible links except those listed. Review newly included links when
+  other configuration changes expand a deny-mode set.
+- Enabled reflection requires 2..32 effective links; publishing alone requires
+  1..32. Enabling mDNS requires at least one function and effective family.
+  Each enabled family needs a usable local address on each selected link;
+  bind/membership/address/ownership failures are explicit apply errors, not
+  partial successful membership.
+- Global `ipv6_enabled: false` suppresses IPv6 transport and **all local AAAA
+  publication**, even AAAA-over-IPv4, while retaining saved mDNS preferences.
+  An IPv6-only enabled configuration then fails validation. No packet-family
+  translation is performed.
+- Filters: empty means all services. At most 64 unique absolute local DNS
+  names with a trailing dot, ASCII labels 1..63 bytes, total at most 253 bytes;
+  normalize ASCII case. Accept service types such as `_ipp._tcp.local.`,
+  DNS-SD subtype names and provider names such as `printer.local.`. No glob,
+  regex or arbitrary instance-name patterns. Filtering reconstructs mixed
+  messages rather than forwarding an entire packet because one service matches.
+- Publishing is separate and off by default. Enabled publishing requires a
+  real publication flag. Hostname is a lowercase single hostname label of
+  1..63 bytes (letters/digits/hyphens, no edge hyphen) or empty to use valid,
+  nonempty configured `system.hostname`; never ambient host state.
+  Domain is `local.` or an absolute subdomain, no underscores, at most 253
+  bytes; generated host/workstation/enumeration names must also fit.
+  Cosmetic `system.domain` never changes mDNS.
+- `aaaa_on_ipv4` needs `ipv4` and `addresses`; `a_on_ipv6` needs `ipv6` and
+  `addresses`. These flags choose published record types, not cross-family
+  reflection. HINFO deliberately exposes Linux/architecture; workstation uses
+  the conventional `_workstation._tcp` record/port 9. No SSH/SFTP/default
+  management service is advertised.
+
+HTTP methods, all with existing API-key authentication:
+
+| Method / path | Permission / result |
+| --- | --- |
+| `GET /api/v1/services/mdns` | `state.read`; `200 MDNSConfig`, committed configuration, independent of observation |
+| `GET /api/v1/services/mdns/status` | `state.read`; `200 {instances: MDNSStatus[], error: string}`, applied singleton snapshot, including provisional state; remains readable on worker failure |
+| `POST /api/v1/services/mdns/reconcile` | `state.read`, `transactions.write`, `mdns.write` and every other enabled-service repair permission; bodyless, `200 RuntimeState`, no new revision |
+
+Reads reject query parameters (`400`); mDNS repair rejects queries and any
+nonempty body, including `{}` (`400`). Existing `401`/`403` authentication and
+authorization, `409` drift/recovery/maintenance guards, apply failure/rollback
+and genuine observation errors remain. Changes/restores require `mdns.write`
+in addition to transaction and other changed-area permissions; changing input
+rules additionally requires `firewall.write`.
+
+`RuntimeState.appliance_services` includes a heterogeneous `mdns` row; do not
+cast it to an NTP sample or discard it as an unknown service. Its status fields:
+
+- `name: "mdns"`, `scope: "managed"`, `enabled: boolean`,
+  `state: "disabled" | "simulated" | "running" | "stopped" | "error"`;
+  `started_at`, `collected_at`, `error`: string or null.
+- `effective_interfaces: string[]`, `effective_families: ("ipv4" | "ipv6")[]`,
+  `reflection_enabled`, `publishing_enabled`: booleans.
+- Exact unsigned decimal-string counters: `received_packets`,
+  `transmitted_packets`, `received_bytes`, `transmitted_bytes`,
+  `malformed_packets`, `hop_limit_drops`, `policy_drops`, `duplicate_drops`,
+  `rate_limit_drops`, `queue_drops`, `oversize_drops`,
+  `unsupported_record_drops`, `send_errors`; `receive_drops` is a decimal
+  string or null if kernel loss accounting becomes unavailable.
+- Counters reset on worker start. `transmitted_packets` counts successful
+  destination sends, not client receipt. `statistics_complete` becomes false
+  after known receive/queue/rate/oversize loss or unavailable loss accounting.
+  Disabled/simulated rows claim no measured completeness.
+- `warnings: string[]`: `receive_loss_accounting_unavailable`, `receive_loss`,
+  `rate_limit_loss`, `queue_loss`, `oversize_loss` as applicable. Render
+  warnings without converting them into a global unhealthy-service lock.
+- `limits`: numeric fixed bounds including `interfaces:32`, `payload_bytes:9000`,
+  `records:512`, `fingerprints:8192`, `fingerprint_seconds:1`,
+  `associations:8192`, `association_seconds:120`, `requesters:1024`,
+  `requester_seconds:5`, `packets_per_second:200`, `burst:400`,
+  `queue_datagrams:256`, `queue_bytes:2097152`, `egress_payload_bytes:1232`,
+  `poll_ms:100`, `shutdown_ms:1000`. These are not editable tuning fields.
+
+Use nonoverlapping 2..5-second polling and preserve drafts on errors. Display
+committed versus applied/provisional membership and global IPv6 suppression.
+Running means local worker readiness, not verified discovery/delivery. No
+remote device inventory, captured TXT, packet dumps or runtime caches are
+exported in configuration/history.
+
+Operator prerequisites: Linux native networking and existing host-service
+opt-in in host mode; sole local UDP 5353 ownership and one active reflector per
+connected domain. No competing daemon is killed or auto-disabled. Restrictive
+host-input policy needs explicit ingress UDP destination port 5353 permits;
+current input rules cannot narrow that to multicast destinations. The worker
+validates destination group/source/hop limit. Normal IPv6 membership/MLD
+behavior also needs packet-path acceptance. Reflection changes no firewall,
+NAT or forwarding sysctl. Unicast connections to discovered addresses/ports
+need separate routing/policy; IPv6 link-local addresses do not become routable.
+
+Protocol boundaries: require IP TTL/hop limit 255; reflected QU questions become
+multicast-answer questions, with legacy requester correlation. Support common
+DNS-SD records A/NS/CNAME/PTR/HINFO/TXT/AAAA/SRV/DNAME/NSEC; other RR types cause
+an explicit counted datagram drop. Output is capped at 1232 payload bytes and
+actual MTU; split at RR boundaries/TC continuations, never truncate bytes.
+Unfit individual records/question sections drop/count; unfit publisher probe
+RRsets reject startup. Route-netlink monitoring starts before socket preparation
+and gates receive, maintenance and sends. Required link deletion/replacement,
+rename, administrative down or lost/invalid notifications latch a worker error
+until explicit repair; identical name/index/address recreation is covered by
+native tests. Valid address changes block stale sockets while refreshing both
+families. Snapshot polling is a backstop, not the isolation mechanism; the final
+notification check/send remains non-atomic. Provider-only PTR answers require a
+learned SRV/provider association; unknown dependencies are not forwarded broadly.
+
+Native veth/namespace tests cover wire reflection and lifecycle but not full
+VLAN/nftables/MLD, Apple/Windows/printer/Avahi interoperability, reference-host
+10k-packet/s performance, reboot or production acceptance. Do not claim exact
+Avahi parity. See [build/acceptance spec](docs/MDNS_SPEC.md) and
+[required handoff](docs/frontend-handoffs/2026-10-25.md#2026-10-25-17-native-mdns-implementation).
 
 ### 6.2 Managed interfaces and VLANs
 
@@ -2624,6 +2826,12 @@ Provide JSON import/export:
   confirmation. It performs no server write.
 - Export config-only JSON; optionally provide a separately labeled current-base
   request export. Export no API key or frontend-only metadata.
+- For a one-request committed configuration download, use
+  `GET /api/v1/revisions/latest` and export its complete `config` object. Label
+  this **Download committed configuration**: pending-confirmation candidates
+  may be temporarily applied but are not included. This is not a full-device
+  backup; external secret files, device accounts/API keys and runtime state are
+  not included. Keep the sensitivity notice and operator-initiated download.
 
 ### 6.11 Transactions
 
@@ -2896,6 +3104,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/transactions` | `Record<string, Transaction>` |
 | GET | `/transactions/{id}` | `Transaction` |
 | GET | `/revisions?limit=50&before_revision=N` | `RevisionPage` |
+| GET | `/revisions/latest` | `Revision`; latest committed configuration, independent of live observation |
 | GET | `/revisions/{revision}` | `Revision` |
 | POST | `/transactions` | Complete package request -> `Transaction` |
 | POST | `/transactions/{id}/confirm` | No body -> `Transaction` |
@@ -2916,11 +3125,25 @@ Paths below are relative to `/api/v1`.
 | POST | `/services/ntp/reconcile` | No body -> `RuntimeState`; all enabled services |
 | POST | `/services/syslog/reconcile` | No body -> `RuntimeState`; all enabled services |
 | POST | `/services/vnstat/reconcile` | No body -> `RuntimeState`; all enabled services |
+| GET | `/services/mdns` | Committed `MDNSConfig`; independent of observation |
+| GET | `/services/mdns/status` | `{instances: MDNSStatus[], error: string}`; applied singleton, readable on failure |
+| POST | `/services/mdns/reconcile` | No body -> `RuntimeState`; all enabled-service repair permissions; no query/body |
 
 For revision lists, `limit` defaults to 50, accepts 1..100, and
 `before_revision` is an exclusive uint64 cursor. Unknown, duplicated, empty, or
 malformed parameters return `400`. Use `next_before_revision` verbatim for the
 next page; absence means exhausted. Do not calculate cursors from dates.
+
+`GET /api/v1/revisions/latest` requires `state.read` and returns `200` with
+exactly the numbered revision detail shape (flattened metadata plus complete
+`config`), including revision 0 before the first commit. It resolves the current
+committed revision in one request without live observation or configuration
+writes. Pending, rolled-back and failed transactions do not advance the
+returned revision; confirming a restore does. No query parameters are accepted
+(`400` with the normal JSON error shape). Authentication/permission failures
+remain `401`/`403`; archive failures are explicit errors, not empty-config
+fallbacks. Existing `Cache-Control: no-store` behavior applies. No attachment
+header or config-only response is added; create the JSON download from `config`.
 
 ### 9.3 Request examples
 
@@ -2983,6 +3206,7 @@ interface Config {
   ntp: NTPConfig;
   syslog: SyslogConfig;
   vnstat: VNStatConfig;
+  mdns: MDNSConfig; // always serialized; see section 6.1.7
   system: SystemConfig; // see section 6.1.6
   dynamic_dns: DynamicDNSConfig[];
   interfaces: ManagedInterface[];
@@ -3285,7 +3509,7 @@ interface RuntimeState {
     dhcp_gateway_monitor_address_families: "ipv4"[];
   };
   dhcp_clients?: DHCPClientRuntime;
-  appliance_services: ApplianceServiceStatus[];
+  appliance_services: (ApplianceServiceStatus | MDNSStatus)[];
   parent_interfaces: ParentInterface[];
   softflowd: SoftflowdStatus[];
   dhcp_relay: DHCPRelayStatus[];

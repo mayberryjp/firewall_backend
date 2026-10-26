@@ -21,6 +21,7 @@ pub struct Config {
     pub ntp: NTPConfig,
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
+    pub mdns: crate::MDNSConfig,
     pub mqtt: MQTTConfig,
     pub system: SystemConfig,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -46,6 +47,7 @@ impl Default for Config {
             ntp: Default::default(),
             syslog: Default::default(),
             vnstat: Default::default(),
+            mdns: Default::default(),
             mqtt: Default::default(),
             system: Default::default(),
             dynamic_dns: Vec::new(),
@@ -724,6 +726,7 @@ impl Config {
         }
         values.extend(self.softflowd.iter().map(|exporter| &exporter.metadata));
         values.extend(self.dynamic_dns.iter().map(|entry| &entry.metadata));
+        values.push(&self.mdns.metadata);
         values.extend(
             self.gateway_monitors
                 .iter()
@@ -755,6 +758,9 @@ impl Config {
             }
         }
         let mut value = serde_json::to_value(self)?;
+        if self.mdns.publishing.enabled && self.mdns.publishing.hostname.is_empty() {
+            value["mdns"]["publishing"]["hostname"] = serde_json::json!(self.system.hostname);
+        }
         value.as_object_mut().unwrap().remove("mqtt");
         value.as_object_mut().unwrap().remove("system");
         value.as_object_mut().unwrap().remove("dynamic_dns");
@@ -780,6 +786,7 @@ impl Config {
         Self::default()
     }
     pub fn normalize(&mut self) {
+        self.mdns.normalize();
         self.dynamic_dns.sort_by(|a, b| a.name.cmp(&b.name));
         self.ntp.servers.sort();
         self.syslog
@@ -839,6 +846,7 @@ impl Config {
         c
     }
     pub fn validate(&self) -> Result<()> {
+        self.mdns.validate(self)?;
         crate::dynamic_dns::validate(self)?;
         self.system.validate()?;
         let mqtt = &self.mqtt;

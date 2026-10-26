@@ -1,12 +1,14 @@
 //! Typed networking domain, durable transactions, and deterministic simulator.
 mod dynamic_dns;
 mod engine;
+mod mdns;
 mod model;
 mod simulator;
 mod store;
 
 pub use dynamic_dns::{DynamicDNSAddressSource, DynamicDNSConfig};
 pub use engine::{Engine, PERMISSIONS, Reply, TimezoneCheck, Transaction, validate_offline_state};
+pub use mdns::{MDNSConfig, MDNSInterfaceMode, MDNSPublishing, MDNSReflection, valid_mdns_name};
 pub use model::*;
 pub use simulator::Simulator;
 
@@ -27,6 +29,16 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    fn mdns_status(&mut self, config: &Config) -> Result<Value> {
+        let runtime = self.runtime(config)?;
+        let rows = runtime["appliance_services"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("backend returned invalid service statuses"))?;
+        Ok(
+            serde_json::json!({"instances":rows.iter().filter(|row|row["name"]=="mdns").collect::<Vec<_>>(),
+            "error":runtime.get("error").cloned().unwrap_or_else(||serde_json::json!(""))}),
+        )
+    }
     fn scope(&self) -> Result<String>;
     fn initial_configuration(&mut self) -> Result<Config> {
         Ok(Config::empty())

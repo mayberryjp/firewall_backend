@@ -58,7 +58,7 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
     let identity = directory.path().join("identity.json");
     let key = directory.path().join("host.ssh-key");
     let mut public_identity = None;
-    for _ in 0..2 {
+    for explicit_listener in [false, true] {
         let http = available();
         let ssh = loop {
             let address = available();
@@ -66,16 +66,24 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
                 break address;
             }
         };
+        let mut command = Command::new(env!("CARGO_BIN_EXE_netcontrold"));
+        command
+            .env("NETCONTROL_ALLOW_HOST_SERVICES", "true")
+            .env("NETCONTROL_GATEWAY_MONITORING", "true")
+            .env(
+                "NETCONTROL_SSH_LISTEN",
+                if explicit_listener {
+                    "invalid-listener".to_string()
+                } else {
+                    ssh.to_string()
+                },
+            )
+            .args(["--listen", &http.to_string()]);
+        if explicit_listener {
+            command.args(["--ssh-listen", &ssh.to_string()]);
+        }
         let mut child = Daemon(
-            Command::new(env!("CARGO_BIN_EXE_netcontrold"))
-                .env("NETCONTROL_ALLOW_HOST_SERVICES", "true")
-                .env("NETCONTROL_GATEWAY_MONITORING", "true")
-                .args([
-                    "--listen",
-                    &http.to_string(),
-                    "--ssh-listen",
-                    &ssh.to_string(),
-                ])
+            command
                 .arg("--state")
                 .arg(&state)
                 .arg("--credential-db")

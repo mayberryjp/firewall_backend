@@ -65,6 +65,21 @@
 
 ### Changed
 
+- Ubuntu `install.sh` and full `upgrade.sh` now enable the existing in-process
+  configuration SSH listener by default on `0.0.0.0:2222` through
+  `NETCONTROL_SSH_LISTEN`. Explicit `--ssh-listen` wins; operator environment
+  files/drop-ins can override or disable the default. Build-only and bare
+  daemon defaults are unchanged. No separate sshd, OS shell, credential change
+  or automatic firewall exception. Review saved host-input policy before
+  upgrading. Recommended bump: minor; baseline unknown, Unreleased.
+  [Operator-help handoff 2026-10-25-16](docs/frontend-handoffs/2026-10-25.md#2026-10-25-16-default-embedded-ssh-for-ubuntu-deployment).
+
+- Documentation only: added the [native mDNS / DNS-SD build specification](docs/MDNS_SPEC.md)
+  for an in-process Rust pfSense-Avahi-like discovery service, including reflection,
+  filters, optional publishing, protocol/lifecycle gates and frontend/deployment
+  coordination. The original proposal alone had no runtime/API effect and
+  recommended no bump; it is now superseded by the implementation entry below.
+
 - Native syslog now requires systemd/journald forwarding through the inherited
   `netcontrol-syslog` datagram socket at `/run/systemd/journal/syslog`. Journald
   retains `/dev/log` and kernel/daemon capture; direct `/dev/log`, `/dev/kmsg` and
@@ -106,6 +121,29 @@
   [handoff 2026-10-24-19](docs/frontend-handoffs/2026-10-24.md#2026-10-24-19-unknown-configuration-fields-are-dropped-and-reported).
 
 ### Added
+
+- Native in-process Rust mDNS/DNS-SD reflection, service/provider/subtype
+  filtering, optional appliance publishing, allow/deny managed-LAN selection
+  and IPv4/IPv6 controls through new always-serialized `config.mdns` (disabled
+  by default). Adds `mdns.write`, committed config/status/repair endpoints and
+  CLI commands, with existing confirmation/rollback/recovery and all-service
+  repair authorization. No Avahi/Go process, D-Bus, general multicast/SSDP/media
+  forwarding, automatic firewall exception or SSH/SFTP advertisement.
+  Exact-string counters and bounded parsing/rate/memory behavior report
+  discovery loss explicitly. Route-netlink gates I/O and latches required-link
+  replacement or notification-loss errors until repair. Common RR types only;
+  real VLAN/nftables/MLD, device interoperability, load and reboot qualification limits
+  are documented in the [implementation spec](docs/MDNS_SPEC.md).
+  Recommended bump: minor; baseline unknown, Unreleased.
+  [Required frontend handoff 2026-10-25-17](docs/frontend-handoffs/2026-10-25.md#2026-10-25-17-native-mdns-implementation).
+
+- `GET /api/v1/revisions/latest` returns the latest committed revision metadata
+  and complete `config` in one request with `state.read`, without requiring
+  healthy live observation. Includes revision 0; excludes unconfirmed candidates.
+  Query parameters return `400`. Existing numbered revision responses are
+  unchanged. Recommended bump: minor (additive endpoint); baseline unknown.
+  Optional frontend download integration:
+  [handoff 2026-10-25-14](docs/frontend-handoffs/2026-10-25.md#2026-10-25-14-single-request-committed-configuration-download).
 
 - `system.domain`: a cosmetic domain name beside `hostname` and `timezone` (CLI `domain NAME` /
   `no domain`). It is stored and returned only; it is never applied to the host or resolver and
