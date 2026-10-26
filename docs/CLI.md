@@ -164,7 +164,9 @@ confirmation. It affects loopback/unmanaged interfaces in the managed namespace,
 not only addresses configured through the CLI. See the
 [global IPv6 contract](../FRONTEND_SPEC.md#global-ipv6-policy).
 
-`hostname NAME` and `timezone ZONE` stage `system.hostname` and `system.timezone`;
+`hostname NAME`, `domain NAME` and `timezone ZONE` stage `system.hostname`,
+`system.domain` and `system.timezone`; the domain is a cosmetic label that is never
+applied to the host or used as a search domain;
 the `no` forms stage the empty (unmanaged) value, which stops management without
 restoring the previous value. They require `system.write` when applied. `commit
 check` validates only the syntax (lowercase RFC 1123 label; IANA zone shape); a

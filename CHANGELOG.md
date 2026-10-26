@@ -107,6 +107,13 @@
 
 ### Added
 
+- `system.domain`: a cosmetic domain name beside `hostname` and `timezone` (CLI `domain NAME` /
+  `no domain`). It is stored and returned only; it is never applied to the host or resolver and
+  never becomes a DNS search domain, and it needs no host support or timezone database. Lowercase
+  DNS name, at most 253 characters (with the host name); empty by default. Recommended bump:
+  minor; baseline unknown. Optional frontend work; see
+  [handoff 2026-10-25-13](docs/frontend-handoffs/2026-10-25.md#2026-10-25-13-cosmetic-system-domain).
+
 - `dns[interface].override_dhcp_dns` (boolean, default **true**): when true and the
   interface has at least one configured DNS server, DNS servers learned from its DHCP lease
   are discarded and only the configured servers are published to systemd-resolved. False

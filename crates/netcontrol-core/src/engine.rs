@@ -850,7 +850,9 @@ impl Engine {
         }
         let system = &r.config.system;
         // Only changed host settings are checked, so unrelated edits survive a missing zone database.
-        if *system != self.state.desired.system
+        // The cosmetic domain is stored only and needs no host support.
+        let desired = &self.state.desired.system;
+        if (system.hostname != desired.hostname || system.timezone != desired.timezone)
             && (!system.hostname.is_empty() || !system.timezone.is_empty())
         {
             let Some(check) = &self.timezone_check else {

@@ -1549,6 +1549,16 @@ fn host_system_settings_need_backend_support_and_only_changed_values_are_checked
     assert_eq!(pending.status, 202, "{}", pending.body);
     let id = pending.body["id"].as_str().unwrap().to_owned();
     assert_eq!(confirm(&mut engine, &id).status, 200);
+    // The cosmetic domain needs no host support, even beside managed host settings.
+    candidate.system.domain = "home.example.test".into();
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    let id = pending.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(confirm(&mut engine, &id).status, 200);
+    assert_eq!(
+        engine.saved_configuration().system.domain,
+        "home.example.test"
+    );
     candidate.system = SystemConfig::default();
     assert_eq!(submit(&mut engine, candidate).status, 202);
 }
@@ -1569,6 +1579,10 @@ fn all_domain_permissions_are_independently_required() {
         ("mqtt.write", json!({"mqtt":{"interval_seconds":120}})),
         ("system.write", json!({"system":{"hostname":"fw-1"}})),
         ("system.write", json!({"system":{"timezone":"UTC"}})),
+        (
+            "system.write",
+            json!({"system":{"domain":"home.example.test"}}),
+        ),
         (
             "firewall.write",
             json!({"firewall":{"allow_all_icmp":false}}),

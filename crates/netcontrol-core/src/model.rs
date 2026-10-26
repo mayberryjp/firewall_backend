@@ -97,6 +97,8 @@ impl BlackholeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SystemConfig {
     pub hostname: String,
+    /// Cosmetic label only: never applied to the host, resolver or search domains.
+    pub domain: String,
     pub timezone: String,
 }
 
@@ -105,6 +107,16 @@ impl SystemConfig {
         ensure!(
             self.hostname.is_empty() || valid_hostname(&self.hostname),
             "hostname must be empty (unmanaged) or a lowercase RFC 1123 label of 1..63 letters, digits and hyphens that neither starts nor ends with a hyphen"
+        );
+        ensure!(
+            self.domain.is_empty() || valid_domain_name(&self.domain),
+            "domain must be empty or a lowercase DNS name of dot-separated labels (letters, digits, hyphens) without a trailing dot, at most 253 characters"
+        );
+        ensure!(
+            self.hostname.is_empty()
+                || self.domain.is_empty()
+                || self.hostname.len() + 1 + self.domain.len() <= 253,
+            "hostname and domain together must not exceed 253 characters"
         );
         ensure!(
             self.timezone.is_empty() || valid_timezone_name(&self.timezone),
@@ -121,6 +133,15 @@ pub fn valid_hostname(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Dot-separated lowercase hostname labels; a bare IP address is not a domain.
+pub fn valid_domain_name(name: &str) -> bool {
+    name.len() <= 253
+        && !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        && name.split('.').all(valid_hostname)
 }
 
 /// Shape only: whether the zone exists on the host is checked by the host system manager.

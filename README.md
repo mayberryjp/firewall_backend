@@ -248,8 +248,9 @@ See the [exact contract](FRONTEND_SPEC.md#614-home-assistant-mqtt-streaming).
 
 ## Host name and time zone
 
-`config.system` holds an optional `hostname` and an optional IANA `timezone`; empty
-means unmanaged (the default). Changes use the ordinary confirmed transaction flow
+`config.system` holds an optional `hostname`, an optional IANA `timezone` and a cosmetic
+`domain`; empty means unmanaged (the default). The `domain` is only stored and shown by
+clients: it is never applied to the host and never becomes a DNS search domain. Changes use the ordinary confirmed transaction flow
 with `transactions.write` plus `system.write`, but the daemon applies them itself
 after confirmation, like MQTT: the network is not touched and a rolled-back
 transaction never changes the host. Linux host mode sets the kernel hostname and
@@ -262,7 +263,7 @@ zone until restarted. The simulator and namespace lab perform no host changes.
 
 `GET /api/v1/system/status` and `GET /api/v1/system/timezones` (`state.read`) report
 the confirmed values, what the host reports and the valid zone names. CLI:
-`hostname NAME`, `timezone ZONE`, `no hostname`, `no timezone`. DNS resolvers are not
+`hostname NAME`, `domain NAME`, `timezone ZONE`, `no hostname`, `no domain`, `no timezone`. DNS resolvers are not
 part of this section: use the per-interface `dns` settings. See the
 [exact contract](FRONTEND_SPEC.md#616-host-name-and-time-zone).
 

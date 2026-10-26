@@ -1746,36 +1746,42 @@ Deployment/operator requirements:
 
 ### 6.1.6 Host name and time zone
 
-`config.system` manages two appliance host settings. It is part of the shared
+`config.system` manages two appliance host settings (host name and time zone) and
+stores one cosmetic label (domain). It is part of the shared
 configuration draft and is always present in `GET /api/v1/state`, transactions and
 revisions:
 
 ```ts
 interface SystemConfig {
   hostname: string; // "" = unmanaged, else a lowercase RFC 1123 label
+  domain: string;   // "" = none, else a lowercase DNS name; cosmetic, never applied
   timezone: string; // "" = unmanaged, else an IANA zone name
 }
 ```
 
 ```json
-{"system":{"hostname":"fw-1","timezone":"America/New_York"}}
+{"system":{"hostname":"fw-1","domain":"home.example.test","timezone":"America/New_York"}}
 ```
 
-There is no `metadata` on this object. Send the whole object (both fields) like
-every other section; an omitted `system` means both unmanaged.
+There is no `metadata` on this object. Send the whole object (all three fields) like
+every other section; an omitted `system` means everything is empty.
 
 Validation (`422` on submit; the SSH `commit check` only validates syntax):
 
 - `hostname`: empty, or 1..63 characters of `a-z`, `0-9` and `-`, not starting or
-  ending with `-`. Uppercase, dots, underscores and spaces are rejected; there is
-  no FQDN or domain setting.
+  ending with `-`. Uppercase, dots, underscores and spaces are rejected; the domain
+  is a separate field.
+- `domain`: empty, or a lowercase DNS name of dot-separated labels (each 1..63 of
+  `a-z`, `0-9`, `-`, not starting or ending with `-`), at most 253 characters, no
+  trailing dot, and not a bare IP address or all digits. `hostname` plus `.` plus
+  `domain` must not exceed 253 characters. A single label such as `lan` is valid.
 - `timezone`: empty, or at most 64 characters in at most three `/`-separated parts of
   letters, digits, `_`, `+` and `-` (`UTC`, `America/New_York`, `Etc/GMT+5`). Dots,
   `..`, empty parts and spaces are rejected.
 - When the **timezone value changes**, it must also exist in the host's timezone
   database (`422`, "timezone is not available on this host"). Unchanged values are
   not rechecked, so unrelated edits still work if the database later disappears.
-- Non-empty values are rejected (`422`, "host system settings are unavailable for this
+- Non-empty `hostname` or `timezone` values are rejected (`422`, "host system settings are unavailable for this
   backend") when the daemon cannot manage the host, such as a namespace lab.
   The simulator accepts any well-formed zone.
 
@@ -1794,6 +1800,11 @@ it and leaves the host as it is**; it does not restore the previous name or zone
 
 Host effects:
 
+- `domain`: **cosmetic only.** It is stored and returned with the configuration so the UI
+  can show a full name (`hostname.domain`), but the daemon never applies it: no host
+  file, kernel domain name, resolver or DNS search domain is changed. It needs no host
+  support, is accepted on any backend, and a change to it needs only `system.write`.
+  Search domains remain `dns[interface].domains` and `dhcp_clients[].use_domains`.
 - `hostname`: the kernel hostname and `/etc/hostname`. The daemon's syslog
   forwarding picks the new name up within a second. `/etc/hosts` is not edited, and
   the per-interface DHCP-client `hostname` is a separate setting.

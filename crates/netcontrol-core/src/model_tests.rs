@@ -105,10 +105,11 @@ fn system_settings_default_unmanaged_validate_and_stay_out_of_native_configurati
     assert_eq!(before.system, SystemConfig::default());
     assert_eq!(
         serde_json::to_value(&before).unwrap()["system"],
-        json!({"hostname":"","timezone":""})
+        json!({"hostname":"","domain":"","timezone":""})
     );
     let mut after = before.clone();
     after.system.hostname = "fw-1".into();
+    after.system.domain = "home.example.test".into();
     after.system.timezone = "America/Argentina/Buenos_Aires".into();
     after.validate().unwrap();
     assert!(after.operational_value().unwrap().get("system").is_none());
@@ -164,7 +165,7 @@ fn system_settings_default_unmanaged_validate_and_stay_out_of_native_configurati
         assert!(invalid.validate().is_err(), "{zone:?}");
     }
     let mut unknown = serde_json::to_value(&after).unwrap();
-    unknown["system"]["domain"] = json!("example.test");
+    unknown["system"]["location"] = json!("rack 4");
     assert!(serde_json::from_value::<Config>(unknown).is_err());
 }
 
@@ -193,6 +194,55 @@ fn dns_override_of_dhcp_servers_defaults_on_and_round_trips() {
     for invalid in [json!(null), json!("no"), json!(0)] {
         assert!(serde_json::from_value::<DNSConfig>(json!({"override_dhcp_dns":invalid})).is_err());
     }
+}
+
+#[test]
+fn system_domain_is_a_cosmetic_dns_name_that_never_reaches_the_host_configuration() {
+    let mut config = candidate();
+    let long_label = "a".repeat(63);
+    let long_domain = format!("{long_label}.{long_label}.{long_label}");
+    for domain in [
+        "lan",
+        "home.arpa",
+        "corp.example.test",
+        "a-b.c1",
+        long_domain.as_str(),
+    ] {
+        config.system.domain = domain.into();
+        config.validate().unwrap();
+        assert!(valid_domain_name(domain), "{domain}");
+    }
+    let too_long = format!("{long_domain}.{long_label}");
+    for domain in [
+        "Example.com",
+        "example.com.",
+        ".example.com",
+        "a..b",
+        "-a.com",
+        "a_b.com",
+        "192.0.2.1",
+        "12345",
+        "exa mple.com",
+        too_long.as_str(),
+    ] {
+        config.system.domain = domain.into();
+        assert!(config.validate().is_err(), "{domain:?}");
+    }
+    // The combined name must stay within the DNS limit.
+    config.system.hostname = "h".repeat(63);
+    config.system.domain = format!("{long_label}.{long_label}.{long_label}.b");
+    assert!(config.validate().is_err());
+    config.system.domain = "example.test".into();
+    config.validate().unwrap();
+    // Stored in the configuration, but invisible to networking, DNS and search domains.
+    let operational = config.operational_value().unwrap();
+    assert!(operational.get("system").is_none());
+    assert!(
+        !serde_json::to_string(&operational)
+            .unwrap()
+            .contains("example.test")
+    );
+    assert!(config.dns.is_empty());
 }
 
 #[test]

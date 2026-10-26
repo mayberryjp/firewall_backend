@@ -195,25 +195,29 @@ fn hostname_and_timezone_are_staged_checked_committed_and_cleared() {
     f.ok(&mut cli, "commit check");
     f.fail(&mut cli, "commit confirmed 30 Unknown zone", "timezone");
     f.ok(&mut cli, "timezone UTC");
+    f.ok(&mut cli, "domain Home.Example");
+    f.fail(&mut cli, "commit check", "domain");
+    f.ok(&mut cli, "domain home.example.test");
     f.ok(&mut cli, "commit check");
     assert_eq!(
         f.request("/api/v1/state")["desired"]["system"],
-        json!({"hostname":"","timezone":""})
+        json!({"hostname":"","domain":"","timezone":""})
     );
     f.ok(&mut cli, "commit confirmed 30 Name the appliance");
     f.ok(&mut cli, "confirm");
     assert_eq!(
         f.request("/api/v1/state")["desired"]["system"],
-        json!({"hostname":"fw-1","timezone":"UTC"})
+        json!({"hostname":"fw-1","domain":"home.example.test","timezone":"UTC"})
     );
     f.ok(&mut cli, "configure terminal");
     f.ok(&mut cli, "no hostname");
+    f.ok(&mut cli, "no domain");
     f.ok(&mut cli, "no timezone");
     f.ok(&mut cli, "commit confirmed 30 Release host settings");
     f.ok(&mut cli, "confirm");
     assert_eq!(
         f.request("/api/v1/state")["desired"]["system"],
-        json!({"hostname":"","timezone":""})
+        json!({"hostname":"","domain":"","timezone":""})
     );
 }
 

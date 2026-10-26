@@ -29,6 +29,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
 Configuration commands:
   ipv6 enable|disable                 Global IPv6 policy (default enabled)
   hostname NAME / no hostname         Managed host name; no hostname leaves it unmanaged
+  domain NAME / no domain             Cosmetic domain label; never applied to the host or resolver
   timezone ZONE / no timezone         Managed IANA time zone, e.g. UTC or America/New_York
   interface NAME [ethernet|dummy|vlan|wireguard] / no interface NAME
   ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
@@ -806,8 +807,12 @@ fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
         ["ipv6", value @ ("enable" | "disable")] => {
             config["ipv6_enabled"] = json!(*value == "enable");
         }
-        [field @ ("hostname" | "timezone"), value] => config["system"][*field] = json!(value),
-        ["no", field @ ("hostname" | "timezone")] => config["system"][*field] = json!(""),
+        [field @ ("hostname" | "domain" | "timezone"), value] => {
+            config["system"][*field] = json!(value)
+        }
+        ["no", field @ ("hostname" | "domain" | "timezone")] => {
+            config["system"][*field] = json!("")
+        }
         ["no", "interface", name] => {
             remove_where(array(config, "interfaces")?, |v| v["name"] == *name)?
         }

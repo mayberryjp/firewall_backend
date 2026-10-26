@@ -371,6 +371,7 @@ impl Manager {
                     .as_str()
                     .unwrap_or_default()
                     .into(),
+                ..Default::default()
             })
             .unwrap_or_default()
     }
@@ -582,6 +583,7 @@ mod tests {
         SystemConfig {
             hostname: hostname.into(),
             timezone: timezone.into(),
+            ..Default::default()
         }
     }
 
