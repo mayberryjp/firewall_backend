@@ -148,6 +148,17 @@ for logging_setup in success repeat symlink_file symlink_directory publish_failu
             ln -s ../original "$logging_root/systemd/journald.conf.d" ;;
     esac
     if (
+        # Ownership options need root; CI runs these tests unprivileged.
+        install() {
+            local -a arguments=()
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    -o|-g) shift 2 ;;
+                    *) arguments+=("$1"); shift ;;
+                esac
+            done
+            command install "${arguments[@]}"
+        }
         mv() { [[ $logging_setup != publish_failure ]] && command mv "$@"; }
         configure_logging_units "$logging_root" || exit 1
         if [[ $logging_setup == repeat ]]; then configure_logging_units "$logging_root" || exit 1; fi
