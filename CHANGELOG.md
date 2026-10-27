@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- Stabilized the privileged mDNS interface-recycling CI fixture by disabling
+  automatic IPv6 address generation through netlink before bringing test links
+  up and restoring an explicit IPv6 address after the link-flap fixture. Explicit
+  fixture addresses and strict identity/recovery assertions remain; production
+  behavior is unchanged. No API or frontend change. Recommended bump: none
+  (test-only fix for unreleased code).
+
 - Native service failures no longer become global configuration-health gates.
   Owned Rust supervisors retry startup/runtime failures, unexpected exits and
   unwind panics with cancellable 1..30-second exponential backoff. Verification

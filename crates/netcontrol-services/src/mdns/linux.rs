@@ -1929,6 +1929,13 @@ mod tests {
         .map_err(|_| anyhow::anyhow!("mDNS client namespace thread panicked"))?
     }
     fn configure_link(name: &str, n: u8, last: u8) -> Result<()> {
+        let mut body = vec![0u8; 16];
+        body[4..8].copy_from_slice(&socket::ifindex(name)?.to_ne_bytes());
+        body.extend(attribute(
+            26,
+            &attribute(libc::AF_INET6 as u16, &attribute(8, &[1])),
+        ));
+        netlink(16, &body)?;
         let fd = socket::socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
         let mut request: libc::ifreq = unsafe { mem::zeroed() };
         for (out, b) in request.ifr_name.iter_mut().zip(name.bytes()) {
@@ -2859,6 +2866,10 @@ mod tests {
             socket::check(unsafe {
                 libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request)
             })?;
+            let mut body = vec![libc::AF_INET6 as u8, 64, libc::IFA_F_NODAD as u8, 0];
+            body.extend_from_slice(&socket::ifindex("lan1")?.to_ne_bytes());
+            body.extend(attribute(1, &"fd00:1::1".parse::<Ipv6Addr>()?.octets()));
+            netlink(20, &body)?;
             let until = Instant::now() + Duration::from_secs(5);
             loop {
                 let status = services.status();
