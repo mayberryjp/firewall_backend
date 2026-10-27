@@ -52,6 +52,56 @@ fn connect(child: &mut Daemon, address: SocketAddr) -> TcpStream {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn actual_daemon_notifies_readiness_progress_and_stopping() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notify.sock");
+    let receiver = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let http = available();
+    let mut child = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+            .env("NOTIFY_SOCKET", &path)
+            .env("WATCHDOG_USEC", "1000000")
+            .env_remove("WATCHDOG_PID")
+            .env_remove("NETCONTROL_SSH_LISTEN")
+            .args(["--listen", &http.to_string()])
+            .arg("--state")
+            .arg(directory.path().join("state.json"))
+            .arg("--credential-db")
+            .arg(directory.path().join("identity.json"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut buffer = [0; 256];
+    let count = receiver.recv(&mut buffer).unwrap();
+    assert!(buffer[..count].starts_with(b"READY=1\n"));
+    let _stream = connect(&mut child, http);
+    let count = receiver.recv(&mut buffer).unwrap();
+    assert_eq!(&buffer[..count], b"WATCHDOG=1");
+    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+    loop {
+        let count = receiver.recv(&mut buffer).unwrap();
+        if &buffer[..count] == b"STOPPING=1" {
+            break;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon did not stop");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("state.json");

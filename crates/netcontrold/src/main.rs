@@ -402,12 +402,29 @@ async fn run(options: Options) -> Result<()> {
         )
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let watchdog = Arc::new(netcontrold::watchdog::Watchdog::from_environment()?);
+    let readiness_watchdog = watchdog.clone();
+    let readiness_handle = handle.clone();
+    let readiness = tokio::spawn(async move {
+        if readiness_handle.listening().await.is_some() {
+            if let Err(error) = readiness_watchdog.ready() {
+                tracing::warn!(%error, "systemd readiness notification failed");
+            }
+        }
+    });
     let tick_engine = engine.clone();
     let tick_app = app.clone();
     let tick_handle = handle.clone();
     let tick_ssh_stop = ssh_stop_tx.clone();
+    let tick_watchdog = watchdog.clone();
+    let task_handles = [
+        ("mqtt", mqtt_task.abort_handle()),
+        ("dynamic_dns", dynamic_dns_task.abort_handle()),
+        ("system", system_task.abort_handle()),
+    ];
     let ticker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
+        let mut next_health = std::time::Instant::now();
         loop {
             tokio::select! {
                 changed = stop_rx.changed() => {
@@ -416,15 +433,28 @@ async fn run(options: Options) -> Result<()> {
                 _ = interval.tick() => {
                     let engine = tick_engine.clone();
                     let app = tick_app.clone();
+                    let refresh_health = std::time::Instant::now() >= next_health;
+                    if refresh_health {
+                        next_health = std::time::Instant::now() + Duration::from_secs(2);
+                    }
+                    let watchdog_enabled = tick_watchdog.enabled();
+                    let tasks: Vec<_> = task_handles.iter().map(|(name, handle)| (*name, handle.is_finished())).collect();
                     let result = tokio::task::spawn_blocking(move || {
                         app.refresh_upgrade_gate()?;
-                        engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.tick()
+                        engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.tick()?;
+                        if refresh_health {
+                            app.refresh_health(watchdog_enabled, &tasks);
+                        }
+                        Ok::<(), anyhow::Error>(())
                     }).await
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("deadline worker failed")));
                     if let Err(error) = result {
                         let _ = tick_ssh_stop.send(true);
                         tick_handle.graceful_shutdown(Some(Duration::from_secs(10)));
                         return Err(error.context("background transaction deadline tick failed"));
+                    }
+                    if let Err(error) = tick_watchdog.heartbeat() {
+                        tracing::warn!(%error, "systemd watchdog notification failed");
                     }
                 }
             }
@@ -469,6 +499,10 @@ async fn run(options: Options) -> Result<()> {
     } else {
         served.await
     };
+    readiness.abort();
+    if let Err(error) = watchdog.stopping() {
+        tracing::warn!(%error, "systemd stopping notification failed");
+    }
     let stopping = *ssh_stop_tx.borrow();
     let _ = ssh_stop_tx.send(true);
     let ssh_result = if let Some(result) = ssh_finished {

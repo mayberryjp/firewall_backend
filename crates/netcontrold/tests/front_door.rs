@@ -97,6 +97,97 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn platform_status_is_authenticated_nonblocking_and_included_with_configuration() {
+    use netcontrold::http::Credential;
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(
+            &directory.path().join("state.json"),
+            Box::new(Simulator::new()),
+        )
+        .unwrap(),
+    ));
+    let app = App::new(
+        engine.clone(),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+            Credential {
+                name: "writer".into(),
+                token_sha256: netcontrold::identity::digest("writer"),
+                permissions: vec!["transactions.write".into()],
+            },
+        ]),
+        false,
+    );
+    app.health.observe(
+        Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})),
+        &[],
+        false,
+    );
+    let snapshot = app.health.snapshot();
+    let service = router(app);
+    for (method, path, body, token, expected) in [
+        ("GET", "/api/v1/platform/status", "", "bad", 401),
+        ("GET", "/api/v1/platform/status", "", "writer", 403),
+        ("POST", "/api/v1/platform/status", "", "reader", 405),
+        ("GET", "/api/v1/platform/status?extra=1", "", "reader", 400),
+        ("GET", "/api/v1/platform/status", "{}", "reader", 400),
+        ("GET", "/api/v1/platform/status", "", "reader", 200),
+        ("GET", "/api/v1/state", "", "reader", 200),
+        ("GET", "/api/v1/runtime", "", "reader", 200),
+    ] {
+        let response = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected, "{method} {path}");
+        if expected == 200 {
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let value: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(value["process_health"], snapshot["process_health"]);
+            assert_eq!(value["active_alerts"], snapshot["active_alerts"]);
+            if path == "/api/v1/state" {
+                assert!(value["desired"].get("active_alerts").is_none());
+                assert_eq!(value["revision"], 0);
+            }
+        }
+    }
+    let (held_sender, held_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = engine.lock().unwrap();
+        held_sender.send(()).unwrap();
+        release_receiver.recv().unwrap();
+    });
+    held_receiver.recv().unwrap();
+    let request = service.oneshot(
+        Request::builder()
+            .uri("/api/v1/platform/status")
+            .header("authorization", "Bearer reader")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), request).await;
+    release_sender.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(response.unwrap().unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn mdns_http_contract_authentication_permissions_queries_and_repair() {
     use netcontrold::http::Credential;
     let directory = tempfile::tempdir().unwrap();

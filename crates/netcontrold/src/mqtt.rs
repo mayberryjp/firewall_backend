@@ -159,6 +159,7 @@ pub enum Mode {
 }
 
 pub struct Manager {
+    pub(crate) health: Arc<crate::health::Monitor>,
     secrets: Mutex<Secrets>,
     status: Mutex<Value>,
     engine: Arc<Mutex<Engine>>,
@@ -184,6 +185,7 @@ impl Manager {
             });
         let device_id = secrets.device_id.clone();
         Ok(Arc::new(Self {
+            health: Arc::new(crate::health::Monitor::default()),
             secrets: Mutex::new(secrets),
             status: Mutex::new(
                 json!({"device_id":device_id,"enabled":false,"state":"disabled","error":null,"last_published_at_unix":null}),
@@ -305,7 +307,7 @@ impl Manager {
     }
 
     fn collect(&self, config: &MQTTConfig) -> Result<(Value, Value, Vec<&'static str>)> {
-        let (revision, statistics) = {
+        let (revision, statistics, statistics_available) = {
             let mut engine = self
                 .engine
                 .lock()
@@ -320,8 +322,16 @@ impl Manager {
                 &["state.read".into()],
                 &[],
             );
-            ensure!(reply.status == 200, "statistics unavailable");
-            (revision, reply.body)
+            let available = reply.status == 200;
+            (
+                revision,
+                if available {
+                    reply.body
+                } else {
+                    json!({"interfaces":[],"gateways":[]})
+                },
+                available,
+            )
         };
         // Host health is optional: a failed read leaves its sensors unknown instead of dropping the sample.
         let snapshot = {
@@ -346,6 +356,9 @@ impl Manager {
                 .map_err(|_| anyhow::anyhow!("CPU baseline unavailable"))?;
             crate::mqtt_host::sensors(snapshot.as_ref(), &mut baseline)
         };
+        if !statistics_available {
+            host.retained.extend(["interface", "gateway"]);
+        }
         // Flow sensors exist only while an instance is configured; a failed read keeps them unknown.
         let flow = {
             let mut engine = self
@@ -371,7 +384,7 @@ impl Manager {
             host.sensors.extend(flow.sensors);
             host.retained.extend(flow.retained);
         }
-        let (discovery, state) = telemetry(
+        let (mut discovery, mut state) = telemetry(
             &self.device_id,
             config,
             revision,
@@ -379,6 +392,31 @@ impl Manager {
             &statistics,
             &host,
         )?;
+        let health = self.health.snapshot();
+        state["process_health"] = health["process_health"].clone();
+        state["active_alerts"] = health["active_alerts"].clone();
+        state["statistics_available"] = json!(statistics_available);
+        for (key, name, value) in [
+            (
+                "process_health",
+                "Process health",
+                health["process_health"]["status"].clone(),
+            ),
+            (
+                "active_alert_count",
+                "Active alert count",
+                json!(health["active_alerts"].as_array().map_or(0, Vec::len)),
+            ),
+        ] {
+            state["metrics"][key] = value;
+            discovery["components"][key] = json!({"platform":"sensor","name":name,"unique_id":format!("netcontrol_{}_{key}", self.device_id),
+                "value_template":format!("{{{{ value_json.metrics.get('{key}', 'unknown') }}}}"),"expire_after":config.interval_seconds * 3});
+        }
+        ensure!(
+            serde_json::to_vec(&state)?.len() <= 1 << 20
+                && serde_json::to_vec(&discovery)?.len() <= 1 << 20,
+            "MQTT payload limit exceeded"
+        );
         Ok((discovery, state, host.retained))
     }
 
@@ -760,6 +798,86 @@ mod tests {
         let status = response.status().as_u16();
         let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mqtt_still_publishes_health_when_network_statistics_fail() {
+        use netcontrol_core::{Backend, Config, Simulator};
+        struct MissingStatistics(Simulator);
+        impl Backend for MissingStatistics {
+            fn scope(&self) -> Result<String> {
+                self.0.scope()
+            }
+            fn observe(&mut self, config: &Config) -> Result<Config> {
+                self.0.observe(config)
+            }
+            fn apply(&mut self, before: &Config, after: &Config) -> Result<()> {
+                self.0.apply(before, after)
+            }
+            fn runtime(&mut self, config: &Config) -> Result<Value> {
+                self.0.runtime(config)
+            }
+            fn statistics(&mut self, _: &Config, _: &str, _: &str) -> Result<Value> {
+                anyhow::bail!("synthetic statistics failure")
+            }
+            fn repair(&mut self, config: &Config) -> Result<Value> {
+                self.0.repair(config)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(MissingStatistics(Simulator::new())),
+            )
+            .unwrap(),
+        ));
+        let manager =
+            Manager::open(&directory.path().join("mqtt"), engine, Mode::Simulated).unwrap();
+        manager.health.observe(None, &[], false);
+        let (_, state, retained) = manager.collect(&MQTTConfig::default()).unwrap();
+        assert_eq!(state["statistics_available"], false);
+        assert_eq!(state["process_health"]["status"], "unknown");
+        assert_eq!(state["active_alerts"][0]["code"], "runtime_unavailable");
+        assert!(retained.contains(&"interface") && retained.contains(&"gateway"));
+    }
+
+    #[tokio::test]
+    async fn mqtt_health_payload_matches_shared_snapshot_and_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(netcontrol_core::Simulator::new()),
+            )
+            .unwrap(),
+        ));
+        let manager =
+            Manager::open(&directory.path().join("mqtt"), engine, Mode::Simulated).unwrap();
+        manager.health.observe(
+            Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})),
+            &[],
+            false,
+        );
+        let (discovery, state, _) = manager.collect(&MQTTConfig::default()).unwrap();
+        assert_eq!(
+            state["process_health"],
+            manager.health.snapshot()["process_health"]
+        );
+        assert_eq!(
+            state["active_alerts"],
+            manager.health.snapshot()["active_alerts"]
+        );
+        assert_eq!(state["metrics"]["process_health"], "unhealthy");
+        assert_eq!(state["metrics"]["active_alert_count"], 1);
+        assert_eq!(
+            discovery["components"]["process_health"]["platform"],
+            "sensor"
+        );
+        assert_eq!(
+            discovery["components"]["active_alert_count"]["platform"],
+            "sensor"
+        );
     }
 
     #[tokio::test]
@@ -1147,6 +1265,7 @@ mod tests {
                 let endpoint = format!("mqtt://{}", listener.local_addr()?);
                 let engine = Arc::new(Mutex::new(Engine::open(&directory.path().join("state.json"), Box::new(Simulator::new()))?));
                 let manager = Manager::open(&directory.path().join("mqtt"), engine.clone(), Mode::Native)?;
+                manager.health.observe(Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})), &[], false);
                 let password_ref = manager.create_password(&mut engine.lock().unwrap(), "synthetic-broker-password")?;
                 let mut config = physical.clone();
                 config.mqtt = MQTTConfig { enabled:true, endpoint, username:"fixture".into(), password_ref, source_interface:"mqtt0".into(), interval_seconds:10 };
@@ -1177,8 +1296,10 @@ mod tests {
                         if topic.ends_with("/state") {
                             let value: Value = serde_json::from_slice(&payload)?;
                             ensure!(value["metrics"]["revision"] == 1, "unconfirmed or wrong revision published");
+                            ensure!(value["process_health"]["status"] == "unhealthy" && value["active_alerts"][0]["retrying"] == true, "health/alerts were not published");
                             ensure!(value["metrics"].get("memory_used_bytes").is_some_and(Value::is_null), "host sensor missing or fabricated by the simulator");
                             connections.push(connection);
+                            manager.health.observe(Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})), &[], false);
                         }
                     }
                     Ok::<(), anyhow::Error>(())

@@ -135,6 +135,17 @@
 
 ### Added
 
+- Shared runtime `process_health` and deduplicated `active_alerts` on HTTP state
+  and runtime reads, plus authenticated engine-independent
+  `GET /api/v1/platform/status`. Health is observational healthy/unhealthy/unknown,
+  not a configuration gate; stale/unavailable monitoring does not claim success
+  or clear known failures. MQTT publishes the same objects and Home Assistant
+  health/alert-count sensors, including partial samples when statistics fail.
+  Packaged systemd service and install/full-upgrade drop-in add readiness and a
+  progress-driven watchdog: restart failed/wedged daemon, not offline services.
+  No persisted config or permission change. Recommended bump: minor; baseline
+  unknown, Unreleased. [Frontend handoff 2026-10-27-02](docs/frontend-handoffs/2026-10-27.md#2026-10-27-02-watchdog-process-health-and-active-alerts).
+
 - Native in-process Rust mDNS/DNS-SD reflection, service/provider/subtype
   filtering, optional appliance publishing, allow/deny managed-LAN selection
   and IPv4/IPv6 controls through new always-serialized `config.mdns` (disabled

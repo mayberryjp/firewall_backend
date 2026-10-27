@@ -646,6 +646,27 @@ at `/etc/systemd/system/netcontrold.service`. It creates root-only directories
 `/var/lib/netcontrol`, `/var/lib/netcontrol/services` and `/etc/netcontrol/keys`.
 The unit runs as root in native host mode, with private file creation (`0077`),
 journald logging, restart on failure and a 60-second shutdown allowance.
+The unit and managed install/full-source-upgrade drop-in use `Type=notify`,
+`NotifyAccess=main`, `WatchdogSec=60s`, `WatchdogSignal=SIGKILL`,
+`TimeoutStartSec=180s`, `Restart=on-failure`, `RestartSec=5s`,
+`StartLimitIntervalSec=0`, and `LimitCORE=0`. Repeated failures keep retrying
+without resetting saved state; invalid configuration/credentials are never
+repaired by deletion. Operator drop-ins can override these settings explicitly.
+The daemon sends READY only after the HTTP listener binds, heartbeats at half
+the systemd-supplied interval after completed engine deadline ticks, and STOPPING
+on listener shutdown. A stalled executor/engine progress path stops heartbeats;
+systemd can kill/restart a wedged daemon. Ordinary worker errors, offline
+upstreams, alerts and unhealthy labels never request a daemon restart.
+The watchdog cannot prove every worker is making progress; task completion and
+service errors are separately observable. Long engine-blocking operations can
+consume the watchdog budget; qualify/tune the timeout for the appliance workload.
+Watchdog termination is abrupt, so normal durable transaction recovery is still
+required on restart. The 60-second shutdown allowance applies to normal stops.
+Manual launches without NOTIFY_SOCKET/WATCHDOG_USEC keep running without a
+systemd watchdog. Non-systemd/OpenRC installs retain their service-manager
+supervision, not this heartbeat feature. A binary-only update does not install
+unit changes; deploy the packaged unit or run the full source upgrade and reload
+systemd. Actual PID-1 hang/restart/reboot acceptance remains a deployment check.
 It does not isolate the network namespace: native operations must reach the
 host networking. The unit selects `--appliance` and the LAN-address management
 listener from `/etc/netcontrol/appliance.env` (default `192.168.0.1:8080`).

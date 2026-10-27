@@ -1518,6 +1518,70 @@ cumulative totals persist; removed interfaces and reset boundaries remain visibl
 No calendar aggregation, Go/vnStat database compatibility, or chart-ready rate
 series is supplied. Do not sum overlapping interfaces or scopes.
 
+### Platform Health And Active Alerts
+
+HTTP `GET /api/v1/state` and `GET /api/v1/runtime` include top-level
+`process_health` and `active_alerts` alongside their existing fields. These are
+ephemeral runtime observations, **not** fields inside `desired`, persisted
+configuration, drafts, revisions or transaction candidates. Do not copy them
+into configuration submissions. They do not create drift or change revisions.
+
+`GET /api/v1/platform/status` returns only `{process_health, active_alerts}` from
+the same cache, independent of the networking engine lock and network
+observation. Use it when configuration observation fails or is busy. Existing
+API-key authentication and `state.read` are required (`401`/`403`); GET only
+(`405`), no query parameters or nonempty body (`400`). Successful reads are
+`200`, no-store, including unhealthy/unknown snapshots. Authentication storage
+failure can still return `503`; no unauthenticated diagnostics are exposed.
+Existing genuine errors from state/runtime reads are not converted into fake
+successful configuration reads. Service reconcile responses need not contain
+the daemon-enriched fields; the GET responses above do.
+
+The monitor samples approximately every two seconds after completed engine
+deadline ticks. `process_health.status` is `healthy`, `unhealthy` or `unknown`;
+`healthy` is respectively `true`, `false` or `null`. Known component states
+`running`/`current` are healthy, `error`/`stopped`/`unavailable`/`reconnecting`
+are unhealthy. Disabled/simulated/waiting/unmanaged components are not failures;
+other unmeasured states make the aggregate unknown. Missing native runtime
+makes the aggregate unknown and preserves previously observed native failures
+until a successful observation can clear them. This is local execution/status
+health, **not** proof of synchronized time, packet forwarding or remote delivery.
+A running NTP worker with unavailable samples is healthy with a warning alert.
+
+`collected_at` is RFC3339 UTC or null before observation. `stale` becomes true
+after 15 seconds without a completed health collection (monotonic timeout);
+aggregate/daemon health becomes unknown, not stale success, and a
+`monitor_stale` alert appears. Initial unsampled health is unknown. Optional
+`runtime_available` says whether the latest native runtime collection succeeded.
+Optional `daemon` reports the real PID, local state/health, sampled uptime in
+seconds and whether systemd watchdog configuration was detected. `components`
+contains stable IDs, component/resource identifiers, actual source state,
+nullable health, retrying flag and last-observed timestamp. Counters/states are
+snapshots; a cached running state is not independent proof of ongoing work.
+
+Covered sources: native appliance workers, relay/export/probe workers, DHCP
+client errors, MQTT, Dynamic DNS, host hostname/timezone status, and completion
+of the three daemon-owned manager tasks. Current errors, unavailable samples,
+unhealthy gateway reports and incomplete capture/warnings become alerts; no
+new CPU/RAM/temperature thresholds or arbitrary health policy are introduced.
+
+Each active alert has stable `id`, `component`, nullable `resource`,
+`severity: warning|error`, machine-readable `code`, sanitized `message`,
+`retrying`, `first_seen_at`, `last_seen_at`. UTC timestamps can be null when
+unavailable. IDs combine source/resource and condition, not error text; repeated
+failures preserve first-seen time. Alerts clear on observed recovery, not on
+failed collection. Known codes are `worker_unavailable`, `service_warning`,
+`runtime_unavailable`, `monitor_stale`, `health_unavailable`; accept future codes.
+Raw backend errors, URLs, credentials and provider responses are not copied
+into alert messages. No alert persistence, history/acknowledgment, notification
+preferences or dismiss action. Restart begins a new observation history.
+
+Render the aggregate and per-component states, freshness and active alert list;
+continue non-overlapping 2..5-second polling. Preserve drafts and configuration
+access: health labels and alerts are **observations only**, never write locks,
+rollback triggers or reasons to stop healthy workers. Existing authorization,
+configuration validation, genuine network drift and durable recovery guards stay.
+
 ### 6.1.4 Home Assistant MQTT Streaming
 
 Provide API-managed settings in the shared configuration draft. This is outbound
@@ -1648,9 +1712,19 @@ Publisher and deployment contract:
   are kept (unknown, expiring). Names are `<name> flow dropped packets` etc. Cap:
   64 instances. `running` is local worker health, not collector delivery; see
   [docs/NETFLOW_IPFIX_SPEC.md](docs/NETFLOW_IPFIX_SPEC.md) section 5.
+- MQTT state payloads additionally carry the exact shared `process_health` object
+  and `active_alerts` array. Home Assistant sensor metrics/discovery add
+  `process_health` (`healthy|unhealthy|unknown`) and numeric `active_alert_count`.
+  Alerts do not change MQTT transport availability: a connected publisher can
+  publish unhealthy or unknown platform state. Broker disconnection still uses
+  the existing offline last will; it cannot deliver alerts while disconnected.
+- `statistics_available: boolean` distinguishes a partial sample when network
+  statistics fail. Health/alerts and other available sensors still publish;
+  existing interface/gateway entities are preserved to expire/appear unknown,
+  not removed or fabricated as zero. A host-sensor failure remains unknown.
 - Samples expire after three publication intervals. Active configuration/maintenance
-  and failed collection pause samples with offline availability; the next successful
-  sample restores availability. No offline backlog or command topics. Limits:
+  and unrecoverable collection failures pause samples with offline availability;
+  the next successful sample restores availability. No offline backlog or command topics. Limits:
   4096 entities and 1 MiB per discovery/state payload; excess fails collection.
 - Back up `<state>.mqtt` with the journal, preserving ownership/owner-only files,
   stable ID, passwords and manifest. Default
@@ -3506,7 +3580,33 @@ interface StateView {
   observed: Config;
   drift: boolean;
   active_transaction?: Transaction;
+  process_health: ProcessHealth;
+  active_alerts: ActiveAlert[];
 }
+
+interface ActiveAlert {
+  id: string;
+  component: string;
+  resource: string | null;
+  severity: "warning" | "error";
+  code: string;
+  message: string;
+  retrying: boolean;
+  first_seen_at: Timestamp | null;
+  last_seen_at: Timestamp | null;
+}
+interface ProcessHealth {
+  status: "healthy" | "unhealthy" | "unknown";
+  healthy: boolean | null;
+  collected_at: Timestamp | null;
+  stale: boolean;
+  runtime_available?: boolean;
+  daemon?: { pid: number; state: "running" | "unknown"; healthy: boolean | null;
+    uptime_seconds: number; watchdog_enabled: boolean };
+  components: { id: string; component: string; resource: string; state: string;
+    healthy: boolean | null; retrying: boolean; collected_at: Timestamp }[];
+}
+interface PlatformStatus { process_health: ProcessHealth; active_alerts: ActiveAlert[] }
 
 interface ParentInterface {
   name: string;
@@ -3541,6 +3641,8 @@ interface SoftflowdStatus {
 }
 
 interface RuntimeState {
+  process_health?: ProcessHealth; // Always present on HTTP GET /runtime; absent from some core action responses.
+  active_alerts?: ActiveAlert[];
   capabilities: {
     gateway_monitor_modes: ("explicit" | "dhcp")[];
     dhcp_gateway_monitor_address_families: "ipv4"[];

@@ -88,6 +88,7 @@ pub enum Authentication {
 }
 pub struct App {
     pub engine: Arc<Mutex<Engine>>,
+    pub health: Arc<crate::health::Monitor>,
     auth: Authentication,
     tls: bool,
     attempts: Mutex<(Instant, usize)>,
@@ -100,6 +101,7 @@ impl App {
     pub fn new(engine: Arc<Mutex<Engine>>, auth: Authentication, tls: bool) -> Arc<Self> {
         Arc::new(Self {
             engine,
+            health: Arc::new(crate::health::Monitor::default()),
             auth,
             tls,
             attempts: Mutex::new((Instant::now(), 0)),
@@ -135,10 +137,44 @@ impl App {
         Ok(())
     }
     pub fn attach_mqtt(app: &mut Arc<Self>, mqtt: Arc<crate::mqtt::Manager>) -> Result<()> {
-        Arc::get_mut(app)
-            .context("application is already shared")?
-            .mqtt = Some(mqtt);
+        let app = Arc::get_mut(app).context("application is already shared")?;
+        app.health = mqtt.health.clone();
+        app.mqtt = Some(mqtt);
         Ok(())
+    }
+    pub fn refresh_health(&self, watchdog: bool, tasks: &[(&str, bool)]) {
+        let runtime = self.engine.try_lock().ok().and_then(|mut engine| {
+            let reply = engine.request(
+                "GET",
+                "/api/v1/runtime",
+                "",
+                "platform-monitor",
+                &["state.read".into()],
+                &[],
+            );
+            (reply.status == 200).then_some(reply.body)
+        });
+        let mut managers = Vec::new();
+        for (name, status) in [
+            ("mqtt", self.mqtt.as_ref().map(|manager| manager.status())),
+            (
+                "dynamic_dns",
+                self.dynamic_dns.as_ref().map(|manager| manager.status()),
+            ),
+            (
+                "system",
+                self.system.as_ref().map(|manager| manager.status()),
+            ),
+        ] {
+            if let Some(status) = status {
+                managers.push((
+                    name,
+                    status.unwrap_or_else(|_| json!({"state":"unavailable"})),
+                ));
+            }
+        }
+        managers.push(("daemon_tasks", json!({"entries":tasks.iter().map(|(name, finished)| json!({"name":name,"state":if *finished {"stopped"} else {"running"}})).collect::<Vec<_>>()})));
+        self.health.observe(runtime.as_ref(), &managers, watchdog);
     }
     pub fn attach_dynamic_dns(
         app: &mut Arc<Self>,
@@ -572,6 +608,22 @@ fn api(
         Ok(body) => body,
         Err(()) => return fail(400, "http: request body too large", true),
     };
+    if path == "/api/v1/platform/status" {
+        if !credential
+            .permissions
+            .iter()
+            .any(|permission| permission == "state.read")
+        {
+            return fail(403, "insufficient platform status permission", true);
+        }
+        if method != "GET" {
+            return fail(405, "platform status requires GET", true);
+        }
+        if !query.is_empty() || !body.is_empty() {
+            return fail(400, "platform status accepts no query or body", true);
+        }
+        return response(200, app.health.snapshot());
+    }
     let Ok(mut engine) = app.engine.lock() else {
         return fail(503, "engine unavailable", true);
     };
@@ -840,7 +892,14 @@ fn api(
         &credential.permissions,
         &body,
     );
-    let mut r = response(reply.status, reply.body);
+    let mut value = reply.body;
+    if reply.status == 200 && method == "GET" && matches!(path, "/api/v1/state" | "/api/v1/runtime")
+    {
+        let health = app.health.snapshot();
+        value["process_health"] = health["process_health"].clone();
+        value["active_alerts"] = health["active_alerts"].clone();
+    }
+    let mut r = response(reply.status, value);
     if let Some(location) = reply.location {
         if let Ok(value) = HeaderValue::from_str(&location) {
             r.headers_mut().insert(header::LOCATION, value);

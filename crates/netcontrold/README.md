@@ -37,6 +37,20 @@ follow the actual listener. On Unix SIGTERM and Ctrl-C initiate graceful
 HTTP/SSH shutdown and durable engine shutdown. Pending transactions retain their
 confirmation deadline for restart recovery; expired deadlines roll back.
 Engine deadline ticks run every 250 ms; a tick failure stops both listeners.
+The packaged systemd service uses notify readiness and a 60-second watchdog.
+READY follows HTTP bind; heartbeats require completed deadline ticks, not
+healthy services. Full install/source upgrade also writes these directives to
+the managed drop-in. Missing systemd notification environment means no watchdog.
+See [deployment details](../../docs/BUILD_AND_INSTALL.md#ubuntu-systemd-service).
+
+HTTP state/runtime reads include shared observational `process_health` and
+`active_alerts`; authenticated `GET /api/v1/platform/status` reads that cache
+without acquiring the networking engine. Health samples approximately every
+two seconds; after 15 seconds without collection it is unknown/stale. Alerts
+deduplicate and clear on observed recovery, are not persisted configuration,
+and never create write locks or stop services. MQTT publishes the same objects
+and Home Assistant health/alert-count sensors, including partial samples when
+network statistics fail. See the [frontend contract](../../FRONTEND_SPEC.md#platform-health-and-active-alerts).
 
 `GET /api/v1/interfaces/discovered` inventories live host interfaces independently
 of configured-state/worker observation, using `state.read`. Discovery is read-only;

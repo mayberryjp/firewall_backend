@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod dynamic_dns;
+pub mod health;
 pub mod host_system;
 pub mod http;
 pub mod identity;
@@ -9,3 +10,4 @@ mod mqtt_host;
 mod private_store;
 pub mod ssh;
 pub mod updates;
+pub mod watchdog;
