@@ -1409,6 +1409,21 @@ Render lifecycle state, scope, optional start time, optional active traffic-hist
 database directory and errors. Native workers use `disabled`, `running`, `error`,
 or `stopped`; simulator rows are `simulated`. Preserve unknown states rather than
 relabeling them as success. HTTP 200 can contain row errors.
+Native service supervisors retry preparation/runtime errors, unexpected exits
+and unwind panics automatically with capped 1, 2, 4, 8, 16, 30-second backoff.
+An attempt lasting at least 60 seconds resets the delay. Optional recovery fields
+on native worker rows (and explicit gateway monitor rows) are `retrying: boolean`,
+`restart_count: number` (nonnegative failed/ended attempt count since supervisor
+creation), and `last_error: string` (retained after recovery). `state: "error"`
+with `retrying: true` is a live recovering supervisor, not a disabled setting.
+`started_at` describes the latest ready execution attempt. Current `error` clears
+on readiness; fresh NTP sample collection resumes as `warming_up`, not stale
+success. Do not treat old sample timestamps/counters as current delivery proof.
+Native verification checks applied settings and active owned supervisors, not
+service health. Runtime service unavailability alone does not fail configuration
+reads, apply/confirmation/rollback, or impose a global editing lock. Structural
+validation, opt-ins, missing syslog activation, genuine networking drift,
+authorization, persistence and transaction recovery errors remain enforced.
 Running proves local worker/namespace/readiness only, **not** synchronized
 clock, complete capture, or remote delivery. NTP exposes optional sample
 `offset_ms`, `delay_ms`, `requested_slew_ms`, `uncorrected_offset_ms`, `server`,
@@ -1426,7 +1441,17 @@ from `GET /api/v1/services/ntp`; an unavailable sample is not an empty server li
 Continue status polling; the next accepted sample clears the warning. Other
 configuration reads, staging and confirmation remain available when no genuine
 backend error exists. Startup, socket I/O and clock-adjustment failures remain
-errors; existing drift, authorization and transaction recovery guards still apply.
+visible service errors and automatically retry; they are not configuration-health
+gates. Existing drift, authorization and transaction recovery guards still apply.
+Syslog keeps local capture and reachable destinations running while unavailable
+destinations reconnect independently (1..30-second exponential backoff, reset on
+successful write). Optional numeric counters `captured_records`,
+`forwarded_records`, and `failed_deliveries` count locally captured records,
+records successfully written to every destination, and missed per-destination
+sends respectively, since the latest execution attempt. `destination_errors`
+is an optional `string[]` of active destination warnings, empty after recovery;
+the row can be `running` with an `error`. No delivery acknowledgment or replay
+of missed records is provided. Render failures as service-local warnings.
 Poll visible status at the existing non-overlapping 2-5 second cadence.
 Failures do not rewrite desired enabled settings or create drift by themselves.
 
@@ -2023,6 +2048,11 @@ cast it to an NTP sample or discard it as an unknown service. Its status fields:
   destination sends, not client receipt. `statistics_complete` becomes false
   after known receive/queue/rate/oversize loss or unavailable loss accounting.
   Disabled/simulated rows claim no measured completeness.
+- Optional `retrying`, `restart_count`, `last_error` have the shared native
+  supervisor semantics in section 6.1.3. Link/port/socket failures are visible
+  and retry automatically without manual repair or global configuration locks.
+  Stale sockets are retired before reopening the configured membership;
+  conflicting local UDP/5353 receivers are never ignored or killed.
 - `warnings: string[]`: `receive_loss_accounting_unavailable`, `receive_loss`,
   `rate_limit_loss`, `queue_loss`, `oversize_loss` as applicable. Render
   warnings without converting them into a global unhealthy-service lock.
@@ -2057,8 +2087,9 @@ actual MTU; split at RR boundaries/TC continuations, never truncate bytes.
 Unfit individual records/question sections drop/count; unfit publisher probe
 RRsets reject startup. Route-netlink monitoring starts before socket preparation
 and gates receive, maintenance and sends. Required link deletion/replacement,
-rename, administrative down or lost/invalid notifications latch a worker error
-until explicit repair; identical name/index/address recreation is covered by
+rename, administrative down or lost/invalid notifications latch an attempt error
+and retire its sockets; the supervisor automatically retries preparation.
+Identical name/index/address recreation and automatic recovery are covered by
 native tests. Valid address changes block stale sockets while refreshing both
 families. Snapshot polling is a backstop, not the isolation mechanism; the final
 notification check/send remains non-atomic. Provider-only PTR answers require a
@@ -3246,6 +3277,12 @@ interface ApplianceServiceStatus {
   source?: "journald"; // syslog worker only
   host_source?: "/run/systemd/journal/syslog"; // syslog worker only
   forwarded_records?: number; // nonnegative integer, per syslog worker start
+  captured_records?: number; // syslog locally captured records, per execution attempt
+  failed_deliveries?: number; // syslog missed per-destination sends, no replay
+  destination_errors?: string[]; // syslog current connection/write warnings
+  retrying?: boolean;
+  restart_count?: number;
+  last_error?: string;
   error?: string;
   sample_status?: "warming_up" | "available" | "unavailable";
   server?: string;

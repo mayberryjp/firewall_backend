@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- Native service failures no longer become global configuration-health gates.
+  Owned Rust supervisors retry startup/runtime failures, unexpected exits and
+  unwind panics with cancellable 1..30-second exponential backoff. Verification
+  checks applied configuration and active supervisors rather than connectivity
+  or sample availability. Adds recovery metadata to worker status; mDNS reopens
+  sockets automatically after link/port recovery without using stale sockets.
+  Syslog reconnects destinations independently, preserves local capture and
+  reachable collectors, and reports missed deliveries without promising replay.
+  Authorization, configuration validation, ownership, network drift and durable
+  recovery guards remain. Recommended bump: minor for additive status fields
+  and availability behavior; baseline unknown, Unreleased. Required frontend
+  warning/status handling: [handoff 2026-10-27-01](docs/frontend-handoffs/2026-10-27.md#2026-10-27-01-resilient-service-supervision).
+
 - A DNS server added to an interface that already used a DHCP-provided server was listed
   first in systemd-resolved but never used: resolved keeps its previously selected server
   while that server stays in the list. Publishing per-interface DNS now reads the link's

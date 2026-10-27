@@ -451,74 +451,7 @@ impl Native {
     }
 
     fn verify_services(&self, config: &Value) -> Result<()> {
-        self.services.verify_mdns(config)?;
-        let status = self.services.status();
-        let enabled = |v: &Value| v["enabled"].as_bool().unwrap_or(false);
-        let running = |group: &str, key: &str, name: &str| -> Result<()> {
-            let row = status[group]
-                .as_array()
-                .and_then(|rows| rows.iter().find(|r| r[key] == name))
-                .with_context(|| format!("native service status missing {name}"))?;
-            let state_key = if group == "gateway_monitors" {
-                "process_state"
-            } else {
-                "state"
-            };
-            ensure!(
-                row[state_key] == "running",
-                "native service {name} is not healthy: {row}"
-            );
-            Ok(())
-        };
-        for (field, names) in [
-            ("mdns", &["mdns"][..]),
-            ("ntp", &["ntp"][..]),
-            ("syslog", &["syslog"][..]),
-            ("vnstat", &["vnstat-host", "vnstat-managed"][..]),
-        ] {
-            if enabled(&config[field]) {
-                for name in names {
-                    running("appliance_services", "name", name)?;
-                }
-            }
-        }
-        for link in config["interfaces"]
-            .as_array()
-            .context("interfaces missing")?
-        {
-            if enabled(&link["dhcp_relay"]) {
-                running(
-                    "dhcp_relay",
-                    "interface",
-                    link["name"].as_str().context("interface name")?,
-                )?;
-            }
-        }
-        for service in config["softflowd"]
-            .as_array()
-            .context("softflowd missing")?
-        {
-            if enabled(service) {
-                running(
-                    "softflowd",
-                    "name",
-                    service["name"].as_str().context("flow name")?,
-                )?;
-            }
-        }
-        for monitor in config["gateway_monitors"]
-            .as_array()
-            .context("gateway_monitors missing")?
-        {
-            if enabled(monitor) && monitor["mode"] != "dhcp" {
-                running(
-                    "gateway_monitors",
-                    "name",
-                    monitor["name"].as_str().context("gateway monitor name")?,
-                )?;
-            }
-        }
-        Ok(())
+        self.services.verify(config)
     }
 
     fn verify(&self, config: &Value) -> Result<()> {

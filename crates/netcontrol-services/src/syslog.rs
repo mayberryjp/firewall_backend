@@ -49,6 +49,44 @@ enum Remote {
     #[cfg(all(target_os = "linux", feature = "tls"))]
     Tls(Box<rustls::ClientConnection>, TcpStream),
 }
+struct DestinationState {
+    destination: super::config::Destination,
+    remote: Option<Remote>,
+    retry_at: Instant,
+    delay: Duration,
+    error: Option<String>,
+}
+impl DestinationState {
+    fn failed(&mut self, error: anyhow::Error) {
+        self.remote = None;
+        self.error = Some(format!("{error:#}"));
+        self.retry_at = Instant::now() + self.delay;
+        self.delay = (self.delay * 2).min(Duration::from_secs(30));
+    }
+    fn reconnect(&mut self, ipv6_enabled: bool) {
+        if self.remote.is_none() && Instant::now() >= self.retry_at {
+            match Remote::connect(&self.destination, ipv6_enabled) {
+                Ok(remote) => {
+                    self.remote = Some(remote);
+                    self.error = None;
+                }
+                Err(error) => self.failed(error),
+            }
+        }
+    }
+    fn forward(&mut self, bytes: &[u8], ctx: &super::worker::ContextState) -> bool {
+        if let Some(remote) = &mut self.remote {
+            match remote.forward(bytes, ctx) {
+                Ok(()) => {
+                    self.delay = Duration::from_secs(1);
+                    return true;
+                }
+                Err(error) => self.failed(error),
+            }
+        }
+        false
+    }
+}
 fn write_bounded(
     stream: &mut TcpStream,
     mut data: &[u8],
@@ -294,10 +332,17 @@ pub(crate) fn prepare(
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
     socket.check_path()?;
-    let mut remotes = Vec::new();
-    for server in config.servers {
-        remotes.push(Remote::connect(&server, ipv6_enabled)?);
-    }
+    let mut remotes: Vec<_> = config
+        .servers
+        .into_iter()
+        .map(|destination| DestinationState {
+            destination,
+            remote: None,
+            retry_at: Instant::now(),
+            delay: Duration::from_secs(1),
+            error: None,
+        })
+        .collect();
     let mut local = OpenOptions::new()
         .create(true)
         .append(true)
@@ -314,9 +359,17 @@ pub(crate) fn prepare(
     Ok(Box::new(move |ctx| {
         let mut buffer = vec![0; 65536];
         let mut forwarded = 0u64;
+        let mut captured = 0u64;
+        let mut failed_deliveries = 0u64;
         let mut hostname_read = Instant::now();
         while !ctx.stopping() {
             socket.check_path()?;
+            for remote in &mut remotes {
+                if ctx.stopping() {
+                    break;
+                }
+                remote.reconnect(ipv6_enabled);
+            }
             // The appliance hostname is configurable at runtime; keep the last good value on a failed read.
             if hostname_read.elapsed() >= Duration::from_secs(1) {
                 hostname_read = Instant::now();
@@ -333,17 +386,45 @@ pub(crate) fn prepare(
                         ensure!(record.len() <= 65000, "syslog record too large");
                         local.write_all(&record)?;
                         local.write_all(b"\n")?;
+                        captured = captured.saturating_add(1);
+                        let mut delivered = true;
                         for remote in &mut remotes {
-                            remote.forward(&record, &ctx)?;
+                            if !remote.forward(&record, &ctx) {
+                                delivered = false;
+                                failed_deliveries = failed_deliveries.saturating_add(1);
+                            }
                         }
-                        forwarded += 1;
+                        if delivered {
+                            forwarded = forwarded.saturating_add(1);
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e).context("journald syslog receive failed"),
                 }
             }
-            ctx.update(|s| s["forwarded_records"] = serde_json::json!(forwarded));
+            ctx.update(|s| {
+                s["forwarded_records"] = serde_json::json!(forwarded);
+                s["captured_records"] = serde_json::json!(captured);
+                s["failed_deliveries"] = serde_json::json!(failed_deliveries);
+                let errors: Vec<_> = remotes
+                    .iter()
+                    .filter_map(|remote| {
+                        remote.error.as_ref().map(|error| {
+                            format!(
+                                "{}:{}: {error}",
+                                remote.destination.host, remote.destination.port
+                            )
+                        })
+                    })
+                    .collect();
+                s["destination_errors"] = serde_json::json!(errors);
+                if errors.is_empty() {
+                    s.as_object_mut().unwrap().remove("error");
+                } else {
+                    s["error"] = serde_json::json!(errors.join("; "));
+                }
+            });
             ctx.wait(Duration::from_millis(20));
         }
         local.sync_data()?;
@@ -415,7 +496,7 @@ mod tests {
                     let directory = directory.clone();
                     let socket = socket.clone();
                     let config = config.clone();
-                    move || prepare(config, directory, socket, true)
+                    move || prepare(config.clone(), directory.clone(), socket.clone(), true)
                 },
             )
             .unwrap();
@@ -455,8 +536,54 @@ mod tests {
         let failing = serde_json::json!({"syslog":{"enabled":true,"servers":[{
             "host":"127.0.0.1","port":unused_port,"transport":"tcp"
         }]}});
-        assert!(services.apply(&enabled, &failing).is_err());
+        services.apply(&enabled, &failing).unwrap();
         assert_eq!(services.workers["syslog"].snapshot()["state"], "running");
+        services.verify(&failing).unwrap();
+        sender
+            .send_to(b"<30>captured during collector outage", &path)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while services.workers["syslog"].snapshot()["captured_records"] != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "local capture stopped during remote outage"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            services.workers["syslog"].snapshot()["failed_deliveries"],
+            1
+        );
+        assert!(
+            std::fs::read_to_string(directory.join("syslog-host.log"))
+                .unwrap()
+                .contains("captured during collector outage")
+        );
+        let recovered_collector = std::net::TcpListener::bind(("127.0.0.1", unused_port)).unwrap();
+        recovered_collector.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut connection, _) = loop {
+            match recovered_collector.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "collector did not reconnect");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        connection
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        sender
+            .send_to(b"<30>collector recovered automatically", &path)
+            .unwrap();
+        let mut recovered = [0; 4096];
+        let count = connection.read(&mut recovered).unwrap();
+        assert!(
+            String::from_utf8_lossy(&recovered[..count])
+                .contains("collector recovered automatically")
+        );
         services.repair(&enabled).unwrap();
         sender
             .send_to(b"<30>restored after rollback and repair", &path)
@@ -477,7 +604,7 @@ mod tests {
                 let socket = socket.clone();
                 let config = config.clone();
                 let directory = directory.clone();
-                move || prepare(config, directory, socket, true)
+                move || prepare(config.clone(), directory.clone(), socket.clone(), true)
             },
         )
         .unwrap();

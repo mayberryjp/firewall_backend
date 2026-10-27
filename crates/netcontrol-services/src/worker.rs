@@ -46,7 +46,7 @@ impl Worker {
         name: String,
         namespace: Option<Arc<std::fs::File>>,
         initial: Value,
-        prepare: impl FnOnce() -> Result<Box<dyn FnOnce(ContextState) -> Result<()> + Send>>
+        mut prepare: impl FnMut() -> Result<Box<dyn FnOnce(ContextState) -> Result<()> + Send>>
         + Send
         + 'static,
     ) -> Result<Self> {
@@ -60,48 +60,80 @@ impl Worker {
         let join = thread::Builder::new()
             .name(format!("nc-{name}"))
             .spawn(move || {
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                        if let Some(file) = namespace {
-                            #[cfg(target_os = "linux")]
-                            {
-                                use std::os::fd::AsRawFd;
-                                use std::os::unix::fs::MetadataExt;
-                                let current = std::fs::metadata("/proc/thread-self/ns/net")?;
-                                let target = file.metadata()?;
-                                if (current.dev(), current.ino()) != (target.dev(), target.ino())
-                                    && unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) }
-                                        != 0
+                let mut delay = Duration::from_secs(1);
+                let mut restart_count = 0u64;
+                while !ctx.stopping() {
+                    let attempt = Instant::now();
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                            if let Some(file) = &namespace {
+                                #[cfg(target_os = "linux")]
                                 {
-                                    return Err(std::io::Error::last_os_error().into());
+                                    use std::os::fd::AsRawFd;
+                                    use std::os::unix::fs::MetadataExt;
+                                    let current = std::fs::metadata("/proc/thread-self/ns/net")?;
+                                    let target = file.metadata()?;
+                                    if (current.dev(), current.ino())
+                                        != (target.dev(), target.ino())
+                                        && unsafe {
+                                            libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET)
+                                        } != 0
+                                    {
+                                        return Err(std::io::Error::last_os_error().into());
+                                    }
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let _ = file;
+                                    anyhow::bail!("network namespace workers require Linux");
                                 }
                             }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                let _ = file;
-                                anyhow::bail!("network namespace workers require Linux");
-                            }
-                        }
-                        let run = prepare()?;
-                        ctx.update(|s| {
-                            s["state"] = json!("running");
-                            s["started_at"] = json!(now());
-                        });
-                        let _ = ready_tx.send(Ok::<(), String>(()));
-                        run(ctx.clone())
-                    }))
-                    .unwrap_or_else(|_| Err(anyhow!("service worker panicked")));
-                match result {
-                    Ok(()) => ctx.update(|s| s["state"] = json!("stopped")),
-                    Err(error) => {
-                        let text = format!("{error:#}");
-                        let _ = ready_tx.send(Err(text.clone()));
-                        ctx.update(|s| {
-                            s["state"] = json!("error");
-                            s["error"] = json!(text);
-                        });
+                            let run = prepare()?;
+                            ctx.update(|s| {
+                                s["state"] = json!("running");
+                                s["started_at"] = json!(now());
+                                s["retrying"] = json!(false);
+                                s["restart_count"] = json!(restart_count);
+                                if s.get("sample_status").is_some() {
+                                    s["sample_status"] = json!("warming_up");
+                                }
+                                s.as_object_mut().unwrap().remove("error");
+                            });
+                            let _ = ready_tx.send(Ok::<(), String>(()));
+                            run(ctx.clone())
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow!("service worker panicked")));
+                    if ctx.stopping() {
+                        break;
                     }
+                    let text = match result {
+                        Ok(()) => "service worker exited unexpectedly".to_owned(),
+                        Err(error) => format!("{error:#}"),
+                    };
+                    restart_count = restart_count.saturating_add(1);
+                    ctx.update(|s| {
+                        s["state"] = json!("error");
+                        s["error"] = json!(text);
+                        s["last_error"] = json!(text);
+                        s["retrying"] = json!(true);
+                        s["restart_count"] = json!(restart_count);
+                        if s.get("sample_status").is_some() {
+                            s["sample_status"] = json!("unavailable");
+                        }
+                    });
+                    let _ = ready_tx.try_send(Ok::<(), String>(()));
+                    if attempt.elapsed() >= Duration::from_secs(60) {
+                        delay = Duration::from_secs(1);
+                    }
+                    if ctx.wait(delay) {
+                        break;
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(30));
                 }
+                ctx.update(|s| {
+                    s["state"] = json!("stopped");
+                    s["retrying"] = json!(false);
+                });
                 let _ = done_tx.send(());
             })
             .context("start native service thread")?;
@@ -129,6 +161,9 @@ impl Worker {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_else(|_| json!({"state":"error","error":"status lock poisoned"}))
+    }
+    pub fn active(&self) -> bool {
+        !self.context.stopping() && self.join.as_ref().is_some_and(|join| !join.is_finished())
     }
     pub fn shutdown(&mut self) -> Result<()> {
         self.context
@@ -201,18 +236,56 @@ mod tests {
         failed.shutdown().unwrap();
     }
     #[test]
-    fn startup_failure_and_panics_are_joined() {
-        assert!(
-            Worker::start("prepare-failure".into(), None, json!({}), || Err(anyhow!(
-                "missing privilege"
-            )))
-            .is_err()
+    fn startup_failure_and_panics_keep_retrying_until_shutdown() {
+        for mut worker in [
+            Worker::start("prepare-failure".into(), None, json!({}), || {
+                Err(anyhow!("missing privilege"))
+            })
+            .unwrap(),
+            Worker::start("prepare-panic".into(), None, json!({}), || {
+                panic!("injected startup panic")
+            })
+            .unwrap(),
+        ] {
+            assert!(worker.active());
+            assert_eq!(worker.snapshot()["state"], "error");
+            assert_eq!(worker.snapshot()["retrying"], true);
+            let start = Instant::now();
+            worker.shutdown().unwrap();
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(!worker.active());
+            assert_eq!(worker.snapshot()["state"], "stopped");
+        }
+    }
+    #[test]
+    fn runtime_failure_reopens_resources_and_recovers_without_operator_action() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let mut worker = Worker::start("recovery".into(), None, json!({}), move || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(move |ctx| {
+                if attempt == 0 {
+                    return Err(anyhow!("injected connectivity failure"));
+                }
+                while !ctx.wait(Duration::from_millis(20)) {}
+                Ok(())
+            }))
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observed.load(std::sync::atomic::Ordering::SeqCst) < 2
+            || worker.snapshot()["state"] != "running"
+        {
+            assert!(Instant::now() < deadline, "worker did not recover");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(worker.snapshot()["retrying"], false);
+        assert_eq!(worker.snapshot()["restart_count"], 1);
+        assert!(worker.snapshot().get("error").is_none());
+        assert_eq!(
+            worker.snapshot()["last_error"],
+            "injected connectivity failure"
         );
-        assert!(
-            Worker::start("prepare-panic".into(), None, json!({}), || panic!(
-                "injected startup panic"
-            ))
-            .is_err()
-        );
+        worker.shutdown().unwrap();
     }
 }

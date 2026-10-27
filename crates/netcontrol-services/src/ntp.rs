@@ -263,6 +263,8 @@ mod tests {
         client.set_nonblocking(true).unwrap();
         let (slew_tx, slew_rx) = mpsc::channel();
         let mut worker = Worker::start("ntp".into(), None, json!({"name":"ntp"}), move || {
+            let client = client.try_clone()?;
+            let slew_tx = slew_tx.clone();
             Ok(Box::new(move |ctx| {
                 poll(
                     ctx,
@@ -325,9 +327,9 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.connect(server.local_addr().unwrap()).unwrap();
         client.set_nonblocking(true).unwrap();
-        let mut client = Some(client);
-        let mut attempts = 0;
         let mut worker = Worker::start("ntp".into(), None, json!({}), move || {
+            let mut client = Some(client.try_clone()?);
+            let mut attempts = 0;
             Ok(Box::new(move |ctx| {
                 poll(
                     ctx,
@@ -386,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_adjustment_failure_remains_a_worker_error() {
+    fn clock_adjustment_failure_reports_recovery_without_stopping_supervision() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -395,6 +397,7 @@ mod tests {
         client.connect(server.local_addr().unwrap()).unwrap();
         client.set_nonblocking(true).unwrap();
         let mut worker = Worker::start("ntp".into(), None, json!({}), move || {
+            let client = client.try_clone()?;
             Ok(Box::new(move |ctx| {
                 poll(
                     ctx,
@@ -411,6 +414,8 @@ mod tests {
         respond(&server);
         let failed = wait_for(&worker, |s| s["state"] == "error");
         assert_eq!(failed["error"], "injected clock adjustment failure");
+        assert_eq!(failed["retrying"], true);
+        assert!(worker.active());
         worker.shutdown().unwrap();
     }
 

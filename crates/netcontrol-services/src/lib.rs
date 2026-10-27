@@ -38,7 +38,7 @@ impl GatewayProbe {
             format!("dhcp-gateway:{name}"),
             Some(namespace),
             json!({"name":name}),
-            move || gateway::prepare(config),
+            move || gateway::prepare(config.clone()),
         )?;
         Ok(Self { worker })
     }
@@ -166,10 +166,8 @@ impl Services {
         );
         if expected.mdns.enabled {
             ensure!(
-                self.workers
-                    .get("mdns")
-                    .is_some_and(|worker| worker.snapshot()["state"] == "running"),
-                "native mDNS worker is not running"
+                self.workers.get("mdns").is_some_and(Worker::active),
+                "native mDNS supervisor is not active"
             );
         } else {
             ensure!(
@@ -211,8 +209,7 @@ impl Services {
         if c.syslog.enabled {
             self.syslog_socket
                 .as_ref()
-                .context("native syslog requires systemd socket activation from netcontrol-syslog.socket and journald ForwardToSyslog=yes")?
-                .check_path()?;
+                .context("native syslog requires systemd socket activation from netcontrol-syslog.socket and journald ForwardToSyslog=yes")?;
         }
         #[cfg(not(target_os = "linux"))]
         ensure!(
@@ -257,14 +254,23 @@ impl Services {
         self.error = None;
         Ok(())
     }
-    /// True only when exactly the workers this configuration needs exist and all are running.
+    pub fn verify(&self, value: &Value) -> Result<()> {
+        let expected = Config::parse(value)?;
+        ensure!(
+            self.config == expected,
+            "native service configuration does not match applied settings"
+        );
+        ensure!(
+            self.workers_current(&expected),
+            "native service supervisors do not match applied settings"
+        );
+        Ok(())
+    }
+    /// True when exactly the requested supervisors exist, including workers awaiting recovery.
     /// A shutdown leaves the stored configuration in place, so an empty worker set is not current.
     fn workers_current(&self, c: &Config) -> bool {
         self.workers.keys().cloned().collect::<BTreeSet<_>>() == expected_workers(c)
-            && self
-                .workers
-                .values()
-                .all(|w| w.snapshot()["state"] == "running")
+            && self.workers.values().all(Worker::active)
     }
     fn start(&mut self, c: &Config) -> Result<()> {
         #[cfg(target_os = "linux")]
@@ -278,7 +284,7 @@ impl Services {
                     "ntp",
                     host.clone(),
                     json!({"name":"ntp","scope":"host","sample_status":"warming_up"}),
-                    move || ntp::prepare(config, ipv6_enabled),
+                    move || ntp::prepare(config.clone(), ipv6_enabled),
                 )?;
             }
             if c.syslog.enabled {
@@ -288,13 +294,13 @@ impl Services {
                     .syslog_socket
                     .clone()
                     .context("systemd syslog socket missing")?;
-                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","source":"journald","host_source":syslog::JOURNAL_SOCKET}),move||syslog::prepare(config,dir,socket,ipv6_enabled))?;
+                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","source":"journald","host_source":syslog::JOURNAL_SOCKET}),move||syslog::prepare(config.clone(),dir.clone(),socket.clone(),ipv6_enabled))?;
             }
             if c.vnstat.enabled {
                 for scope in ["host", "managed"] {
                     let dir = self.options.state_directory.clone();
                     let scope_owned = scope.to_owned();
-                    self.insert(&format!("vnstat-{scope}"),if scope=="host"{host.clone()}else{managed.clone()},json!({"name":format!("vnstat-{scope}"),"scope":scope,"schema":"netcontrol-services/counters/v1"}),move||counters::prepare(dir,scope_owned))?;
+                    self.insert(&format!("vnstat-{scope}"),if scope=="host"{host.clone()}else{managed.clone()},json!({"name":format!("vnstat-{scope}"),"scope":scope,"schema":"netcontrol-services/counters/v1"}),move||counters::prepare(dir.clone(),scope_owned.clone()))?;
                 }
             }
             let relays: Vec<_> = c
@@ -308,7 +314,7 @@ impl Services {
                 config.publishing.aaaa_on_ipv4 &= c.ipv6_enabled;
                 let interfaces = c.mdns_interfaces.clone();
                 self.insert("mdns", managed.clone(), c.mdns_status.clone(), move || {
-                    mdns::prepare(config, interfaces)
+                    mdns::prepare(config.clone(), interfaces.clone())
                 })?;
             }
             if !relays.is_empty() {
@@ -316,12 +322,12 @@ impl Services {
                     "dhcp-relay",
                     managed.clone(),
                     json!({"name":"dhcp-relay","scope":"managed"}),
-                    move || dhcp::prepare(relays),
+                    move || dhcp::prepare(relays.clone()),
                 )?;
             }
             for f in c.softflowd.iter().filter(|f| f.enabled) {
                 let config = f.clone();
-                self.insert(&format!("flow:{}",f.name),managed.clone(),                                json!({"name":f.name,"scope":"managed","export_version":f.export_version,"address_family":if !ipv6_enabled || [1,5].contains(&f.export_version){"ipv4"}else{"dual"},"fragments":"excluded","capture_filter":f.capture_filter,"sampling_rate":f.sampling_rate,"sampling_metadata":f.export_version!=1}),move||flow::prepare(config,ipv6_enabled))?;
+                self.insert(&format!("flow:{}",f.name),managed.clone(),                                json!({"name":f.name,"scope":"managed","export_version":f.export_version,"address_family":if !ipv6_enabled || [1,5].contains(&f.export_version){"ipv4"}else{"dual"},"fragments":"excluded","capture_filter":f.capture_filter,"sampling_rate":f.sampling_rate,"sampling_metadata":f.export_version!=1}),move||flow::prepare(config.clone(),ipv6_enabled))?;
             }
             for m in c
                 .gateway_monitors
@@ -333,7 +339,7 @@ impl Services {
                     &format!("gateway:{}", m.name),
                     managed.clone(),
                     json!({"name":m.name,"scope":"managed"}),
-                    move || gateway::prepare(config),
+                    move || gateway::prepare(config.clone()),
                 )?;
             }
         }
@@ -349,7 +355,7 @@ impl Services {
         name: &str,
         namespace: Option<std::sync::Arc<std::fs::File>>,
         initial: Value,
-        prepare: impl FnOnce() -> Result<Box<dyn FnOnce(worker::ContextState) -> Result<()> + Send>>
+        prepare: impl FnMut() -> Result<Box<dyn FnOnce(worker::ContextState) -> Result<()> + Send>>
         + Send
         + 'static,
     ) -> Result<()> {
@@ -450,6 +456,11 @@ impl Services {
             let row=self.row(&format!("gateway:{}",m.name),m.enabled,json!({"name":m.name}));
             let mut stats=row.get("statistics").cloned().unwrap_or_else(||json!({"name":m.name,"process_state":row["state"],"sample_status":if m.enabled {"warming_up"}else{"disabled"},"health":"unknown","started_at":row["started_at"],"collected_at":null,"health_changed_at":null,"last_success_at":null,"sent":0,"received":0,"lost":0,"pending":0,"variation_pairs":0,"loss_percent":null,"rtt_min_ms":null,"rtt_max_ms":null,"rtt_avg_ms":null,"rtt_stddev_ms":null,"rtt_p50_ms":null,"rtt_p95_ms":null,"rtt_variation_ms":null}));
             stats["process_state"]=row["state"].clone();
+            for key in ["retrying", "restart_count", "last_error"] {
+                if let Some(value) = row.get(key) {
+                    stats[key] = value.clone();
+                }
+            }
             if row["state"]=="error" {stats["sample_status"]=json!("unavailable");stats["health"]=json!("unknown");stats["error"]=row["error"].clone();}
             else if row["state"]=="stopped"||row["state"]=="disabled"{stats["sample_status"]=row["state"].clone();stats["health"]=json!("unknown");}
             stats["mode"]=json!(m.mode);
@@ -800,6 +811,36 @@ mod tests {
         assert!(!services.workers_current(&enabled));
         services.shutdown().unwrap();
         assert!(!services.workers_current(&enabled));
+        drop(services);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn recovering_services_verify_without_requiring_network_health() {
+        let directory =
+            std::env::temp_dir().join(format!("services-recovery-{}", rand::random::<u64>()));
+        let mut services = Services::new(ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: true,
+            allow_gateway_monitoring: false,
+        })
+        .unwrap();
+        let config = json!({"ntp":{"enabled":true,"servers":["192.0.2.1"]}});
+        services.config = Config::parse(&config).unwrap();
+        services.workers.insert(
+            "ntp".into(),
+            Worker::start("ntp".into(), None, json!({}), || {
+                Err(anyhow::anyhow!("synthetic connectivity outage"))
+            })
+            .unwrap(),
+        );
+        assert_eq!(services.workers["ntp"].snapshot()["state"], "error");
+        services.verify(&config).unwrap();
+        services.apply(&config, &config).unwrap();
+        assert_eq!(services.workers["ntp"].snapshot()["restart_count"], 1);
+        assert!(services.verify(&json!({})).is_err());
+        services.shutdown().unwrap();
+        assert!(services.verify(&config).is_err());
         drop(services);
         std::fs::remove_dir_all(directory).unwrap();
     }

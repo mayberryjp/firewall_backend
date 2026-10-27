@@ -17,7 +17,9 @@ Implemented does not mean complete Avahi parity or production qualification.
 - Same-family sockets are per-interface and bound to their device. Route-netlink
   monitoring starts before snapshots/socket preparation and gates receive,
   maintenance and sends. Required deletion/replacement, rename, administrative
-  down or lost/invalid notifications latch worker failure until explicit repair.
+  down or lost/invalid notifications retire the failed attempt's sockets. The
+  owned supervisor reports errors and retries preparation automatically with
+  capped backoff; configuration verification is not a service-health gate.
   Valid address changes block stale sockets and refresh both families. Snapshot
   polling remains a backstop; the final notification check/send is not atomic.
 - Egress payload is at most 1232 bytes, reduced for MTU. RR-boundary splitting
@@ -237,7 +239,8 @@ work. No resolver, desktop discovery daemon or external codec was added.
   64 datagrams per drain, 64 KiB per datagram, 512 messages per datagram and
   8192 deletion tombstones. Receive, maintenance and sends check the monitor.
   Valid address replacement blocks stale sockets while refreshing both families.
-  Link failure requires explicit repair, not silent membership shrinkage.
+  Link failure triggers automatic resource reopening with capped backoff, not
+  silent membership shrinkage. Failures stay visible while recovery is pending.
   The last check and send are non-atomic; no mathematical TOCTOU guarantee.
 
 ### Reflection semantics
@@ -362,12 +365,15 @@ delivery verification, even if the socket joins successfully.
 - Extend `expected_workers` / `workers_current` with `mdns`; identical service
   config after network-only apply must still restart a stopped worker.
 - Prepare sockets and memberships before reporting ready. On failed startup,
-  tear down every partially prepared socket and restore the previous service
-  configuration through existing apply/rollback. Do not turn packet drops or
-  malformed peer messages into failed configuration verification.
+  tear down every partially prepared socket and retry the requested configuration
+  with capped backoff. Report a recovering error without claiming readiness.
+  Invalid configuration and structural transaction failures still use the
+  existing apply/rollback path. Do not turn packet drops or malformed peer
+  messages into failed configuration verification.
 - Genuine socket, required-interface or worker failure is an explicit service
-  error. Follow existing verification and recovery blocking for such failures;
-  do not suppress them to make transactions confirm.
+  error, not a global configuration-health gate. Verification checks requested
+  configuration and active owned supervisors, including recovering workers;
+  it does not assert network delivery or erase service errors to confirm.
 - Stop/join the worker before changing/removing links; prevent send-after-stop.
   Rollback, explicit repair, restart and boot reapply restore configured
   membership, not vanished discovery caches or client sessions.

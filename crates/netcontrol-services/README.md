@@ -27,14 +27,27 @@ service configuration on a failed start where possible. `repair` deliberately
 restarts the requested service set. Workers have bounded socket I/O, cooperative
 stops, ten-second stop notifications, and owned joins. They never invent PIDs.
 Startup can take up to sixty seconds for bounded DNS/TLS connection attempts.
-Errors are retained in worker status rather than reporting failed workers as
-running. Linux-native operations are unavailable on other platforms.
+Each owned worker supervises repeated preparation/execution attempts. Startup
+errors, runtime errors, unexpected exits and unwind panics retain an error and
+retry after 1, 2, 4, 8, 16, then at most 30 seconds; an attempt lasting at least
+60 seconds resets the delay. Stops interrupt backoff and prevent further retries.
+Failed attempts release their resources before reopening them. Linux-native
+operations are unavailable on other platforms.
 
 Runtime status keeps `appliance_services`, `dhcp_relay`, `softflowd`, and
 `gateway_monitors` collections. Rows use `state: disabled|running|error|stopped`,
 with real `started_at` and `error` information where applicable. Gateway rows
 use the existing `process_state`, `sample_status`, and health/statistics fields.
 These are worker states, not external daemon states; there is no `pid` field.
+`state: error` with `retrying: true` means the supervisor is alive and recovering,
+not that the requested service was disabled. `restart_count` counts failed or
+unexpectedly completed attempts since supervisor creation; `last_error` retains
+the latest failure after recovery while the current `error` clears on readiness.
+Configuration verification checks applied settings and owned active supervisors,
+not connectivity, delivery, samples or service health. Runtime unavailability
+does not block unrelated reads, apply, confirmation or rollback. Configuration
+validation, explicit opt-ins, missing syslog activation, authorization, network
+drift and durable transaction recovery safeguards remain enforced.
 
 ## Implemented services and boundaries
 
@@ -76,8 +89,10 @@ These are worker states, not external daemon states; there is no `pid` field.
   saved preferences. Cross-family flags only select published record types.
   Link/address snapshots are checked every second, not by netlink subscription.
   Address replacement prepares replacement sockets and reprobes publications;
-  missing/down/replaced required links fail the worker rather than silently
-  shrinking membership. Readiness is not proof of network delivery.
+  missing/down/replaced required links stop use of stale sockets rather than
+  silently shrinking membership. The supervisor reports the failure and
+  automatically reopens resources when the configured links become available.
+  Readiness is not proof of network delivery.
   Runtime `appliance_services` includes the singleton `mdns` row. Its counters
   are decimal strings, reset at worker start. Linux `SO_RXQ_OVFL` accounts
   socket receive loss; unavailable accounting, descriptor replacement or
@@ -129,7 +144,8 @@ These are worker states, not external daemon states; there is no `pid` field.
   with a row-local error while the worker keeps running and polling, even after
   three failed rounds. A valid sample clears the warning automatically.
   This condition does not fail configuration observation or confirmation;
-  startup, socket I/O and clock-adjustment failures remain fatal errors.
+  startup, socket I/O and clock-adjustment failures are reported while the
+  supervisor automatically retries resource preparation and polling.
   No NTP serving, NTS, drift
   estimator, server consensus/falseticker algorithm, or chrony command API.
 * **Syslog:** RFC5424 output over UDP and RFC6587 octet-counted TCP/TLS.
@@ -151,13 +167,21 @@ These are worker states, not external daemon states; there is no `pid` field.
   Journald's forwarded message text is wrapped in bounded RFC5424 output with
   APP-NAME `journald`; this is not a journal cursor reader or metadata-preserving
   journal export. A local copy is appended to `syslog-host.log`.
-  Messages are bounded to 65,000 bytes. Failed connections, writes or socket-path
-  loss become errors. Systemd owns socket lifetime; worker repair/rollback
+  Messages are bounded to 65,000 bytes. Each remote destination reconnects
+  independently with a 1..30-second capped exponential backoff; successful writes
+  reset its delay. Connection/write failures retain a row-local warning while
+  local capture and other destinations continue. `destination_errors` lists
+  current destination failures; `captured_records` counts local records,
+  `forwarded_records` counts records written successfully to every destination,
+  and `failed_deliveries` counts missed per-destination sends. These numeric
+  counters reset when the worker restarts; successful sends do not prove receipt.
+  Missed deliveries are not queued or replayed. Socket-path/local I/O failure
+  invokes shared worker recovery. Systemd owns socket lifetime; worker repair/rollback
   reuses the inherited receiver and never unlinks it. While disabled/stopped,
   the bounded socket queue may retain messages for later forwarding or overflow;
   daemon stop/restart closes the managed socket and its queue. Journald capture,
   rate limits and forwarding settings determine coverage. No complete delivery,
-  acknowledgment, durable forwarding queue/replay, rotation or reconnect is claimed.
+  acknowledgment, durable forwarding queue/replay or rotation is claimed.
 * **Traffic counters:** host and managed workers sample all `/proc/thread-self/net/dev`
   interfaces, including loopback, every five seconds. Captures byte/packet
   baselines, accumulates observed deltas, and records boot/namespace/interface/reset

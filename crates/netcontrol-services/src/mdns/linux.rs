@@ -195,7 +195,7 @@ impl LinkHistory {
                         })
                     {
                         return self
-                            .fail("required interface was deleted; explicit repair is required");
+                            .fail("required interface was deleted; worker resources must reopen");
                     }
                 }
                 LinkEvent::New { index, flags, name } => {
@@ -204,10 +204,10 @@ impl LinkHistory {
                             .as_ref()
                             .is_some_and(|name| name != required.as_bytes())
                         {
-                            return self.fail("required interface was renamed or replaced; explicit repair is required");
+                            return self.fail("required interface was renamed or replaced; worker resources must reopen");
                         }
                         if flags & libc::IFF_UP as u32 == 0 {
-                            return self.fail("required interface became administratively down; explicit repair is required");
+                            return self.fail("required interface became administratively down; worker resources must reopen");
                         }
                         self.changed(index)?;
                     }
@@ -2043,7 +2043,7 @@ mod tests {
                     "mdns-wire-test".into(),
                     None,
                     json!({}),
-                    move || prepare(config, vec!["lan1".into(), "lan2".into()]),
+                    move || prepare(config.clone(), vec!["lan1".into(), "lan2".into()]),
                 )?;
                 ensure!(
                     ownership().is_err(),
@@ -2274,7 +2274,7 @@ mod tests {
                 "mdns-publisher-test".into(),
                 None,
                 json!({}),
-                move || prepare(first, vec!["lan1".into()]),
+                move || prepare(first.clone(), vec!["lan1".into()]),
             )?;
             let peer = inside(clients[0].clone(), || Port::open("peer1", false, &[]))?;
             // DAD/lifetime changes notify even when the address set is identical.
@@ -2411,7 +2411,7 @@ mod tests {
                 "mdns-conflict-test".into(),
                 None,
                 json!({}),
-                move || prepare(config, vec!["lan1".into()]),
+                move || prepare(config.clone(), vec!["lan1".into()]),
             )?;
             let conflict = response(vec![Record {
                 name: Name::text("appliance.local."),
@@ -2460,7 +2460,7 @@ mod tests {
     }
     #[test]
     #[ignore = "requires NETCONTROL_INTEGRATION=1 and fresh Linux network namespace/veth privileges"]
-    fn native_mdns_recycled_interface_identity_latches_error_until_repair() {
+    fn native_mdns_recycled_interface_identity_reopens_automatically() {
         isolated(|clients| {
             let directory = std::env::current_dir()?
                 .join("target")
@@ -2553,12 +2553,30 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(5));
             }
-            ensure!(
-                services.verify_mdns(&enabled).is_err(),
-                "failed identity passed verification"
-            );
+            services.verify(&enabled)?;
             drop(old);
-            services.repair(&enabled)?;
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = services.status();
+                let row = status["appliance_services"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["name"] == "mdns")
+                    .unwrap();
+                if row["state"] == "running" {
+                    ensure!(
+                        row["restart_count"].as_u64().unwrap_or(0) > 0,
+                        "resources were not reopened"
+                    );
+                    break;
+                }
+                ensure!(
+                    Instant::now() < until,
+                    "mDNS did not recover automatically: {row}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
             services.verify_mdns(&enabled)?;
             let peer1 = inside(clients[0].clone(), || Port::open("peer1", false, &[]))?;
             let peer2 = inside(clients[1].clone(), || Port::open("peer2", false, &[]))?;
@@ -2576,7 +2594,7 @@ mod tests {
             services.shutdown()?;
             ensure!(
                 started.elapsed() < Duration::from_secs(1),
-                "repaired worker shutdown was not bounded"
+                "recovered worker shutdown was not bounded"
             );
             drop(services);
             std::fs::remove_dir_all(directory)?;
@@ -2592,7 +2610,7 @@ mod tests {
                 "mdns-refresh-test".into(),
                 None,
                 json!({}),
-                move || prepare(config, vec!["lan1".into(), "lan2".into()]),
+                move || prepare(config.clone(), vec!["lan1".into(), "lan2".into()]),
             )?;
             let watch =
                 std::sync::Arc::new(std::sync::Mutex::new(LinkMonitor::open(&["lan1".into()])?));
@@ -2748,12 +2766,38 @@ mod tests {
             let disabled = netcontrol_core::Config::default().operational_value()?;
             let enabled = config.operational_value()?;
             let competing = std::net::UdpSocket::bind("0.0.0.0:5353")?;
-            ensure!(
-                services.apply(&disabled, &enabled).is_err(),
-                "conflicting UDP 5353 receiver was accepted"
-            );
-            drop(competing);
             services.apply(&disabled, &enabled)?;
+            let row = services.status()["appliance_services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == "mdns")
+                .unwrap()
+                .clone();
+            ensure!(
+                row["state"] == "error" && row["retrying"] == true,
+                "competing UDP 5353 receiver was not reported: {row}"
+            );
+            services.verify(&enabled)?;
+            drop(competing);
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = services.status();
+                let row = status["appliance_services"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["name"] == "mdns")
+                    .unwrap();
+                if row["state"] == "running" {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < until,
+                    "port ownership did not recover: {row}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
             services.verify_mdns(&enabled)?;
             ensure!(
                 services.status()["appliance_services"]
@@ -2768,12 +2812,9 @@ mod tests {
             let mut broken = config.clone();
             broken.interfaces[1].name = "missing".into();
             broken.mdns.interfaces[1] = "missing".into();
-            ensure!(
-                services
-                    .apply(&enabled, &broken.operational_value()?)
-                    .is_err(),
-                "missing link was accepted"
-            );
+            let broken = broken.operational_value()?;
+            services.apply(&enabled, &broken)?;
+            services.verify(&broken)?;
             let row = services.status()["appliance_services"]
                 .as_array()
                 .unwrap()
@@ -2782,9 +2823,10 @@ mod tests {
                 .unwrap()
                 .clone();
             ensure!(
-                row["state"] == "running",
-                "failed apply did not restore previous worker: {row}"
+                row["state"] == "error" && row["retrying"] == true,
+                "missing link did not enter recovery: {row}"
             );
+            services.apply(&broken, &enabled)?;
             let fd = socket::socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
             let mut request: libc::ifreq = unsafe { mem::zeroed() };
             for (out, b) in request.ifr_name.iter_mut().zip(b"lan1") {
@@ -2804,10 +2846,7 @@ mod tests {
                     .find(|r| r["name"] == "mdns")
                     .unwrap();
                 if row["state"] == "error" {
-                    ensure!(
-                        services.verify_mdns(&enabled).is_err(),
-                        "failed mDNS worker passed verification"
-                    );
+                    services.verify(&enabled)?;
                     break;
                 }
                 ensure!(
@@ -2820,7 +2859,21 @@ mod tests {
             socket::check(unsafe {
                 libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request)
             })?;
-            services.repair(&enabled)?;
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = services.status();
+                let row = status["appliance_services"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["name"] == "mdns")
+                    .unwrap();
+                if row["state"] == "running" {
+                    break;
+                }
+                ensure!(Instant::now() < until, "link-up did not recover: {row}");
+                thread::sleep(Duration::from_millis(10));
+            }
             services.verify_mdns(&enabled)?;
             let row = services.status()["appliance_services"]
                 .as_array()

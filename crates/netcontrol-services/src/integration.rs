@@ -85,7 +85,7 @@ fn native_counter_worker_persists_history_and_joins() {
             json!({"name":"counter-test"}),
             {
                 let directory = directory.clone();
-                move || counters::prepare(directory, "managed".into())
+                move || counters::prepare(directory.clone(), "managed".into())
             },
         )?;
         let path = directory.join("traffic-managed-v1.json");
@@ -201,7 +201,7 @@ fn native_af_packet_drops_report_incomplete_statistics_and_keep_exporting() {
             None,
             json!({"name":"loss-test"}),
             move || {
-                let run = flow::prepare(config, true)?;
+                let run = flow::prepare(config.clone(), true)?;
                 // Fill the capture socket before its receive loop starts.
                 for _ in 0..16_384 {
                     sender.send_to(&[0; 1024], target.local_addr()?)?;
@@ -297,9 +297,9 @@ fn native_flow_capacity_exports_are_batched_and_lossless() {
             None,
             json!({"name":"capacity-test"}),
             move || {
-                let run = flow::prepare(config, true)?;
+                let run = flow::prepare(config.clone(), true)?;
                 // Queue a bounded burst so each receive batch contains multiple flows.
-                for sender in senders {
+                for sender in &senders {
                     sender.send_to(&[0; 16], destination)?;
                 }
                 Ok(run)
@@ -380,7 +380,7 @@ fn native_flow_sustained_capture_above_old_receive_ceiling() {
                 "flow-throughput-test".into(),
                 None,
                 json!({"name":"throughput-test"}),
-                move || flow::prepare(config, true),
+                move || flow::prepare(config.clone(), true),
             )?;
             let started = Instant::now();
             const DATAGRAMS: u32 = 32_768;
@@ -476,7 +476,7 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                 "flow-test".into(),
                 None,
                 json!({"name":"flow-test"}),
-                move || flow::prepare(config, true),
+                move || flow::prepare(config.clone(), true),
             )?;
             let target = UdpSocket::bind(if [1, 5].contains(&version) {
                 "127.0.0.1:25001"

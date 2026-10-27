@@ -907,12 +907,29 @@ fn native_network_only_change_restarts_the_services_it_stopped() -> Result<()> {
         config(json!({
             "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":mtu,"up":true,
                 "addresses":["192.0.2.1/24"]}],
-            "vnstat":{"enabled":true}
+            "vnstat":{"enabled":true},
+            "ntp":{"enabled":true,"servers":["192.0.2.123"]}
         }))
     };
     let first = build(1500)?;
     native.apply(&empty, &first)?;
     native.observe(&first)?;
+    let capabilities = fs::read_to_string("/proc/self/status")?;
+    let effective = capabilities
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:\t"))
+        .context("CapEff missing")?;
+    if u64::from_str_radix(effective, 16)? & (1 << 25) == 0 {
+        let status = native.runtime(&first)?;
+        let ntp = status["appliance_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "ntp")
+            .unwrap();
+        assert_eq!(ntp["state"], "error");
+        assert_eq!(ntp["retrying"], true);
+    }
     let second = build(1400)?;
     native.apply(&first, &second)?;
     native.observe(&second)?;
