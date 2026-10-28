@@ -58,16 +58,18 @@ impl Monitor {
                 .unwrap_or(matches!(state, "reconnecting" | "connecting"));
             components.push(json!({"id":id,"component":component,"resource":resource,"state":state,"healthy":healthy,"retrying":retrying,"collected_at":timestamp}));
             let failed = healthy == Some(false);
+            let inactive = matches!(state, "disabled" | "simulated");
             let warning = row["error"].as_str().is_some_and(|error| !error.is_empty())
-                || row["sample_status"] == "unavailable"
-                || matches!(
-                    row["health"].as_str(),
-                    Some("down" | "degraded" | "unhealthy")
-                )
-                || row["statistics_complete"] == false
-                || row["warnings"]
-                    .as_array()
-                    .is_some_and(|warnings| !warnings.is_empty());
+                || (!inactive
+                    && (row["sample_status"] == "unavailable"
+                        || matches!(
+                            row["health"].as_str(),
+                            Some("down" | "degraded" | "unhealthy")
+                        )
+                        || row["statistics_complete"] == false
+                        || row["warnings"]
+                            .as_array()
+                            .is_some_and(|warnings| !warnings.is_empty())));
             if failed || warning {
                 let code = if failed {
                     "worker_unavailable"
@@ -248,6 +250,47 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_mdns_statistics_do_not_raise_alerts_and_disable_clears_failure() {
+        let monitor = Monitor::default();
+        let config = netcontrol_core::Config::default();
+        let mut row = config.mdns.status(&config, "error");
+        row["error"] = json!("synthetic worker failure");
+        monitor.observe(Some(&json!({"appliance_services":[row]})), &[], false);
+        assert_eq!(monitor.snapshot()["process_health"]["status"], "unhealthy");
+        assert_eq!(
+            monitor.snapshot()["active_alerts"][0]["code"],
+            "worker_unavailable"
+        );
+
+        for state in ["disabled", "simulated"] {
+            let mut row = config.mdns.status(&config, state);
+            monitor.observe(
+                Some(&json!({"appliance_services":[row.clone()]})),
+                &[],
+                false,
+            );
+            assert_eq!(monitor.snapshot()["process_health"]["status"], "healthy");
+            assert_eq!(monitor.snapshot()["active_alerts"], json!([]));
+            assert_eq!(
+                monitor.snapshot()["process_health"]["components"][0]["healthy"],
+                Value::Null
+            );
+
+            row["warnings"] = json!(["receive_loss_accounting_unavailable"]);
+            monitor.observe(Some(&json!({"appliance_services":[row]})), &[], false);
+            assert_eq!(monitor.snapshot()["active_alerts"], json!([]));
+        }
+
+        let row = config.mdns.status(&config, "running");
+        monitor.observe(Some(&json!({"appliance_services":[row]})), &[], false);
+        assert_eq!(monitor.snapshot()["process_health"]["status"], "healthy");
+        assert_eq!(
+            monitor.snapshot()["active_alerts"][0]["code"],
+            "service_warning"
+        );
+    }
 
     #[test]
     fn health_alerts_are_observational_deduplicated_and_clear_on_recovery() {

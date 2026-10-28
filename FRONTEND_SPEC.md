@@ -1547,6 +1547,9 @@ makes the aggregate unknown and preserves previously observed native failures
 until a successful observation can clear them. This is local execution/status
 health, **not** proof of synchronized time, packet forwarding or remote delivery.
 A running NTP worker with unavailable samples is healthy with a warning alert.
+Disabled/simulated services do not raise sample/capture-statistics alerts merely
+because statistics are unmeasured or incomplete. Explicit service errors remain
+visible; running services still report unavailable accounting and capture loss.
 
 `collected_at` is RFC3339 UTC or null before observation. `stale` becomes true
 after 15 seconds without a completed health collection (monotonic timeout);
@@ -2121,7 +2124,9 @@ cast it to an NTP sample or discard it as an unknown service. Its status fields:
 - Counters reset on worker start. `transmitted_packets` counts successful
   destination sends, not client receipt. `statistics_complete` becomes false
   after known receive/queue/rate/oversize loss or unavailable loss accounting.
-  Disabled/simulated rows claim no measured completeness.
+  Disabled/simulated rows claim no measured completeness (`statistics_complete:
+  false`, `receive_drops: null`) and have empty `warnings`; do not render these
+  unmeasured statistics as an unhealthy service.
 - Optional `retrying`, `restart_count`, `last_error` have the shared native
   supervisor semantics in section 6.1.3. Link/port/socket failures are visible
   and retry automatically without manual repair or global configuration locks.

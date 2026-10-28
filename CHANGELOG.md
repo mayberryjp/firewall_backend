@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- Disabled/simulated mDNS no longer emits a receive-loss-accounting warning.
+  Unmeasured capture statistics remain explicitly incomplete, but no longer
+  generate platform/MQTT active alerts for inactive services. Running-service
+  warnings and explicit errors remain visible. Recommended bump: patch;
+  baseline unknown, Unreleased. Required frontend rendering clarification:
+  [handoff 2026-10-27-03](docs/frontend-handoffs/2026-10-27.md#2026-10-27-03-inactive-mdns-is-not-unhealthy).
+
 - Stabilized the privileged mDNS interface-recycling CI fixture by disabling
   automatic IPv6 address generation through netlink before bringing test links
   up and restoring an explicit IPv6 address after the link-flap fixture. Explicit

@@ -235,7 +235,8 @@ impl MDNSConfig {
             "effective_interfaces":self.effective_interfaces(config),
             "effective_families":[],
             "reflection_enabled":self.reflection.enabled,"publishing_enabled":self.publishing.enabled,
-            "receive_drops":null,"statistics_complete":false,"warnings":["receive_loss_accounting_unavailable"],
+            "receive_drops":null,"statistics_complete":false,
+            "warnings":if matches!(state, "disabled" | "simulated") {vec![]} else {vec!["receive_loss_accounting_unavailable"]},
             "limits":{"interfaces":32,"payload_bytes":9000,"records":512,"fingerprints":8192,
                 "fingerprint_seconds":1,"association_seconds":120,"egress_payload_bytes":1232,
                 "associations":8192,"requesters":1024,"requester_seconds":5,
@@ -274,6 +275,22 @@ impl MDNSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inactive_status_does_not_report_receive_loss_warnings() {
+        let config = Config::default();
+        for state in ["disabled", "simulated"] {
+            let status = config.mdns.status(&config, state);
+            assert_eq!(status["state"], state);
+            assert_eq!(status["warnings"], json!([]));
+            assert_eq!(status["statistics_complete"], false);
+            assert_eq!(status["receive_drops"], Value::Null);
+        }
+        assert_eq!(
+            config.mdns.status(&config, "running")["warnings"],
+            json!(["receive_loss_accounting_unavailable"])
+        );
+    }
+
     fn config() -> Config {
         let mut c = Config::default();
         for name in ["lan1", "lan2", "wan"] {
