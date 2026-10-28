@@ -39,9 +39,13 @@ Configuration commands:
   firewall rule SOURCE|any DESTINATION|any accept|drop / no firewall rule INDEX
   firewall host JSON / firewall interface-policy JSON
   nat masquerade ipv4|ipv6 INTERFACE [SOURCE] / no nat masquerade INDEX
+  nat destination-rewrite WAN tcp|udp PORT LAN TARGET_IP / no nat destination-rewrite INDEX
   ntp server HOST / no ntp server HOST / ntp enable|disable
   mdns JSON / no mdns                 Replace/reset native discovery candidate
   show mdns / show mdns status        Committed settings / applied worker
+  bgp JSON / no bgp                   Replace/reset BGP candidate
+  show bgp / show bgp status          Committed BGP settings / neighbor status
+  show routes bgp                    BGP learned paths and installation status
   syslog server HOST PORT udp|tcp|tls / no syslog server INDEX / syslog enable|disable
   vnstat enable|disable
   exporter JSON / no exporter NAME / gateway-monitor JSON / no gateway-monitor NAME
@@ -489,6 +493,9 @@ impl CliSession {
             ["state"] => "/api/v1/state".to_owned(),
             ["runtime"] => "/api/v1/runtime".to_owned(),
             ["mdns"] => "/api/v1/services/mdns".to_owned(),
+            ["bgp"] => "/api/v1/services/bgp".to_owned(),
+            ["bgp", "status"] => "/api/v1/services/bgp/status".to_owned(),
+            ["routes", "bgp"] => "/api/v1/routes/bgp".to_owned(),
             ["mdns", "status"] => "/api/v1/services/mdns/status".to_owned(),
             ["interfaces"] => "/api/v1/interfaces".to_owned(),
             ["interfaces", "discovered"] => "/api/v1/interfaces/discovered".to_owned(),
@@ -810,6 +817,14 @@ fn check_family(family: &str, prefix: &str) -> Result<()> {
 
 fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
     match words {
+        ["bgp", ..] => {
+            let bgp: netcontrol_core::BGPConfig =
+                serde_json::from_str(command_input(line, "bgp").context("BGP JSON required")?)?;
+            config["bgp"] = serde_json::to_value(bgp)?;
+        }
+        ["no", "bgp"] => {
+            config["bgp"] = serde_json::to_value(netcontrol_core::BGPConfig::default())?
+        }
         ["mdns", ..] => {
             let mdns: netcontrol_core::MDNSConfig =
                 serde_json::from_str(command_input(line, "mdns").context("mDNS JSON required")?)?;
@@ -896,6 +911,25 @@ fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
         ["no", "nat", "masquerade", index] => {
             remove_index(array(&mut config["firewall"]["nat"], "masquerade")?, index)?
         }
+        [
+            "nat",
+            "destination-rewrite",
+            wan,
+            protocol,
+            port,
+            lan,
+            target,
+        ] => {
+            push_unique(
+                array(&mut config["firewall"]["nat"], "destination_rewrite")?,
+                json!({"out_interface":wan,"protocol":protocol,"destination_port":number(port)?,
+                    "target_interface":lan,"target_address":target}),
+            )?;
+        }
+        ["no", "nat", "destination-rewrite", index] => remove_index(
+            array(&mut config["firewall"]["nat"], "destination_rewrite")?,
+            index,
+        )?,
         ["ntp", "server", host] => push_unique(array(&mut config["ntp"], "servers")?, json!(host))?,
         ["no", "ntp", "server", host] => {
             remove_where(array(&mut config["ntp"], "servers")?, |v| v == host)?

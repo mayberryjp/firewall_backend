@@ -66,6 +66,14 @@ Enabling SSH does not provision interfaces or forwarding.
 
 ## Candidate, apply, and confirmation
 
+BGP uses `bgp JSON` / `no bgp` to replace/reset the private candidate's BGP
+object. Commit requires `transactions.write` and `bgp.write`, plus permissions
+for other changed areas. `show bgp`, `show bgp status` and `show routes bgp`
+require `state.read`; the last lists learned paths independently of configured
+static routes. See the [complete BGP contract](../FRONTEND_SPEC.md#native-ipv4-bgp)
+for a configuration example, interface/WireGuard selection, timers, default
+route opt-in, installation status and limitations.
+
 Every SSH shell has a private in-memory candidate. Entering configuration mode
 copies the **committed** configuration and its revision, not observed live state.
 Commands edit only that candidate. They never change networking individually.
@@ -146,6 +154,8 @@ firewall host JSON
 firewall interface-policy JSON
 nat masquerade ipv4|ipv6 INTERFACE [SOURCE]
 no nat masquerade INDEX
+nat destination-rewrite WAN tcp|udp PORT LAN TARGET_IP
+no nat destination-rewrite INDEX
 ntp server HOST
 no ntp server HOST
 ntp enable|disable
@@ -259,6 +269,17 @@ For host routing, main table `254` is also supported. Forwarding remains an
 operator prerequisite: the CLI rejects forwarding sysctls because their
 collateral device/RA changes cannot currently be safely rolled back.
 Roles do not enable forwarding, acquire DHCP leases or create NAT automatically.
+
+Destination rewrite matches forwarded traffic's original WAN route and one exact
+TCP/UDP destination port, replacing only the destination IP with another device
+on the selected LAN subnet. Use separate TCP and UDP rules for DNS. For example:
+`nat destination-rewrite wan0 udp 53 lan0 192.168.10.53`.
+The client IP and destination port remain unchanged; arrange replies through the
+firewall (a same-subnet target normally replies directly and breaks reverse NAT).
+Firewall-originated traffic is excluded, ordinary filtering still applies to
+the rewritten target, and existing conntrack translations persist after edits.
+Commands stage the same confirmed transaction and require `nat.write`; see the
+[canonical contract](../FRONTEND_SPEC.md#destination-rewrite).
 
 ## Complete-schema JSON editing
 

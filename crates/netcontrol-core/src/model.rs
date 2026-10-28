@@ -22,6 +22,7 @@ pub struct Config {
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
     pub mdns: crate::MDNSConfig,
+    pub bgp: crate::BGPConfig,
     pub mqtt: MQTTConfig,
     pub system: SystemConfig,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -48,6 +49,7 @@ impl Default for Config {
             syslog: Default::default(),
             vnstat: Default::default(),
             mdns: Default::default(),
+            bgp: Default::default(),
             mqtt: Default::default(),
             system: Default::default(),
             dynamic_dns: Vec::new(),
@@ -397,6 +399,18 @@ impl Default for Firewall {
 #[serde(default, deny_unknown_fields)]
 pub struct NAT {
     pub masquerade: Vec<MasqueradeRule>,
+    pub destination_rewrite: Vec<DestinationRewriteRule>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationRewriteRule {
+    #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
+    pub metadata: ObjectMetadata,
+    pub out_interface: String,
+    pub protocol: String,
+    pub destination_port: u16,
+    pub target_interface: String,
+    pub target_address: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -680,10 +694,12 @@ fn action(s: &str) -> bool {
 impl Config {
     fn metadata_values(&self) -> Vec<&ObjectMetadata> {
         let mut values = vec![
+            &self.bgp.metadata,
             &self.ntp.metadata,
             &self.syslog.metadata,
             &self.vnstat.metadata,
         ];
+        values.extend(self.bgp.neighbors.iter().map(|n| &n.metadata));
         for server in &self.syslog.servers {
             values.push(&server.metadata);
         }
@@ -705,6 +721,13 @@ impl Config {
             self.firewall
                 .nat
                 .masquerade
+                .iter()
+                .map(|rule| &rule.metadata),
+        );
+        values.extend(
+            self.firewall
+                .nat
+                .destination_rewrite
                 .iter()
                 .map(|rule| &rule.metadata),
         );
@@ -786,6 +809,7 @@ impl Config {
         Self::default()
     }
     pub fn normalize(&mut self) {
+        self.bgp.neighbors.sort_by(|a, b| a.name.cmp(&b.name));
         self.mdns.normalize();
         self.dynamic_dns.sort_by(|a, b| a.name.cmp(&b.name));
         self.ntp.servers.sort();
@@ -846,6 +870,7 @@ impl Config {
         c
     }
     pub fn validate(&self) -> Result<()> {
+        self.bgp.validate(self)?;
         self.mdns.validate(self)?;
         crate::dynamic_dns::validate(self)?;
         self.system.validate()?;
@@ -1218,10 +1243,92 @@ impl Config {
                 "masquerade egress requires an address of its family or an IPv4 DHCP client"
             );
         }
+        self.validate_destination_rewrite()?;
         self.validate_softflowd()?;
         self.validate_monitors()?;
         if !self.ipv6_enabled {
             self.validate_ipv4_only()?;
+        }
+        Ok(())
+    }
+    fn validate_destination_rewrite(&self) -> Result<()> {
+        let rules = &self.firewall.nat.destination_rewrite;
+        ensure!(rules.len() <= 256, "at most 256 destination rewrite rules");
+        let mut matches = BTreeSet::new();
+        for rule in rules {
+            let target = canonical_ip(&rule.target_address)?;
+            ensure!(
+                global_unicast(target) && (self.ipv6_enabled || target.is_ipv4()),
+                "destination rewrite target must be unicast and use an enabled IP family"
+            );
+            ensure!(
+                ["tcp", "udp"].contains(&rule.protocol.as_str()) && rule.destination_port != 0,
+                "destination rewrite requires tcp/udp and an exact port in 1..65535"
+            );
+            ensure!(
+                self.interfaces
+                    .iter()
+                    .any(|link| link.name == rule.out_interface
+                        && link.role == "wan"
+                        && link.up
+                        && (link
+                            .addresses
+                            .iter()
+                            .any(|address| canonical_prefix(address, false)
+                                .is_ok_and(|(ip, _)| ip.is_ipv4() == target.is_ipv4()))
+                            || (target.is_ipv4() && self.dhcp_clients.contains_key(&link.name)))),
+                "destination rewrite requires an up managed WAN with the target IP family"
+            );
+            let local = self
+                .interfaces
+                .iter()
+                .find(|link| link.name == rule.target_interface && link.role == "lan" && link.up)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "destination rewrite requires an up managed LAN target interface"
+                    )
+                })?;
+            ensure!(
+                local.addresses.iter().any(|address| {
+                    canonical_prefix(address, false).is_ok_and(|(ip, bits)| {
+                        if ip.is_ipv4() != target.is_ipv4()
+                            || masked(ip, bits) != masked(target, bits)
+                        {
+                            return false;
+                        }
+                        match target {
+                            IpAddr::V4(ip) if bits < 31 => {
+                                let network = u32::from(match masked(target, bits) {
+                                    IpAddr::V4(network) => network,
+                                    _ => unreachable!(),
+                                });
+                                let broadcast = network | (u32::MAX >> bits);
+                                u32::from(ip) != network && u32::from(ip) != broadcast
+                            }
+                            _ => true,
+                        }
+                    })
+                }),
+                "destination rewrite target must be a usable address on its LAN subnet"
+            );
+            ensure!(
+                !self
+                    .interfaces
+                    .iter()
+                    .flat_map(|link| &link.addresses)
+                    .any(|address| canonical_prefix(address, false)
+                        .is_ok_and(|(ip, _)| ip == target)),
+                "destination rewrite target must be another device, not the firewall"
+            );
+            ensure!(
+                matches.insert((
+                    &rule.out_interface,
+                    &rule.protocol,
+                    rule.destination_port,
+                    target.is_ipv4()
+                )),
+                "duplicate destination rewrite WAN/protocol/port/IP-family match"
+            );
         }
         Ok(())
     }

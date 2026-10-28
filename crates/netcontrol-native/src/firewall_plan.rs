@@ -13,6 +13,41 @@ pub struct Match {
     pub action: String,
     pub established_related: bool,
 }
+
+pub fn destination_rewrites(
+    firewall: &Value,
+) -> Result<Vec<netcontrol_core::DestinationRewriteRule>> {
+    let Some(value) = firewall["nat"].get("destination_rewrite") else {
+        return Ok(vec![]);
+    };
+    let rules: Vec<netcontrol_core::DestinationRewriteRule> =
+        serde_json::from_value(value.clone()).context("destination rewrite rules")?;
+    ensure!(rules.len() <= 256, "at most 256 destination rewrite rules");
+    let mut matches = std::collections::BTreeSet::new();
+    for rule in &rules {
+        let target: IpAddr = rule.target_address.parse()?;
+        ensure!(
+            target.to_string() == rule.target_address
+                && netcontrol_core::global_unicast(target)
+                && crate::safe_name(&rule.out_interface, 15)
+                && crate::safe_name(&rule.target_interface, 15)
+                && rule.out_interface != rule.target_interface
+                && matches!(rule.protocol.as_str(), "tcp" | "udp")
+                && rule.destination_port != 0,
+            "invalid destination rewrite rule"
+        );
+        ensure!(
+            matches.insert((
+                &rule.out_interface,
+                &rule.protocol,
+                rule.destination_port,
+                target.is_ipv4()
+            )),
+            "duplicate destination rewrite match"
+        );
+    }
+    Ok(rules)
+}
 fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
@@ -38,6 +73,7 @@ fn host_prefix(value: &str) -> Result<String> {
 }
 
 pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
+    destination_rewrites(firewall)?;
     action(string(firewall, "policy"))?;
     ensure!(
         firewall["allow_all_icmp"].is_boolean(),

@@ -65,6 +65,180 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
 }
 
 #[test]
+fn bgp_api_permissions_transactions_restart_and_route_visibility() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut candidate = config();
+    candidate.bgp=serde_json::from_value(json!({"enabled":true,"local_asn":65001,"router_id":"192.0.2.1",
+        "neighbors":[{"name":"edge","interface":"lan0","local_address":"192.0.2.1","address":"192.0.2.2","remote_asn":65002}]})).unwrap();
+    let transaction = submit(&mut engine, candidate.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    for path in [
+        "/api/v1/services/bgp",
+        "/api/v1/services/bgp/status",
+        "/api/v1/routes/bgp",
+    ] {
+        let response = engine.request("GET", path, "", "reader", &["state.read".into()], &[]);
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(
+            engine
+                .request("GET", path, "x=1", "reader", &["state.read".into()], &[])
+                .status,
+            400
+        );
+        assert_eq!(
+            engine.request("GET", path, "", "reader", &[], &[]).status,
+            403
+        );
+        assert_eq!(
+            engine
+                .request("POST", path, "", "reader", &["state.read".into()], b"{}")
+                .status,
+            405
+        );
+    }
+    let routes = request(&mut engine, "GET", "/api/v1/routes/bgp", Value::Null);
+    assert_eq!(routes.body["source"], "bgp");
+    assert_eq!(routes.body["state"], "simulated");
+    assert_eq!(routes.body["routes"], json!([]));
+    assert_eq!(engine.restart_process("bgp").body["status"], "simulated");
+    assert_eq!(engine.committed_revision(), 1);
+    let stats = request(&mut engine, "GET", "/api/v1/statistics", Value::Null);
+    assert_eq!(stats.body["bgp"]["state"], "simulated");
+    let mut no_bgp = all();
+    no_bgp.retain(|p| p != "bgp.write");
+    candidate.bgp.keepalive_seconds = 20;
+    let response=engine.request("POST","/api/v1/transactions","","operator",&no_bgp,
+        &serde_json::to_vec(&json!({"base_revision":1,"confirm_timeout_seconds":30,"description":"BGP timers","config":candidate})).unwrap());
+    assert_eq!(response.status, 403, "{}", response.body);
+}
+
+#[test]
+fn destination_rewrite_permissions_persistence_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut initial = config();
+    initial.interfaces.push(
+        serde_json::from_value(json!({
+            "name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,
+            "addresses":["198.51.100.1/24"]
+        }))
+        .unwrap(),
+    );
+    let transaction = submit(&mut engine, initial.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let mut rewritten = initial.clone();
+    rewritten.firewall.nat.destination_rewrite.push(
+        serde_json::from_value(json!({
+            "out_interface":"wan0","protocol":"udp","destination_port":53,
+            "target_interface":"lan0","target_address":"192.0.2.53",
+            "metadata":{"display_name":"Local DNS","description":"Forwarded UDP DNS"}
+        }))
+        .unwrap(),
+    );
+    let limited: Vec<_> = all().into_iter().filter(|p| p != "nat.write").collect();
+    let body = serde_json::to_vec(
+        &json!({"base_revision":1,"confirm_timeout_seconds":30,"config":rewritten}),
+    )
+    .unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "limited",
+                &limited,
+                &body
+            )
+            .status,
+        403
+    );
+    let mut invalid = rewritten.clone();
+    invalid.firewall.nat.destination_rewrite[0].target_address = "203.0.113.53".into();
+    assert_eq!(submit(&mut engine, invalid).status, 422);
+    let transaction = submit(&mut engine, rewritten.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    let id = transaction.body["id"].as_str().unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                &format!("/api/v1/transactions/{id}/confirm"),
+                "",
+                "limited",
+                &limited,
+                &[]
+            )
+            .status,
+        403
+    );
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    let nat = request(&mut engine, "GET", "/api/v1/firewall/nat", Value::Null);
+    assert_eq!(nat.status, 200);
+    assert_eq!(
+        nat.body["destination_rewrite"][0]["target_address"],
+        "192.0.2.53"
+    );
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(rewritten.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(engine.saved_configuration(), &rewritten);
+    let transaction = submit(&mut engine, initial);
+    assert_eq!(transaction.status, 202);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                transaction.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.saved_configuration(), &rewritten);
+    let mut metadata = rewritten.clone();
+    metadata.firewall.nat.destination_rewrite[0]
+        .metadata
+        .description = "Updated description".into();
+    assert_eq!(
+        metadata.operational_value().unwrap(),
+        rewritten.operational_value().unwrap()
+    );
+    let body = serde_json::to_vec(
+        &json!({"base_revision":2,"confirm_timeout_seconds":30,"config":metadata}),
+    )
+    .unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "limited",
+                &limited,
+                &body
+            )
+            .status,
+        403
+    );
+}
+
+#[test]
 fn operational_restarts_do_not_change_revision_and_reject_pending_transactions() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

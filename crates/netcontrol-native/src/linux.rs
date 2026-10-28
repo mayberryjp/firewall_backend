@@ -40,6 +40,9 @@ mod firewall {
     }
 }
 mod adoption;
+mod bgp;
+#[cfg(feature = "nftables")]
+mod destination_rewrite;
 mod dhcp_client;
 mod dhcp_monitors;
 #[cfg(all(test, feature = "nftables"))]
@@ -64,6 +67,7 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 }
 
 pub struct Native {
+    bgp: bgp::Manager,
     link_monitor: link_monitor::Monitor,
     options: NativeOptions,
     namespace: Arc<File>,
@@ -323,6 +327,7 @@ impl Native {
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
         let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
+            bgp: bgp::Manager::new(namespace.clone(), state.clone())?,
             link_monitor: link_monitor::Monitor::new(namespace.clone())?,
             dhcp,
             dhcp_monitors,
@@ -347,6 +352,7 @@ impl Native {
             ownership.kernel_baseline.host.is_empty() || native.host_namespace.is_some(),
             "host tunable ownership requires explicit allow_host_tunables for recovery"
         );
+        native.bgp.recover()?;
         let originals = ownership.handover_originals(
             host_mode,
             host_mode && native.state.join("adoption.json").try_exists()?,
@@ -389,14 +395,17 @@ impl Native {
     }
 
     fn stop_services(&mut self) -> Result<()> {
+        self.bgp.shutdown()?;
         self.dhcp_monitors.shutdown()?;
         self.services.shutdown()
     }
 
     fn repair_services(&mut self, config: &Value) -> Result<()> {
+        self.bgp.shutdown()?;
         self.dhcp_monitors.shutdown()?;
         self.services.repair(config)?;
-        self.dhcp_monitors.configure(config)
+        self.dhcp_monitors.configure(config)?;
+        self.bgp.configure(config)
     }
 
     fn gateway_statistics(&self, path: &str) -> Result<Value> {
@@ -459,7 +468,14 @@ impl Native {
 
     fn verify(&self, config: &Value) -> Result<()> {
         self.check_scope()?;
-        let mut network = Network::parse(config)?;
+        let bgp_state = self
+            .bgp
+            .state
+            .lock()
+            .map_err(|_| anyhow!("BGP state poisoned"))?;
+        let mut effective_config = config.clone();
+        bgp_state.effective(&mut effective_config)?;
+        let mut network = Network::parse(&effective_config)?;
         network.validate(&self.parents.keys().cloned().collect())?;
         let leases = self
             .dhcp
@@ -895,6 +911,12 @@ impl Native {
 }
 
 impl Backend for Native {
+    fn bgp_status(&mut self, _: &Config) -> Result<Value> {
+        self.check_scope()?;
+        let mut value = self.bgp.snapshot()?;
+        value["scope"] = json!(self.identity);
+        Ok(value)
+    }
     fn prepare_dns_lookup(
         &mut self,
         config: &Config,
@@ -955,6 +977,9 @@ impl Backend for Native {
         if target == "link-diagnostics" {
             self.link_monitor.restart(self.namespace.clone())?;
             return self.link_monitor.snapshot();
+        }
+        if target == "bgp" {
+            return self.bgp.restart();
         }
         self.services.restart_worker(target)
     }
@@ -1210,6 +1235,7 @@ impl Backend for Native {
             ownership.boot = self.boot.clone();
             self.services.apply(&before, &after)?;
             self.dhcp_monitors.configure(&after)?;
+            self.bgp.configure(&after)?;
             self.log("native networking and services converged")?;
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))
@@ -1274,6 +1300,15 @@ impl Backend for Native {
             rt.block_on(networking::parent_status(handle, &parents))
         })?;
         let mut value = self.services.status();
+        let mut bgp = self.bgp.snapshot()?;
+        bgp.as_object_mut()
+            .context("BGP status missing")?
+            .remove("routes");
+        value["appliance_services"]
+            .as_array_mut()
+            .context("service status missing")?
+            .push(bgp.clone());
+        value["bgp"] = bgp;
         self.dhcp_monitors.merge(&mut value["gateway_monitors"])?;
         if !value.is_object() {
             value = json!({"services":value});
@@ -1387,6 +1422,11 @@ impl Backend for Native {
             ))
         })?;
         if all {
+            let mut bgp = self.bgp.snapshot()?;
+            bgp.as_object_mut()
+                .context("BGP status missing")?
+                .remove("routes");
+            value["bgp"] = bgp;
             let mut diagnostics = self.link_monitor.snapshot()?;
             diagnostics["scope"] = json!(self.identity);
             value["link_diagnostics"] = diagnostics;
@@ -1478,6 +1518,9 @@ impl Backend for Native {
 
 impl Drop for Native {
     fn drop(&mut self) {
+        if let Err(error) = self.bgp.shutdown() {
+            eprintln!("BGP shutdown failed: {error:#}");
+        }
         let _ = self.dhcp_monitors.shutdown();
         let _ = self.dhcp.shutdown();
         let _ = self.services.shutdown();

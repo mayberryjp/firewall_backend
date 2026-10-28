@@ -150,6 +150,44 @@ fn exchange(
     attrs: &[u8],
     ack: bool,
 ) -> Result<Vec<Vec<u8>>> {
+    let mut request = Vec::new();
+    request.extend((20u32 + attrs.len() as u32).to_ne_bytes());
+    request.extend(((subsystem << 8) | message).to_ne_bytes());
+    request.extend(if ack { 5u16 } else { 0x301u16 }.to_ne_bytes());
+    request.extend(1u32.to_ne_bytes());
+    request.extend(0u32.to_ne_bytes());
+    request.extend([family, 0, 0, 0]);
+    request.extend(attrs);
+    exchange_request(&request, subsystem, ack, None)
+}
+
+pub(super) fn send_batch(request: &[u8], last_sequence: u32) -> Result<()> {
+    exchange_request(request, 10, true, Some(last_sequence))?;
+    Ok(())
+}
+
+fn exchange_request(
+    request: &[u8],
+    subsystem: u16,
+    ack: bool,
+    batch_sequence: Option<u32>,
+) -> Result<Vec<Vec<u8>>> {
+    let mut headers = BTreeMap::new();
+    if batch_sequence.is_some() {
+        let mut frames = request;
+        while !frames.is_empty() {
+            ensure!(frames.len() >= 20, "short nftables batch frame");
+            let length = u32::from_ne_bytes(frames[..4].try_into()?) as usize;
+            ensure!(
+                length >= 20 && length <= frames.len(),
+                "invalid nftables batch frame"
+            );
+            headers.insert(u32::from_ne_bytes(frames[8..12].try_into()?), &frames[..16]);
+            let aligned = (length + 3) & !3;
+            ensure!(aligned <= frames.len(), "short nftables batch padding");
+            frames = &frames[aligned..];
+        }
+    }
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -176,6 +214,24 @@ fn exchange(
         "bind netfilter socket: {}",
         std::io::Error::last_os_error()
     );
+    if batch_sequence.is_some() {
+        // A whole atomic batch is processed before its ACKs can be drained.
+        // Reserve bounded queue space for per-rule ACK socket-buffer overhead.
+        let capacity: libc::c_int = 4 * 1024 * 1024;
+        ensure!(
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &capacity as *const _ as *const _,
+                    std::mem::size_of_val(&capacity) as u32,
+                )
+            } == 0,
+            "reserve nftables batch acknowledgement buffer: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     let timeout = libc::timeval {
         tv_sec: 5,
         tv_usec: 0,
@@ -192,14 +248,6 @@ fn exchange(
         } == 0,
         "netfilter socket timeout"
     );
-    let mut request = Vec::new();
-    request.extend((20u32 + attrs.len() as u32).to_ne_bytes());
-    request.extend(((subsystem << 8) | message).to_ne_bytes());
-    request.extend(if ack { 5u16 } else { 0x301u16 }.to_ne_bytes());
-    request.extend(1u32.to_ne_bytes());
-    request.extend(0u32.to_ne_bytes());
-    request.extend([family, 0, 0, 0]);
-    request.extend(attrs);
     ensure!(
         unsafe {
             libc::sendto(
@@ -270,7 +318,9 @@ fn exchange(
             let flags = u16::from_ne_bytes(data[6..8].try_into()?);
             let sequence = u32::from_ne_bytes(data[8..12].try_into()?);
             ensure!(
-                length >= 16 && length <= data.len() && sequence == 1,
+                length >= 16
+                    && length <= data.len()
+                    && batch_sequence.map_or(sequence == 1, |_| headers.contains_key(&sequence)),
                 "invalid netfilter response frame"
             );
             ensure!(
@@ -280,8 +330,17 @@ fn exchange(
             let payload = &data[16..length];
             if kind == 2 {
                 if ack {
-                    delete_acknowledgement(payload, &request)?;
-                    return Ok(result);
+                    let header = if batch_sequence.is_some() {
+                        headers
+                            .get(&sequence)
+                            .context("unknown nftables acknowledgement")?
+                    } else {
+                        &request
+                    };
+                    delete_acknowledgement(payload, header)?;
+                    if batch_sequence.is_none_or(|last| sequence == last) {
+                        return Ok(result);
+                    }
                 }
                 ensure!(payload.len() >= 4, "short netlink error");
                 let error = i32::from_ne_bytes(payload[..4].try_into()?);

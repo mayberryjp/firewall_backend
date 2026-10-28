@@ -81,6 +81,46 @@ impl Fixture {
 }
 
 #[test]
+fn destination_rewrite_cli_stages_validates_commits_and_removes() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.interface(&mut cli, "lan0");
+    f.ok(&mut cli, "interface wan0 dummy");
+    f.ok(&mut cli, "role wan");
+    f.ok(&mut cli, "no shutdown");
+    f.ok(&mut cli, "ip address 198.51.100.1/24");
+    f.ok(&mut cli, "exit");
+    f.ok(
+        &mut cli,
+        "nat destination-rewrite wan0 udp 53 lan0 192.0.2.53",
+    );
+    f.ok(
+        &mut cli,
+        "nat destination-rewrite wan0 tcp 53 lan0 192.0.2.53",
+    );
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/firewall/nat")["destination_rewrite"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "no nat destination-rewrite 0");
+    f.ok(&mut cli, "no nat destination-rewrite 0");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/firewall/nat")["destination_rewrite"],
+        json!([])
+    );
+}
+
+#[test]
 fn link_diagnostics_show_is_read_only_and_permission_checked() {
     let f = Fixture::new(&["state.read"]);
     let mut cli = CliSession::new();
@@ -90,6 +130,33 @@ fn link_diagnostics_show_is_read_only_and_permission_checked() {
     assert!(value["local_tcp"].is_null());
     let denied = Fixture::new(&[]);
     denied.fail(&mut cli, "show statistics link-diagnostics", "403");
+}
+
+#[test]
+fn bgp_candidate_status_routes_and_permissions() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli,r#"set /interfaces [{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}]"#);
+    f.ok(&mut cli,r#"bgp {"enabled":true,"local_asn":65001,"router_id":"192.0.2.1","neighbors":[{"name":"edge","address":"192.0.2.2","local_address":"192.0.2.1","interface":"lan0","remote_asn":65002}]}"#);
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    let status: Value = serde_json::from_str(&f.ok(&mut cli, "show bgp status")).unwrap();
+    assert_eq!(status["state"], "simulated");
+    let routes: Value = serde_json::from_str(&f.ok(&mut cli, "show routes bgp")).unwrap();
+    assert_eq!(routes["source"], "bgp");
+    assert_eq!(routes["routes"], json!([]));
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "no bgp");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(f.request("/api/v1/services/bgp")["enabled"], false);
+    let denied = Fixture::new(&["state.read", "transactions.write"]);
+    let mut cli = CliSession::new();
+    denied.configure(&mut cli);
+    denied.ok(&mut cli, r#"bgp {"metadata":{"display_name":"Routing"}}"#);
+    denied.fail(&mut cli, "commit confirmed 30", "bgp.write");
 }
 
 #[test]

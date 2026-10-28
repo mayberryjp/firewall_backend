@@ -94,6 +94,20 @@ No resolver override, shell lookup or external helper is used. See the
 [complete action contract](FRONTEND_SPEC.md#operational-restart-and-dns-diagnostics)
 for targets, limits, statuses, timing and side effects.
 
+Basic native IPv4 BGP runs inside the daemon: configure `bgp` in a full
+transaction with local ASN/router ID, interface-bound neighbors and keepalive/
+hold timers. It advertises connected prefixes from all configured up interfaces,
+installs accepted learned routes, and maintains BGP-owned WireGuard AllowedIPs
+for explicitly referenced peers. Default-route import requires opt-in.
+Inspect `GET /api/v1/services/bgp/status`, `GET /api/v1/routes/bgp`,
+`show bgp status` or `show routes bgp`; MQTT includes the summary and shared
+process health. Static configuration is preserved on withdrawal/session loss.
+See the [BGP contract and operator prerequisites](FRONTEND_SPEC.md#native-ipv4-bgp)
+for limits, bootstrap routing, privileges, ownership and unsupported features.
+A [synthetic BGP-over-WireGuard transaction](examples/bgp.json) illustrates
+the current schema; provision keys/underlay and adapt the complete configuration
+before applying it.
+
 Optional Ubuntu amd64 self-upgrade uses `POST /api/v1/system/upgrade` with a
 specific SemVer version and `GET` on the same path for durable job status.
 It is disabled until a trusted release-signing public key and fixed GitHub
@@ -105,6 +119,27 @@ to preview the explicit service/package profile. Nothing changes without
 `--apply`. AppArmor remains enabled unless `--disable-apparmor` is explicitly
 selected; that protection opt-out requires GRUB and a later manual reboot.
 See [scope and recovery](docs/BUILD_AND_INSTALL.md#ubuntu-os-footprint-reduction).
+
+## Destination rewrite
+
+Exact-port destination NAT can redirect forwarded Internet-bound traffic to a
+device on a local subnet. Match the original WAN, TCP or UDP and one port using
+`firewall.nat.destination_rewrite`; see the
+[example](examples/destination-rewrite.json) and
+[complete contract](FRONTEND_SPEC.md#destination-rewrite).
+For DNS, configure both TCP/53 and UDP/53. The destination port and client IP
+are preserved; firewall-originated traffic is excluded. Ordinary forwarding
+rules see the rewritten target and still apply.
+
+The target must send replies through this firewall. A target on the client's
+own subnet normally replies directly and will not work without an explicitly
+arranged routed return path. No automatic source NAT or hairpin masquerade is
+added. Configure a separate target subnet if needed. Changes affect new
+connections; existing conntrack translations are not automatically deleted.
+The target device is not automatically exempt: its own upstream queries must
+not use the intercepted WAN/port, or they will be redirected back to it.
+Linux nftables inet FIB/NAT support, forwarding and working routes are required.
+Edits use normal confirmed transactions and `nat.write`.
 
 ## Start and onboard
 

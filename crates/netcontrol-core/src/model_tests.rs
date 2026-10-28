@@ -10,6 +10,104 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn destination_rewrite_exact_ports_local_targets_and_strict_schema() {
+    let mut value = serde_json::to_value(candidate()).unwrap();
+    value["interfaces"].as_array_mut().unwrap().push(json!({
+        "name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,
+        "addresses":["198.51.100.1/24","2001:db8:1::1/64"]
+    }));
+    value["interfaces"][0]["addresses"] = json!(["192.0.2.1/24", "2001:db8:2::1/64"]);
+    let rule = json!({"out_interface":"wan0","protocol":"udp","destination_port":53,
+        "target_interface":"lan0","target_address":"192.0.2.53"});
+    value["firewall"]["nat"]["destination_rewrite"] = json!([rule.clone()]);
+    let decode = |value: Value| serde_json::from_value::<Config>(value).unwrap();
+    let valid = decode(value.clone());
+    valid.validate().unwrap();
+    assert_eq!(decode(serde_json::to_value(&valid).unwrap()), valid);
+    assert_eq!(
+        valid.operational_value().unwrap()["firewall"]["nat"]["destination_rewrite"][0],
+        rule
+    );
+    for (field, invalid) in [
+        ("out_interface", json!("missing")),
+        ("out_interface", json!("lan0")),
+        ("target_interface", json!("wan0")),
+        ("target_interface", json!("missing")),
+        ("protocol", json!("tcp_udp")),
+        ("destination_port", json!(0)),
+        ("target_address", json!("192.0.2.1")),
+        ("target_address", json!("192.0.2.0")),
+        ("target_address", json!("192.0.2.255")),
+        ("target_address", json!("203.0.113.53")),
+        ("target_address", json!("127.0.0.1")),
+        ("target_address", json!("224.0.0.53")),
+        ("target_address", json!("fe80::53")),
+    ] {
+        let mut bad = value.clone();
+        bad["firewall"]["nat"]["destination_rewrite"][0][field] = invalid;
+        assert!(decode(bad).validate().is_err(), "{field}");
+    }
+    for (field, invalid) in [
+        ("destination_port", json!(65536)),
+        ("destination_port", json!("53")),
+        ("destination_port", json!([53, 54])),
+        ("target_address", Value::Null),
+        ("source", json!("192.0.2.0/24")),
+    ] {
+        let mut bad = value.clone();
+        bad["firewall"]["nat"]["destination_rewrite"][0][field] = invalid;
+        assert!(serde_json::from_value::<Config>(bad).is_err(), "{field}");
+    }
+    for index in [0, 1] {
+        let mut bad = value.clone();
+        bad["interfaces"][index]["up"] = json!(false);
+        assert!(decode(bad).validate().is_err());
+    }
+    let mut dynamic = value.clone();
+    dynamic["interfaces"][1]["addresses"] = json!([]);
+    assert!(decode(dynamic.clone()).validate().is_err());
+    dynamic["dhcp_clients"]["wan0"] = json!({});
+    dynamic["interfaces"][1]["kind"] = json!("ethernet");
+    decode(dynamic).validate().unwrap();
+    let mut dual = value.clone();
+    let mut tcp = rule.clone();
+    tcp["protocol"] = json!("tcp");
+    dual["firewall"]["nat"]["destination_rewrite"]
+        .as_array_mut()
+        .unwrap()
+        .push(tcp);
+    let mut ipv6 = rule.clone();
+    ipv6["target_address"] = json!("2001:db8:2::53");
+    dual["firewall"]["nat"]["destination_rewrite"]
+        .as_array_mut()
+        .unwrap()
+        .push(ipv6);
+    decode(dual.clone()).validate().unwrap();
+    dual["ipv6_enabled"] = json!(false);
+    assert!(decode(dual).validate().is_err());
+    let mut duplicate = value.clone();
+    duplicate["firewall"]["nat"]["destination_rewrite"]
+        .as_array_mut()
+        .unwrap()
+        .push(rule.clone());
+    assert!(decode(duplicate).validate().is_err());
+    let mut maximum = value.clone();
+    maximum["firewall"]["nat"]["destination_rewrite"] = json!(
+        (1..=256)
+            .map(|port| {
+                let mut item = rule.clone();
+                item["destination_port"] = json!(port);
+                item
+            })
+            .collect::<Vec<_>>()
+    );
+    decode(maximum).validate().unwrap();
+    let mut too_many = value;
+    too_many["firewall"]["nat"]["destination_rewrite"] = json!(vec![rule; 257]);
+    assert!(decode(too_many).validate().is_err());
+}
+
+#[test]
 fn blackhole_section_is_named_once_and_many_routes_may_target_it() {
     let mut config = candidate();
     let default_json = serde_json::to_value(&config).unwrap();
@@ -1042,7 +1140,9 @@ fn all_current_example_feature_schemas_validate() {
     }
     for raw in [
         include_str!("../../../examples/appliance-services.json"),
+        include_str!("../../../examples/bgp.json"),
         include_str!("../../../examples/dhcp-relay.json"),
+        include_str!("../../../examples/destination-rewrite.json"),
         include_str!("../../../examples/gateway-monitoring.json"),
         include_str!("../../../examples/host-policies.json"),
         include_str!("../../../examples/kernel-mixed-conservative.json"),

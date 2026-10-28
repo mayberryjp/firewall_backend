@@ -80,6 +80,532 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated namespaces/net_admin, forwarding and nft FIB/NAT"]
+fn native_destination_rewrite_packets_filtering_restart_and_rollback() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use std::io::Read;
+    use std::{
+        net::{TcpListener, TcpStream, UdpSocket},
+        time::Duration,
+    };
+    let router = Fixture::new()?;
+    let client = Fixture::new()?;
+    let server = Fixture::new()?;
+    let router_ns = Arc::new(File::open(&router.namespace)?);
+    let client_ns = Arc::new(File::open(&client.namespace)?);
+    let server_ns = Arc::new(File::open(&server.namespace)?);
+    for (name, peer, namespace, address, gateway) in [
+        (
+            "lan0",
+            "client0",
+            client_ns.clone(),
+            "192.0.2.2",
+            "192.0.2.1",
+        ),
+        (
+            "lan1",
+            "server0",
+            server_ns.clone(),
+            "198.51.100.53",
+            "198.51.100.1",
+        ),
+    ] {
+        let target = namespace.clone();
+        session(router_ns.clone(), move |rt, handle| {
+            rt.block_on(async {
+                handle
+                    .link()
+                    .add()
+                    .veth(name.into(), peer.into())
+                    .execute()
+                    .await?;
+                let link = handle
+                    .link()
+                    .get()
+                    .match_name(peer.into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("peer missing")?;
+                handle
+                    .link()
+                    .set(link.header.index)
+                    .setns_by_fd(target.as_raw_fd())
+                    .execute()
+                    .await?;
+                Ok(())
+            })
+        })?;
+        session(namespace, move |rt, handle| {
+            rt.block_on(async {
+                fs::write(format!("/proc/sys/net/ipv6/conf/{peer}/accept_dad"), "0")?;
+                let (ipv6, gateway6) = if peer == "client0" {
+                    ("2001:db8:3::2", "2001:db8:3::1")
+                } else {
+                    ("2001:db8:2::53", "2001:db8:2::1")
+                };
+                let link = handle
+                    .link()
+                    .get()
+                    .match_name(peer.into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("peer missing")?;
+                handle
+                    .address()
+                    .add(link.header.index, ipv6.parse()?, 64)
+                    .execute()
+                    .await?;
+                handle
+                    .address()
+                    .add(link.header.index, address.parse()?, 24)
+                    .execute()
+                    .await?;
+                handle.link().set(link.header.index).up().execute().await?;
+                handle
+                    .route()
+                    .add()
+                    .v4()
+                    .destination_prefix("0.0.0.0".parse()?, 0)
+                    .gateway(gateway.parse()?)
+                    .output_interface(link.header.index)
+                    .execute()
+                    .await?;
+                handle
+                    .route()
+                    .add()
+                    .v6()
+                    .destination_prefix("::".parse()?, 0)
+                    .gateway(gateway6.parse()?)
+                    .output_interface(link.header.index)
+                    .execute()
+                    .await?;
+                Ok(())
+            })
+        })?;
+    }
+    session(router_ns.clone(), |_, _| {
+        for name in ["lan0", "lan1"] {
+            fs::write(format!("/proc/sys/net/ipv6/conf/{name}/accept_dad"), "0")?;
+        }
+        Ok(())
+    })?;
+    let options = router.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let desired = config(json!({
+        "interfaces":[
+            {"name":"lan0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["192.0.2.1/24","2001:db8:3::1/64"]},
+            {"name":"lan1","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["198.51.100.1/24","2001:db8:2::1/64"]},
+            {"name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,"addresses":["203.0.113.1/24","2001:db8:1::1/64"]}
+        ],
+        "routes":[
+            {"destination":"0.0.0.0/0","interface":"wan0","table":254,"metric":100},
+            {"destination":"::/0","interface":"wan0","table":254,"metric":100}
+        ],
+        "firewall":{"allow_all_icmp":false,"policy":"accept","nat":{"destination_rewrite":[
+            {"out_interface":"wan0","protocol":"udp","destination_port":53,"target_interface":"lan1","target_address":"198.51.100.53"},
+            {"out_interface":"wan0","protocol":"tcp","destination_port":53,"target_interface":"lan1","target_address":"198.51.100.53"},
+            {"out_interface":"wan0","protocol":"udp","destination_port":53,"target_interface":"lan1","target_address":"2001:db8:2::53"}
+        ]}}
+    }))?;
+    desired.validate()?;
+    native
+        .apply(&empty, &desired)
+        .context("install destination rewrite fixture")?;
+    session(router_ns.clone(), |_, _| {
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+        fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
+        Ok(())
+    })?;
+    let (udp, tcp) = session(server_ns.clone(), |_, _| {
+        let udp = UdpSocket::bind("198.51.100.53:53")?;
+        udp.set_read_timeout(Some(Duration::from_millis(300)))?;
+        let tcp = TcpListener::bind("198.51.100.53:53")?;
+        tcp.set_nonblocking(true)?;
+        Ok((udp, tcp))
+    })?;
+    let exchange = |destination: &'static str| -> Result<()> {
+        let socket = session(client_ns.clone(), move |_, _| {
+            let socket = UdpSocket::bind("192.0.2.2:0")?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.send_to(b"rewrite", destination)?;
+            Ok(socket)
+        })?;
+        let mut bytes = [0; 32];
+        let (size, peer) = udp
+            .recv_from(&mut bytes)
+            .with_context(|| format!("target did not receive {destination}"))?;
+        ensure!(
+            peer.ip().to_string() == "192.0.2.2" && &bytes[..size] == b"rewrite",
+            "source or payload changed"
+        );
+        udp.send_to(b"reply", peer)?;
+        let (size, peer) = socket.recv_from(&mut bytes).with_context(|| {
+            format!("client did not receive reverse NAT reply from {destination}")
+        })?;
+        ensure!(
+            peer.to_string() == destination && &bytes[..size] == b"reply",
+            "reverse NAT failed"
+        );
+        Ok(())
+    };
+    exchange("8.8.8.8:53")?;
+    exchange("9.9.9.9:53")?;
+    let udp6 = session(server_ns.clone(), |_, _| {
+        let socket = UdpSocket::bind("[2001:db8:2::53]:53")?;
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        Ok(socket)
+    })?;
+    let client6 = session(client_ns.clone(), |_, _| {
+        let socket = UdpSocket::bind("[2001:db8:3::2]:0")?;
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        socket.send_to(b"ipv6", "[2001:4860:4860::8888]:53")?;
+        Ok(socket)
+    })?;
+    let mut bytes6 = [0; 16];
+    let (size, peer) = udp6
+        .recv_from(&mut bytes6)
+        .context("IPv6 target did not receive rewrite")?;
+    ensure!(
+        peer.ip().to_string() == "2001:db8:3::2" && &bytes6[..size] == b"ipv6",
+        "IPv6 source/payload changed"
+    );
+    udp6.send_to(b"reply6", peer)?;
+    let (size, peer) = client6
+        .recv_from(&mut bytes6)
+        .context("IPv6 reverse NAT failed")?;
+    ensure!(
+        peer.to_string() == "[2001:4860:4860::8888]:53" && &bytes6[..size] == b"reply6",
+        "IPv6 reply tuple/payload changed"
+    );
+    let tcp_client = session(client_ns.clone(), |_, _| {
+        Ok(TcpStream::connect_timeout(
+            &"8.8.4.4:53".parse()?,
+            Duration::from_secs(2),
+        )?)
+    })?;
+    let (mut stream, peer) = tcp.accept()?;
+    ensure!(peer.ip().to_string() == "192.0.2.2", "TCP source changed");
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut tcp_client = tcp_client;
+    tcp_client.set_read_timeout(Some(Duration::from_secs(2)))?;
+    tcp_client.write_all(b"tcp")?;
+    let mut data = [0; 3];
+    stream.read_exact(&mut data)?;
+    ensure!(&data == b"tcp", "TCP data failed");
+    stream.write_all(b"ack")?;
+    tcp_client.read_exact(&mut data)?;
+    ensure!(&data == b"ack", "TCP reverse NAT failed");
+    let no_rewrite = |namespace: Arc<File>, destination: &'static str| -> Result<()> {
+        session(namespace, move |_, _| {
+            let socket = UdpSocket::bind("0.0.0.0:0")?;
+            socket.send_to(b"not rewritten", destination)?;
+            Ok(())
+        })?;
+        match udp.recv_from(&mut [0; 32]) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(())
+            }
+            other => anyhow::bail!("unexpected rewritten packet: {other:?}"),
+        }
+    };
+    no_rewrite(client_ns.clone(), "8.8.8.8:54")?;
+    no_rewrite(router_ns.clone(), "9.9.9.9:53")?;
+    // A LAN-routed destination on the same port must remain local, not hit this server.
+    no_rewrite(client_ns.clone(), "198.51.100.99:53")?;
+    let fingerprint = session(router_ns.clone(), |_, _| netfilter::fingerprint())?;
+    native.observe(&desired)?;
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.repair(&desired)?;
+    native.observe(&desired)?;
+    ensure!(
+        session(router_ns.clone(), |_, _| netfilter::fingerprint())? == fingerprint,
+        "restart changed firewall"
+    );
+    exchange("1.1.1.1:53")?;
+    let mut blocked = desired.clone();
+    blocked.firewall.policy = "drop".into();
+    native.apply(&desired, &blocked)?;
+    no_rewrite(client_ns.clone(), "8.8.4.4:53")?;
+    native.apply(&blocked, &desired)?;
+    exchange("208.67.222.222:53")?;
+    let mut removed = desired.clone();
+    removed.firewall.nat.destination_rewrite.clear();
+    native.apply(&desired, &removed)?;
+    no_rewrite(client_ns.clone(), "1.0.0.1:53")?;
+    native.apply(&removed, &desired)?;
+    exchange("208.67.220.220:53")?;
+    native.observe(&desired)?;
+    let mut maximum = desired.clone();
+    maximum.firewall.nat.destination_rewrite = (1..=256)
+        .map(|port| {
+            let mut rule = desired.firewall.nat.destination_rewrite[0].clone();
+            rule.destination_port = port;
+            rule
+        })
+        .collect();
+    maximum.validate()?;
+    native.apply(&desired, &maximum)?;
+    native.observe(&maximum)?;
+    native.apply(&maximum, &desired)?;
+    native.observe(&desired)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, namespaces/net_admin, nftables and WireGuard"]
+fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configuration() -> Result<()>
+{
+    use futures_util::TryStreamExt;
+    let first = Fixture::new()?;
+    let second = Fixture::new()?;
+    let ns1 = Arc::new(File::open(&first.namespace)?);
+    let ns2 = Arc::new(File::open(&second.namespace)?);
+    let target = ns2.clone();
+    session(ns1.clone(), move |rt, h| {
+        rt.block_on(async {
+            h.link()
+                .add()
+                .veth("under0".into(), "under1".into())
+                .execute()
+                .await?;
+            let peer = h
+                .link()
+                .get()
+                .match_name("under1".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("veth missing")?;
+            h.link()
+                .set(peer.header.index)
+                .setns_by_fd(target.as_raw_fd())
+                .execute()
+                .await?;
+            let local = h
+                .link()
+                .get()
+                .match_name("under0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("veth missing")?;
+            h.address()
+                .add(local.header.index, "192.0.2.1".parse()?, 24)
+                .execute()
+                .await?;
+            h.link().set(local.header.index).up().execute().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })?;
+    session(ns2, |rt, h| {
+        rt.block_on(async {
+            let link = h
+                .link()
+                .get()
+                .match_name("under1".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("veth missing")?;
+            h.address()
+                .add(link.header.index, "192.0.2.2".parse()?, 24)
+                .execute()
+                .await?;
+            h.link().set(link.header.index).up().execute().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })?;
+    let key1 = wireguard::create_key(&first.root.join("keys"), "bgp")?;
+    let key2 = wireguard::create_key(&second.root.join("keys"), "bgp")?;
+    let make = |side: u8, peer_key: &str| -> Result<Config> {
+        let other = 3 - side;
+        config(json!({
+            "interfaces":[
+                {"name":"wg0","kind":"wireguard","role":"wan","up":true,"mtu":1420,"addresses":[format!("10.10.0.{side}/30")],
+                    "wireguard":{"key_ref":"bgp","listen_port":51820,"peers":[{"public_key":peer_key,"endpoint":format!("192.0.2.{other}:51820"),"allowed_ips":[format!("10.10.0.{other}/32")]}]}},
+                {"name":"lan0","kind":"dummy","role":"lan","up":true,"mtu":1500,"addresses":[format!("198.51.{side}.1/24")]}
+            ],
+            "bgp":{"enabled":true,"local_asn":65000+u32::from(side),"router_id":format!("10.10.0.{side}"),
+                "hold_seconds":6,"keepalive_seconds":2,
+                "neighbors":[{"name":"remote","address":format!("10.10.0.{other}"),"remote_asn":65000+u32::from(other),"interface":"wg0","local_address":format!("10.10.0.{side}"),"wireguard_public_key":peer_key}]}
+        }))
+    };
+    let config1 = make(1, &key2)?;
+    config1.validate()?;
+    let config2 = make(2, &key1)?;
+    config2.validate()?;
+    let mut a = Native::open(first.options())?;
+    let mut b = Native::open(second.options())?;
+    a.apply(&Config::empty(), &config1)
+        .context("first BGP router apply")?;
+    b.apply(&Config::empty(), &config2)
+        .context("second BGP router apply")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let status = a.bgp_status(&config1)?;
+        if status["routes"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r["prefix"] == "198.51.2.0/24" && r["installed"] == true)
+        }) {
+            break;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "BGP did not install route: {status}; remote {}",
+            b.bgp_status(&config2)?
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    ensure!(
+        a.observe(&config1)? == config1,
+        "BGP contaminated desired configuration"
+    );
+    let check = |namespace: Arc<File>, expected: bool| -> Result<()> {
+        session(namespace, move |rt, h| {
+            let device = wireguard_control::Device::get(
+                &"wg0".parse()?,
+                wireguard_control::Backend::Kernel,
+            )?;
+            let ips = device.peers[0]
+                .config
+                .allowed_ips
+                .iter()
+                .map(|p| format!("{}/{}", p.address, p.cidr))
+                .collect::<Vec<_>>();
+            ensure!(
+                ips.contains(&"10.10.0.2/32".to_string()),
+                "static WireGuard prefix lost"
+            );
+            ensure!(
+                ips.contains(&"198.51.2.0/24".to_string()) == expected,
+                "dynamic WireGuard prefix mismatch: {ips:?}"
+            );
+            let routes = rt.block_on(
+                h.route()
+                    .get(rtnetlink::IpVersion::V4)
+                    .execute()
+                    .try_collect::<Vec<_>>(),
+            )?;
+            let found=routes.iter().any(|r|r.header.protocol==netlink_packet_route::route::RouteProtocol::Other(245)
+                && r.attributes.iter().any(|attr|matches!(attr,netlink_packet_route::route::RouteAttribute::Destination(netlink_packet_route::route::RouteAddress::Inet(ip)) if *ip=="198.51.2.0".parse::<std::net::Ipv4Addr>().unwrap())));
+            ensure!(found == expected, "BGP kernel route mismatch");
+            Ok(())
+        })
+    };
+    check(a.namespace.clone(), true)?;
+    {
+        let _guard = a
+            .bgp
+            .state
+            .lock()
+            .map_err(|_| anyhow!("BGP fixture lock"))?;
+        let peer_key = key2.clone();
+        session(a.namespace.clone(), move |rt, h| {
+            let key = wireguard_control::Key::from_base64(&peer_key)?;
+            wireguard_control::DeviceUpdate::new()
+                .add_peers(&[wireguard_control::PeerConfigBuilder::new(&key)
+                    .replace_allowed_ips()
+                    .add_allowed_ip("10.10.0.2".parse()?, 32)])
+                .apply(&"wg0".parse()?, wireguard_control::Backend::Kernel)?;
+            rt.block_on(async {
+                let routes = h
+                    .route()
+                    .get(rtnetlink::IpVersion::V4)
+                    .execute()
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                for route in routes {
+                    if route.header.protocol
+                        == netlink_packet_route::route::RouteProtocol::Other(245)
+                    {
+                        h.route().del(route).execute().await?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+        })?;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        match check(a.namespace.clone(), true) {
+            Ok(()) => break,
+            Err(error) => {
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "BGP audit did not repair missing owned entries: {error:#}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    a.bgp.abandon_for_crash_fixture()?;
+    let mut recovered = bgp::Manager::new(a.namespace.clone(), a.state.clone())?;
+    recovered.recover()?;
+    a.bgp = recovered;
+    check(a.namespace.clone(), false)?;
+    a.bgp.configure(&config1.operational_value()?)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let status = a.bgp_status(&config1)?;
+        if status["routes"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r["prefix"] == "198.51.2.0/24" && r["installed"] == true)
+        }) {
+            break;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "BGP did not recover after crash fixture: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    b.bgp.shutdown()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = a.bgp_status(&config1)?;
+        if status["routes"].as_array().is_some_and(Vec::is_empty) {
+            break;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "BGP did not withdraw on session loss: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    check(a.namespace.clone(), false)?;
+    a.bgp.restart()?;
+    ensure!(
+        a.observe(&config1)? == config1,
+        "BGP restart changed configuration"
+    );
+    let mut changed = config1.clone();
+    changed
+        .interfaces
+        .iter_mut()
+        .find(|i| i.name == "lan0")
+        .context("LAN missing")?
+        .mtu = 1400;
+    a.apply(&config1, &changed)?;
+    ensure!(
+        a.observe(&changed)? == changed,
+        "BGP blocked a network-only apply"
+    );
+    a.apply(&changed, &config1)?;
+    ensure!(a.observe(&config1)? == config1, "BGP blocked rollback");
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and nftables"]
 fn native_operational_dns_and_link_monitor_restart_preserve_configuration() -> Result<()> {
     use futures_util::TryStreamExt;

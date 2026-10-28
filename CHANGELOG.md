@@ -4,6 +4,29 @@
 
 ### Added
 
+- Basic in-process Rust IPv4 BGP with local/remote ASNs (including four-octet
+  capability), router ID, interface/local-address-bound neighbors, keepalive/
+  hold timers and bounded prefix capacity. Advertises connected networks from
+  configured up interfaces; installs selected learned Linux routes and
+  explicitly mapped WireGuard AllowedIPs, with withdrawal/session-loss cleanup
+  and scoped durable ownership recovery. Default-route import requires opt-in.
+  Adds transactional `bgp` configuration/`bgp.write`, BGP status and dedicated
+  route APIs, candidate/show CLI commands, `bgp` worker restart, process health
+  and MQTT summaries. No external routing daemon/integration or installer
+  dependency. IPv4 connected export only, not a full/transit BGP implementation.
+  Recommended bump: minor; baseline unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-28-02](docs/frontend-handoffs/2026-10-28.md#2026-10-28-02-basic-native-ipv4-bgp).
+
+- Destination rewrite: exact TCP/UDP-port DNAT for forwarded traffic whose
+  original route uses a selected managed WAN, targeting another device on a
+  managed LAN. Preserves client IP and destination port, excludes local output,
+  retains normal filtering and confirmed transaction/recovery semantics.
+  Adds `firewall.nat.destination_rewrite`, existing `nat.write` authorization,
+  CLI commands and IPv4/IPv6 validation. Replies must route through the firewall;
+  no automatic hairpin SNAT or conntrack flush. Recommended bump: minor;
+  baseline unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-28-03](docs/frontend-handoffs/2026-10-28.md#2026-10-28-03-destination-rewrite).
+
 - Authorized native operational APIs: `POST /api/v1/processes/restart`
   (`system.restart`) selectively restarts managed workers, async managers or
   the supervised native daemon without arbitrary process control; failed async

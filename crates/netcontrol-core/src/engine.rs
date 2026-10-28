@@ -22,6 +22,7 @@ pub const PERMISSIONS: &[&str] = &[
     "gateway_monitors.write",
     "ntp.write",
     "mdns.write",
+    "bgp.write",
     "syslog.write",
     "vnstat.write",
     "mqtt.write",
@@ -225,6 +226,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ),
         ("ntp.write", a.ntp != b.ntp),
         ("mdns.write", a.mdns != b.mdns),
+        ("bgp.write", a.bgp != b.bgp),
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
         ("mqtt.write", a.mqtt != b.mqtt),
@@ -627,6 +629,18 @@ impl Engine {
         if path == "/api/v1/interfaces/discovered" {
             return Err(ApiError::new(405, "interface discovery is read-only"));
         }
+        if [
+            "/api/v1/services/bgp",
+            "/api/v1/services/bgp/status",
+            "/api/v1/routes/bgp",
+        ]
+        .contains(&path)
+        {
+            return Err(ApiError::new(
+                405,
+                "BGP endpoints are read-only; configure BGP through transactions",
+            ));
+        }
         if path == "/api/v1/statistics" || path.starts_with("/api/v1/statistics/") {
             return Err(ApiError::new(405, "statistics endpoints are read-only"));
         }
@@ -733,6 +747,7 @@ impl Engine {
             let expected = self.expected();
             for (p, enabled) in [
                 ("mdns.write", expected.mdns.enabled),
+                ("bgp.write", expected.bgp.enabled),
                 ("ntp.write", expected.ntp.enabled),
                 ("syslog.write", expected.syslog.enabled),
                 ("vnstat.write", expected.vnstat.enabled),
@@ -826,6 +841,7 @@ impl Engine {
             "ntp" => Some(c.ntp.enabled),
             "syslog" => Some(c.syslog.enabled),
             "mdns" => Some(c.mdns.enabled),
+            "bgp" => Some(c.bgp.enabled),
             "vnstat-host" | "vnstat-managed" => Some(c.vnstat.enabled),
             "dhcp-relay" => Some(c.interfaces.iter().any(|link| link.dhcp_relay.enabled)),
             "dhcp-gateway-monitors" => Some(
@@ -1319,6 +1335,37 @@ impl Engine {
                     service_error(e)
                 }
             });
+        }
+        if [
+            "/api/v1/services/bgp",
+            "/api/v1/services/bgp/status",
+            "/api/v1/routes/bgp",
+        ]
+        .contains(&path)
+        {
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "BGP endpoints do not accept query parameters",
+                ));
+            }
+            if path == "/api/v1/services/bgp" {
+                return value(&self.state.desired.bgp);
+            }
+            let mut status = self
+                .backend
+                .bgp_status(&self.expected())
+                .map_err(service_error)?;
+            if path == "/api/v1/routes/bgp" {
+                return Ok(
+                    json!({"source":"bgp","scope":status["scope"],"state":status["state"],"error":status["error"],"routes":status["routes"]}),
+                );
+            }
+            status
+                .as_object_mut()
+                .ok_or_else(|| service_error("invalid BGP status"))?
+                .remove("routes");
+            return Ok(status);
         }
         if path == "/api/v1/services/mdns/status" {
             if !query.is_empty() {

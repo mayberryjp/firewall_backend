@@ -39,6 +39,8 @@ Support:
   optional managed egress-interface matches, TCP/UDP destination ports, and
   automatic established/related return traffic.
 - IPv4/IPv6 masquerading.
+- Exact-port IPv4/IPv6 destination rewrite of forwarded traffic originally
+  routed through a selected WAN to another device on a managed LAN.
 - Transactional global IPv6 enable/disable policy, enabled by default.
 - WireGuard key references, peers, endpoints, allowed networks, and keepalive.
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
@@ -71,7 +73,8 @@ Do not present as supported:
   through the API, bridges, DHCP server management, DHCPv6 clients/relay, DNS
   server management, or forwarding sysctl management. NetworkManager takeover
   and dynamic global IPv6 inheritance are not implemented.
-- SNAT, DNAT, port forwarding, arbitrary protocol matches/port ranges, sets, conntrack
+- Static SNAT, general DNAT/port forwarding beyond destination rewrite,
+  arbitrary protocol matches/port ranges, sets, conntrack
   controls, traffic control, device tuning, or hardware offload.
 - Private-key upload/generation, key-file listing, package installation, arbitrary
   commands, process identity configuration, or systemd control.
@@ -113,6 +116,7 @@ zero values and subsequently failing semantic validation. Required fields:
 | Policy rule | `priority`, `source`, `table` |
 | Firewall/host rule | `action` |
 | Masquerade rule | `family`, `out_interface` |
+| Destination rewrite rule | `out_interface`, `protocol`, `destination_port`, `target_interface`, `target_address` |
 | Firewall host | `id`, `name`, `addresses`, `policy` |
 | Ingress policy | `interface` |
 | Syslog destination | `host`, `port`, `transport` |
@@ -205,6 +209,7 @@ configuration, not a separate annotation endpoint.
 | DNS settings / domain | `dns[interface].metadata`, `dns[interface].domains[].metadata` |
 | Route | `routes[].metadata` |
 | Ordered firewall rule / masquerade rule | `firewall.rules[].metadata`, `firewall.nat.masquerade[].metadata` |
+| Destination rewrite rule | `firewall.nat.destination_rewrite[].metadata` |
 | Firewall host / outbound host rule | `firewall.policies.hosts[].metadata`, `firewall.policies.hosts[].rules[].metadata` |
 | Interface policy / rule | `firewall.policies.interfaces[].metadata`, `firewall.policies.interfaces[].rules[].metadata` |
 | Input interface policy / rule | `firewall.input.interfaces[].metadata`, `firewall.input.interfaces[].rules[].metadata` |
@@ -315,7 +320,7 @@ routes, not backend endpoints.
 | `/parents` | Read-only adopted parent inventory |
 | `/routes` | Routes |
 | `/firewall` | Host inventory/outbound policies, ingress overrides, global default, or explicit legacy ordered-rule view |
-| `/nat` | Masquerade rules |
+| `/nat` | Masquerade and destination rewrite rules |
 | `/wireguard` | WireGuard-focused interface/peer view |
 | `/services/softflowd` | Configured instances joined with runtime status |
 | `/services/softflowd/:name` | Instance detail and staged editor |
@@ -601,11 +606,12 @@ Configuration changes additionally require permissions for every changed area:
 | WireGuard settings and removal of a WireGuard interface | `wireguard.write` |
 | Routes | `routes.write` |
 | Filter policy/rules | `firewall.write` |
-| Masquerading | `nat.write` |
+| Masquerading / destination rewrite | `nat.write` |
 | softflowd configuration | `softflowd.write` |
 | Gateway monitor configuration | `gateway_monitors.write` |
 | NTP server/client settings | `ntp.write` |
 | mDNS reflection/publishing and metadata | `mdns.write` |
+| BGP ASN, router ID, timers, neighbors and import policy | `bgp.write` |
 | Whole-appliance syslog/remote destinations | `syslog.write` |
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
 | MQTT streaming configuration | `mqtt.write` |
@@ -942,14 +948,14 @@ Show additions, modifications, deletions, and ordered-list moves by subsystem:
 - WireGuard peers: identity by public key within an interface.
 - Routes: identity by `(table, destination, metric)`.
 - Policy rules: identity by priority.
-- Filter and masquerade rules: ordered arrays, with frontend-only stable row IDs.
+- Filter, masquerade and destination rewrite rules: ordered arrays, with frontend-only stable row IDs.
   Never send those row IDs to the backend.
 - Interface rename is delete/create, not an API rename operation.
 
 Ignore ordering differences the backend normalizes: interfaces by name, addresses
 lexically, peers by public key, allowed IPs lexically, softflowd and gateway monitors by name, policy
 rules by priority, and routes by the backend's route-key string. Ignore JSON map
-key order. Preserve filter and masquerade rule order.
+key order. Preserve filter, masquerade and destination rewrite rule order.
 
 Counts are counts of UI entities, not a prediction of kernel operation count.
 Show exact old/new values on expansion and offer read-only JSON comparison.
@@ -2480,6 +2486,223 @@ VLAN/nftables/MLD, Apple/Windows/printer/Avahi interoperability, reference-host
 Avahi parity. See [build/acceptance spec](docs/MDNS_SPEC.md) and
 [required handoff](docs/frontend-handoffs/2026-10-25.md#2026-10-25-17-native-mdns-implementation).
 
+### Native IPv4 BGP
+
+Implemented as an in-process Rust BGP-4 worker using native TCP sockets,
+netlink routes and WireGuard kernel updates. No FRR/BIRD/Go executable, shell,
+supervised process, third-party integration or eBPF prerequisite. This is a
+bounded connected-route speaker, not a full Internet routing daemon.
+
+#### Configuration and permissions
+
+Top-level `config.bgp` participates in full configuration transactions,
+confirmation, rollback and revision history. Changes require
+`transactions.write` plus `bgp.write` and the existing permissions for other
+changed areas. Device keys receive the new permission; scoped files must grant
+it explicitly. The existing all-enabled-service reconciliation permission rule
+also requires `bgp.write` when BGP is enabled.
+
+Synthetic configuration fragment (merge into a complete configuration with the
+referenced interface/address and, for WireGuard, peer already configured):
+
+```json
+{
+  "bgp": {
+    "enabled": true,
+    "local_asn": 65001,
+    "router_id": "10.10.0.1",
+    "keepalive_seconds": 30,
+    "hold_seconds": 90,
+    "max_prefixes": 4096,
+    "neighbors": [
+      {
+        "name": "remote",
+        "address": "10.10.0.2",
+        "local_address": "10.10.0.1",
+        "interface": "wg0",
+        "remote_asn": 65002,
+        "wireguard_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        "accept_default": false
+      }
+    ]
+  }
+}
+```
+
+Defaults: disabled, ASN `0`, empty router ID, keepalive `30`, hold `90`,
+max prefixes `4096`, empty neighbors. ASN/router ID must be supplied together
+when configuring an identity or neighbors, including while disabled. Enabled
+BGP requires at least one neighbor. Local/remote ASN are uint32, nonzero,
+excluding `23456` (AS_TRANS), `65535` and `4294967295`; four-octet ASN negotiation is
+supported. Router ID must be nonzero unicast IPv4, distinct from the remote
+router ID during session negotiation.
+
+Keepalive is integer seconds, at least 1 and at most one third of hold time.
+Hold is integer seconds `3..65535`. These are global configured timers, not
+per-neighbor overrides or a BGP "hello" interval. Effective hold is the minimum
+of local/remote proposals; remote hold 0 disables the negotiated hold/keepalive
+timer. Effective keepalive is the lesser of configured keepalive and one third
+of negotiated hold. Handshake timeout is 30 seconds; reconnect attempts are
+approximately every 5 seconds. Worker-level failures retry after approximately
+one second with explicit status errors.
+
+`max_prefixes` is integer `1..16384`, bounding accepted paths across all
+neighbors (alternate paths count separately). Exceeding capacity closes the
+affected session and withdraws its routes, not a partial silently accepted
+table. Maximum 32 neighbors. Neighbor names follow interface-name shape/length
+rules and are unique; IPv4 neighbor addresses must be unique, unicast and
+different from their local address.
+
+Each neighbor requires `name`, `address`, `local_address`, `interface`,
+`remote_asn`. `local_address` must be a static IPv4 address on a configured up
+peering interface. Non-WireGuard peers must be directly connected on that
+interface. Non-WireGuard `wireguard_public_key` must be empty (default).
+For WireGuard it must identify an enabled peer on the selected interface;
+one BGP neighbor per WireGuard peer is supported. That peer's **static**
+AllowedIPs must already cover the neighbor address to bootstrap BGP. Operators
+also need a connected/static route to the neighbor through the tunnel and a
+working underlay route to its WireGuard endpoint. BGP cannot learn the route
+needed to establish its own initial connection.
+
+`accept_default` defaults false per neighbor. True permits receiving `0.0.0.0/0`;
+it does not originate a default route or override ownership protections.
+Both BGP config and neighbor objects accept the normal descriptive `metadata`
+object; metadata is validated and excluded from operational/kernel settings.
+Unknown transaction config fields follow the existing ignored-field reporting
+contract; incorrect types and invalid supported fields fail validation.
+
+#### Export, import and forwarding behavior
+
+- Both active and passive peering use TCP 179, explicitly bound to the selected
+  interface and local IPv4 address. Only configured remote source addresses
+  are admitted. Simultaneous connections use router-ID-based collision
+  selection. Basic eBGP and iBGP sessions are supported.
+- Advertise IPv4 connected prefixes from **all configured administratively up,
+  live up interfaces**, including current DHCP IPv4 addresses. Re-read native
+  addresses approximately every two seconds and withdraw removed prefixes.
+  Prefixes are canonicalized/deduplicated; special unspecified/loopback/
+  multicast local addresses are omitted. Export is bounded at 4096 prefixes.
+  Configured static routes and BGP-learned routes are not redistributed.
+- Receive IPv4 unicast UPDATEs. Reject own-AS loops, eBGP paths whose first AS
+  differs from the configured remote AS, default routes without opt-in, invalid
+  addresses and paths whose NEXT_HOP is not the neighbor's peering address.
+  For iBGP, the other speaker must use next-hop-self for nonlocal paths.
+  Rejected prefixes are counted, not retained as accepted path rows.
+- Deterministic basic selection: highest iBGP LOCAL_PREF (eBGP uses 100),
+  shortest AS sequence, lowest ORIGIN, prefer eBGP over iBGP, then neighbor
+  name. MED is exposed but not used in this initial local selection policy.
+  No ECMP, route reflection, learned-route transit/export, recursive next-hop
+  resolution, IPv6/MP-BGP, route-refresh, graceful restart, AS_SET/confederation
+  segments, routing-policy language, BFD, TCP MD5 or TCP-AO. Unsupported or
+  malformed protocol inputs close the session with an explicit error.
+- Install selected accepted prefixes in Linux main table `254`, metric `200`,
+  owned protocol `245`. Non-WireGuard routes use the received next hop on the
+  selected interface; WireGuard routes use the tunnel interface. Configured
+  static/connected routes with the same prefix take precedence in the BGP
+  ownership policy. Other protocols' routes are not removed or overwritten;
+  an exact kernel key conflict is an explicit install error. `installed` means
+  the route was installed, not that it wins over every other kernel route.
+- For a selected WireGuard path, union the prefix into the **referenced peer's**
+  effective AllowedIPs unless its own static AllowedIPs already cover it.
+  Reject overlap with another configured peer's static AllowedIPs or another
+  selected peer's BGP-owned prefixes on the same WireGuard interface; do not
+  steal prefixes between peers. These prefixes affect both cryptokey routing
+  and which source addresses that peer may send. Trust peers accordingly.
+- Withdrawals, disconnect/hold expiry, disable, restart, transaction apply/
+  rollback and shutdown remove BGP-owned routes/additions. Preserve static
+  AllowedIPs, unrelated routes, desired config and revision IDs. A private
+  ownership journal records additions before mutation; startup cleans stale
+  owned entries only after native scope/ownership validation, then relearns.
+  Learned routes are runtime state, never saved as desired routes/AllowedIPs.
+  Reconciliation audits owned entries approximately every two seconds and
+  repairs missing additions without replacing foreign route conflicts.
+  Changes remove obsolete owned paths before installing replacements; no
+  interruption-free failover or graceful restart is promised.
+
+#### API, status, CLI and MQTT
+
+API-key authentication and `state.read`:
+
+| Method and path | Response |
+| --- | --- |
+| `GET /api/v1/services/bgp` | Committed `BGPConfig` |
+| `GET /api/v1/services/bgp/status` | Applied worker/neighbor status, without full learned path rows |
+| `GET /api/v1/routes/bgp` | `{source:"bgp",scope,state,error,routes:[...]}` learned paths |
+
+No query parameters (`400`). These paths are read-only (`405` otherwise);
+configuration is transactional. Normal `401`/`403`; unavailable scope/backend/
+status returns `503`. BGP session/install failures remain readable as status,
+not empty success-shaped kernel data. The ordinary `/api/v1/routes` remains
+configured static routes; do not infer BGP visibility from that endpoint.
+
+Synthetic learned path envelope:
+
+```json
+{"source":"bgp","scope":"linux:<opaque>","state":"running","error":null,"routes":[{"prefix":"198.51.100.0/24","neighbor":"remote","interface":"wg0","next_hop":"10.10.0.2","as_path":[65002],"origin":0,"local_pref":100,"med":0,"selected":true,"installed":true,"reason":null,"source":"bgp"}]}
+```
+
+Route fields: canonical IPv4 `prefix`, neighbor name/interface, IPv4
+`next_hop`, uint32 ASN array `as_path`, numeric ORIGIN `0..2`, uint32
+`local_pref`/`med`, booleans `selected` and `installed`, nullable string reason,
+literal `source:"bgp"`. A selected path can have `installed:false` when
+reconciliation fails; inspect envelope/status error. Nonselected reasons:
+`alternate_path`, `connected_or_static_route`, `wireguard_static_peer_overlap`,
+`wireguard_dynamic_peer_overlap`. Policy-rejected NLRI are not listed; inspect
+neighbor rejected-prefix counters. Route arrays include alternate accepted
+paths and are bounded by configured max prefixes; no pagination/history.
+
+Worker states: `disabled`, `starting`, `running`, `error`, `stopped`, and
+simulator `simulated`. Running worker `health` is `up` only when all sessions
+are established and installation succeeded, otherwise `degraded`. A running
+process is not proof of established BGP. Active running status includes
+`local_asn`, `router_id`, `connected_prefixes` (canonical string array),
+`installed_prefixes` (number), `kernel_protocol:245`, `route_metric:200`,
+`table:254`, nullable error and `neighbors`.
+
+Neighbor rows include `name`, IPv4 `address`, `interface`, session `state`
+(`active`, `open_sent`, `open_confirm`, `established`), numeric
+`received_prefixes`, `advertised_prefixes`, cumulative `rejected_prefixes`,
+nullable `negotiated_hold_seconds`, nullable IPv4 `remote_router_id` and
+nullable last `error`. Counts/reset state are ephemeral and reset on worker
+restart; previous session errors clear on a new establishment. Inactive/
+starting/error snapshots can omit active-only fields. Simulator reports
+`simulated` or `disabled`, no learned routes, null unmeasured counts, and no
+real session/forwarding claim. Treat `scope` as opaque.
+
+`runtime.bgp` and an `appliance_services` row named `bgp` expose the same
+summary without full route rows. Shared `process_health` and `active_alerts`
+observe the worker: running with down neighbors is a service warning, not a
+global configuration gate or dead daemon. Aggregate statistics add `bgp`
+summary; existing MQTT state publication carries it plus the existing
+process-health/alerts. No per-route MQTT flood, new broker integration, or
+immediate event delivery is promised.
+
+`POST /api/v1/processes/restart` with `{"target":"bgp"}` uses
+`system.restart`, existing transaction/upgrade guards, and native `200`
+supervisor restart semantics (`409` disabled). It withdraws/relearns, not an
+in-place protocol reset. Simulator restart is explicitly simulated.
+
+CLI: `bgp JSON`, `no bgp` edit the private candidate; `show bgp`,
+`show bgp status`, `show routes bgp` use the corresponding read APIs.
+
+Frontend tasks: add a BGP settings form to transactional networking, local/
+remote ASN validation, router ID, interface/local-address and WireGuard peer
+selectors, timer/prefix bounds, and a clearly warned default-route opt-in.
+Add neighbor-state and BGP-specific route tables with AS path, source,
+selected/installed/reason/error distinctions; poll status single-flight while
+visible and fetch route rows separately. Preserve configured AllowedIPs in
+forms; display learned additions as read-only runtime state. Wire the existing
+restart confirmation and process-health/MQTT display without disabling unrelated
+editing due to peer availability.
+
+Deployment: permit TCP 179 only from configured peers on selected interfaces;
+ensure WireGuard underlay UDP, bootstrap addressing/routes and kernel support.
+Existing root native service has the socket/netlink privileges; no installer
+module/security weakening or helper package is needed. There is no BGP
+authentication beyond configured address admission; prefer WireGuard/trusted
+links. Real-appliance and interoperability acceptance remain separate from
+isolated native tests.
+
 ### 6.2 Managed interfaces and VLANs
 
 Table columns: name, kind, WAN/LAN role, administrative up/down, MTU, addresses, VLAN parent/ID
@@ -3085,7 +3308,9 @@ rules clearly; deleting the DHCP/LAN allowances can affect reachability/renewal.
 Enabling the global ICMP exception also allows WAN ICMP before input drops.
 Warn before removing the input policy: doing so removes WAN host protection.
 
-### 6.7 NAT masquerading
+### 6.7 NAT
+
+#### Masquerading
 
 Ordered table/editor: position, family (`ipv4`/`ipv6`), optional source network or
 Any, managed egress interface. Provide move up/down as well as add/edit/delete.
@@ -3096,9 +3321,97 @@ Explain missing options and link to interface editing. Switching family must
 revalidate source and egress rather than silently rewriting values.
 
 Show: “Masquerading does not enable forwarding, create routes, or bypass filter
-rules.” No static translation or port-forward controls. NAT edits remain separate
+rules.” No general static translation or port-forward controls. NAT edits remain separate
 from filter edits for review and permissions, but share the same transaction and
 owned nftables table.
+
+#### Destination rewrite
+
+Expose `firewall.nat.destination_rewrite` as an ordered rule editor titled
+**Destination rewrite**. This is destination NAT (DNAT), not 1:1 NAT.
+Previously only `masquerade` was available; reads now include both arrays,
+including empty `destination_rewrite: []`. Omission defaults to an empty array;
+null is invalid. No new endpoint or permission is introduced.
+
+Each rule requires:
+
+| Field | Type and contract |
+| --- | --- |
+| `out_interface` | Up managed interface with role `wan`; matches the original destination's route before rewriting, not the rewritten packet's outgoing interface. Requires a static address of the target family, or DHCPv4 for an IPv4 target. |
+| `protocol` | Exactly `"tcp"` or `"udp"`. Use two rules for both DNS transports. |
+| `destination_port` | Integer 1..65535, exactly one port; no ranges, lists, source filters or port translation. |
+| `target_interface` | Up managed interface with role `lan`, with a static subnet containing the target. Validation/reference field; ordinary routing still determines how packets reach the target. |
+| `target_address` | Canonical unicast IPv4/IPv6 literal, another device on the selected LAN subnet, not any configured firewall address, loopback, link-local, multicast, unspecified, IPv4 subnet network/broadcast or mapped IPv6. Determines the matching original IP family; no cross-family NAT. |
+| `metadata` | Optional standard display name/description. Cosmetic edits still require `nat.write`. |
+
+At most 256 rules. Duplicate `(out_interface, protocol, destination_port,
+IP family)` matches are rejected, even with different targets. IPv6 rules require
+`ipv6_enabled: true`. Interface role/down/address changes and deletions must
+resolve dependent rules in the same complete candidate. Target IPs are not
+probed and no service reachability is promised.
+
+Synthetic `firewall.nat` fragment for Internet-bound DNS interception:
+
+```json
+{
+  "masquerade": [],
+  "destination_rewrite": [
+    {"out_interface":"wan0","protocol":"udp","destination_port":53,
+     "target_interface":"lan0","target_address":"192.168.10.53"},
+    {"out_interface":"wan0","protocol":"tcp","destination_port":53,
+     "target_interface":"lan0","target_address":"192.168.10.53"}
+  ]
+}
+```
+
+Native rules run in prerouting at DNAT priority, before the routing decision and
+ordinary forwarding filters. A kernel FIB lookup of the original destination
+(including source and packet mark) must resolve through `out_interface`.
+LAN-routed destinations, other ports/protocols/families and firewall-originated
+Internet traffic are not intercepted. Rules preserve destination port and client
+source IP. Conntrack reverses translation on replies, so clients see the original
+destination. Matching changes apply to new connections only; existing conntrack
+translations survive edits, removal and rollback until expiry or explicit
+connection deletion. Do not silently flush connections on configuration changes.
+
+**Required warning:** The target's replies must route back through this firewall.
+For clients and target sharing a subnet, direct replies bypass reverse NAT and
+usually break the connection. Require operator-arranged routed return paths or
+a separate target subnet. There is no automatic source NAT/hairpin masquerade.
+Other explicitly configured masquerade rules still apply normally. Do not add a
+source-NAT toggle or silently change the source address.
+There is no automatic exemption for the target device's own forwarded traffic:
+if its upstream DNS queries use the selected WAN and port 53, they are rewritten
+too. Configure the resolver's upstream path/transport so it does not match these
+rules; otherwise DNS resolution can loop or fail.
+
+**Filtering/routing:** DNAT does not grant access or create routes. Forward rules
+see the rewritten destination and actual LAN egress; a rule allowing only WAN
+egress may need a separate explicit allow to the local target. Include that filter
+change in review; never automatically insert an accept. Global forwarding,
+working routes/return paths and nftables inet FIB/NAT kernel support are operator
+prerequisites. IPv6 forwarding is not enabled by the installer.
+
+Save via `POST /api/v1/transactions` with `transactions.write` and `nat.write`
+(plus permissions for other changes). Confirm/rollback/history restore and
+recovery use the existing workflow. Read via `GET /api/v1/firewall/nat`,
+`GET /api/v1/firewall/rules` or state/config views, with `state.read`.
+Missing/wrongly typed required fields (including port values outside the
+unsigned 16-bit range) return `400`; port zero, invalid references,
+target subnet/family, duplicate matches or collection limit return `422`;
+normal authorization/conflict/drift/native failure statuses remain unchanged.
+Structurally typed configuration rejects unknown fields; the transaction endpoint
+retains its documented unknown-field pruning and reports `ignored_fields`.
+Do not submit unsupported source/range/target-port fields.
+
+Frontend tasks: add client types, add/edit/delete/reorder controls, WAN/LAN role
+and family-aware options, exact-port and target validation, separate TCP/UDP DNS
+rows, metadata and dependency handling, ordered diff/history rendering, and
+prominent source-preserving return-route/new-connections/filtering warnings.
+Deploy the backend before enabling the editor; preserve `masquerade` and all
+unrelated candidate sections. Validate routed TCP/UDP replies, bypass cases,
+default-drop filtering, errors, persistence and rollback on a Linux test router.
+Simulator results do not prove packet forwarding.
 
 ### 6.8 WireGuard
 
@@ -3429,6 +3742,7 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Masquerade family | Exactly `ipv4` or `ipv6` |
 | Masquerade source | Optional canonical network matching explicit family |
 | Masquerade egress | Managed draft interface with an address of matching family, or a DHCPv4 client for IPv4 |
+| Destination rewrite | <=256 rules; up managed WAN/LAN, canonical usable LAN target on another device; exact TCP/UDP port 1..65535; unique WAN/protocol/port/family; IPv6 requires global enable |
 | Description | Optional, trimmed; maximum 1024 UTF-8 bytes after trimming |
 | Confirmation window | 10..300 seconds |
 
@@ -3502,10 +3816,13 @@ Paths below are relative to `/api/v1`.
 | GET | `/vlans` | Observed VLAN `Interface[]` |
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |
 | GET | `/routes` | Observed `Route[]` |
+| GET | `/routes/bgp` | BGP-only learned/selected/installed path rows; not desired static routes |
+| GET | `/services/bgp` | Committed `BGPConfig` |
+| GET | `/services/bgp/status` | Applied BGP worker and neighbor summary |
 | GET | `/firewall/rules` | Entire observed `Firewall`, including policy and NAT |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
-| GET | `/firewall/nat` | Observed `{ "masquerade": [...] }` |
+| GET | `/firewall/nat` | Observed `{ "masquerade": [...], "destination_rewrite": [...] }` |
 | GET | `/services/softflowd` | Observed `SoftflowdConfig[]` |
 | GET | `/services/softflowd/status` | `{ "instances": SoftflowdStatus[], "error": string }` |
 | GET | `/services/dhcp-relay/status` | `{ "interfaces": DHCPRelayStatus[], "error": string }` |
@@ -3803,7 +4120,7 @@ interface Firewall {
   allow_all_icmp: boolean; // Omitted input defaults to true; null is invalid.
   policy: "accept" | "drop";
   rules: Array<{ source?: string; destination?: string; action: "accept" | "drop" }>;
-  nat: { masquerade: MasqueradeRule[] };
+  nat: { masquerade: MasqueradeRule[]; destination_rewrite: DestinationRewriteRule[] };
   policies?: { hosts: FirewallHost[]; interfaces: InterfacePolicy[] } | null;
   input?: InputFirewall | null;
 }
@@ -3842,6 +4159,15 @@ interface MasqueradeRule {
   family: "ipv4" | "ipv6";
   source?: string;
   out_interface: string;
+}
+
+interface DestinationRewriteRule {
+  metadata?: { display_name?: string; description?: string };
+  out_interface: string; // Original WAN, before DNAT.
+  protocol: "tcp" | "udp";
+  destination_port: number;
+  target_interface: string;
+  target_address: string;
 }
 
 interface SoftflowdConfig {

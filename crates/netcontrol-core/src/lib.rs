@@ -1,5 +1,7 @@
 //! Typed networking domain, durable transactions, and deterministic simulator.
+mod bgp;
 mod diagnostics;
+pub use bgp::{BGPConfig, BGPNeighbor};
 mod dynamic_dns;
 pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;
@@ -31,6 +33,13 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    fn bgp_status(&mut self, config: &Config) -> Result<Value> {
+        let runtime = self.runtime(config)?;
+        runtime
+            .get("bgp")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("BGP status unavailable"))
+    }
     fn prepare_dns_lookup(
         &mut self,
         _config: &Config,

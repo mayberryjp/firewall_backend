@@ -249,6 +249,17 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bgp_worker_health_is_independent_of_neighbor_availability() {
+        let monitor = super::Monitor::default();
+        monitor.observe(Some(&serde_json::json!({"appliance_services":[{"name":"bgp","state":"running","health":"degraded","error":null}]})),&[],false);
+        let value = monitor.snapshot();
+        assert_eq!(value["process_health"]["components"][0]["resource"], "bgp");
+        assert_eq!(value["process_health"]["components"][0]["healthy"], true);
+        assert_eq!(value["active_alerts"][0]["code"], "service_warning");
+        monitor.observe(Some(&serde_json::json!({"appliance_services":[{"name":"bgp","state":"running","health":"up","error":null}]})),&[],false);
+        assert_eq!(monitor.snapshot()["active_alerts"], serde_json::json!([]));
+    }
     use super::*;
 
     #[test]

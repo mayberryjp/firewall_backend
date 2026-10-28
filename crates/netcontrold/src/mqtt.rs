@@ -813,6 +813,7 @@ fn telemetry(
         "origin":{"name":"netcontrold"},"components":components,"state_topic":format!("{base}/state"),
         "availability_topic":format!("{base}/availability"),"qos":1});
     let state = json!({"collected_at_unix":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"metrics":metrics,
+        "bgp":statistics.get("bgp").cloned().unwrap_or_else(||json!({"state":"unavailable","error":"BGP statistics unavailable","neighbors":[]})),
         "link_diagnostics":statistics.get("link_diagnostics").cloned().unwrap_or_else(|| json!({"status":"unavailable","error":"network statistics unavailable","signals":[]}))});
     ensure!(
         serde_json::to_vec(&discovery)?.len() <= 1 << 20
@@ -1435,6 +1436,23 @@ mod tests {
             .unwrap();
             assert!(secrets.references().is_err());
         }
+    }
+
+    #[test]
+    fn mqtt_bgp_preserves_neighbor_status_without_exporting_route_table() {
+        let status = json!({"name":"bgp","state":"running","health":"degraded","installed_prefixes":3,
+            "neighbors":[{"name":"edge","state":"active","received_prefixes":0,"error":"connection refused"}]});
+        let (_, state) = telemetry(
+            "0123456789abcdef0123456789abcdef",
+            &MQTTConfig::default(),
+            0,
+            1,
+            &json!({"interfaces":[],"bgp":status}),
+            &crate::mqtt_host::HostSensors::default(),
+        )
+        .unwrap();
+        assert_eq!(state["bgp"], status);
+        assert!(state["bgp"].get("routes").is_none());
     }
 
     #[test]

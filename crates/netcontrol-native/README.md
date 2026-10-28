@@ -53,6 +53,27 @@ without the C/header toolchain: TLS requests then fail explicitly and
 `Native::open` always fails because nftables is essential. It is **not** a
 functional networking build or a permissive firewall fallback.
 
+## Native IPv4 BGP
+
+The owned `nc-bgp` Rust worker implements bounded BGP-4 peering on interface-
+bound TCP/179 with configurable ASN/router ID and keepalive/hold timers.
+It advertises connected IPv4 networks from configured up interfaces and installs
+selected received paths through netlink (main table, protocol 245, metric 200).
+For WireGuard neighbors, an explicit peer key maps learned prefixes to effective
+AllowedIPs, preserving static entries and refusing cross-peer prefix overlap.
+Disconnect/withdraw/stop removes owned runtime additions. A durable private
+ownership journal is recovered only after native namespace/scope validation;
+learned state is not desired configuration or a revision.
+
+Runtime status, process health, MQTT summary, restart and BGP-only route APIs
+are described in the [canonical contract](../../FRONTEND_SPEC.md#native-ipv4-bgp).
+Operators provide bootstrap routes/static AllowedIPs, TCP 179 input permits
+and WireGuard underlay reachability. Existing native socket/netlink privileges
+are required; no helper daemon, eBPF, installer package or automatic firewall
+permit is added. IPv6, transit/learned-route exports, recursive next hops,
+AS_SET/confederations, route reflection/refresh, graceful restart, BFD and
+TCP authentication are outside this first implementation.
+
 ## Native mDNS
 
 Native mDNS is a managed in-process UDP worker, not forwarding or an Avahi
@@ -455,6 +476,20 @@ therefore remain repairable without weakening networking drift protection.
 
 ## Runtime, statistics and limitations
 
+Destination rewrite uses exact-port prerouting DNAT in the owned inet table,
+atomically installed with ordinary filtering and masquerade. A kernel FIB lookup
+of the original destination/source/packet mark matches the selected WAN before
+DNAT; ordinary routing then selects the local target's path. Requires nftables
+inet FIB and NAT support (`nft_fib_inet`, IPv4/IPv6 FIB implementations, NAT/
+conntrack), working forwarding and routes. Unsupported kernel expressions fail
+the apply explicitly; modules are not loaded by the daemon.
+Client IP/port are not changed, no filter accepts are inserted, local output
+is excluded, and conntrack handles reverse translation. Targets must reply via
+the firewall; same-subnet direct replies bypass reverse NAT. No automatic hairpin
+SNAT is provided. Existing connections survive configuration edits/rollback.
+See the [contract](../../FRONTEND_SPEC.md#destination-rewrite) and
+[configuration example](../../examples/destination-rewrite.json).
+
 - Runtime includes adopted parent availability/identity errors, service status,
   public WireGuard/peer handshake and byte statistics, and actual sysctl state.
   It never exposes private keys or invented process IDs.
@@ -501,11 +536,14 @@ therefore remain repairable without weakening networking drift protection.
   defaults; configure any required per-device hardening after that transition.
   IPv6 forwarding is not enabled; it has additional per-device/RA side effects.
   Named-value sysctl snapshots alone cannot promise safe rollback for these.
-- Privileged Linux integration tests have **not** been executed. Cross compilation is not
-  evidence of packet forwarding, firewall/NAT semantics, host tuning, crash/power
-  loss behavior, or real service interoperability. In particular, the current
-  native tests exercise kernel installation/observation and mutation drift;
-  a multi-namespace packet-forwarding/NAT acceptance suite remains necessary.
+- Cross compilation is not evidence of packet forwarding, firewall/NAT
+  semantics, host tuning, crash/power loss behavior, or real service
+  interoperability. Destination rewrite has passed an isolated router/client/
+  target namespace fixture for IPv4 TCP/UDP and IPv6 UDP forwarding, reverse
+  translation, filtering, bypass, rollback/reopen and the 256-rule limit.
+  See the [actual validation journal](../../docs/journal/2026-10-28.md#destination-rewrite).
+  This does not qualify physical appliance connectivity, same-subnet operator
+  return paths, reboot/crash recovery or unrelated privileged fixtures.
 
 ## Validation
 

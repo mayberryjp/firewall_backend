@@ -1,0 +1,56 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 30,
+  "description": "Synthetic IPv4 BGP over WireGuard example; provision the private key and underlay first",
+  "config": {
+    "interfaces": [
+      {
+        "name": "wg0",
+        "kind": "wireguard",
+        "role": "wan",
+        "mtu": 1420,
+        "up": true,
+        "addresses": ["10.10.0.1/30"],
+        "wireguard": {
+          "key_ref": "example-bgp",
+          "listen_port": 51820,
+          "peers": [
+            {
+              "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+              "endpoint": "192.0.2.2:51820",
+              "allowed_ips": ["10.10.0.2/32"],
+              "persistent_keepalive_seconds": 25
+            }
+          ]
+        }
+      },
+      {
+        "name": "lan0",
+        "kind": "dummy",
+        "role": "lan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": ["198.51.100.1/24"]
+      }
+    ],
+    "bgp": {
+      "enabled": true,
+      "local_asn": 65001,
+      "router_id": "10.10.0.1",
+      "keepalive_seconds": 30,
+      "hold_seconds": 90,
+      "max_prefixes": 4096,
+      "neighbors": [
+        {
+          "name": "remote",
+          "address": "10.10.0.2",
+          "local_address": "10.10.0.1",
+          "interface": "wg0",
+          "remote_asn": 65002,
+          "wireguard_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+          "accept_default": false
+        }
+      ]
+    }
+  }
+}

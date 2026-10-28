@@ -36,6 +36,7 @@ pub fn verify(value: &Value, recorded: &Option<Value>, fingerprint: Option<&str>
                     && value["nat"]["masquerade"]
                         .as_array()
                         .is_some_and(Vec::is_empty)
+                    && crate::firewall_plan::destination_rewrites(value)?.is_empty()
                     && value.get("policies").is_none_or(Value::is_null)
                     && value.get("input").is_none_or(Value::is_null),
                 "nonempty firewall has no durable owned state",
@@ -165,6 +166,15 @@ pub fn apply(value: &Value) -> Result<()> {
     for plan in &plans {
         matching(&forward, plan)?.add_to_batch(&mut batch);
     }
+    let rewrites = crate::firewall_plan::destination_rewrites(value)?;
+    if !rewrites.is_empty() {
+        Chain::new(&table)
+            .with_name("destination_rewrite")
+            .with_type(ChainType::Nat)
+            .with_hook(Hook::new(HookClass::PreRouting, -100))
+            .with_policy(ChainPolicy::Accept)
+            .add_to_batch(&mut batch);
+    }
     if let Some(nat) = value["nat"]["masquerade"]
         .as_array()
         .filter(|v| !v.is_empty())
@@ -192,6 +202,10 @@ pub fn apply(value: &Value) -> Result<()> {
                 .add_to_batch(&mut batch);
         }
     }
-    batch.send()?;
+    if rewrites.is_empty() {
+        batch.send()?;
+    } else {
+        super::destination_rewrite::send(batch, &rewrites)?;
+    }
     Ok(())
 }

@@ -1,0 +1,56 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 60,
+  "description": "Rewrite forwarded Internet-bound DNS to a local resolver; arrange routed replies",
+  "config": {
+  "interfaces": [
+    {
+      "name": "wan0",
+      "kind": "ethernet",
+      "role": "wan",
+      "mtu": 1500,
+      "up": true,
+      "addresses": ["203.0.113.2/24"]
+    },
+    {
+      "name": "lan0",
+      "kind": "ethernet",
+      "role": "lan",
+      "mtu": 1500,
+      "up": true,
+      "addresses": ["192.168.10.1/24"]
+    }
+  ],
+  "routes": [
+    {
+      "destination": "0.0.0.0/0",
+      "gateway": "203.0.113.1",
+      "interface": "wan0",
+      "table": 254,
+      "metric": 100
+    }
+  ],
+  "firewall": {
+    "policy": "accept",
+    "nat": {
+      "masquerade": [],
+      "destination_rewrite": [
+        {
+          "out_interface": "wan0",
+          "protocol": "udp",
+          "destination_port": 53,
+          "target_interface": "lan0",
+          "target_address": "192.168.10.53"
+        },
+        {
+          "out_interface": "wan0",
+          "protocol": "tcp",
+          "destination_port": 53,
+          "target_interface": "lan0",
+          "target_address": "192.168.10.53"
+        }
+      ]
+    }
+    }
+  }
+}

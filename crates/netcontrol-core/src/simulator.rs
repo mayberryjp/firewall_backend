@@ -45,6 +45,13 @@ pub(crate) fn gateway_samples(config: &Config) -> Vec<Value> {
     })).collect()
 }
 impl Backend for Simulator {
+    fn bgp_status(&mut self, config: &Config) -> Result<Value> {
+        Ok(
+            json!({"name":"bgp","scope":"simulator","state":if config.bgp.enabled{"simulated"}else{"disabled"},
+            "local_asn":config.bgp.local_asn,"router_id":config.bgp.router_id,"neighbors":config.bgp.neighbors.iter().map(|n|json!({"name":n.name,"address":n.address,"interface":n.interface,"state":"simulated","received_prefixes":null,"advertised_prefixes":null,"rejected_prefixes":null,"error":null})).collect::<Vec<_>>(),
+            "routes":[],"connected_prefixes":[],"installed_prefixes":null,"error":null}),
+        )
+    }
     fn prepare_dns_lookup(
         &mut self,
         _: &Config,
@@ -162,8 +169,10 @@ impl Backend for Simulator {
                 "disabled"
             },
         ));
+        let bgp = self.bgp_status(config)?;
+        appliance.push(bgp.clone());
         Ok(
-            json!({"appliance_services":appliance,"gateway_monitors":gateway_samples(config),"dhcp_relay":relays,"parent_interfaces":[],"softflowd":softflowd,
+            json!({"bgp":bgp,"appliance_services":appliance,"gateway_monitors":gateway_samples(config),"dhcp_relay":relays,"parent_interfaces":[],"softflowd":softflowd,
             "ipv6":{"enabled":config.ipv6_enabled,"status":"simulated","disable_ipv6":null,"drift":null},
             "kernel_tunables":{"desired":config.kernel,"configured":config.kernel,"effective":self.live,"observed":self.live,
                 "captured_original":self.original,"drift":false}}),
@@ -236,7 +245,7 @@ impl Backend for Simulator {
         match path {
             "/api/v1/statistics/link-diagnostics" => Ok(diagnostics),
             "/api/v1/statistics" => Ok(
-                json!({"sample":sample,"interfaces":interfaces,"protocols":protocols,"gateways":gateways,"link_diagnostics":diagnostics}),
+                json!({"sample":sample,"interfaces":interfaces,"protocols":protocols,"gateways":gateways,"link_diagnostics":diagnostics,"bgp":self.bgp_status(config)?}),
             ),
             "/api/v1/statistics/interfaces" => Ok(json!({"sample":sample,"interfaces":interfaces})),
             "/api/v1/statistics/protocols" => Ok(json!({"sample":sample,"protocols":protocols})),
