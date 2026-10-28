@@ -71,6 +71,29 @@ syslog receivers. Journald keeps `/dev/log`, kernel capture and the local journa
 Review [logging ownership and recovery](docs/BUILD_AND_INSTALL.md#host-logging-ownership);
 saved syslog settings are not enabled automatically.
 
+Native Linux mode continuously collects [link diagnostics](FRONTEND_SPEC.md#native-link-diagnostics):
+qdisc backlog/drops, interface errors, local TCP RTT/retransmissions/congestion
+windows, and bounded plaintext ingress TCP advertised-window observations
+(including forwarded traffic). Use `GET /api/v1/statistics/link-diagnostics`,
+`show statistics link-diagnostics`, aggregate statistics, or existing MQTT state
+publication. Collection is in-process Rust using netlink and filtered AF_PACKET
+sockets, not eBPF tools or supervised helpers. Install/full source upgrade loads
+and persists the required packet/TCP diagnostics modules. Signals are evidence,
+not proof of the failing upstream hop; receiver pressure is not link congestion.
+
+Operational actions run entirely in Rust:
+`POST /api/v1/processes/restart` with `{"target":"ntp"}` selectively restarts a
+managed worker (`system.restart` permission). Target `netcontrold` schedules a
+graceful full restart only under the packaged native systemd/watchdog service;
+it never kills arbitrary OS processes.
+`POST /api/v1/diagnostics/dns-lookup` with
+`{"interface":"wan0","hostname":"google.com","record_type":"A","timeout_ms":2000}`
+queries that interface's configured/DHCP DNS servers and returns measured
+`rtt_ms`, answers, DNS response code and attempt errors (`diagnostics.run`).
+No resolver override, shell lookup or external helper is used. See the
+[complete action contract](FRONTEND_SPEC.md#operational-restart-and-dns-diagnostics)
+for targets, limits, statuses, timing and side effects.
+
 Optional Ubuntu amd64 self-upgrade uses `POST /api/v1/system/upgrade` with a
 specific SemVer version and `GET` on the same path for durable job status.
 It is disabled until a trusted release-signing public key and fixed GitHub

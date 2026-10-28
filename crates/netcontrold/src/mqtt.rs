@@ -753,11 +753,67 @@ fn telemetry(
             sensor.class,
         );
     }
+    let diagnostics = &statistics["link_diagnostics"];
+    let available = diagnostics["status"] == "available";
+    for (field, unit) in [
+        ("observed_retransmissions", None),
+        ("observed_cwnd_reductions", None),
+        ("retransmissions_per_second", Some("segments/s")),
+        ("retransmissions_per_thousand_segments", None),
+        ("cwnd_reductions", None),
+        ("cwnd_min_segments", None),
+        ("cwnd_max_segments", None),
+        ("send_queue_max_bytes", Some("B")),
+        ("peer_window_min_bytes", Some("B")),
+        ("rtt_p50_ms", Some("ms")),
+        ("rtt_p95_ms", Some("ms")),
+        ("rtt_variation_max_ms", Some("ms")),
+        ("rto_max_ms", Some("ms")),
+        ("peer_zero_window_sockets", None),
+    ] {
+        add(
+            metric_key("link", "local_tcp", field),
+            format!("Local TCP {field}"),
+            if available {
+                diagnostics["local_tcp"][field].clone()
+            } else {
+                Value::Null
+            },
+            unit,
+            Some(if field.starts_with("observed_") {
+                "total_increasing"
+            } else {
+                "measurement"
+            }),
+        );
+    }
+    add(
+        metric_key("link", "monitor", "status"),
+        "Link diagnostics status".into(),
+        diagnostics
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| json!("unavailable")),
+        None,
+        None,
+    );
+    add(
+        metric_key("link", "monitor", "signal_count"),
+        "Link diagnostic signal count".into(),
+        if available {
+            json!(diagnostics["signals"].as_array().map_or(0, Vec::len))
+        } else {
+            Value::Null
+        },
+        None,
+        Some("measurement"),
+    );
     ensure!(components.len() <= 4096, "MQTT entity limit exceeded");
     let discovery = json!({"device":{"identifiers":[format!("netcontrol_{device_id}")],"name":format!("Netcontrol {}", &device_id[..8]),"manufacturer":"Netcontrol","model":"Firewall"},
         "origin":{"name":"netcontrold"},"components":components,"state_topic":format!("{base}/state"),
         "availability_topic":format!("{base}/availability"),"qos":1});
-    let state = json!({"collected_at_unix":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"metrics":metrics});
+    let state = json!({"collected_at_unix":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"metrics":metrics,
+        "link_diagnostics":statistics.get("link_diagnostics").cloned().unwrap_or_else(|| json!({"status":"unavailable","error":"network statistics unavailable","signals":[]}))});
     ensure!(
         serde_json::to_vec(&discovery)?.len() <= 1 << 20
             && serde_json::to_vec(&state)?.len() <= 1 << 20,
@@ -1379,6 +1435,48 @@ mod tests {
             .unwrap();
             assert!(secrets.references().is_err());
         }
+    }
+
+    #[test]
+    fn mqtt_link_diagnostics_preserve_signals_precision_and_staleness() {
+        let mut stats = json!({"interfaces":[],"link_diagnostics":{
+            "status":"available","local_tcp":{"rtt_p95_ms":25.5,"retransmissions_per_second":2.0,"observed_retransmissions":"9007199254740993"},
+            "signals":["local_egress_drops"],"packet_headers":{"kernel_drops":"9007199254740993"}}});
+        let id = "0123456789abcdef0123456789abcdef";
+        let (_, state) = telemetry(
+            id,
+            &MQTTConfig::default(),
+            0,
+            1,
+            &stats,
+            &crate::mqtt_host::HostSensors::default(),
+        )
+        .unwrap();
+        assert_eq!(state["link_diagnostics"], stats["link_diagnostics"]);
+        assert_eq!(
+            state["metrics"][metric_key("link", "local_tcp", "observed_retransmissions")],
+            "9007199254740993"
+        );
+        assert_eq!(
+            state["metrics"][metric_key("link", "local_tcp", "rtt_p95_ms")],
+            25.5
+        );
+        assert_eq!(
+            state["metrics"][metric_key("link", "monitor", "signal_count")],
+            1
+        );
+        stats["link_diagnostics"]["status"] = json!("stale");
+        let (_, state) = telemetry(
+            id,
+            &MQTTConfig::default(),
+            0,
+            1,
+            &stats,
+            &crate::mqtt_host::HostSensors::default(),
+        )
+        .unwrap();
+        assert!(state["metrics"][metric_key("link", "local_tcp", "rtt_p95_ms")].is_null());
+        assert!(state["metrics"][metric_key("link", "monitor", "signal_count")].is_null());
     }
 
     #[test]

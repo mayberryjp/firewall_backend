@@ -40,6 +40,8 @@ mod conntrack;
 mod firewall_plan;
 #[cfg(target_os = "linux")]
 mod host_health;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod link_monitor;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

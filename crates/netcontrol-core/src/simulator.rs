@@ -45,6 +45,22 @@ pub(crate) fn gateway_samples(config: &Config) -> Vec<Value> {
     })).collect()
 }
 impl Backend for Simulator {
+    fn prepare_dns_lookup(
+        &mut self,
+        _: &Config,
+        request: &crate::DNSLookupRequest,
+    ) -> Result<crate::DNSLookup> {
+        let request = request.clone();
+        Ok(Box::new(move || {
+            Ok(
+                json!({"status":"simulated","scope":"simulator","interface":request.interface,"hostname":request.hostname,
+            "record_type":request.record_type,"rtt_ms":null,"elapsed_ms":null,"server":null,"transport":null,"rcode":null,"addresses":[],"attempts":[]}),
+            )
+        }))
+    }
+    fn restart_process(&mut self, _: &Config, _: &str) -> Result<Value> {
+        Ok(json!({"state":"simulated"}))
+    }
     fn scope(&self) -> Result<String> {
         Ok("simulator".into())
     }
@@ -214,9 +230,13 @@ impl Backend for Simulator {
             .map(|name| json!({"name":name,"status":"simulated","groups":null}))
             .collect();
         let gateways = gateway_samples(config);
+        let diagnostics = json!({"schema":"netcontrol-link-diagnostics/v1","scope":"simulator",
+            "status":"simulated","collected_at":null,"age_ms":null,"interval_seconds":null,
+            "error":null,"interfaces":null,"queues":null,"local_tcp":null,"packet_headers":null,"signals":[]});
         match path {
+            "/api/v1/statistics/link-diagnostics" => Ok(diagnostics),
             "/api/v1/statistics" => Ok(
-                json!({"sample":sample,"interfaces":interfaces,"protocols":protocols,"gateways":gateways}),
+                json!({"sample":sample,"interfaces":interfaces,"protocols":protocols,"gateways":gateways,"link_diagnostics":diagnostics}),
             ),
             "/api/v1/statistics/interfaces" => Ok(json!({"sample":sample,"interfaces":interfaces})),
             "/api/v1/statistics/protocols" => Ok(json!({"sample":sample,"protocols":protocols})),

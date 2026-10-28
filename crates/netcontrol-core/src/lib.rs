@@ -1,5 +1,7 @@
 //! Typed networking domain, durable transactions, and deterministic simulator.
+mod diagnostics;
 mod dynamic_dns;
+pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;
 mod mdns;
 mod model;
@@ -29,6 +31,16 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    fn prepare_dns_lookup(
+        &mut self,
+        _config: &Config,
+        _request: &DNSLookupRequest,
+    ) -> Result<DNSLookup> {
+        anyhow::bail!("DNS diagnostics are not supported by this backend")
+    }
+    fn restart_process(&mut self, _config: &Config, _target: &str) -> Result<Value> {
+        anyhow::bail!("managed worker restart is not supported by this backend")
+    }
     fn mdns_status(&mut self, config: &Config) -> Result<Value> {
         let runtime = self.runtime(config)?;
         let rows = runtime["appliance_services"]

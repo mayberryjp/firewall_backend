@@ -3,6 +3,8 @@
 mod config;
 mod counters;
 mod dhcp;
+mod dns_lookup;
+pub use dns_lookup::lookup as dns_lookup;
 mod flow;
 mod gateway;
 #[cfg(all(test, target_os = "linux"))]
@@ -561,6 +563,14 @@ impl Services {
         self.error = None;
         Ok(())
     }
+    pub fn restart_worker(&mut self, target: &str) -> Result<Value> {
+        let worker = self
+            .workers
+            .get_mut(target)
+            .context("enabled service worker not found")?;
+        worker.restart()?;
+        Ok(worker.snapshot())
+    }
     pub fn shutdown(&mut self) -> Result<()> {
         self.stop_all()
     }
@@ -626,6 +636,53 @@ impl Drop for Services {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selective_restart_preserves_unrelated_worker() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let directory =
+            std::env::temp_dir().join(format!("nc-selective-restart-{}", rand::random::<u64>()));
+        let mut services = Services::new(ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: false,
+            allow_gateway_monitoring: false,
+        })?;
+        let starts = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        for (name, count) in ["ntp", "mdns"].into_iter().zip(&starts) {
+            let count = count.clone();
+            services.workers.insert(
+                name.into(),
+                Worker::start(name.into(), None, json!({"name":name}), move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(|context| {
+                        while !context.wait(std::time::Duration::from_millis(5)) {}
+                        Ok(())
+                    }))
+                })?,
+            );
+        }
+        let previous = services.workers["ntp"].context.clone();
+        let untouched = services.workers["mdns"].context.clone();
+        assert_eq!(services.restart_worker("ntp")?["state"], "running");
+        assert!(previous.stopping());
+        assert!(!untouched.stopping());
+        assert!(Arc::ptr_eq(
+            &untouched.stop,
+            &services.workers["mdns"].context.stop
+        ));
+        assert_eq!(starts[0].load(Ordering::SeqCst), 2);
+        assert_eq!(starts[1].load(Ordering::SeqCst), 1);
+        assert!(services.restart_worker("unknown").is_err());
+        services.shutdown()?;
+        drop(services);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn syslog_without_systemd_activation_fails_before_stopping_workers() {

@@ -98,6 +98,24 @@ unload, forwarding enablement or cross-namespace enforcement is introduced.
 Use IPv4 management plus console access when disabling. See the
 [canonical API/runtime contract](../../FRONTEND_SPEC.md#global-ipv6-policy).
 
+## Native link diagnostics
+
+An owned namespace-pinned Rust thread collects routing-netlink qdisc backlog/
+drops, interface errors, established TCP socket diagnostics and filtered
+AF_PACKET ingress TCP header observations. Runs independently of HTTP polling
+and configuration transactions, retries errors, joins on drop, and never starts
+helper processes or changes qdiscs/firewall/sysctls. No eBPF dependency.
+Expose cached data through `/api/v1/statistics/link-diagnostics` and aggregate
+`link_diagnostics`; the existing MQTT publisher includes it and local TCP sensors.
+Forwarded TCP has observable advertised windows but no router-owned `cwnd`/RTT.
+Receiver pressure is not link congestion; encrypted outer tunnel traffic cannot
+expose inner TCP. All counters are ephemeral and capture loss/capacity/gaps are
+explicit. Bounds, units, statuses and remaining limitations are in the
+[canonical contract](../../FRONTEND_SPEC.md#native-link-diagnostics).
+Ubuntu installation/full source upgrade loads/persists packet/TCP diagnostic
+modules; [other deployment prerequisites](../../docs/BUILD_AND_INSTALL.md#native-link-diagnostics-prerequisites)
+remain operator responsibilities.
+
 ## Host health sensors
 
 Host performance sensors are separate from namespace networking statistics:
@@ -451,7 +469,8 @@ therefore remain repairable without weakening networking drift protection.
   values are decimal strings, including counters above JavaScript's exact range.
   `/api/v1/statistics/interfaces/<name>` selects a single interface.
   All query parameters are rejected explicitly.
-  Other statistics paths are delegated to the services crate.
+  Link diagnostics and host/connection statistics have dedicated native collectors;
+  other statistics paths are delegated to the services crate.
 - `/api/v1/statistics/vnstat`, `/api/v1/statistics/vnstat/host` and
   `/api/v1/statistics/vnstat/managed` delegate to the live services traffic
   database, preserving `{schema,scopes}` and adding the actual backend `scope`

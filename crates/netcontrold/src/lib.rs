@@ -8,6 +8,7 @@ pub mod mqtt;
 mod mqtt_flow;
 mod mqtt_host;
 mod private_store;
+pub mod processes;
 pub mod ssh;
 pub mod updates;
 pub mod watchdog;

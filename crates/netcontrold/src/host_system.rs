@@ -307,6 +307,15 @@ impl Manager {
             .clone())
     }
 
+    pub fn reset_retry(&self) -> Result<()> {
+        *self
+            .backoff
+            .lock()
+            .map_err(|_| anyhow::anyhow!("host system retry state unavailable"))? =
+            [Backoff::default(), Backoff::default()];
+        Ok(())
+    }
+
     pub fn timezones(&self) -> Vec<String> {
         match self.mode {
             Mode::Native => self.host.zones(),

@@ -586,7 +586,10 @@ revoke it; use device key management (or operator edits/restart in legacy mode).
 
 All reads require `state.read`. POST actions require `transactions.write`, except
 the per-interface DHCP retry action (`interfaces.write`), MQTT password upload
-(`mqtt.write`) and software upgrade submission (`system.upgrade`). Device-account
+(`mqtt.write`) and software upgrade submission (`system.upgrade`).
+Operational restart requires `system.restart`; an on-demand DNS lookup requires
+`diagnostics.run`, not `transactions.write` or `state.read`. These permissions
+do not grant configuration editing. Device-account
 API keys have all permissions,
 including upgrade authority when the operator explicitly enables self-upgrade;
 scoped credential files must grant `system.upgrade` explicitly.
@@ -632,6 +635,152 @@ issuing writes. Deployment-supplied UI permission hints may disable controls, bu
 must be labeled advisory; otherwise offer actions and handle `403` explicitly.
 Show permission errors near the action, preserve the draft, and explain that
 another appropriately authorized operator may need to confirm or recover.
+
+### Operational restart and DNS diagnostics
+
+These are implemented, API-key-authenticated, explicit actions, not transactions
+or background polling. Both paths accept POST only (`405` otherwise), no query
+parameters (`400`), strict JSON objects with no unknown fields, and the normal
+`401`/`403` authentication/permission errors. Neither changes desired
+configuration or creates a configuration revision. Both reject an active
+configuration transaction, recovery, upgrade or daemon restart with `409`.
+Preparation/backend unavailability returns `503`. No shell commands, child
+processes, arbitrary PID control or request-supplied resolver addresses are used.
+
+#### Restart managed processes
+
+`POST /api/v1/processes/restart`, permission `system.restart`:
+
+```json
+{"target":"ntp"}
+```
+
+`target` is a nonempty ASCII string, at most 80 characters, without control
+characters. Exact supported identifiers:
+
+| Target | Scope and prerequisites |
+| --- | --- |
+| `ntp`, `syslog`, `mdns` | Selected enabled native service worker |
+| `vnstat-host`, `vnstat-managed` | Selected accounting scope; vnStat enabled |
+| `dhcp-relay` | Shared relay worker; at least one enabled relay |
+| `flow:NAME` | One configured enabled flow exporter |
+| `gateway:NAME` | One configured enabled explicit gateway monitor |
+| `dhcp-client:INTERFACE` | One configured DHCP client on an up interface |
+| `dhcp-gateway-monitors` | Shared DHCP-derived monitor manager; at least one enabled DHCP-mode monitor |
+| `link-diagnostics` | Native link diagnostic collector |
+| `mqtt`, `dynamic-dns`, `system` | Daemon-owned async manager runner; restarting an idle/disabled runner does not enable its configuration |
+| `netcontrold` | Entire daemon, including HTTP/SSH; supervised native host-mode systemd/watchdog deployment only |
+
+Unknown/unconfigured targets return `404`; disabled native service targets return
+`409`. An unavailable worker/controller or unsupported daemon deployment returns
+`503`. Native restart joins the old worker before starting its replacement and
+returns `200`, for example:
+
+```json
+{"target":"ntp","status":"restarted","worker":{"name":"ntp","state":"running"}}
+```
+
+`worker` is the target's existing status snapshot; the example is abbreviated.
+Completion means the owned supervisor has been restarted, not that upstream
+connectivity, a new DHCP lease, clock synchronization, delivery or measurement
+health has been established. A recovering worker can report retry/error status.
+Simulator-native targets return `200` with `status:"simulated"` and do no work.
+Restart is targeted, not the broad service reconciliation action.
+
+Async manager requests return `202`, for example:
+
+```json
+{"target":"mqtt","status":"restart_requested","generation":1}
+```
+
+`generation` is an ephemeral monotonically increasing request counter, not a
+configuration revision or completion token. Requests received during the same
+drain may coalesce into one new attempt. Old attempts drain before replacement.
+Unexpected exits/panics remain visible as errors in platform health under
+`managed_processes`; the controller stays available for an explicit restart.
+These health entries also include `running`, `restarting` and `stopped` states;
+ordinary manager status remains independently available.
+
+Daemon restart returns `202 {"target":"netcontrold","status":"restart_requested"}`,
+blocks new mutations, drains HTTP/SSH and workers, durably closes the engine,
+then exits nonzero. The existing packaged systemd `Restart=on-failure` policy
+starts it again after approximately five seconds, plus shutdown/startup time.
+Manual, simulator, OpenRC and namespace-lab launches cannot request daemon
+restart. HTTP success acknowledges scheduling, not a completed boot; connectivity
+can close before the client receives a response. Require confirmation, preserve
+drafts, avoid automatic resubmission, and reconnect with bounded backoff.
+There is no durable restart-job/status endpoint.
+
+Restart discards the selected worker's ephemeral state/caches/counters;
+accounting databases and desired configuration are preserved. DHCP retry may
+reacquire a lease and affect connectivity; syslog may miss deliveries while
+restarting. Monitor restarts reset sampling baselines. Show these effects before
+confirmation and poll the existing target/platform status afterward.
+
+#### Timed DNS lookup
+
+`POST /api/v1/diagnostics/dns-lookup`, permission `diagnostics.run`:
+
+```json
+{"interface":"wan0","hostname":"google.com","record_type":"A","timeout_ms":2000}
+```
+
+- Required `interface`: valid interface name, configured and administratively up.
+  Selection is explicit for multi-WAN appliances; no automatic interface choice.
+- Required `hostname`: ASCII DNS name with labels 1..63 characters, total at most
+  253 characters excluding an optional final dot. Alphanumeric/hyphen labels
+  must start/end alphanumeric. IP literals, whitespace, empty labels and Unicode
+  fail `400`. The normalized result is lowercase without a final dot.
+- `record_type`: `"A"` (default) or `"AAAA"` only.
+- `timeout_ms`: integer, default `2000`, inclusive range `100..5000`. This is the
+  overall network attempt budget, shared among remaining servers; scheduling/
+  kernel timeout granularity can extend observed elapsed time slightly.
+- No resolver override: uses that interface's configured servers first, then
+  valid matching DHCP-lease servers unless its DNS override setting suppresses
+  DHCP DNS. Duplicate DHCP entries are omitted. IPv6 resolver addresses are
+  excluded when global IPv6 is disabled; an AAAA question can still use IPv4.
+  Missing/down interface, no effective servers, more than 16 effective servers
+  or unavailable resolver state return `503`, not an invented public fallback.
+- At most two concurrent lookups per daemon; additional requests return `429`.
+  The engine lock is released before network I/O; configuration can proceed
+  while the query uses its captured committed configuration/lease snapshot.
+
+Direct native UDP queries target port 53 in the managed namespace and bind
+nonloopback resolvers to the selected interface. Loopback resolvers use loopback
+routing. Truncated UDP responses retry over native TCP using the remaining
+attempt deadline. This bypasses OS hosts/cache lookup, but the selected DNS
+server can itself cache answers. No DNSSEC validation or active link diagnosis
+is implied.
+
+`200` returns a diagnostic result, including when every attempt fails.
+Synthetic successful response:
+
+```json
+{"status":"answered","interface":"wan0","hostname":"example.test","record_type":"A","server":"192.0.2.53","transport":"udp","rcode":0,"addresses":["192.0.2.7"],"rtt_ms":12.5,"elapsed_ms":13.2,"error":null,"attempts":[{"server":"192.0.2.53","transport":"udp","rcode":0,"addresses":["192.0.2.7"],"rtt_ms":12.5,"status":"answered","error":null}],"scope":"host:<opaque>","revision":7}
+```
+
+`rtt_ms` is a measured numeric DNS request/response time in milliseconds,
+including resolver processing, not ICMP RTT. For TCP fallback it excludes TCP
+connect time and the earlier UDP exchange. `elapsed_ms` includes all attempts
+and fallback setup. `scope` is opaque; `revision` identifies the captured
+committed configuration, not necessarily the current revision when returning.
+`rcode` is the numeric DNS response code. The first valid response ends the
+lookup, including NXDOMAIN, SERVFAIL or REFUSED; nonzero codes return no
+addresses and remain measured answers. Only transport/protocol failures try
+the next configured server.
+
+Failed attempts contain `server`, `status:"failed"`, `rtt_ms:null`, `error`;
+successful attempts have the successful answer fields shown above. If all fail,
+the top-level result has `status:"failed"`, null `server`, `transport`, `rcode`
+and `rtt_ms`, empty `addresses`, and explicit errors in `attempts`. Null is not
+zero. Simulator returns `status:"simulated"`, `scope:"simulator"`, null timing/
+server/transport/code, empty answers/attempts, and no fabricated RTT. Query-job
+or namespace failure outside the diagnostic exchange returns `503`.
+
+Frontend: add a deliberate lookup form with interface, hostname, A/AAAA and
+bounded timeout, single-flight submission, result/attempt/error rendering, and
+labels distinguishing DNS response codes from transport failures. No continuous
+lookup polling or automatic restart on a DNS error.
 
 ### 4.4 Transactional SSH configuration CLI
 
@@ -832,12 +981,13 @@ accept no query parameters:
 
 | GET endpoint | Response |
 | --- | --- |
-| `/api/v1/statistics` | `{sample, interfaces, protocols, gateways?}` |
+| `/api/v1/statistics` | `{sample, interfaces, protocols, gateways?, link_diagnostics}` |
 | `/api/v1/statistics/interfaces` | `{sample, interfaces}` |
 | `/api/v1/statistics/interfaces/{name}` | `{sample, interface}` |
 | `/api/v1/statistics/protocols` | `{sample, protocols}` |
 | `/api/v1/statistics/connections` | Connection snapshot with filters/paging; `netcontrol-connections/v1` |
 | `/api/v1/statistics/host` | Host health snapshot; `netcontrol-host-health/v1` (see below) |
+| `/api/v1/statistics/link-diagnostics` | Cached native link observations; `netcontrol-link-diagnostics/v1` |
 | `/api/v1/statistics/gateways` | `{sample, monitors}` |
 | `/api/v1/statistics/gateways/{name}` | `{sample, monitor}` |
 
@@ -890,6 +1040,156 @@ counter history can be restored with a revision. Statistics remain independent
 of full configuration observation errors. Connection state is available only
 through the explicit endpoint below; interface/protocol statistics do not imply
 driver-specific, host-global softnet/sockstat, WireGuard peer, or streaming APIs.
+
+#### Native link diagnostics
+
+`GET /api/v1/statistics/link-diagnostics` requires API-key Bearer authentication
+and `state.read`. GET only (`405` otherwise); query parameters are rejected
+(`400`), normal `401`/`403` authorization applies. A readable cache returns `200`
+even while starting/unavailable/stale; a cache/scope read failure returns `503`.
+No configuration writes, new permission, enabled setting, active probe, or
+transaction/confirmation/rollback policy is introduced. CLI:
+`show statistics link-diagnostics`. Aggregate statistics embeds the same cache
+as `link_diagnostics`, with independent freshness/status; its older `sample`
+does not describe the diagnostics sampling interval.
+
+The collector runs continuously in the managed network namespace, including
+unmanaged interfaces and loopback. Native Rust uses routing netlink,
+`NETLINK_SOCK_DIAG`/`TCP_INFO`, and a kernel-filtered AF_PACKET datagram socket.
+No subprocess, third-party collector, eBPF program, BTF, tracefs, or provider
+integration is involved. Packet payloads/endpoints are not stored or exported.
+Headers are observed before firewall acceptance/checksum validation; observations
+do not prove packet acceptance, delivery or application behavior.
+
+Envelope:
+- `schema: "netcontrol-link-diagnostics/v1"`, opaque backend `scope`.
+- `status: "starting"|"available"|"unavailable"|"stale"|"simulated"`.
+- `collected_at: string|null`: UTC RFC3339 last successful collection.
+  `age_ms: number|null`: monotonic age of that success (startup age before the
+  first success). `interval_seconds: number|null`: actual elapsed sample time,
+  null for the first successful sample or after an unavailable interval.
+- `error: string|null`, `interfaces`, `queues`, `local_tcp`, `packet_headers`,
+  `signals: string[]`, and native `coverage` strings explaining measurement
+  boundaries. Failed sources return explicit unavailable status/error, null
+  sections and no active signals, not fabricated zeros. A sample older than
+  five seconds is stale; retained sections are historical only. Simulator
+  returns simulated status, null sections/timing and no signals.
+
+Native collection takes a snapshot approximately once per second (plus collection
+cost), independent of HTTP/MQTT poll frequency. Each of four netlink dumps is
+bounded by a one-second deadline, 16 MiB and 8192 rows; oversized/interrupted/
+truncated/denied/unsupported dumps explicitly fail the sample and reset delta
+baselines. The header socket requests a bounded 4 MiB buffer (kernel limits
+apply), snapshots at most 256 bytes per packet, processes at most 4096 packets
+per receive round, tracks at most 8192 directed flow keys and interface rows,
+and expires directions after 120 seconds idle. Shutdown joins the owned thread;
+collection errors retry without blocking configuration or restarting the daemon.
+
+`interfaces: object[]|null`: rows have numeric `index`, string `name`,
+`errors` (RX+TX errors), `drops` (RX+TX drops), and nullable `errors_delta`,
+`drops_delta`. Counters/deltas are exact unsigned decimal strings, not JSON
+numbers. First/reset/new-identity deltas are null; indexes/names cannot detect
+every recreation. Counts are observations, not unique packet-loss totals.
+
+`queues: object[]|null`: each row has `index: number`, `name: string|null`,
+`handle: number`, `parent: number`, `kind: string`, `status:
+"available"|"unavailable"`, `queue: object|null`, `drops_delta: string|null`,
+`backlog_growth_bytes: string|null` (signed decimal). `queue` contains numeric
+`qlen_packets`, `backlog_bytes`, and exact decimal strings `drops`, `requeues`,
+`overlimits`. No queue statistics means unavailable, not zero. Identity includes
+interface index, handle, parent and kind. Never sum hierarchical qdisc rows;
+overlimits do not necessarily mean loss. Backlog is a gauge; growth is the
+difference from the previous successful snapshot, not a byte rate or queue
+sojourn-time measurement. Counters may reset when qdiscs are replaced.
+
+`local_tcp: object|null` covers **established sockets terminated on this router
+only**, not forwarded TCP:
+- Numeric `established_sockets`, `compared_sockets`; deltas include only socket
+  cookies observed in both successful samples. Short-lived sockets and transient
+  events between snapshots can be missed. First samples do not invent deltas.
+- `retransmissions_delta: string|null`, numeric nullable
+  `retransmissions_per_second`, `retransmissions_per_thousand_segments`
+  (denominator is observed outgoing segments, not a physical-loss probability),
+  `cwnd_reductions` (sampled reductions, including non-loss causes).
+- Exact cumulative decimal strings `observed_retransmissions` and
+  `observed_cwnd_reductions`, since collector start across successful comparisons.
+  These retain observed events between slower MQTT publications. They survive
+  collection errors, reset on daemon restart, and do not recover unobserved
+  short-lived sockets or unavailable intervals; they are not kernel boot totals.
+- Nullable numeric `cwnd_min_segments`, `cwnd_max_segments`, `rtt_p50_ms`,
+  `rtt_p95_ms` (nearest-rank over positive current socket SRTT values, not packet
+  latency percentiles), `rtt_variation_max_ms`, `rto_max_ms`,
+  `unacked_segments_max`, `lost_segments_max`, `send_queue_max_bytes`,
+  `peer_window_min_bytes`. Send-queue bytes are socket queue occupancy, not qdisc
+  occupancy. No sockets/usable values yields null extrema, not measured zero.
+- Numeric `peer_window_measured_sockets`, nullable numeric
+  `peer_zero_window_sockets`; if any socket's kernel TCP_INFO lacks the peer
+  window field, the zero-window count is null rather than claiming completeness.
+  Peer-window minimum summarizes only measured sockets.
+
+`packet_headers: object|null` covers plaintext **ingress** IPv4/IPv6 TCP ACKs,
+including forwarded and locally delivered traffic. Outgoing duplicates are
+excluded. Decrypted WireGuard interfaces can expose inner TCP; an encrypted
+outer UDP packet cannot. IPv4 options and up to eight supported IPv6 extension
+headers are decoded; no fragment reassembly, IPv6 jumbograms or arbitrary
+encapsulation decoding. VLAN parent/child/tunnel observations may duplicate a
+path; never sum interfaces as unique flows. NAT can create different directed
+keys. Only 16-bit raw advertised windows are compared within a direction;
+scaling handshakes are not used to invent byte windows or forwarded `cwnd`.
+
+- `status: "available"`, numeric `tracked_directions`, `flow_limit: 8192`.
+- Exact cumulative decimal strings `kernel_drops`, `rejected_headers`,
+  `untracked_packets`, `capture_gaps`, and boolean `statistics_complete`.
+  Any kernel loss, malformed/truncated header, capacity rejection or reopened
+  capture makes completeness false until daemon restart. This is completeness
+  for the declared capture scope, not all traffic; unsupported protocols/
+  fragments are excluded. Dropped samples are not retransmissions.
+- `interfaces` rows contain numeric `index`, nullable `name`, exact decimal
+  strings `tcp_ack_packets`, `zero_window_observations`,
+  `zero_window_transitions`, `window_decreases`, and nullable numeric
+  `window_raw_min`, `window_raw_max` (raw 16-bit values). Counts/extrema are since
+  collector start while the interface remains observed, not the last second.
+  The first observed zero counts as an observation, not a transition; SYN,
+  FIN/RST and sequence/ACK reordering do not create tracked window transitions.
+  Flow expiry/capacity/loss can miss transitions. A zero window means receiver
+  pressure, not physical link congestion. Exact zero-window duration is not
+  measured.
+
+`signals` are **evidence indicators**, not confirmed root-cause alarms or daemon
+health gates. Current codes: `interface_errors`, `interface_drops`,
+`local_egress_drops`, `local_queue_growth`, `local_tcp_retransmissions`,
+`local_tcp_cwnd_reductions`, `local_tcp_rtt_rise`, `receiver_window_pressure`.
+Counter signals require a positive interval delta; queue growth requires a
+positive backlog difference. RTT rise means socket SRTT median exceeds both
+twice the previous median and a 20 ms increase; changing socket populations can
+also cause it. Receiver pressure means new captured zero-window ACK observations
+or a current local socket peer-zero window. Show queue/interface evidence with
+the relevant rows and keep local TCP evidence explicitly separate. RTT rise
+plus queue growth/drops suggests local congestion; retransmissions alone do not
+locate upstream loss. There is no cross-router correlation, exact upstream-hop
+diagnosis, packet-loss history, per-destination aggregation or automatic repair.
+Existing gateway-probe statistics remain separately available for comparison.
+
+MQTT's existing QoS-1 nonretained `netcontrol/<device_id>/state` payload gains
+the same `link_diagnostics` object. Existing interval, permissions, confirmed
+settings, availability/LWT, payload bounds and no-backlog behavior are unchanged;
+one-second collection is **not** one-second publication. Home Assistant discovery
+adds status/signal-count and local TCP rate/window/RTT sensors using the existing
+`metric_key("link", resource, field)` encoding (`resource` is `monitor` or
+`local_tcp`). Measurements are null unless diagnostic status is available;
+unavailable aggregate reads carry an explicit unavailable object. Queue/header
+detail remains in the raw object, not thousands of discovery entities.
+
+Frontend tasks: add read-only diagnostic types/cards; poll non-overlapping every
+2..5 seconds while visible; gate all measurements by status/freshness, preserve
+decimal precision and display capture incompleteness. Keep receiver-pressure,
+local-queue and local-socket observations distinct, and render unknown signal
+codes generically. Never copy diagnostics into configuration drafts or disable
+editing because of them. Deployment requires kernel packet/inet/TCP diagnostics
+support, CAP_NET_RAW for capture and appropriate namespace-entry privileges;
+Ubuntu install/full source upgrade loads/persists modules. No unprivileged-BPF
+sysctl, AppArmor or lockdown weakening. Other package/manual upgrade paths need
+operator kernel-module prerequisites; API reads never repair them.
 
 #### Host health sensors
 
@@ -3196,6 +3496,8 @@ Paths below are relative to `/api/v1`.
 | GET | `/interfaces` | Observed `Interface[]` |
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
 | GET | `/interfaces/{name}` | One observed `Interface` |
+| POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |
+| POST | `/diagnostics/dns-lookup` | Timed configured-resolver diagnostic result `200`; `diagnostics.run` |
 | POST | `/interfaces/{name}/dhcp/retry` | No body or `{}` -> `202 {interface, status: "retrying"}`; `interfaces.write`, runtime only |
 | GET | `/vlans` | Observed VLAN `Interface[]` |
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |

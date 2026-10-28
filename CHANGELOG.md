@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Added
+
+- Authorized native operational APIs: `POST /api/v1/processes/restart`
+  (`system.restart`) selectively restarts managed workers, async managers or
+  the supervised native daemon without arbitrary process control; failed async
+  attempts remain observable and explicitly restartable.
+  `POST /api/v1/diagnostics/dns-lookup` (`diagnostics.run`) queries the selected
+  interface's configured/DHCP servers directly with measured DNS RTT, bounded
+  deadlines/concurrency, explicit attempt errors and TCP truncation fallback.
+  Neither action changes configuration revisions; transaction/upgrade/restart
+  guards remain. Recommended bump: minor; baseline unknown, Unreleased.
+  Required frontend work:
+  [handoff 2026-10-28-01](docs/frontend-handoffs/2026-10-28.md#2026-10-28-01-managed-restart-and-timed-dns-actions).
+
+- Continuous native Rust link diagnostics using routing/socket netlink and
+  bounded kernel-filtered packet-header capture, without eBPF tools, subprocesses
+  or third-party collectors. Measures qdisc backlog/drops, interface errors,
+  local established TCP RTT/RTO/retransmissions/cwnd/socket queues, and plaintext
+  ingress TCP advertised-window pressure including forwarded traffic. Adds
+  `GET /api/v1/statistics/link-diagnostics`, aggregate `link_diagnostics`, CLI
+  inspection, existing MQTT payload/discovery sensors, explicit freshness/loss/
+  coverage limits and cumulative observed-event counters. Ubuntu install/full
+  source upgrade loads/persists packet/TCP diagnostics modules; missing support
+  aborts deployment or produces explicit runtime unavailability. Signals do not
+  identify an exact upstream hop or gate configuration. Recommended bump:
+  minor; baseline unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-27-04](docs/frontend-handoffs/2026-10-27.md#2026-10-27-04-native-link-diagnostics).
+
 ### Fixed
 
 - Disabled/simulated mDNS no longer emits a receive-loss-accounting warning.

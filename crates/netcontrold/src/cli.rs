@@ -18,7 +18,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   show state / runtime / interfaces / routes / firewall / kernel
   show interfaces discovered          Read-only inventory, including unmanaged host NICs
   show transactions / transaction ID / revisions / revision NUMBER
-  show statistics [host|interfaces|protocols|gateways|vnstat|vnstat/host|vnstat/managed]
+  show statistics [host|interfaces|protocols|gateways|link-diagnostics|vnstat|vnstat/host|vnstat/managed]
   commit check                        Normalize and validate; no networking changes
   commit confirmed SECONDS [TEXT]     Apply full candidate; 10..300 seconds to confirm
   confirm [ID] / rollback [ID]         Explicit transaction action; last local ID if omitted
@@ -510,6 +510,7 @@ impl CliSession {
                         | "host"
                         | "protocols"
                         | "gateways"
+                        | "link-diagnostics"
                         | "vnstat"
                         | "vnstat/host"
                         | "vnstat/managed"

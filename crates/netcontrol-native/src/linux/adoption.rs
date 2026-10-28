@@ -100,18 +100,27 @@ fn dns_state(
 
 /// Configured servers first; DHCP-learned servers follow unless the configuration overrides them.
 fn dns_servers(configured: &DNSConfig, lease_dns: &[Ipv4Addr]) -> Result<Vec<DnsServer>> {
+    Ok(dns_addresses(configured, lease_dns)?
+        .into_iter()
+        .map(|address| match address {
+            std::net::IpAddr::V4(address) => (libc::AF_INET, address.octets().to_vec()),
+            std::net::IpAddr::V6(address) => (libc::AF_INET6, address.octets().to_vec()),
+        })
+        .collect())
+}
+pub fn dns_addresses(
+    configured: &DNSConfig,
+    lease_dns: &[Ipv4Addr],
+) -> Result<Vec<std::net::IpAddr>> {
     let mut servers = Vec::new();
     for server in &configured.servers {
         let address: std::net::IpAddr = server.parse()?;
-        servers.push(match address {
-            std::net::IpAddr::V4(address) => (libc::AF_INET, address.octets().to_vec()),
-            std::net::IpAddr::V6(address) => (libc::AF_INET6, address.octets().to_vec()),
-        });
+        servers.push(address);
     }
     // With nothing configured there is nothing to override with, so DHCP servers are kept.
     if !(configured.override_dhcp_dns && !configured.servers.is_empty()) {
         for server in lease_dns {
-            let server = (libc::AF_INET, server.octets().to_vec());
+            let server = std::net::IpAddr::V4(*server);
             if !servers.contains(&server) {
                 servers.push(server);
             }

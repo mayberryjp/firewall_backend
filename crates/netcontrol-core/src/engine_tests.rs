@@ -65,6 +65,58 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
 }
 
 #[test]
+fn operational_restarts_do_not_change_revision_and_reject_pending_transactions() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let reply = engine.restart_process("link-diagnostics");
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["status"], "simulated");
+    assert_eq!(engine.committed_revision(), 0);
+    assert_eq!(engine.restart_process("ntp").status, 409);
+    assert_eq!(engine.restart_process("flow:missing").status, 404);
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert!(engine.begin_restart().is_err());
+    assert_eq!(engine.restart_process("link-diagnostics").status, 409);
+    let request: crate::DNSLookupRequest =
+        serde_json::from_value(json!({"interface":"lan0","hostname":"example.test"})).unwrap();
+    assert!(engine.prepare_dns_lookup(&request).is_err());
+}
+
+#[test]
+fn link_diagnostics_are_read_only_scoped_and_never_fabricated_in_simulator() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let path = "/api/v1/statistics/link-diagnostics";
+    let reply = engine.request("GET", path, "", "reader", &["state.read".into()], &[]);
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body["schema"], "netcontrol-link-diagnostics/v1");
+    assert_eq!(reply.body["status"], "simulated");
+    assert!(reply.body["local_tcp"].is_null());
+    assert!(reply.body["packet_headers"].is_null());
+    let aggregate = request(&mut engine, "GET", "/api/v1/statistics", Value::Null);
+    assert_eq!(aggregate.body["link_diagnostics"], reply.body);
+    assert_eq!(
+        engine.request("GET", path, "", "reader", &[], &[]).status,
+        403
+    );
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                path,
+                "limit=1",
+                "reader",
+                &["state.read".into()],
+                &[]
+            )
+            .status,
+        400
+    );
+    assert_eq!(request(&mut engine, "POST", path, Value::Null).status, 405);
+}
+
+#[test]
 fn dynamic_dns_permissions_references_confirmation_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
@@ -2010,6 +2062,7 @@ fn read_routes_runtime_statistics_and_reconcile_contract() {
         "statistics",
         "statistics/interfaces",
         "statistics/protocols",
+        "statistics/link-diagnostics",
         "statistics/gateways",
     ];
     for path in paths {

@@ -40,23 +40,43 @@ pub(crate) struct Worker {
     pub context: ContextState,
     join: Option<JoinHandle<()>>,
     done: mpsc::Receiver<()>,
+    namespace: Option<Arc<std::fs::File>>,
+    initial: Value,
+    prepare: Arc<Mutex<Prepare>>,
 }
+type Prepare =
+    Box<dyn FnMut() -> Result<Box<dyn FnOnce(ContextState) -> Result<()> + Send>> + Send>;
 impl Worker {
     pub fn start(
         name: String,
         namespace: Option<Arc<std::fs::File>>,
         initial: Value,
-        mut prepare: impl FnMut() -> Result<Box<dyn FnOnce(ContextState) -> Result<()> + Send>>
+        prepare: impl FnMut() -> Result<Box<dyn FnOnce(ContextState) -> Result<()> + Send>>
         + Send
         + 'static,
+    ) -> Result<Self> {
+        Self::start_shared(
+            name,
+            namespace,
+            initial,
+            Arc::new(Mutex::new(Box::new(prepare))),
+        )
+    }
+    fn start_shared(
+        name: String,
+        namespace: Option<Arc<std::fs::File>>,
+        initial: Value,
+        prepare: Arc<Mutex<Prepare>>,
     ) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done) = mpsc::sync_channel(1);
         let context = ContextState {
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            status: Arc::new(Mutex::new(initial)),
+            status: Arc::new(Mutex::new(initial.clone())),
         };
         let ctx = context.clone();
+        let worker_namespace = namespace.clone();
+        let worker_prepare = prepare.clone();
         let join = thread::Builder::new()
             .name(format!("nc-{name}"))
             .spawn(move || {
@@ -66,7 +86,7 @@ impl Worker {
                     let attempt = Instant::now();
                     let result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                            if let Some(file) = &namespace {
+                            if let Some(file) = &worker_namespace {
                                 #[cfg(target_os = "linux")]
                                 {
                                     use std::os::fd::AsRawFd;
@@ -88,7 +108,19 @@ impl Worker {
                                     anyhow::bail!("network namespace workers require Linux");
                                 }
                             }
-                            let run = prepare()?;
+                            let run = {
+                                let mut prepare = worker_prepare
+                                    .lock()
+                                    .map_err(|_| anyhow!("worker preparation lock poisoned"))?;
+                                // Catch preparation panics before dropping the factory guard,
+                                // so the reusable factory remains available for recovery.
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    &mut *prepare,
+                                ))
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow!("service worker preparation panicked"))
+                                })?
+                            };
                             ctx.update(|s| {
                                 s["state"] = json!("running");
                                 s["started_at"] = json!(now());
@@ -142,6 +174,9 @@ impl Worker {
             context,
             join: Some(join),
             done,
+            namespace,
+            initial,
+            prepare,
         };
         match ready_rx.recv_timeout(Duration::from_secs(60)) {
             Ok(Ok(())) => Ok(worker),
@@ -154,6 +189,16 @@ impl Worker {
                 Err(anyhow!("service startup failed: {other:?}"))
             }
         }
+    }
+    pub fn restart(&mut self) -> Result<()> {
+        self.shutdown()?;
+        *self = Self::start_shared(
+            self.name.clone(),
+            self.namespace.clone(),
+            self.initial.clone(),
+            self.prepare.clone(),
+        )?;
+        Ok(())
     }
     pub fn snapshot(&self) -> Value {
         self.context
@@ -195,6 +240,60 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forced_restart_reuses_factory_and_joins_the_previous_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let count = prepared.clone();
+        let mut worker = Worker::start(
+            "restart-test".into(),
+            None,
+            json!({"name":"restart-test"}),
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(|ctx| {
+                    while !ctx.wait(Duration::from_millis(5)) {}
+                    Ok(())
+                }))
+            },
+        )
+        .unwrap();
+        let old = worker.context.clone();
+        worker.restart().unwrap();
+        assert!(old.stopping());
+        assert_eq!(old.status.lock().unwrap()["state"], "stopped");
+        assert_eq!(prepared.load(Ordering::SeqCst), 2);
+        assert!(worker.active());
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn preparation_panic_does_not_poison_recovery_or_forced_restart() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let count = prepared.clone();
+        let mut worker = Worker::start("prepare-panic".into(), None, json!({}), move || {
+            assert_ne!(
+                count.fetch_add(1, Ordering::SeqCst),
+                0,
+                "synthetic preparation panic"
+            );
+            Ok(Box::new(|ctx| {
+                while !ctx.wait(Duration::from_millis(5)) {}
+                Ok(())
+            }))
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while worker.snapshot()["state"] != "running" {
+            assert!(Instant::now() < deadline, "{}", worker.snapshot());
+            thread::sleep(Duration::from_millis(10));
+        }
+        worker.restart().unwrap();
+        assert_eq!(prepared.load(Ordering::SeqCst), 3);
+        worker.shutdown().unwrap();
+    }
+
     #[test]
     fn bounded_stop_and_error_status_without_process_ids() {
         let mut w = Worker::start(

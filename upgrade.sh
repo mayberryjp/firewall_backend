@@ -126,7 +126,7 @@ upgrade_binary() (
 
 deploy_upgrade() {
     local binary=$1 destination=$2 installer=$3
-    root_command bash -c 'source "$1"; configure_conntrack && configure_appliance_services && configure_logging_units && systemctl daemon-reload' bash "$installer" || return 1
+    root_command bash -c 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_appliance_services && configure_logging_units && systemctl daemon-reload' bash "$installer" || return 1
     printf 'Restarting the firewall daemon with embedded configuration SSH enabled on TCP 2222 by default; existing --ssh-listen overrides take precedence. Review host-input firewall exposure. Use a local console or independent OS SSH session.\n'
     upgrade_binary "$binary" "$destination" "$installer"
 }

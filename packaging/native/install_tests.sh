@@ -79,6 +79,46 @@ for conntrack_scenario in success repeat module_failure write_failure read_failu
 done
 printf 'Conntrack live settings, boot persistence and prerequisite-failure tests passed (mocked kernel commands).\n'
 
+for diagnostics_scenario in success repeat module_failure persist_failure symlink_file; do
+    diagnostics_directory="$temporary/link-diagnostics-$diagnostics_scenario"
+    mkdir -p "$diagnostics_directory"
+    printf 'unrelated\n' > "$diagnostics_directory/other.conf"
+    if [[ $diagnostics_scenario == symlink_file ]]; then
+        ln -s other.conf "$diagnostics_directory/netcontrol-link-diagnostics.conf"
+    fi
+    if (
+        modprobe() {
+            printf '%s\n' "$*" >> "$diagnostics_directory/commands"
+            [[ $diagnostics_scenario != module_failure ]]
+        }
+        install() {
+            [[ $diagnostics_scenario != persist_failure ]] || return 1
+            local -a arguments=()
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    -o|-g) shift 2 ;;
+                    *) arguments+=("$1"); shift ;;
+                esac
+            done
+            command install "${arguments[@]}"
+        }
+        configure_link_diagnostics "$diagnostics_directory" || exit 1
+        if [[ $diagnostics_scenario == repeat ]]; then
+            configure_link_diagnostics "$diagnostics_directory" || exit 1
+        fi
+    ); then
+        [[ $diagnostics_scenario == success || $diagnostics_scenario == repeat ]] || exit 1
+        [[ $(< "$diagnostics_directory/netcontrol-link-diagnostics.conf") == $'af_packet\ninet_diag\ntcp_diag' ]]
+        [[ $(head -n 3 "$diagnostics_directory/commands") == $'af_packet\ninet_diag\ntcp_diag' ]]
+    else
+        [[ $diagnostics_scenario != success && $diagnostics_scenario != repeat ]] || exit 1
+        [[ ! -f $diagnostics_directory/netcontrol-link-diagnostics.conf ||
+           -L $diagnostics_directory/netcontrol-link-diagnostics.conf ]] || exit 1
+    fi
+    [[ $(< "$diagnostics_directory/other.conf") == unrelated ]]
+done
+printf 'Native link diagnostics module setup and failure tests passed (mocked kernel commands).\n'
+
 for service_scenario in success repeat directory_failure chmod_failure publish_failure symlink_file symlink_directory file_directory nonregular_target; do
     service_directory="$temporary/service-opt-ins-$service_scenario"
     mkdir -p "$service_directory/drop-ins"
@@ -396,7 +436,7 @@ for deployment_scenario in success setup_failure deploy_failure; do
         deployment_trace=''
         root_command() {
             [[ $# -eq 5 && $1 == bash && $2 == -c &&
-                $3 == 'source "$1"; configure_conntrack && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
+                $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
             deployment_trace+='setup;'
             [[ $deployment_scenario != setup_failure ]]
         }
@@ -424,6 +464,10 @@ configure_conntrack() {
     printf 'conntrack\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != conntrack_failure ]]
 }
+configure_link_diagnostics() {
+    printf 'link-diagnostics\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != diagnostics_failure ]]
+}
 configure_appliance_services() {
     printf 'services\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != services_failure ]]
@@ -438,7 +482,7 @@ systemctl() {
     [[ $SETUP_SCENARIO != reload_failure ]]
 }
 EOF
-for setup_scenario in success conntrack_failure services_failure logging_units_failure reload_failure; do
+for setup_scenario in success conntrack_failure diagnostics_failure services_failure logging_units_failure reload_failure; do
     (
         export SETUP_SCENARIO=$setup_scenario SETUP_TRACE="$temporary/setup-$setup_scenario.trace"
         root_command() { "$@"; }
@@ -449,11 +493,12 @@ for setup_scenario in success conntrack_failure services_failure logging_units_f
             [[ $setup_scenario != success ]] || exit 1
         fi
         case $setup_scenario in
-            success) expected=$'conntrack\nservices\nlogging-units\nreload\ndeploy' ;;
+            success) expected=$'conntrack\nlink-diagnostics\nservices\nlogging-units\nreload\ndeploy' ;;
             conntrack_failure) expected=conntrack ;;
-            services_failure) expected=$'conntrack\nservices' ;;
-            logging_units_failure) expected=$'conntrack\nservices\nlogging-units' ;;
-            reload_failure) expected=$'conntrack\nservices\nlogging-units\nreload' ;;
+            diagnostics_failure) expected=$'conntrack\nlink-diagnostics' ;;
+            services_failure) expected=$'conntrack\nlink-diagnostics\nservices' ;;
+            logging_units_failure) expected=$'conntrack\nlink-diagnostics\nservices\nlogging-units' ;;
+            reload_failure) expected=$'conntrack\nlink-diagnostics\nservices\nlogging-units\nreload' ;;
         esac
         [[ $(< "$SETUP_TRACE") == "$expected" ]]
     )
@@ -517,7 +562,7 @@ for scenario in success fail_stage fail_logging fail_restart fail_health first_i
                         grep -q "^systemctl stop netcontrold.service$" "$UPGRADE_TEST_DIRECTORY/commands" || return 1
                         [[ $UPGRADE_TEST_SCENARIO != fail_logging ]]
                     else
-                        [[ $3 == '\''source "$1"; configure_conntrack && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
+                        [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
                     fi ;;
                 install)
                     [[ $UPGRADE_TEST_SCENARIO != fail_stage ]] || return 1

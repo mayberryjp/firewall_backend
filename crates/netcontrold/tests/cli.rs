@@ -81,6 +81,18 @@ impl Fixture {
 }
 
 #[test]
+fn link_diagnostics_show_is_read_only_and_permission_checked() {
+    let f = Fixture::new(&["state.read"]);
+    let mut cli = CliSession::new();
+    let value: Value =
+        serde_json::from_str(&f.ok(&mut cli, "show statistics link-diagnostics")).unwrap();
+    assert_eq!(value["status"], "simulated");
+    assert!(value["local_tcp"].is_null());
+    let denied = Fixture::new(&[]);
+    denied.fail(&mut cli, "show statistics link-diagnostics", "403");
+}
+
+#[test]
 fn mdns_candidate_show_status_repair_and_permission() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

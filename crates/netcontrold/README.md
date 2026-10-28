@@ -58,6 +58,24 @@ NICs are selected explicitly as `kind: "ethernet"` in full configuration
 transactions. `GET /api/v1/interfaces` remains managed configuration.
 Native mode inside Docker manages only the container's namespace.
 
+`POST /api/v1/processes/restart` requires `system.restart` and accepts a managed
+`target`, not an OS PID or arbitrary executable. Native workers stop/join before
+replacement; MQTT, Dynamic DNS and host-system managers restart behind stable
+controllers which retain explicit failed/panicked attempt status and remain
+manually restartable. Only supervised native host mode with an active systemd
+watchdog exposes `netcontrold` restart: drain listeners/workers, durable engine
+shutdown, then nonzero exit so the existing on-failure service policy restarts it.
+No subprocess or service-manager command is invoked.
+
+`POST /api/v1/diagnostics/dns-lookup` requires `diagnostics.run`. An explicit
+configured up interface selects configured/valid DHCP DNS servers; a bounded
+native UDP query (TCP fallback on truncation) measures DNS response time. Two
+lookups can run concurrently without holding the configuration engine lock.
+Both actions preserve configuration revisions and reject active configuration/
+upgrade/restart workflows. See the
+[operational API contract](../../FRONTEND_SPEC.md#operational-restart-and-dns-diagnostics)
+for complete request/response, authorization, targets, timing and failure rules.
+
 With host services enabled on Linux, structured daemon events are appended to
 `<services-state-dir>/backend.log` and stderr. The file is private; native syslog
 receives the stderr copy through journald forwarding, not by tailing the file.

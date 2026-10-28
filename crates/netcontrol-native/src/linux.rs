@@ -47,6 +47,7 @@ mod host_integration;
 #[cfg(all(test, feature = "nftables"))]
 mod integration;
 mod ipv6;
+mod link_monitor;
 mod netfilter;
 mod networking;
 mod sysctl;
@@ -63,6 +64,7 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 }
 
 pub struct Native {
+    link_monitor: link_monitor::Monitor,
     options: NativeOptions,
     namespace: Arc<File>,
     namespace_path: PathBuf,
@@ -321,6 +323,7 @@ impl Native {
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
         let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
+            link_monitor: link_monitor::Monitor::new(namespace.clone())?,
             dhcp,
             dhcp_monitors,
             options,
@@ -892,6 +895,69 @@ impl Native {
 }
 
 impl Backend for Native {
+    fn prepare_dns_lookup(
+        &mut self,
+        config: &Config,
+        request: &netcontrol_core::DNSLookupRequest,
+    ) -> Result<netcontrol_core::DNSLookup> {
+        self.check_scope()?;
+        ensure!(
+            config
+                .interfaces
+                .iter()
+                .any(|link| link.name == request.interface && link.up),
+            "DNS lookup requires a configured up interface"
+        );
+        let state = self
+            .dhcp
+            .state
+            .lock()
+            .map_err(|_| anyhow!("DHCP state poisoned"))?;
+        let configured = config
+            .dns
+            .get(&request.interface)
+            .cloned()
+            .unwrap_or_default();
+        let lease = state.leases.get(&request.interface).filter(|lease| {
+            lease.valid() && config.dhcp_clients.get(&request.interface) == Some(&lease.client)
+        });
+        let servers =
+            adoption::dns_addresses(&configured, lease.map_or(&[], |lease| lease.dns.as_slice()))?
+                .into_iter()
+                .filter(|ip| config.ipv6_enabled || ip.is_ipv4())
+                .collect::<Vec<_>>();
+        ensure!(
+            !servers.is_empty() && servers.len() <= 16,
+            "selected interface requires 1..16 effective configured DNS servers"
+        );
+        let namespace = self.namespace.clone();
+        let request = request.clone();
+        let scope = self.identity.clone();
+        Ok(Box::new(move || {
+            session(namespace, move |_, _| {
+                let mut value = netcontrol_services::dns_lookup(&request, &servers)?;
+                value["scope"] = json!(scope);
+                Ok(value)
+            })
+        }))
+    }
+    fn restart_process(&mut self, config: &Config, target: &str) -> Result<Value> {
+        self.check_scope()?;
+        let value = config.operational_value()?;
+        if let Some(interface) = target.strip_prefix("dhcp-client:") {
+            self.dhcp.retry(&value, interface)?;
+            return Ok(json!({"state":"restart_requested","interface":interface}));
+        }
+        if target == "dhcp-gateway-monitors" {
+            self.dhcp_monitors.configure(&value)?;
+            return self.gateway_statistics("/api/v1/statistics/gateways");
+        }
+        if target == "link-diagnostics" {
+            self.link_monitor.restart(self.namespace.clone())?;
+            return self.link_monitor.snapshot();
+        }
+        self.services.restart_worker(target)
+    }
     fn initial_configuration(&mut self) -> Result<Config> {
         if !self.options.namespace.is_empty() {
             return Ok(Config::empty());
@@ -1285,6 +1351,11 @@ impl Backend for Native {
             return crate::host_health::snapshot();
         }
         self.check_scope()?;
+        if path == "/api/v1/statistics/link-diagnostics" {
+            let mut value = self.link_monitor.snapshot()?;
+            value["scope"] = json!(self.identity);
+            return Ok(value);
+        }
         if path == "/api/v1/statistics/gateways" || path.starts_with("/api/v1/statistics/gateways/")
         {
             return crate::statistics::service_response(
@@ -1316,6 +1387,9 @@ impl Backend for Native {
             ))
         })?;
         if all {
+            let mut diagnostics = self.link_monitor.snapshot()?;
+            diagnostics["scope"] = json!(self.identity);
+            value["link_diagnostics"] = diagnostics;
             let gateways = self.gateway_statistics("/api/v1/statistics/gateways")?;
             value["gateways"] = gateways["gateways"].clone();
             if gateways["sample"]["status"] == "partial" {

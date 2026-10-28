@@ -31,6 +31,8 @@ pub const PERMISSIONS: &[&str] = &[
     "kernel.host.write",
     "system.upgrade",
     "connections.delete",
+    "system.restart",
+    "diagnostics.run",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -270,6 +272,7 @@ pub struct Engine {
     backend: Box<dyn Backend>,
     closed: bool,
     maintenance: bool,
+    restarting: bool,
     mqtt_passwords: Option<BTreeSet<String>>,
     dynamic_dns_secrets: Option<BTreeSet<String>>,
     timezone_check: Option<TimezoneCheck>,
@@ -359,6 +362,7 @@ impl Engine {
             backend,
             closed: false,
             maintenance: false,
+            restarting: false,
             mqtt_passwords: None,
             dynamic_dns_secrets: None,
             timezone_check: None,
@@ -479,6 +483,9 @@ impl Engine {
     ) -> ApiResult<Reply> {
         if actor.trim().is_empty() {
             return Err(ApiError::new(401, "valid API key required"));
+        }
+        if self.restarting && method != "GET" {
+            return Err(ApiError::new(409, "daemon restart is pending"));
         }
         if self.maintenance && method != "GET" {
             return Err(ApiError::new(
@@ -787,7 +794,87 @@ impl Engine {
     }
 
     pub fn configuration_busy(&self) -> bool {
-        self.maintenance || self.active().is_some()
+        self.restarting || self.maintenance || self.active().is_some()
+    }
+
+    pub fn begin_restart(&mut self) -> Result<()> {
+        ensure!(
+            !self.closed && !self.configuration_busy(),
+            "configuration transaction, upgrade or restart is active"
+        );
+        self.restarting = true;
+        Ok(())
+    }
+    pub fn cancel_restart(&mut self) {
+        self.restarting = false;
+    }
+    pub fn prepare_dns_lookup(
+        &mut self,
+        request: &crate::DNSLookupRequest,
+    ) -> Result<crate::DNSLookup> {
+        ensure!(
+            !self.closed && !self.configuration_busy(),
+            "configuration transaction, upgrade or restart is active"
+        );
+        self.backend
+            .prepare_dns_lookup(&self.state.desired, request)
+    }
+
+    pub fn restart_process(&mut self, target: &str) -> Reply {
+        let c = self.saved_configuration();
+        let enabled = match target {
+            "ntp" => Some(c.ntp.enabled),
+            "syslog" => Some(c.syslog.enabled),
+            "mdns" => Some(c.mdns.enabled),
+            "vnstat-host" | "vnstat-managed" => Some(c.vnstat.enabled),
+            "dhcp-relay" => Some(c.interfaces.iter().any(|link| link.dhcp_relay.enabled)),
+            "dhcp-gateway-monitors" => Some(
+                c.gateway_monitors
+                    .iter()
+                    .any(|m| m.enabled && m.mode == crate::GatewayMode::Dhcp),
+            ),
+            "link-diagnostics" => Some(true),
+            _ if target.starts_with("flow:") => c
+                .softflowd
+                .iter()
+                .find(|f| Some(f.name.as_str()) == target.strip_prefix("flow:"))
+                .map(|f| f.enabled),
+            _ if target.starts_with("gateway:") => c
+                .gateway_monitors
+                .iter()
+                .find(|m| {
+                    Some(m.name.as_str()) == target.strip_prefix("gateway:")
+                        && m.mode == crate::GatewayMode::Explicit
+                })
+                .map(|m| m.enabled),
+            _ if target.starts_with("dhcp-client:") => c
+                .dhcp_clients
+                .get(target.trim_start_matches("dhcp-client:"))
+                .map(|_| true),
+            _ => None,
+        };
+        if self.closed {
+            return service_error("engine is shut down").reply();
+        }
+        if self.configuration_busy() {
+            return ApiError::new(
+                409,
+                "configuration transaction, upgrade or restart is active",
+            )
+            .reply();
+        }
+        match enabled {
+            None => return ApiError::new(404, "managed worker target not found").reply(),
+            Some(false) => return ApiError::new(409, "managed worker is disabled").reply(),
+            Some(true) => {}
+        }
+        match self.backend.restart_process(&self.state.desired, target) {
+            Ok(status) => Reply::value(
+                200,
+                json!({"target":target,"status":if status["state"]=="simulated"{"simulated"}else{"restarted"},"worker":status}),
+            ),
+            Err(error) => service_error(error).reply(),
+        }
     }
 
     pub fn configure_mqtt(&mut self, references: Option<BTreeSet<String>>) {
@@ -1487,6 +1574,7 @@ fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
         "/api/v1/statistics/interfaces",
         "/api/v1/statistics/protocols",
         "/api/v1/statistics/host",
+        "/api/v1/statistics/link-diagnostics",
         "/api/v1/statistics/gateways",
         "/api/v1/statistics/vnstat",
         "/api/v1/statistics/vnstat/host",

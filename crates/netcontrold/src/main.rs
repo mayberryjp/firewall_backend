@@ -387,12 +387,60 @@ async fn run(options: Options) -> Result<()> {
     };
     let system = netcontrold::host_system::Manager::open(engine.clone(), system_mode)?;
     App::attach_system(&mut app, system.clone())?;
+    let watchdog = Arc::new(netcontrold::watchdog::Watchdog::from_environment()?);
+    let (restart_tx, restart_rx) = tokio::sync::watch::channel(false);
+    let restart_requested = restart_rx.clone();
+    let controls: std::collections::BTreeMap<_, _> = ["mqtt", "dynamic-dns", "system"]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                Arc::new(netcontrold::processes::Control::default()),
+            )
+        })
+        .collect();
+    App::attach_processes(
+        &mut app,
+        controls.clone(),
+        (system_mode == netcontrold::host_system::Mode::Native && watchdog.enabled())
+            .then_some(restart_tx),
+    )?;
     let (system_stop, system_receiver) = tokio::sync::watch::channel(false);
-    let system_task = tokio::spawn(system.run(system_receiver));
+    let system_control = controls["system"].clone();
+    let system_task = tokio::spawn(async move {
+        system_control
+            .run(system_receiver, move |receiver| {
+                let system = system.clone();
+                async move {
+                    system.reset_retry()?;
+                    system.run(receiver).await;
+                    Ok(())
+                }
+            })
+            .await
+    });
     let (dynamic_dns_stop, dynamic_dns_receiver) = tokio::sync::watch::channel(false);
-    let dynamic_dns_task = tokio::spawn(dynamic_dns.run(dynamic_dns_receiver));
+    let dynamic_dns_control = controls["dynamic-dns"].clone();
+    let dynamic_dns_task = tokio::spawn(async move {
+        dynamic_dns_control
+            .run(dynamic_dns_receiver, move |receiver| {
+                dynamic_dns.clone().run(receiver)
+            })
+            .await
+    });
     let (mqtt_stop, mqtt_receiver) = tokio::sync::watch::channel(false);
-    let mqtt_task = tokio::spawn(mqtt.run(mqtt_receiver));
+    let mqtt_control = controls["mqtt"].clone();
+    let mqtt_task = tokio::spawn(async move {
+        mqtt_control
+            .run(mqtt_receiver, move |receiver| {
+                let mqtt = mqtt.clone();
+                async move {
+                    mqtt.run(receiver).await;
+                    Ok(())
+                }
+            })
+            .await
+    });
     let handle = axum_server::Handle::new();
     let (ssh_stop_tx, ssh_stop_rx) = tokio::sync::watch::channel(false);
     let mut ssh_task = ssh.map(|(listener, path)| {
@@ -402,7 +450,6 @@ async fn run(options: Options) -> Result<()> {
         )
     });
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-    let watchdog = Arc::new(netcontrold::watchdog::Watchdog::from_environment()?);
     let readiness_watchdog = watchdog.clone();
     let readiness_handle = handle.clone();
     let readiness = tokio::spawn(async move {
@@ -463,7 +510,17 @@ async fn run(options: Options) -> Result<()> {
     let signal_handle = handle.clone();
     let signal_ssh_stop = ssh_stop_tx.clone();
     let signals = tokio::spawn(async move {
-        shutdown_signal().await;
+        let mut restart = restart_rx;
+        tokio::select! {
+            _=shutdown_signal()=>{},
+            _=async {
+                // An absent API restart sender is not a shutdown request.
+                loop {
+                    if *restart.borrow() {break;}
+                    if restart.changed().await.is_err() {std::future::pending::<()>().await;}
+                }
+            }=>{},
+        }
         let _ = signal_ssh_stop.send(true);
         signal_handle.graceful_shutdown(Some(Duration::from_secs(10)));
     });
@@ -529,10 +586,10 @@ async fn run(options: Options) -> Result<()> {
     let _ = dynamic_dns_stop.send(true);
     let _ = system_stop.send(true);
     signals.abort();
-    mqtt_task.await.context("MQTT worker shutdown failed")?;
+    mqtt_task.await.context("MQTT worker shutdown failed")??;
     system_task
         .await
-        .context("host system worker shutdown failed")?;
+        .context("host system worker shutdown failed")??;
     dynamic_dns_task
         .await
         .context("Dynamic DNS worker shutdown failed")??;
@@ -544,6 +601,9 @@ async fn run(options: Options) -> Result<()> {
     shutdown_result.context("durable engine shutdown failed")?;
     tick_result??;
     ssh_result.context("configuration SSH server failed")?;
+    if *restart_requested.borrow() {
+        bail!("daemon restart requested; supervised service will restart");
+    }
     served.context("HTTP listener failed")
 }
 async fn shutdown_signal() {

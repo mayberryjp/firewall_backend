@@ -80,6 +80,73 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and nftables"]
+fn native_operational_dns_and_link_monitor_restart_preserve_configuration() -> Result<()> {
+    use futures_util::TryStreamExt;
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    let desired = config(json!({
+        "interfaces":[{"name":"diag0","kind":"dummy","role":"wan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
+        "dns":{"diag0":{"servers":["127.0.0.1"]}}
+    }))?;
+    desired.validate()?;
+    let mut network = desired.clone();
+    // Namespace fixtures cannot publish DNS to the host's systemd-resolved.
+    network.dns.clear();
+    native.apply(&Config::empty(), &network)?;
+    let namespace = native.namespace.clone();
+    let listener = session(namespace, |runtime, handle| {
+        runtime.block_on(async {
+            let link = handle
+                .link()
+                .get()
+                .match_name("lo".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("loopback missing")?;
+            handle.link().set(link.header.index).up().execute().await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:53")?;
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+        Ok(socket)
+    })?;
+    let server = std::thread::spawn(move || -> Result<()> {
+        let mut bytes = [0; 512];
+        let (size, peer) = listener.recv_from(&mut bytes)?;
+        let mut response = bytes[..size].to_vec();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[7] = 1;
+        response.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+        listener.send_to(&response, peer)?;
+        Ok(())
+    });
+    let mut request: netcontrol_core::DNSLookupRequest =
+        serde_json::from_value(json!({"interface":"diag0","hostname":"example.test"}))?;
+    request.validate()?;
+    let lookup = native.prepare_dns_lookup(&desired, &request)?;
+    let value = lookup()?;
+    server
+        .join()
+        .map_err(|_| anyhow!("DNS fixture panicked"))??;
+    ensure!(
+        value["status"] == "answered"
+            && value["server"] == "127.0.0.1"
+            && value["addresses"] == json!(["192.0.2.7"])
+            && value["rtt_ms"].as_f64().is_some_and(|v| v > 0.0),
+        "configured DNS lookup failed: {value}"
+    );
+    native.restart_process(&network, "link-diagnostics")?;
+    ensure!(
+        native.observe(&network)? == network,
+        "restart or diagnostic changed configuration"
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
 fn native_blackhole_routes_drop_traffic_change_action_rename_rollback_and_restart() -> Result<()> {
     let fixture = Fixture::new()?;

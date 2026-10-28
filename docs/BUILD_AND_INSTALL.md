@@ -131,11 +131,11 @@ checks leave the running daemon untouched. A checkout-local lock rejects
 concurrent invocations; do not run other installers or upgrades, including
 from another checkout, at the same time.
 
-Full deployment runs the installer's shared conntrack and appliance-service
+Full deployment runs the installer's shared conntrack, native link-diagnostics and appliance-service
 permission setup, then reloads systemd as root after the build and service-path
 check, before staging/replacing/stopping the daemon.
 Keep `install.sh` beside `upgrade.sh` from the same reviewed checkout.
-`--build-only` performs no conntrack/service setup or host changes. See
+`--build-only` performs no conntrack/diagnostics/service setup or host changes. See
 [conntrack host prerequisites](#conntrack-host-prerequisites) for persistence,
 failure limitations and accounting behavior.
 
@@ -290,6 +290,40 @@ from this fixed checkout. If systemd warns about changed units, first run
 after deployment with `sudo systemctl start netcontrold.service`, then inspect
 status/journal, API data, saved configuration and connectivity. The tool itself
 does not deploy a binary or prove appliance startup/network health.
+
+## Native link diagnostics prerequisites
+
+Linux native mode continuously collects qdisc/socket diagnostics and bounded
+plaintext TCP headers in Rust; no external collector or eBPF runtime is required.
+Ubuntu `install.sh` and full `upgrade.sh` run the shared
+`configure_link_diagnostics` before provisioning/replacing the daemon. It loads
+`af_packet`, `inet_diag`, `tcp_diag` (built-in implementations are valid) and
+persists those names in root-owned mode-0644
+`/etc/modules-load.d/netcontrol-link-diagnostics.conf`. Symlink/non-regular
+targets are refused; unrelated module files are preserved. Missing modules,
+commands or persistence errors abort deployment before daemon replacement.
+Already-loaded modules/host prerequisites are not rolled back on later failure.
+`--build-only` does not load modules or modify the host.
+
+Kernel requirements are `CONFIG_PACKET`, `CONFIG_INET_DIAG`,
+`CONFIG_INET_TCP_DIAG`, routing-netlink qdisc statistics and IPv4/IPv6 socket
+diagnostics. The existing root daemon needs CAP_NET_RAW; entering a separate
+network namespace also needs appropriate SYS_ADMIN permissions. Restricted
+containers/capability overrides must allow the corresponding sockets/setns.
+Neither script enables unprivileged BPF, installs BCC/bpftrace/ss/tc collectors,
+mounts tracefs/bpffs, or weakens AppArmor/lockdown. No reboot is normally required.
+No API or collector-side host sysctl/module mutation is added.
+
+Other deployment paths (signed package/self-update/OpenRC/manual binaries)
+require operator-provided kernel support/modules. Missing support produces an
+explicit unavailable diagnostic sample with retries, not a healthy zero, service
+crash or configuration-write lock. Verify with authenticated
+`GET /api/v1/statistics/link-diagnostics` or
+`show statistics link-diagnostics`, and generate real traffic. Runtime collection
+is approximately one second; MQTT retains its configured publication interval.
+Do not treat lack of TCP sockets on a forwarding router as a missing collector:
+local TCP diagnostics and forwarded packet-header coverage are distinct.
+See the [canonical measurement/limits contract](../FRONTEND_SPEC.md#native-link-diagnostics).
 
 ## Conntrack host prerequisites
 

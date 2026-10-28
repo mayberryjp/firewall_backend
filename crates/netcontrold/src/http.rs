@@ -96,6 +96,9 @@ pub struct App {
     mqtt: Option<Arc<crate::mqtt::Manager>>,
     dynamic_dns: Option<Arc<crate::dynamic_dns::Manager>>,
     system: Option<Arc<crate::host_system::Manager>>,
+    processes: std::collections::BTreeMap<String, Arc<crate::processes::Control>>,
+    daemon_restart: Option<tokio::sync::watch::Sender<bool>>,
+    dns_slots: tokio::sync::Semaphore,
 }
 impl App {
     pub fn new(engine: Arc<Mutex<Engine>>, auth: Authentication, tls: bool) -> Arc<Self> {
@@ -109,7 +112,20 @@ impl App {
             mqtt: None,
             dynamic_dns: None,
             system: None,
+            processes: Default::default(),
+            daemon_restart: None,
+            dns_slots: tokio::sync::Semaphore::new(2),
         })
+    }
+    pub fn attach_processes(
+        app: &mut Arc<Self>,
+        controls: std::collections::BTreeMap<String, Arc<crate::processes::Control>>,
+        daemon: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> Result<()> {
+        let app = Arc::get_mut(app).context("application is already shared")?;
+        app.processes = controls;
+        app.daemon_restart = daemon;
+        Ok(())
     }
     pub fn with_updates(
         engine: Arc<Mutex<Engine>>,
@@ -174,6 +190,14 @@ impl App {
             }
         }
         managers.push(("daemon_tasks", json!({"entries":tasks.iter().map(|(name, finished)| json!({"name":name,"state":if *finished {"stopped"} else {"running"}})).collect::<Vec<_>>()})));
+        managers.push((
+            "managed_processes",
+            json!({"entries":self.processes.iter().map(|(name,control)| {
+            let mut status=control.status().unwrap_or_else(|error|json!({"state":"error","error":error.to_string()}));
+            status["name"]=json!(name);
+            status
+        }).collect::<Vec<_>>()}),
+        ));
         self.health.observe(runtime.as_ref(), &managers, watchdog);
     }
     pub fn attach_dynamic_dns(
@@ -623,6 +647,131 @@ fn api(
             return fail(400, "platform status accepts no query or body", true);
         }
         return response(200, app.health.snapshot());
+    }
+    if matches!(
+        path,
+        "/api/v1/processes/restart" | "/api/v1/diagnostics/dns-lookup"
+    ) {
+        let restart = path == "/api/v1/processes/restart";
+        let permission = if restart {
+            "system.restart"
+        } else {
+            "diagnostics.run"
+        };
+        if !credential.permissions.iter().any(|p| p == permission) {
+            return fail(403, "insufficient operational permission", true);
+        }
+        if method != "POST" {
+            return fail(405, "operational action requires POST", true);
+        }
+        if !query.is_empty() {
+            return fail(400, "operational action accepts no query parameters", true);
+        }
+        if let Err(error) = app.refresh_upgrade_gate() {
+            tracing::error!(%error,"operational upgrade gate unavailable");
+            return fail(503, "upgrade state unavailable", true);
+        }
+        let Ok(mut engine) = app.engine.lock() else {
+            return fail(503, "engine unavailable", true);
+        };
+        if engine.configuration_busy() {
+            return fail(
+                409,
+                "configuration transaction, upgrade or restart is active",
+                true,
+            );
+        }
+        if restart {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Restart {
+                target: String,
+            }
+            let Ok(input) = serde_json::from_slice::<Restart>(&body) else {
+                return fail(
+                    400,
+                    "expected JSON object containing only target string",
+                    true,
+                );
+            };
+            if input.target.is_empty()
+                || input.target.len() > 80
+                || !input.target.is_ascii()
+                || input.target.chars().any(|c| c.is_control())
+            {
+                return fail(400, "invalid managed process target", true);
+            }
+            if input.target == "netcontrold" {
+                let Some(signal) = &app.daemon_restart else {
+                    return fail(
+                        503,
+                        "daemon restart requires the supervised native systemd service",
+                        true,
+                    );
+                };
+                if signal.is_closed() {
+                    return fail(503, "daemon shutdown listener unavailable", true);
+                }
+                if let Err(error) = engine.begin_restart() {
+                    return fail(409, &error.to_string(), true);
+                }
+                // Receiver lifetime is owned by main until HTTP drain finishes.
+                if signal.send(true).is_err() {
+                    engine.cancel_restart();
+                    return fail(503, "daemon shutdown listener unavailable", true);
+                }
+                tracing::warn!(actor=%credential.name,"daemon restart requested");
+                return response(
+                    202,
+                    json!({"target":"netcontrold","status":"restart_requested"}),
+                );
+            }
+            if let Some(control) = app.processes.get(&input.target) {
+                return match control.request() {
+                    Ok(generation) => {
+                        tracing::warn!(actor=%credential.name,target=%input.target,"managed task restart requested");
+                        response(202, crate::processes::reply(&input.target, generation))
+                    }
+                    Err(error) => fail(503, &error.to_string(), true),
+                };
+            }
+            if ["mqtt", "dynamic-dns", "system"].contains(&input.target.as_str()) {
+                return fail(503, "managed task is unavailable", true);
+            }
+            let reply = engine.restart_process(&input.target);
+            tracing::warn!(actor=%credential.name,target=%input.target,status=reply.status,"native worker restart action completed");
+            return response(reply.status, reply.body);
+        }
+        let Ok(mut input) = serde_json::from_slice::<netcontrol_core::DNSLookupRequest>(&body)
+        else {
+            return fail(
+                400,
+                "expected interface, hostname and optional record_type/timeout_ms",
+                true,
+            );
+        };
+        if let Err(error) = input.validate() {
+            return fail(400, &error.to_string(), true);
+        }
+        let Ok(_slot) = app.dns_slots.try_acquire() else {
+            return fail(429, "DNS diagnostic concurrency limit reached", true);
+        };
+        let revision = engine.committed_revision();
+        let lookup = match engine.prepare_dns_lookup(&input) {
+            Ok(lookup) => lookup,
+            Err(error) => return fail(503, &error.to_string(), true),
+        };
+        drop(engine);
+        return match lookup() {
+            Ok(mut value) => {
+                value["revision"] = json!(revision);
+                response(200, value)
+            }
+            Err(error) => {
+                tracing::warn!(%error,"DNS diagnostic failed");
+                fail(503, &error.to_string(), true)
+            }
+        };
     }
     let Ok(mut engine) = app.engine.lock() else {
         return fail(503, "engine unavailable", true);
