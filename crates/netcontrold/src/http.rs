@@ -746,7 +746,7 @@ fn api(
         else {
             return fail(
                 400,
-                "expected interface, hostname and optional record_type/timeout_ms",
+                "expected hostname, interface or server, and optional record_type/timeout_ms",
                 true,
             );
         };

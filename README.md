@@ -90,7 +90,11 @@ it never kills arbitrary OS processes.
 `{"interface":"wan0","hostname":"google.com","record_type":"A","timeout_ms":2000}`
 queries that interface's configured/DHCP DNS servers and returns measured
 `rtt_ms`, answers, DNS response code and attempt errors (`diagnostics.run`).
-No resolver override, shell lookup or external helper is used. See the
+Add `"server":"192.0.2.53"` to query only that IP on port 53, without configured
+resolver fallback or changing saved DNS settings. With an explicit server,
+omit `interface` to use normal kernel routing, for example
+`{"hostname":"example.test","server":"192.0.2.53"}`. No shell lookup or external
+helper is used. See the
 [complete action contract](FRONTEND_SPEC.md#operational-restart-and-dns-diagnostics)
 for targets, limits, statuses, timing and side effects.
 

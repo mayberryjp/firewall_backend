@@ -50,7 +50,7 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 }
 
 #[cfg(target_os = "linux")]
-fn tcp(address: SocketAddr, interface: &str, deadline: Instant) -> Result<TcpStream> {
+fn tcp(address: SocketAddr, interface: Option<&str>, deadline: Instant) -> Result<TcpStream> {
     use std::os::fd::AsRawFd;
     let fd = crate::linux::socket(
         if address.is_ipv4() {
@@ -62,7 +62,9 @@ fn tcp(address: SocketAddr, interface: &str, deadline: Instant) -> Result<TcpStr
         0,
     )?;
     if !address.ip().is_loopback() {
-        crate::linux::bind_device(fd.as_raw_fd(), interface)?;
+        if let Some(interface) = interface {
+            crate::linux::bind_device(fd.as_raw_fd(), interface)?;
+        }
     }
     let (target, length) = crate::linux::sockaddr(address, 0);
     let result = unsafe {
@@ -112,18 +114,16 @@ fn tcp(address: SocketAddr, interface: &str, deadline: Instant) -> Result<TcpStr
 #[cfg(target_os = "linux")]
 fn exchange(request: &DNSLookupRequest, server: SocketAddr, deadline: Instant) -> Result<Value> {
     use std::os::fd::AsRawFd;
-    let interface = if server.ip().is_loopback() {
-        "lo"
-    } else {
-        &request.interface
-    };
+    let interface = request.interface.as_deref();
     let socket = UdpSocket::bind(if server.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
     })?;
     if !server.ip().is_loopback() {
-        crate::linux::bind_device(socket.as_raw_fd(), interface)?;
+        if let Some(interface) = interface {
+            crate::linux::bind_device(socket.as_raw_fd(), interface)?;
+        }
     }
     socket.connect(server)?;
     let id = rand::random::<u16>();
@@ -267,7 +267,12 @@ mod tests {
     #[test]
     fn real_udp_query_is_timed_and_tcp_truncation_fallback_works() -> Result<()> {
         use std::{net::TcpListener, thread};
-        for truncated in [false, true] {
+        for (truncated, interface) in [
+            (false, Some("wan0")),
+            (true, Some("wan0")),
+            (false, None),
+            (true, None),
+        ] {
             let udp = UdpSocket::bind("127.0.0.1:0")?;
             let address = udp.local_addr()?;
             let tcp = TcpListener::bind(address)?;
@@ -310,8 +315,10 @@ mod tests {
                 }
                 Ok(())
             });
-            let request: DNSLookupRequest =
-                serde_json::from_str(r#"{"interface":"lo","hostname":"example.test"}"#)?;
+            let mut request: DNSLookupRequest = serde_json::from_value(json!({
+                "interface":interface,"hostname":"example.test","server":address.ip()
+            }))?;
+            request.validate()?;
             let value = exchange(&request, address, Instant::now() + Duration::from_secs(2))?;
             fixture.join().unwrap()?;
             ensure!(

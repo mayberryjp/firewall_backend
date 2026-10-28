@@ -923,31 +923,40 @@ impl Backend for Native {
         request: &netcontrol_core::DNSLookupRequest,
     ) -> Result<netcontrol_core::DNSLookup> {
         self.check_scope()?;
-        ensure!(
-            config
-                .interfaces
-                .iter()
-                .any(|link| link.name == request.interface && link.up),
-            "DNS lookup requires a configured up interface"
-        );
-        let state = self
-            .dhcp
-            .state
-            .lock()
-            .map_err(|_| anyhow!("DHCP state poisoned"))?;
-        let configured = config
-            .dns
-            .get(&request.interface)
-            .cloned()
-            .unwrap_or_default();
-        let lease = state.leases.get(&request.interface).filter(|lease| {
-            lease.valid() && config.dhcp_clients.get(&request.interface) == Some(&lease.client)
-        });
-        let servers =
+        if let Some(interface) = request.interface.as_deref() {
+            ensure!(
+                config
+                    .interfaces
+                    .iter()
+                    .any(|link| link.name == interface && link.up),
+                "DNS lookup requires a configured up interface"
+            );
+        }
+        let servers = if let Some(server) = request.server {
+            ensure!(
+                config.ipv6_enabled || server.is_ipv4(),
+                "IPv6 DNS server requires global IPv6 to be enabled"
+            );
+            vec![server]
+        } else {
+            let interface = request
+                .interface
+                .as_deref()
+                .ok_or_else(|| anyhow!("server is required when interface is omitted"))?;
+            let state = self
+                .dhcp
+                .state
+                .lock()
+                .map_err(|_| anyhow!("DHCP state poisoned"))?;
+            let configured = config.dns.get(interface).cloned().unwrap_or_default();
+            let lease = state.leases.get(interface).filter(|lease| {
+                lease.valid() && config.dhcp_clients.get(interface) == Some(&lease.client)
+            });
             adoption::dns_addresses(&configured, lease.map_or(&[], |lease| lease.dns.as_slice()))?
                 .into_iter()
                 .filter(|ip| config.ipv6_enabled || ip.is_ipv4())
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
         ensure!(
             !servers.is_empty() && servers.len() <= 16,
             "selected interface requires 1..16 effective configured DNS servers"

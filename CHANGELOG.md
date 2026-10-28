@@ -4,6 +4,14 @@
 
 ### Added
 
+- DNS diagnostics accept an optional `server` IPv4/IPv6 literal at
+  `POST /api/v1/diagnostics/dns-lookup` to query only that resolver on port 53,
+  even without configured DNS. Retains optional explicit interface selection, global
+  IPv6 policy, permissions, deadlines and measured results; no fallback or
+  saved configuration change. Recommended bump: minor; baseline unknown,
+  Unreleased. Required frontend work:
+  [handoff 2026-10-28-04](docs/frontend-handoffs/2026-10-28.md#2026-10-28-04-explicit-dns-diagnostic-server).
+
 - Basic in-process Rust IPv4 BGP with local/remote ASNs (including four-octet
   capability), router ID, interface/local-address-bound neighbors, keepalive/
   hold timers and bounded prefix capacity. Advertises connected networks from
@@ -52,6 +60,17 @@
   identify an exact upstream hop or gate configuration. Recommended bump:
   minor; baseline unknown, Unreleased. Required frontend work:
   [handoff 2026-10-27-04](docs/frontend-handoffs/2026-10-27.md#2026-10-27-04-native-link-diagnostics).
+
+### Changed
+
+- DNS diagnostics no longer require `interface` when an explicit `server` is
+  supplied. Omitted/null interface uses normal kernel routing for UDP/TCP;
+  response `interface` is null rather than an invented egress device. At least
+  one of server/interface is required. Supplied interfaces still validate as
+  configured/up; configured/DHCP selection and saved settings are unchanged.
+  Recommended bump: major for nullable public response interface; baseline
+  unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-28-05](docs/frontend-handoffs/2026-10-28.md#2026-10-28-05-optional-dns-diagnostic-interface).
 
 ### Fixed
 

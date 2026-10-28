@@ -68,7 +68,11 @@ shutdown, then nonzero exit so the existing on-failure service policy restarts i
 No subprocess or service-manager command is invoked.
 
 `POST /api/v1/diagnostics/dns-lookup` requires `diagnostics.run`. An explicit
-configured up interface selects configured/valid DHCP DNS servers; a bounded
+configured up interface selects configured/valid DHCP DNS servers, or an optional
+`server` IP selects only that resolver on port 53 with no fallback or saved DNS
+changes (no configured DNS required). With `server`, omit/null `interface` to
+use normal kernel routing without device binding; response `interface` is null.
+At least one of interface/server is required. A bounded
 native UDP query (TCP fallback on truncation) measures DNS response time. Two
 lookups can run concurrently without holding the configuration engine lock.
 Both actions preserve configuration revisions and reject active configuration/

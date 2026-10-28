@@ -138,11 +138,44 @@ async fn operational_actions_auth_validation_and_simulated_dns_are_explicit() {
     assert_eq!(value["scope"], "simulator");
     assert_eq!(value["revision"], 0);
     assert_eq!(f.app.engine.lock().unwrap().committed_revision(), 0);
+    for server in [json!("192.0.2.53"), json!("2001:db8::53"), Value::Null] {
+        let (status, value) = f
+            .request(
+                "POST",
+                dns,
+                json!({"interface":"wan0","hostname":"example.test","server":server}),
+                "synthetic-operator",
+            )
+            .await;
+        assert_eq!(status, 200, "{value}");
+        assert_eq!(value["status"], "simulated");
+        assert!(value["server"].is_null());
+        assert_eq!(value["revision"], 0);
+    }
     for body in [
+        json!({"hostname":"example.test","server":"192.0.2.53"}),
+        json!({"interface":null,"hostname":"example.test","server":"2001:db8::53"}),
+    ] {
+        let (status, value) = f.request("POST", dns, body, "synthetic-operator").await;
+        assert_eq!(status, 200, "{value}");
+        assert_eq!(value["status"], "simulated");
+        assert!(value["interface"].is_null());
+        assert!(value["rtt_ms"].is_null());
+        assert_eq!(value["revision"], 0);
+    }
+    for body in [
+        json!({"hostname":"example.test"}),
+        json!({"interface":null,"hostname":"example.test","server":null}),
+        json!({"interface":"","hostname":"example.test","server":"192.0.2.53"}),
         json!({"interface":"wan0","hostname":"google.com","timeout_ms":5001}),
         json!({"interface":"wan0","hostname":"127.0.0.1"}),
         json!({"interface":"wan0","hostname":"google.com","record_type":"TXT"}),
-        json!({"interface":"wan0","hostname":"google.com","server":"192.0.2.1"}),
+        json!({"interface":"wan0","hostname":"google.com","server":"dns.example.test"}),
+        json!({"interface":"wan0","hostname":"google.com","server":"192.0.2.53:5353"}),
+        json!({"interface":"wan0","hostname":"google.com","server":"0.0.0.0"}),
+        json!({"interface":"wan0","hostname":"google.com","server":"ff02::1"}),
+        json!({"interface":"wan0","hostname":"google.com","server":53}),
+        json!({"interface":"wan0","hostname":"google.com","resolver":"192.0.2.53"}),
     ] {
         assert_eq!(
             f.request("POST", dns, body, "synthetic-operator").await.0,

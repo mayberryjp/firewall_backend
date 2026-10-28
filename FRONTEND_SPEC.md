@@ -731,8 +731,18 @@ confirmation and poll the existing target/platform status afterward.
 {"interface":"wan0","hostname":"google.com","record_type":"A","timeout_ms":2000}
 ```
 
-- Required `interface`: valid interface name, configured and administratively up.
-  Selection is explicit for multi-WAN appliances; no automatic interface choice.
+To query only a specific resolver (synthetic example):
+
+```json
+{"hostname":"example.test","server":"192.0.2.53","record_type":"A","timeout_ms":2000}
+```
+
+- Optional `interface`: valid interface name, configured and administratively up
+  when supplied. Omitted or null with an explicit `server` uses normal kernel
+  routing in the managed namespace without binding to a device. No configured
+  interface is required in that mode. With no `server`, `interface` is required
+  to select configured/DHCP resolvers; omitting both returns `400`. Empty string
+  is invalid, not automatic selection.
 - Required `hostname`: ASCII DNS name with labels 1..63 characters, total at most
   253 characters excluding an optional final dot. Alphanumeric/hyphen labels
   must start/end alphanumeric. IP literals, whitespace, empty labels and Unicode
@@ -741,7 +751,14 @@ confirmation and poll the existing target/platform status afterward.
 - `timeout_ms`: integer, default `2000`, inclusive range `100..5000`. This is the
   overall network attempt budget, shared among remaining servers; scheduling/
   kernel timeout granularity can extend observed elapsed time slightly.
-- No resolver override: uses that interface's configured servers first, then
+- Optional `server`: one IPv4 or IPv6 address string, not a hostname, URL or
+  IP:port. Omitted or null uses the configured resolver selection below.
+  Unspecified, multicast and IPv4 limited-broadcast addresses fail `400`.
+  An explicit server is queried exclusively on port 53: no configured/DHCP
+  fallback, and no configured DNS servers or DHCP resolver state are required.
+  Any supplied interface must still be configured and up. An IPv6 server when global
+  IPv6 is disabled returns `503`; A/AAAA selection is independent of transport.
+- Without `server`, uses that interface's configured servers first, then
   valid matching DHCP-lease servers unless its DNS override setting suppresses
   DHCP DNS. Duplicate DHCP entries are omitted. IPv6 resolver addresses are
   excluded when global IPv6 is disabled; an AAAA question can still use IPv4.
@@ -752,8 +769,9 @@ confirmation and poll the existing target/platform status afterward.
   while the query uses its captured committed configuration/lease snapshot.
 
 Direct native UDP queries target port 53 in the managed namespace and bind
-nonloopback resolvers to the selected interface. Loopback resolvers use loopback
-routing. Truncated UDP responses retry over native TCP using the remaining
+nonloopback resolvers only when an interface is supplied. Otherwise normal
+kernel routing selects the path for both UDP and TCP. Loopback resolvers use
+loopback routing. Truncated UDP responses retry over native TCP using the remaining
 attempt deadline. This bypasses OS hosts/cache lookup, but the selected DNS
 server can itself cache answers. No DNSSEC validation or active link diagnosis
 is implied.
@@ -773,7 +791,11 @@ committed configuration, not necessarily the current revision when returning.
 `rcode` is the numeric DNS response code. The first valid response ends the
 lookup, including NXDOMAIN, SERVFAIL or REFUSED; nonzero codes return no
 addresses and remain measured answers. Only transport/protocol failures try
-the next configured server.
+the next configured server when no explicit `server` was supplied.
+
+Response `interface` is `string | null`: the requested interface when supplied,
+otherwise null, including in simulator mode. It is not a discovered egress
+interface; do not infer which interface the kernel used from this field.
 
 Failed attempts contain `server`, `status:"failed"`, `rtt_ms:null`, `error`;
 successful attempts have the successful answer fields shown above. If all fail,
@@ -783,8 +805,9 @@ zero. Simulator returns `status:"simulated"`, `scope:"simulator"`, null timing/
 server/transport/code, empty answers/attempts, and no fabricated RTT. Query-job
 or namespace failure outside the diagnostic exchange returns `503`.
 
-Frontend: add a deliberate lookup form with interface, hostname, A/AAAA and
-bounded timeout, single-flight submission, result/attempt/error rendering, and
+Frontend: add a deliberate lookup form with hostname, optional interface/server
+IP (at least one required), A/AAAA and bounded timeout, single-flight submission,
+result/attempt/error rendering, and
 labels distinguishing DNS response codes from transport failures. No continuous
 lookup polling or automatic restart on a DNS error.
 
@@ -3811,7 +3834,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |
-| POST | `/diagnostics/dns-lookup` | Timed configured-resolver diagnostic result `200`; `diagnostics.run` |
+| POST | `/diagnostics/dns-lookup` | Timed configured- or explicit-resolver diagnostic result `200`; `diagnostics.run` |
 | POST | `/interfaces/{name}/dhcp/retry` | No body or `{}` -> `202 {interface, status: "retrying"}`; `interfaces.write`, runtime only |
 | GET | `/vlans` | Observed VLAN `Interface[]` |
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |

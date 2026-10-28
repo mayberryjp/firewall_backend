@@ -634,19 +634,21 @@ fn native_operational_dns_and_link_monitor_restart_preserve_configuration() -> R
             handle.link().set(link.header.index).up().execute().await?;
             Ok::<(), anyhow::Error>(())
         })?;
-        let socket = std::net::UdpSocket::bind("127.0.0.1:53")?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:53")?;
         socket.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
         Ok(socket)
     })?;
     let server = std::thread::spawn(move || -> Result<()> {
         let mut bytes = [0; 512];
-        let (size, peer) = listener.recv_from(&mut bytes)?;
-        let mut response = bytes[..size].to_vec();
-        response[2] = 0x81;
-        response[3] = 0x80;
-        response[7] = 1;
-        response.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
-        listener.send_to(&response, peer)?;
+        for _ in 0..5 {
+            let (size, peer) = listener.recv_from(&mut bytes)?;
+            let mut response = bytes[..size].to_vec();
+            response[2] = 0x81;
+            response[3] = 0x80;
+            response[7] = 1;
+            response.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+            listener.send_to(&response, peer)?;
+        }
         Ok(())
     });
     let mut request: netcontrol_core::DNSLookupRequest =
@@ -654,15 +656,67 @@ fn native_operational_dns_and_link_monitor_restart_preserve_configuration() -> R
     request.validate()?;
     let lookup = native.prepare_dns_lookup(&desired, &request)?;
     let value = lookup()?;
-    server
-        .join()
-        .map_err(|_| anyhow!("DNS fixture panicked"))??;
     ensure!(
         value["status"] == "answered"
             && value["server"] == "127.0.0.1"
             && value["addresses"] == json!(["192.0.2.7"])
             && value["rtt_ms"].as_f64().is_some_and(|v| v > 0.0),
         "configured DNS lookup failed: {value}"
+    );
+    request.server = Some("127.0.0.1".parse()?);
+    let mut overridden = desired.clone();
+    overridden.dns.get_mut("diag0").unwrap().servers = vec!["127.0.0.2".into()];
+    for snapshot in [&overridden, &network] {
+        let value = native.prepare_dns_lookup(snapshot, &request)?()?;
+        ensure!(
+            value["status"] == "answered"
+                && value["server"] == "127.0.0.1"
+                && value["attempts"]
+                    .as_array()
+                    .is_some_and(|attempts| attempts.len() == 1),
+            "explicit DNS server was not used exclusively: {value}"
+        );
+    }
+    request.interface = None;
+    request.server = Some("192.0.2.1".parse()?);
+    for snapshot in [&network, &Config::empty()] {
+        let value = native.prepare_dns_lookup(snapshot, &request)?()?;
+        ensure!(
+            value["status"] == "answered"
+                && value["server"] == "192.0.2.1"
+                && value["interface"].is_null()
+                && value["attempts"]
+                    .as_array()
+                    .is_some_and(|attempts| attempts.len() == 1),
+            "unbound explicit DNS query failed: {value}"
+        );
+    }
+    server
+        .join()
+        .map_err(|_| anyhow!("DNS fixture panicked"))??;
+    request.server = Some("127.0.0.2".parse()?);
+    request.timeout_ms = 100;
+    let value = native.prepare_dns_lookup(&desired, &request)?()?;
+    ensure!(
+        value["status"] == "failed"
+            && value["attempts"]
+                .as_array()
+                .is_some_and(|attempts| attempts.len() == 1)
+            && value["attempts"][0]["server"] == "127.0.0.2",
+        "explicit DNS failure fell back to configured servers: {value}"
+    );
+    request.server = Some("::1".parse()?);
+    let mut ipv4_only = network.clone();
+    ipv4_only.ipv6_enabled = false;
+    ensure!(
+        native.prepare_dns_lookup(&ipv4_only, &request).is_err(),
+        "IPv6 policy bypassed"
+    );
+    request.server = Some("127.0.0.1".parse()?);
+    request.interface = Some("missing0".into());
+    ensure!(
+        native.prepare_dns_lookup(&network, &request).is_err(),
+        "missing interface accepted"
     );
     native.restart_process(&network, "link-diagnostics")?;
     ensure!(
