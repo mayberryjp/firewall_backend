@@ -638,6 +638,7 @@ impl Engine {
             "/api/v1/services/bgp",
             "/api/v1/services/bgp/status",
             "/api/v1/routes/bgp",
+            "/api/v1/routes/bgp/advertised",
         ]
         .contains(&path)
         {
@@ -1358,6 +1359,7 @@ impl Engine {
             "/api/v1/services/bgp",
             "/api/v1/services/bgp/status",
             "/api/v1/routes/bgp",
+            "/api/v1/routes/bgp/advertised",
         ]
         .contains(&path)
         {
@@ -1374,15 +1376,21 @@ impl Engine {
                 .backend
                 .bgp_status(&self.expected())
                 .map_err(service_error)?;
-            if path == "/api/v1/routes/bgp" {
+            if matches!(path, "/api/v1/routes/bgp" | "/api/v1/routes/bgp/advertised") {
+                let routes = if path.ends_with("/advertised") {
+                    "advertised_routes"
+                } else {
+                    "routes"
+                };
                 return Ok(
-                    json!({"source":"bgp","scope":status["scope"],"state":status["state"],"error":status["error"],"routes":status["routes"]}),
+                    json!({"source":"bgp","scope":status["scope"],"state":status["state"],"error":status["error"],"routes":status[routes]}),
                 );
             }
-            status
+            let summary = status
                 .as_object_mut()
-                .ok_or_else(|| service_error("invalid BGP status"))?
-                .remove("routes");
+                .ok_or_else(|| service_error("invalid BGP status"))?;
+            summary.remove("routes");
+            summary.remove("advertised_routes");
             return Ok(status);
         }
         if path == "/api/v1/services/mdns/status" {

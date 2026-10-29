@@ -49,7 +49,7 @@ impl Backend for Simulator {
         Ok(
             json!({"name":"bgp","scope":"simulator","state":if config.bgp.enabled{"simulated"}else{"disabled"},
             "local_asn":config.bgp.local_asn,"router_id":config.bgp.router_id,"neighbors":config.bgp.neighbors.iter().map(|n|json!({"name":n.name,"address":n.address,"interface":n.interface,"state":"simulated","received_prefixes":null,"advertised_prefixes":null,"rejected_prefixes":null,"error":null})).collect::<Vec<_>>(),
-            "routes":[],"connected_prefixes":[],"installed_prefixes":null,"error":null}),
+            "routes":[],"advertised_routes":[],"connected_prefixes":[],"installed_prefixes":null,"error":null}),
         )
     }
     fn prepare_dns_lookup(

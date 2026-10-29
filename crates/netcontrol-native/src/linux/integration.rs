@@ -936,6 +936,31 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let status = a.bgp_status(&config1)?;
+    let advertised = status["advertised_routes"]
+        .as_array()
+        .context("advertised inventory missing")?;
+    ensure!(advertised.iter().any(|row| row == &json!({"prefix":"198.51.1.0/24","neighbor":"remote","interface":"wg0","next_hop":"10.10.0.1","source":"bgp"})), "established BGP session did not expose its advertisements: {status}");
+    ensure!(
+        !advertised
+            .iter()
+            .any(|row| row["prefix"] == "198.51.2.0/24"),
+        "received route was mislabeled as advertised"
+    );
+    ensure!(
+        status["neighbors"][0]["advertised_prefixes"].as_u64() == Some(advertised.len() as u64),
+        "advertised count/list mismatch: {status}"
+    );
+    let runtime = a.runtime(&config1)?;
+    ensure!(
+        runtime["bgp"].get("advertised_routes").is_none(),
+        "runtime leaked full advertised inventory"
+    );
+    let statistics = a.statistics(&config1, "/api/v1/statistics", "")?;
+    ensure!(
+        statistics["bgp"].get("advertised_routes").is_none(),
+        "statistics leaked full advertised inventory"
+    );
     ensure!(
         a.observe(&config1)? == config1,
         "BGP contaminated desired configuration"
@@ -1022,6 +1047,10 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
     let mut recovered = bgp::Manager::new(a.namespace.clone(), a.state.clone())?;
     recovered.recover()?;
     a.bgp = recovered;
+    ensure!(
+        a.bgp_status(&config1)?["advertised_routes"] == json!([]),
+        "recovery retained stale advertisements"
+    );
     check(a.namespace.clone(), false)?;
     a.bgp.configure(&config1.operational_value()?)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1040,10 +1069,18 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     b.bgp.shutdown()?;
+    ensure!(
+        b.bgp_status(&config2)?["advertised_routes"] == json!([]),
+        "shutdown retained stale advertisements"
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let status = a.bgp_status(&config1)?;
-        if status["routes"].as_array().is_some_and(Vec::is_empty) {
+        if status["routes"].as_array().is_some_and(Vec::is_empty)
+            && status["advertised_routes"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        {
             break;
         }
         ensure!(
@@ -1054,6 +1091,10 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
     }
     check(a.namespace.clone(), false)?;
     a.bgp.restart()?;
+    ensure!(
+        a.bgp_status(&config1)?["advertised_routes"] == json!([]),
+        "restart retained stale advertisements"
+    );
     ensure!(
         a.observe(&config1)? == config1,
         "BGP restart changed configuration"

@@ -4,6 +4,14 @@
 
 ### Added
 
+- `GET /api/v1/routes/bgp/advertised` exposes exact per-neighbor prefix inventory
+  tracked by established BGP sessions (`state.read`), with local next hop and
+  empty lists after session loss/restart. Distinct from received routes and
+  connected-prefix candidates; tracks queued UPDATEs, not peer acceptance.
+  Bulk lists remain outside status/telemetry. Recommended bump: minor; baseline
+  unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-28-07](docs/frontend-handoffs/2026-10-28.md#2026-10-28-07-bgp-advertised-route-inventory).
+
 - In-process IPv4 UDP broadcast/multicast relay with pfSense-style global and
   per-instance controls, selected Ethernet/VLAN interfaces, original/interface
   source modes and instance-ID DSCP echo suppression. Adds transactional

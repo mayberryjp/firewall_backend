@@ -1310,9 +1310,9 @@ impl Backend for Native {
         })?;
         let mut value = self.services.status();
         let mut bgp = self.bgp.snapshot()?;
-        bgp.as_object_mut()
-            .context("BGP status missing")?
-            .remove("routes");
+        let summary = bgp.as_object_mut().context("BGP status missing")?;
+        summary.remove("routes");
+        summary.remove("advertised_routes");
         value["appliance_services"]
             .as_array_mut()
             .context("service status missing")?
@@ -1432,9 +1432,9 @@ impl Backend for Native {
         })?;
         if all {
             let mut bgp = self.bgp.snapshot()?;
-            bgp.as_object_mut()
-                .context("BGP status missing")?
-                .remove("routes");
+            let summary = bgp.as_object_mut().context("BGP status missing")?;
+            summary.remove("routes");
+            summary.remove("advertised_routes");
             value["bgp"] = bgp;
             let mut diagnostics = self.link_monitor.snapshot()?;
             diagnostics["scope"] = json!(self.identity);

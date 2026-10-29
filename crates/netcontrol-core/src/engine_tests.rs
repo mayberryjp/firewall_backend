@@ -157,6 +157,42 @@ fn udp_relay_api_authorization_persistence_and_rollback() {
 }
 
 #[test]
+fn bgp_advertised_api_returns_the_session_inventory_not_received_routes() {
+    let fixture = Fixture::new();
+    let advertised = json!([{"prefix":"203.0.113.0/24","neighbor":"edge","interface":"wan0","next_hop":"192.0.2.1","source":"bgp"}]);
+    let received = json!([{"prefix":"198.51.100.0/24","neighbor":"edge"}]);
+    let faults = Arc::new(Mutex::new(Faults {
+        bgp_response: Some(json!({"scope":"fault-test","state":"running","error":null,
+            "routes":received,"advertised_routes":advertised,"connected_prefixes":["203.0.113.0/24","192.0.2.0/24"]})),
+        ..Default::default()
+    }));
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults))).unwrap();
+    let response = request(
+        &mut engine,
+        "GET",
+        "/api/v1/routes/bgp/advertised",
+        Value::Null,
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.body,
+        json!({"source":"bgp","scope":"fault-test","state":"running","error":null,"routes":advertised})
+    );
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/routes/bgp", Value::Null).body["routes"],
+        received
+    );
+    let summary = request(
+        &mut engine,
+        "GET",
+        "/api/v1/services/bgp/status",
+        Value::Null,
+    );
+    assert!(summary.body.get("routes").is_none());
+    assert!(summary.body.get("advertised_routes").is_none());
+}
+
+#[test]
 fn bgp_api_permissions_transactions_restart_and_route_visibility() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
@@ -173,6 +209,7 @@ fn bgp_api_permissions_transactions_restart_and_route_visibility() {
         "/api/v1/services/bgp",
         "/api/v1/services/bgp/status",
         "/api/v1/routes/bgp",
+        "/api/v1/routes/bgp/advertised",
     ] {
         let response = engine.request("GET", path, "", "reader", &["state.read".into()], &[]);
         assert_eq!(response.status, 200, "{}", response.body);
@@ -197,6 +234,23 @@ fn bgp_api_permissions_transactions_restart_and_route_visibility() {
     assert_eq!(routes.body["source"], "bgp");
     assert_eq!(routes.body["state"], "simulated");
     assert_eq!(routes.body["routes"], json!([]));
+    let advertised = request(
+        &mut engine,
+        "GET",
+        "/api/v1/routes/bgp/advertised",
+        Value::Null,
+    );
+    assert_eq!(advertised.body["source"], "bgp");
+    assert_eq!(advertised.body["state"], "simulated");
+    assert_eq!(advertised.body["routes"], json!([]));
+    let summary = request(
+        &mut engine,
+        "GET",
+        "/api/v1/services/bgp/status",
+        Value::Null,
+    );
+    assert!(summary.body.get("routes").is_none());
+    assert!(summary.body.get("advertised_routes").is_none());
     assert_eq!(engine.restart_process("bgp").body["status"], "simulated");
     assert_eq!(engine.committed_revision(), 1);
     let stats = request(&mut engine, "GET", "/api/v1/statistics", Value::Null);
@@ -940,6 +994,7 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    bgp_response: Option<Value>,
     connection_flushes: usize,
     connection_targets: Vec<Option<(u32, crate::ConnectionTarget)>>,
     missing_connection: bool,
@@ -964,6 +1019,14 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn bgp_status(&mut self, _: &Config) -> Result<Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .bgp_response
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("BGP test snapshot unavailable"))
+    }
     fn delete_connections(
         &mut self,
         target: Option<(u32, &crate::ConnectionTarget)>,

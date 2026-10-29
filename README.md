@@ -111,8 +111,9 @@ transaction with local ASN/router ID, interface-bound neighbors and keepalive/
 hold timers. It advertises connected prefixes from all configured up interfaces,
 installs accepted learned routes, and maintains BGP-owned WireGuard AllowedIPs
 for explicitly referenced peers. Default-route import requires opt-in.
-Inspect `GET /api/v1/services/bgp/status`, `GET /api/v1/routes/bgp`,
-`show bgp status` or `show routes bgp`; MQTT includes the summary and shared
+Inspect `GET /api/v1/services/bgp/status` or `GET /api/v1/routes/bgp`;
+`GET /api/v1/routes/bgp/advertised` lists exact per-neighbor session exports.
+CLI inspection uses `show bgp status` or `show routes bgp`; MQTT includes the summary and shared
 process health. Static configuration is preserved on withdrawal/session loss.
 See the [BGP contract and operator prerequisites](FRONTEND_SPEC.md#native-ipv4-bgp)
 for limits, bootstrap routing, privileges, ownership and unsupported features.

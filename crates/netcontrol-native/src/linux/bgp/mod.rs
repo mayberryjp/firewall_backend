@@ -89,7 +89,7 @@ impl Manager {
             namespace,
             file,
             state: Arc::new(Mutex::new(State {
-                status: json!({"name":"bgp","state":"disabled","neighbors":[],"routes":[],"error":null}),
+                status: json!({"name":"bgp","state":"disabled","neighbors":[],"routes":[],"advertised_routes":[],"error":null}),
                 ledger: Ledger::default(),
             })),
             stop: Arc::new(AtomicBool::new(false)),
@@ -134,16 +134,14 @@ impl Manager {
             self.state
                 .lock()
                 .map_err(|_| anyhow!("BGP state poisoned"))?
-                .status =
-                json!({"name":"bgp","state":"disabled","neighbors":[],"routes":[],"error":null});
+                .status = json!({"name":"bgp","state":"disabled","neighbors":[],"routes":[],"advertised_routes":[],"error":null});
             return Ok(());
         }
         self.stop = Arc::new(AtomicBool::new(false));
         self.state
             .lock()
             .map_err(|_| anyhow!("BGP state poisoned"))?
-            .status =
-            json!({"name":"bgp","state":"starting","neighbors":[],"routes":[],"error":null});
+            .status = json!({"name":"bgp","state":"starting","neighbors":[],"routes":[],"advertised_routes":[],"error":null});
         let (stop, state, namespace, file) = (
             self.stop.clone(),
             self.state.clone(),
@@ -172,6 +170,7 @@ impl Manager {
                         if let Err(error) = result {
                             let mut shared =
                                 state.lock().map_err(|_| anyhow!("BGP state poisoned"))?;
+                            shared.status["advertised_routes"] = json!([]);
                             if let Err(cleanup) =
                                 reconcile(&namespace, &file, &mut shared, &Ledger::default())
                             {
@@ -214,6 +213,7 @@ impl Manager {
             .state
             .lock()
             .map_err(|_| anyhow!("BGP state poisoned"))?;
+        state.status["advertised_routes"] = json!([]);
         let ledger = state.ledger.clone();
         super::session(self.namespace.clone(), move |rt, h| {
             rt.block_on(async {
@@ -561,6 +561,23 @@ fn process(
     }
     Ok(())
 }
+fn advertised_routes(neighbors: &[Neighbor]) -> Vec<Value> {
+    let mut routes = Vec::new();
+    for neighbor in neighbors {
+        if let Some(connection) = neighbor
+            .connections
+            .iter()
+            .find(|connection| connection.established)
+        {
+            for prefix in &connection.advertised {
+                routes.push(json!({"prefix":prefix.to_string(),"neighbor":neighbor.config.name,
+                    "interface":neighbor.config.interface,"next_hop":neighbor.config.local_address,"source":"bgp"}));
+            }
+        }
+    }
+    routes
+}
+
 fn desired(
     config: &Config,
     neighbors: &[Neighbor],
@@ -864,7 +881,7 @@ fn run(
                 "remote_router_id":connection.and_then(|c|c.open.as_ref()).map(|o|o.router_id),"error":n.error})
         }).collect::<Vec<_>>();
         shared.status = json!({"name":"bgp","state":"running","health":if error.is_some(){"degraded"}else if peers.iter().all(|p|p["state"]=="established"){"up"}else{"degraded"},
-            "local_asn":bgp.local_asn,"router_id":bgp.router_id,"neighbors":peers,"routes":routes,"error":error,
+            "local_asn":bgp.local_asn,"router_id":bgp.router_id,"neighbors":peers,"routes":routes,"advertised_routes":advertised_routes(&neighbors),"error":error,
             "connected_prefixes":connected.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "installed_prefixes":if synced{next.routes.len()}else{0},"kernel_protocol":kernel::PROTOCOL,"route_metric":kernel::METRIC,"table":254});
         drop(shared);
@@ -895,6 +912,45 @@ mod tests {
             rejected: 0,
         }
     }
+    #[test]
+    fn advertised_route_rows_follow_established_session_state() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let bgp = BGPConfig {
+            local_asn: 65001,
+            router_id: "192.0.2.1".into(),
+            ..Default::default()
+        };
+        let prefix = Prefix::new("203.0.113.0".parse()?, 24)?;
+        let mut neighbors = Vec::new();
+        let mut remotes = Vec::new();
+        for (name, established) in [("edge", true), ("other", true), ("connecting", false)] {
+            let stream = TcpStream::connect(listener.local_addr()?)?;
+            remotes.push(listener.accept()?.0);
+            let mut connection = Connection::new(stream, true, &bgp)?;
+            connection.established = established;
+            connection.advertised.insert(prefix);
+            let mut peer = neighbor();
+            peer.config.name = name.into();
+            peer.connections.push(connection);
+            neighbors.push(peer);
+        }
+        let rows = advertised_routes(&neighbors);
+        assert_eq!(
+            rows,
+            vec![
+                json!({"prefix":"203.0.113.0/24","neighbor":"edge","interface":"test0","next_hop":"192.0.2.1","source":"bgp"}),
+                json!({"prefix":"203.0.113.0/24","neighbor":"other","interface":"test0","next_hop":"192.0.2.1","source":"bgp"}),
+            ]
+        );
+        neighbors[0].connections[0].advertised.clear();
+        assert_eq!(advertised_routes(&neighbors).len(), 1);
+        neighbors[1].connections[0].established = false;
+        assert!(advertised_routes(&neighbors).is_empty());
+        neighbors[0].connections.clear();
+        assert!(advertised_routes(&neighbors).is_empty());
+        Ok(())
+    }
+
     #[test]
     fn sessions_filter_loops_defaults_withdraw_and_expire_hold_timer() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0")?;

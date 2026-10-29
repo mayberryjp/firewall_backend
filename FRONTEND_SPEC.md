@@ -2751,8 +2751,9 @@ API-key authentication and `state.read`:
 | Method and path | Response |
 | --- | --- |
 | `GET /api/v1/services/bgp` | Committed `BGPConfig` |
-| `GET /api/v1/services/bgp/status` | Applied worker/neighbor status, without full learned path rows |
+| `GET /api/v1/services/bgp/status` | Applied worker/neighbor status, without full learned or advertised route rows |
 | `GET /api/v1/routes/bgp` | `{source:"bgp",scope,state,error,routes:[...]}` learned paths |
+| `GET /api/v1/routes/bgp/advertised` | Same envelope, per-neighbor advertised routes |
 
 No query parameters (`400`). These paths are read-only (`405` otherwise);
 configuration is transactional. Normal `401`/`403`; unavailable scope/backend/
@@ -2775,6 +2776,34 @@ reconciliation fails; inspect envelope/status error. Nonselected reasons:
 `wireguard_dynamic_peer_overlap`. Policy-rejected NLRI are not listed; inspect
 neighbor rejected-prefix counters. Route arrays include alternate accepted
 paths and are bounded by configured max prefixes; no pagination/history.
+
+Advertised-route envelope (synthetic):
+
+```json
+{"source":"bgp","scope":"linux:<opaque>","state":"running","error":null,"routes":[{"prefix":"203.0.113.0/24","neighbor":"remote","interface":"wg0","next_hop":"10.10.0.1","source":"bgp"}]}
+```
+
+Advertised rows have canonical IPv4 `prefix`, configured neighbor-name string,
+interface-name string, IPv4 `next_hop` (that neighbor's local session address)
+and literal `source:"bgp"`. They come from each established connection's tracked
+advertised prefix set, not from `connected_prefixes` or received routes. The
+same prefix can have a row for each peer; key rows by neighbor plus prefix.
+`routes` is always an array, empty before establishment, when inactive, after
+session loss/withdrawal, on worker failure/shutdown/restart, and in the simulator.
+No saved config, revision, forwarding or export policy changes are made by reads.
+The list tracks UPDATEs queued for the established session, not remote receipt,
+acceptance or installation; BGP has no per-prefix acknowledgement. Do not label
+the rows as peer-confirmed routes. Local connected networks are the current
+export policy, but `connected_prefixes` is not the per-peer advertised inventory.
+There is no advertised AS-path/best-path/installed flag in this row schema.
+
+Offer Received/Advertised route views under BGP and filter/group by neighbor
+client-side; this endpoint accepts no query parameters, pagination or history.
+Use the existing received schema only in Received view and the new row type
+in Advertised view. Current session `advertised_prefixes` counts correspond
+to that peer's rows in a matching running snapshot; separate requests can race
+with session changes. Bulk advertised rows are excluded from the status API,
+native runtime summaries, aggregate statistics and MQTT publication.
 
 Worker states: `disabled`, `starting`, `running`, `error`, `stopped`, and
 simulator `simulated`. Running worker `health` is `up` only when all sessions
@@ -3942,6 +3971,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |
 | GET | `/routes` | Observed `Route[]` |
 | GET | `/routes/bgp` | BGP-only learned/selected/installed path rows; not desired static routes |
+| GET | `/routes/bgp/advertised` | Exact established-session advertised prefixes per neighbor; not peer acceptance |
 | GET | `/services/bgp` | Committed `BGPConfig` |
 | GET | `/services/bgp/status` | Applied BGP worker and neighbor summary |
 | GET | `/firewall/rules` | Entire observed `Firewall`, including policy and NAT |
