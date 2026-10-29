@@ -164,7 +164,7 @@ Revision lists default to 50 items, accept 1..100 and an exclusive
 `parent_interfaces`, `softflowd`, and `kernel_tunables`. No PIDs are invented.
 
 - Appliance entries are `{name,scope,state}` for `ntp`/`host`, `syslog`/`host`,
-  `vnstat-host`/`host`, `vnstat-managed`/`managed`.
+  `vnstat`/`host`.
 - Softflowd entries are `{name,state}`.
 - DHCP relay entries are `{interface,state}`.
 - Enabled entries have `state:"simulated"`; disabled entries use `"disabled"`.
@@ -192,32 +192,38 @@ individual resources return `404`.
 
 ### Persistent traffic history endpoints
 
-`GET /api/v1/statistics/vnstat`, `/api/v1/statistics/vnstat/host`, and
-`/api/v1/statistics/vnstat/managed` require `state.read` and reject every nonempty
+`GET /api/v1/statistics/vnstat` requires `state.read` and rejects every nonempty
 query with `400`. Unknown scopes, trailing slashes and additional path segments
 return `404` before calling a backend. Other methods return `405`.
 
-The engine delegates the three valid routes to the backend without discarding
+The engine delegates the single valid route to the backend without discarding
 the response. Native services return:
 
 ```text
 {
-  schema: "netcontrol-services/counters/v1",
-  scopes: {
-    host?: CounterDatabase,
-    managed?: CounterDatabase
-  }
+  schema: "netcontrol-services/counters/v2",
+  scope: "host",
+  interfaces: Record<string, CounterInterface>,
+  history: CounterRecord[],
+  last_report_date: string | null,
+  last_report_error: string | null,
+  sent_datagrams: string,
+  failed_datagrams: string
 }
 ```
 
-The aggregate endpoint includes both scopes; each scoped endpoint selects only
-that scope. Each database contains `schema`, `scope`, `interfaces` and `history`.
-Interface rows contain `ifindex`, `boot_id`, `namespace_id`, `last`, `total`,
+The `/host` and `/managed` paths are removed (`404`), not aliases.
+Interface rows contain `ifindex`, `boot_id`, `namespace_id`, `last`, `total`, `day`, `month`,
 `resets`, `last_seen` and `present`. History rows contain `collected_at`,
 `interface`, `delta` and `reset`. Every `last`/`total`/`delta` counter object
 contains decimal-string `rx_bytes`, `tx_bytes`, `rx_packets` and `tx_packets`.
-The native backend may additionally identify its enclosing managed scope;
-this does not replace the `host`/`managed` database selection.
+`day`/`month` each contain a local-calendar `date` and `counts` object. All host
+interfaces are sampled regardless of management or role. `vnstat.collector` is
+null or a validated literal unicast UDP IP:port destination, with existing
+`vnstat.write` authorization. At 23:59 local time, one version-1 human-readable
+vnStat oneline report is attempted per present interface. See the canonical
+[frontend contract](../../FRONTEND_SPEC.md#native-traffic-history) for delivery,
+approximation and retained-state requirements.
 
 Disabled collection, unavailable workers and collection/storage errors produce
 `503` with the normal `{error,transaction:null}` envelope. A valid but unready

@@ -148,8 +148,7 @@ impl Backend for Simulator {
         for (name, scope, enabled) in [
             ("ntp", "host", config.ntp.enabled),
             ("syslog", "host", config.syslog.enabled),
-            ("vnstat-host", "host", config.vnstat.enabled),
-            ("vnstat-managed", "managed", config.vnstat.enabled),
+            ("vnstat", "host", config.vnstat.enabled),
         ] {
             appliance.push(
                 json!({"name":name,"scope":scope,"state":if enabled{"simulated"}else{"disabled"}}),
@@ -224,13 +223,7 @@ impl Backend for Simulator {
                 "sections":sections
             }));
         }
-        if [
-            "/api/v1/statistics/vnstat",
-            "/api/v1/statistics/vnstat/host",
-            "/api/v1/statistics/vnstat/managed",
-        ]
-        .contains(&path)
-        {
+        if path == "/api/v1/statistics/vnstat" {
             ensure!(config.vnstat.enabled, "vnstat is disabled");
             anyhow::bail!(
                 "traffic history unavailable: simulator does not collect traffic counters"

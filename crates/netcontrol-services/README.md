@@ -196,19 +196,45 @@ drift and durable transaction recovery safeguards remain enforced.
   daemon stop/restart closes the managed socket and its queue. Journald capture,
   rate limits and forwarding settings determine coverage. No complete delivery,
   acknowledgment, durable forwarding queue/replay or rotation is claimed.
-* **Traffic counters:** host and managed workers sample all `/proc/thread-self/net/dev`
+* **Traffic counters:** one host-namespace Rust worker samples all `/proc/thread-self/net/dev`
   interfaces, including loopback, every five seconds. Captures byte/packet
   baselines, accumulates observed deltas, and records boot/namespace/interface/reset
   boundaries. The first observation is a baseline, not invented earlier
   traffic. A reset adds the new counter value rather than subtracting/wrapping.
   Removed interfaces remain in history. The latest 10,000 per-interface sample
-  records are retained; cumulative totals are not truncated. Files
-  `traffic-host-v1.json` and `traffic-managed-v1.json` use the independent
-  `netcontrol-services/counters/v1` schema. Snapshots use exclusive `.pending`
+  records are retained; cumulative totals and current local day/month buckets
+  are independent of history pruning. The single `traffic-host-v2.json` uses
+  `netcontrol-services/counters/v2`. Prior host/managed v1 files are retained;
+  if a host v1 file exists without v2, explicit operator archival is required
+  before starting a new accounting baseline. No conversion/reset is performed.
+  Snapshots use exclusive `.pending`
   creation, fsync, atomic rename and directory fsync; an unresolved `.pending`
   file causes an explicit error and requires operator review. Invalid/incompatible
   records are never deleted, reset, migrated, or interpreted as Go/vnStat data.
-  There is no vnStat database/client compatibility or calendar aggregation.
+  `vnstat.collector` defaults to null (collection only). A configured literal
+  unicast UDP IP:port enables reporting at the first sample during local 23:59.
+  One datagram per present interface contains `hostname|ONELINE\n`; ONELINE
+  matches the 15-field version-1 human-readable `vnstat --oneline` layout.
+  Byte quantities use B/KiB/MiB/GiB/etc.; rates use bit/s and decimal prefixes.
+  The hostname is read from the appliance, not hardcoded. No subprocess,
+  `vnstatd`, netcat, cron job or vnStat database is involved.
+  Reporting uses nonblocking UDP, with no acknowledgment/backfill/durable queue.
+  A successful send means local acceptance only. Per-interface failures do not
+  stop other reports or collection; setup failures retry on the next sample
+  within the reporting minute. The persisted report date suppresses another
+  completed daily attempt across normal restart; send-before-persist crashes
+  can duplicate datagrams. Collector deduplication should use hostname/interface/date.
+  Missing the whole minute misses that day's export. There is no invented-zero
+  fallback on unavailable data; observed zero usage is valid. Removed interfaces
+  are not exported. Unsafe report delimiters in interface names skip only their
+  export with an explicit error, not accounting of other interfaces.
+  The last minute after sampling is omitted from the export; accounting continues.
+  Initial samples are baselines, so initial/partially observed periods are not
+  full historical totals. Deltas crossing a date/reset boundary belong to the
+  observation's period. Average rates use nominal calendar elapsed seconds;
+  polling, DST, outages and reset boundaries are approximate by design. Uses
+  host local time; restart the daemon after timezone changes to refresh libc's
+  timezone cache. This is output-format compatibility, not vnStat DB compatibility.
 * **NetFlow:** AF_PACKET Ethernet/VLAN capture and NetFlow v1/v5/v9/IPFIX UDP export,
   bounded flow capacity, configured sampling, idle/protocol/flag/maxlife/export
   timeouts, and shutdown flushing. Excludes its collector traffic to avoid
@@ -289,11 +315,11 @@ not silently substituted configurations.
 `statistics(path, query)` accepts no query parameters:
 
 * `/api/v1/statistics/gateways[/<name>]`: existing gateway sample/monitor shape.
-* `/api/v1/statistics/vnstat[/host|managed]`: this crate returns
-  `{ "schema": "netcontrol-services/counters/v1", "scopes": { ... } }`; the native
-  backend adds its opaque string `scope` identity before the HTTP response.
-  Scope records include `interfaces` (last/raw/cumulative counters and reset
-  identity) and `history` (timestamp/interface/delta/reset). All byte/packet
+* `/api/v1/statistics/vnstat`: returns a single flat
+  `{ "schema": "netcontrol-services/counters/v2", "scope": "host", "interfaces": { ... }, "history": [ ... ], ... }`.
+  There is no scopes wrapper or native-scope decoration. `/host` and `/managed`
+  suffixes are removed. Interface records include raw/cumulative/calendar counters
+  and reset identity; history contains timestamp/interface/delta/reset. All byte/packet
   counter values are decimal strings, never precision-losing JavaScript numbers.
 
 The `/api/v1` prefix may be omitted for the native adapter's internal dispatch.
@@ -350,9 +376,11 @@ Common enabled appliance row:
   `kernel_source` fields are removed. `forwarded_records` is a nonnegative
   integer, reset per worker start. It counts complete
   records written to every configured destination, not acknowledgments.
-* Each `vnstat-host`/`vnstat-managed` row adds
-  `schema: "netcontrol-services/counters/v1"`, `database_directory` path,
-  `collected_at`, and an `interfaces` map described below.
+* The single `vnstat` row has `scope:"host"` and adds
+  `schema: "netcontrol-services/counters/v2"`, `database_directory` path,
+  `collected_at`, an `interfaces` map described below, nullable `collector`,
+  `last_report_date` and `last_report_error`, and decimal-string `sent_datagrams`
+  and `failed_datagrams`. Reporting warnings never impose a configuration lock.
 * DHCP row: `interface`, `name: "dhcp-relay"`, `scope: "managed"`, `state`,
   `started_at`, optional `error`. All enabled relay interfaces share the
   exclusive socket worker; a worker error affects every enabled relay row.
@@ -407,53 +435,38 @@ Individual response: `{ "sample": SAMPLE, "monitor": ROW }`.
 and `status: "available"|"partial"`; it is partial unless every requested
 monitor is available or disabled.
 
-Native traffic HTTP response example (synthetic, `/api/v1/statistics/vnstat/managed`):
+Native traffic HTTP response example (synthetic, `/api/v1/statistics/vnstat`):
 
 ```json
 {
-  "schema": "netcontrol-services/counters/v1",
-  "scope": "linux:11111111-1111-4111-8111-111111111111:4:4026533000",
-  "scopes": {
-    "managed": {
-      "schema": "netcontrol-services/counters/v1",
-      "scope": "managed",
-      "interfaces": {
-        "lan0": {
-          "ifindex": 3,
-          "boot_id": "synthetic-boot-id",
-          "namespace_id": "4:4026533000",
-          "last": {
-            "rx_bytes": "120", "tx_bytes": "100",
-            "rx_packets": "2", "tx_packets": "1"
-          },
-          "total": {
-            "rx_bytes": "20", "tx_bytes": "0",
-            "rx_packets": "1", "tx_packets": "0"
-          },
-          "resets": 0,
-          "last_seen": "2026-10-19T05:00:00Z",
-          "present": true
-        }
-      },
-      "history": [{
-        "collected_at": "2026-10-19T05:00:00Z",
-        "interface": "lan0",
-        "delta": {
-          "rx_bytes": "20", "tx_bytes": "0",
-          "rx_packets": "1", "tx_packets": "0"
-        },
-        "reset": false
-      }]
+  "schema": "netcontrol-services/counters/v2",
+  "scope": "host",
+  "interfaces": {
+    "lan0": {
+      "ifindex": 3,
+      "boot_id": "synthetic-boot-id",
+      "namespace_id": "4:4026533000",
+      "last": {"rx_bytes":"120","tx_bytes":"100","rx_packets":"2","tx_packets":"1"},
+      "total": {"rx_bytes":"20","tx_bytes":"0","rx_packets":"1","tx_packets":"0"},
+      "day": {"date":"2026-10-28","counts":{"rx_bytes":"20","tx_bytes":"0","rx_packets":"1","tx_packets":"0"}},
+      "month": {"date":"2026-10","counts":{"rx_bytes":"20","tx_bytes":"0","rx_packets":"1","tx_packets":"0"}},
+      "resets": 0,
+      "last_seen": "2026-10-28T05:00:00Z",
+      "present": true
     }
-  }
+  },
+  "history": [{"collected_at":"2026-10-28T05:00:00Z","interface":"lan0","delta":{"rx_bytes":"20","tx_bytes":"0","rx_packets":"1","tx_packets":"0"},"reset":false}],
+  "last_report_date": null,
+  "last_report_error": null,
+  "sent_datagrams": "0",
+  "failed_datagrams": "0"
 }
 ```
 
-The base `/api/v1/statistics/vnstat` reply has the identical envelope with both
-`scopes.host` and `scopes.managed`; each DB has its own corresponding `scope`.
-The `/host` reply contains only `scopes.host`. The added top-level `scope` is an
-opaque native-backend identity (not `host` or `managed`); store/compare it without
-parsing. This crate's direct return value omits only that top-level decoration.
+All three byte/packet counter groups (`last`, `total`, history `delta`) and
+both calendar `counts` objects use decimal strings. Datagram counters do too.
+The host-wide response is identical through the native adapter, with no additional
+namespace wrapper. Runtime report fields can be absent until the first sample.
 The simulator truthfully returns an unavailable error instead of this measured
 native database. The HTTP/core layer requires `state.read`; it returns 400 for
 nonempty queries, 404 for invalid scopes/path suffixes, and 503 for disabled,

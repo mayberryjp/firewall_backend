@@ -2727,26 +2727,19 @@ fn host_health_simulator_never_measures_the_development_host() {
 fn traffic_history_routes_reach_backend_and_preserve_canonical_history() {
     let fixture = Fixture::new();
     let (mut engine, backend) = faulty(&fixture);
-    for (path, scopes) in [
-        ("/api/v1/statistics/vnstat", vec!["host", "managed"]),
-        ("/api/v1/statistics/vnstat/host", vec!["host"]),
-        ("/api/v1/statistics/vnstat/managed", vec!["managed"]),
-    ] {
-        let mut databases = serde_json::Map::new();
-        for scope in scopes {
-            databases.insert(scope.into(), json!({
-                "schema":"netcontrol-services/counters/v1",
-                "scope":scope,
-                "interfaces":{},
-                "history":[{
-                    "collected_at":"2026-10-19T06:30:00Z",
-                    "interface":"lan0",
-                    "delta":{"rx_bytes":"1000","tx_bytes":"2000","rx_packets":"10","tx_packets":"20"},
-                    "reset":false
-                }]
-            }));
-        }
-        let expected = json!({"schema":"netcontrol-services/counters/v1","scopes":databases});
+    let path = "/api/v1/statistics/vnstat";
+    {
+        let expected = json!({
+            "schema":"netcontrol-services/counters/v2",
+            "scope":"host",
+            "interfaces":{},
+            "history":[{
+                "collected_at":"2026-10-19T06:30:00Z",
+                "interface":"lan0",
+                "delta":{"rx_bytes":"1000","tx_bytes":"2000","rx_packets":"10","tx_packets":"20"},
+                "reset":false
+            }]
+        });
         backend.lock().unwrap().traffic_response = Some(expected.clone());
         let reply = request(&mut engine, "GET", path, Value::Null);
         assert_eq!(reply.status, 200, "{}", reply.body);
@@ -2776,6 +2769,8 @@ fn traffic_history_auth_query_scope_and_backend_errors_are_not_hidden() {
         );
     }
     for invalid in [
+        "/api/v1/statistics/vnstat/host",
+        "/api/v1/statistics/vnstat/managed",
         "/api/v1/statistics/vnstat/",
         "/api/v1/statistics/vnstat/unknown",
         "/api/v1/statistics/vnstat/host/extra",
@@ -2804,11 +2799,19 @@ fn traffic_history_auth_query_scope_and_backend_errors_are_not_hidden() {
 fn simulator_traffic_history_never_fabricates_measured_counters() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
-    for path in [
-        "/api/v1/statistics/vnstat",
-        "/api/v1/statistics/vnstat/host",
-        "/api/v1/statistics/vnstat/managed",
-    ] {
+    let status = request(
+        &mut engine,
+        "GET",
+        "/api/v1/services/vnstat/status",
+        Value::Null,
+    );
+    assert_eq!(status.status, 200);
+    assert_eq!(
+        status.body["instances"],
+        json!([{"name":"vnstat","scope":"host","state":"disabled"}])
+    );
+    {
+        let path = "/api/v1/statistics/vnstat";
         let disabled = request(&mut engine, "GET", path, Value::Null);
         assert_eq!(disabled.status, 503);
         assert_eq!(disabled.body["error"], "vnstat is disabled");
@@ -2816,11 +2819,8 @@ fn simulator_traffic_history_never_fabricates_measured_counters() {
     let mut config = Config::empty();
     config.vnstat.enabled = true;
     assert_eq!(submit(&mut engine, config).status, 202);
-    for path in [
-        "/api/v1/statistics/vnstat",
-        "/api/v1/statistics/vnstat/host",
-        "/api/v1/statistics/vnstat/managed",
-    ] {
+    {
+        let path = "/api/v1/statistics/vnstat";
         let unavailable = request(&mut engine, "GET", path, Value::Null);
         assert_eq!(unavailable.status, 503);
         assert!(

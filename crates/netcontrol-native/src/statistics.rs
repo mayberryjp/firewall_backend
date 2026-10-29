@@ -7,27 +7,14 @@ pub fn service_response(path: &str, mut value: Value, scope: &str) -> Result<Val
         value["sample"]["scope"] = json!(scope);
     }
     match path {
-        "/api/v1/statistics/vnstat"
-        | "/api/v1/statistics/vnstat/host"
-        | "/api/v1/statistics/vnstat/managed" => {
+        "/api/v1/statistics/vnstat" => {
             ensure!(
-                value["schema"] == "netcontrol-services/counters/v1" && value["scopes"].is_object(),
+                value["schema"] == "netcontrol-services/counters/v2"
+                    && value["scope"] == "host"
+                    && value["interfaces"].is_object()
+                    && value["history"].is_array(),
                 "invalid native traffic history response"
             );
-            let expected: &[&str] = match path {
-                "/api/v1/statistics/vnstat/host" => &["host"],
-                "/api/v1/statistics/vnstat/managed" => &["managed"],
-                _ => &["host", "managed"],
-            };
-            let scopes = value["scopes"].as_object().unwrap();
-            ensure!(
-                scopes.len() == expected.len()
-                    && expected
-                        .iter()
-                        .all(|name| scopes.get(*name).is_some_and(Value::is_object)),
-                "native traffic history scopes unavailable"
-            );
-            value["scope"] = json!(scope);
         }
         "/api/v1/statistics/gateways" => {
             let gateways = value
@@ -124,33 +111,20 @@ mod tests {
     #[test]
     fn traffic_history_preserves_schema_scopes_and_exact_counter_strings() {
         let services = json!({
-            "schema":"netcontrol-services/counters/v1",
-            "scopes":{"managed":{"scope":"managed","interfaces":{"vlan100":{
+            "schema":"netcontrol-services/counters/v2", "scope":"host", "history":[],
+            "interfaces":{"vlan100":{
                 "namespace_id":"net:[123456]","rx_bytes":"18446744073709551615",
                 "daily":{"2026-01-01":{"rx_bytes":"9007199254740993","tx_bytes":"7"}}
-            }}}}
+            }}
         });
-        for path in [
+        let output = service_response(
             "/api/v1/statistics/vnstat",
-            "/api/v1/statistics/vnstat/host",
-            "/api/v1/statistics/vnstat/managed",
-        ] {
-            let mut selected = services.clone();
-            selected["scopes"]["host"] = json!({"scope":"host","interfaces":{}});
-            if let Some(name) = path.strip_prefix("/api/v1/statistics/vnstat/") {
-                selected["scopes"]
-                    .as_object_mut()
-                    .unwrap()
-                    .retain(|key, _| key == name);
-            }
-            let output = service_response(path, selected.clone(), "boot:namespace").unwrap();
-            assert_eq!(output["schema"], selected["schema"]);
-            assert_eq!(output["scopes"], selected["scopes"]);
-            assert_eq!(output["scope"], "boot:namespace");
-            assert!(output.get("sample").is_none());
-        }
+            services.clone(),
+            "boot:namespace",
+        )
+        .unwrap();
+        assert_eq!(output, services);
         assert!(service_response("/api/v1/statistics/vnstat", json!({}), "scope").is_err());
-        assert!(service_response("/api/v1/statistics/vnstat/host", services, "scope").is_err());
     }
 
     #[test]

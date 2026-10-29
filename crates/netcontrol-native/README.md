@@ -506,10 +506,9 @@ See the [contract](../../FRONTEND_SPEC.md#destination-rewrite) and
   All query parameters are rejected explicitly.
   Link diagnostics and host/connection statistics have dedicated native collectors;
   other statistics paths are delegated to the services crate.
-- `/api/v1/statistics/vnstat`, `/api/v1/statistics/vnstat/host` and
-  `/api/v1/statistics/vnstat/managed` delegate to the live services traffic
-  database, preserving `{schema,scopes}` and adding the actual backend `scope`
-  identity. Database scope names, per-interface namespace identities, history,
+- `/api/v1/statistics/vnstat` delegates to the single host-wide v2 services traffic
+  database without a scopes wrapper or managed-scope decoration. `/host` and
+  `/managed` suffixes are removed. Per-interface namespace identities, calendar buckets, history,
   and decimal-string counters are preserved. Disabled, unavailable or
   not-yet-collected workers return explicit errors; history is never fabricated.
 - Kernel and service drift currently returns an observation **error**, not a

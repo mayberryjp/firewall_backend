@@ -1,7 +1,7 @@
 {
   "base_revision": 0,
   "confirm_timeout_seconds": 120,
-  "description": "Enable appliance NTP, remote logging and dual-scope vnstat",
+  "description": "Enable appliance NTP, remote logging and host-wide daily traffic reporting",
   "config": {
     "interfaces": [],
     "routes": [],
@@ -23,6 +23,6 @@
         { "host": "logs.example.invalid", "port": 6514, "transport": "tls" }
       ]
     },
-    "vnstat": { "enabled": true }
+    "vnstat": { "enabled": true, "collector": "192.0.2.10:9999" }
   }
 }

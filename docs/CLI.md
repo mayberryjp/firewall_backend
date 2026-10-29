@@ -328,7 +328,7 @@ show kernel
 show statistics
 show statistics host
 show statistics link-diagnostics
-show statistics vnstat/managed
+show statistics vnstat
 show transactions
 show transaction TRANSACTION_ID
 show revisions

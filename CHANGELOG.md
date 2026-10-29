@@ -88,6 +88,17 @@
 
 ### Changed
 
+- vnStat accounting now uses one host-wide Rust worker covering every interface,
+  persisted day/month/lifetime totals and optional nonblocking UDP reports at
+  23:59 local time. Each datagram matches `hostname|vnstat --oneline` version-1
+  human-readable framing with a trailing newline; no fabricated-zero fallback
+  or delivery guarantee. Adds nullable `vnstat.collector` IP:port. Replaces
+  dual-scope worker names, scope-specific statistics paths and response/state
+  schema with a flat host-only v2 database. Prior files are retained, never
+  automatically migrated/reset. Recommended bump: major for public API/state
+  changes; baseline unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-28-10](docs/frontend-handoffs/2026-10-28.md#2026-10-28-10-host-wide-daily-traffic-reporting).
+
 - DNS diagnostics no longer require `interface` when an explicit `server` is
   supplied. Omitted/null interface uses normal kernel routing for UDP/TCP;
   response `interface` is null rather than an invented egress device. At least

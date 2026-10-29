@@ -2014,15 +2014,12 @@ fn native_vnstat_statistics_delegates_live_history_and_scope() -> Result<()> {
             Err(error) => return Err(error),
         }
     };
-    assert_eq!(all["schema"], "netcontrol-services/counters/v1");
-    assert_eq!(all["scope"], native.scope()?);
-    assert_eq!(all["scopes"].as_object().unwrap().len(), 2);
+    assert_eq!(all["schema"], "netcontrol-services/counters/v2");
+    assert_eq!(all["scope"], "host");
+    assert!(all["interfaces"].is_object());
     for name in ["host", "managed"] {
         let path = format!("/api/v1/statistics/vnstat/{name}");
-        let selected = native.statistics(&desired, &path, "")?;
-        assert_eq!(selected["scopes"].as_object().unwrap().len(), 1);
-        assert_eq!(selected["scopes"][name]["scope"], name);
-        assert_eq!(selected["scope"], all["scope"]);
+        assert!(native.statistics(&desired, &path, "").is_err());
         assert!(native.statistics(&desired, &path, "limit=1").is_err());
     }
     assert!(
@@ -2037,7 +2034,8 @@ fn native_vnstat_statistics_delegates_live_history_and_scope() -> Result<()> {
         serde_json::to_value(&desired)?
     );
     let repaired = native.repair(&desired)?;
-    for name in ["vnstat-host", "vnstat-managed"] {
+    {
+        let name = "vnstat";
         let worker = repaired["appliance_services"]
             .as_array()
             .unwrap()

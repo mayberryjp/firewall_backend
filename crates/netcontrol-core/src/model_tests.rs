@@ -10,6 +10,33 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn vnstat_collector_requires_explicit_valid_socket_address() {
+    let mut config = candidate();
+    config.vnstat.enabled = true;
+    for address in ["192.0.2.10:9999", "127.0.0.1:9999", "[2001:db8::10]:9999"] {
+        config.vnstat.collector = Some(address.into());
+        config.validate().unwrap();
+    }
+    for address in [
+        "",
+        "collector.example:9999",
+        "192.0.2.10:0",
+        "0.0.0.0:9999",
+        "239.1.1.1:9999",
+        "255.255.255.255:9999",
+    ] {
+        config.vnstat.collector = Some(address.into());
+        assert!(config.validate().is_err(), "accepted {address}");
+    }
+    config.vnstat.collector = Some("[2001:db8::10]:9999".into());
+    config.ipv6_enabled = false;
+    assert!(config.validate().is_err());
+    config.vnstat.collector = None;
+    config.validate().unwrap();
+    let value = serde_json::to_value(&config).unwrap();
+    assert!(value["vnstat"]["collector"].is_null());
+}
+#[test]
 fn destination_rewrite_exact_ports_local_targets_and_strict_schema() {
     let mut value = serde_json::to_value(candidate()).unwrap();
     value["interfaces"].as_array_mut().unwrap().push(json!({

@@ -25,11 +25,7 @@ pub(crate) struct Syslog {
     pub enabled: bool,
     pub servers: Vec<Destination>,
 }
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct Vnstat {
-    pub enabled: bool,
-}
+pub(crate) type Vnstat = netcontrol_core::VNStatConfig;
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Relay {
@@ -294,6 +290,7 @@ impl Config {
     pub(crate) fn parse(v: &Value) -> Result<Self> {
         ensure!(v.is_object(), "service configuration must be an object");
         let mut c: Self = serde_json::from_value(v.clone()).context("service configuration")?;
+        c.vnstat.validate(c.ipv6_enabled)?;
         if v.get("udp_broadcast_relay").is_some() {
             let config: netcontrol_core::Config =
                 serde_json::from_value(v.clone()).context("UDP relay operational configuration")?;

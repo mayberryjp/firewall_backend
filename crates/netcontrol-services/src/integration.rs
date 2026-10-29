@@ -77,7 +77,7 @@ fn native_icmp_v4_v6_echo_no_children() {
 fn native_counter_worker_persists_history_and_joins() {
     isolated(|| {
         let directory =
-            std::env::current_dir()?.join(format!("native-counters-{}", rand::random::<u64>()));
+            std::env::temp_dir().join(format!("native-counters-{}", rand::random::<u64>()));
         std::fs::create_dir(&directory)?;
         let mut worker = worker::Worker::start(
             "counter-test".into(),
@@ -85,10 +85,12 @@ fn native_counter_worker_persists_history_and_joins() {
             json!({"name":"counter-test"}),
             {
                 let directory = directory.clone();
-                move || counters::prepare(directory.clone(), "managed".into())
+                move || {
+                    counters::prepare(directory.clone(), netcontrol_core::VNStatConfig::default())
+                }
             },
         )?;
-        let path = directory.join("traffic-managed-v1.json");
+        let path = directory.join(counters::FILE_NAME);
         let start = Instant::now();
         while !path.exists() && start.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(10));
@@ -101,7 +103,7 @@ fn native_counter_worker_persists_history_and_joins() {
         server.recv(&mut buffer)?;
         let sampled = Instant::now();
         while sampled.elapsed() < Duration::from_secs(8) {
-            if counters::Database::load(&path, "managed")?
+            if counters::Database::load(&path, "host")?
                 .interfaces
                 .get("lo")
                 .is_some_and(|value| value.total.rx_packets > 0)
@@ -116,14 +118,14 @@ fn native_counter_worker_persists_history_and_joins() {
             "counter worker failed: {}",
             worker.snapshot()
         );
-        let db = counters::Database::load(&path, "managed")?;
+        let db = counters::Database::load(&path, "host")?;
         ensure!(
             db.interfaces["lo"].total.rx_bytes >= 14 && db.interfaces["lo"].total.rx_packets > 0,
             "counter worker did not record loopback traffic"
         );
         ensure!(db.history.len() >= 2, "counter history not persisted");
         let persisted = std::fs::read(&path)?;
-        let loaded = counters::Database::load(&path, "managed")?;
+        let loaded = counters::Database::load(&path, "host")?;
         ensure!(
             loaded.interfaces["lo"].total.rx_bytes == db.interfaces["lo"].total.rx_bytes,
             "counter reload changed history"
@@ -131,6 +133,36 @@ fn native_counter_worker_persists_history_and_joins() {
         ensure!(
             std::fs::read(&path)? == persisted,
             "counter read modified file"
+        );
+        client.send_to(b"restart traffic", server.local_addr()?)?;
+        server.recv(&mut buffer)?;
+        let mut resumed = worker::Worker::start(
+            "counter-test".into(),
+            None,
+            json!({"name":"counter-test"}),
+            {
+                let directory = directory.clone();
+                move || {
+                    counters::prepare(directory.clone(), netcontrol_core::VNStatConfig::default())
+                }
+            },
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let current = counters::Database::load(&path, "host")?;
+            if current.interfaces["lo"].total.rx_bytes > db.interfaces["lo"].total.rx_bytes {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "counter restart did not preserve/advance history"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        resumed.shutdown()?;
+        ensure!(
+            resumed.snapshot()["state"] == "stopped",
+            "restarted worker did not join"
         );
         std::fs::remove_dir_all(directory)?;
         Ok(())

@@ -517,6 +517,25 @@ pub struct VNStatConfig {
     #[serde(skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
     pub enabled: bool,
+    pub collector: Option<String>,
+}
+impl VNStatConfig {
+    pub fn validate(&self, ipv6_enabled: bool) -> Result<()> {
+        if let Some(collector) = &self.collector {
+            let address: std::net::SocketAddr = collector.parse().map_err(|_| {
+                anyhow::anyhow!("vnstat collector must be an IP:port socket address")
+            })?;
+            ensure!(
+                address.port() != 0
+                    && !address.ip().is_unspecified()
+                    && !address.ip().is_multicast()
+                    && address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST)
+                    && (ipv6_enabled || address.is_ipv4()),
+                "vnstat collector requires a unicast destination, nonzero port and enabled address family"
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -953,6 +972,7 @@ impl Config {
                 "invalid or duplicate syslog destination"
             );
         }
+        self.vnstat.validate(self.ipv6_enabled)?;
         self.kernel.validate()?;
         let mut names = BTreeSet::new();
         let mut vlan_ids = BTreeSet::new();

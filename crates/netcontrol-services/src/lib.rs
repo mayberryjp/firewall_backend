@@ -302,11 +302,14 @@ impl Services {
                 self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","source":"journald","host_source":syslog::JOURNAL_SOCKET}),move||syslog::prepare(config.clone(),dir.clone(),socket.clone(),ipv6_enabled))?;
             }
             if c.vnstat.enabled {
-                for scope in ["host", "managed"] {
-                    let dir = self.options.state_directory.clone();
-                    let scope_owned = scope.to_owned();
-                    self.insert(&format!("vnstat-{scope}"),if scope=="host"{host.clone()}else{managed.clone()},json!({"name":format!("vnstat-{scope}"),"scope":scope,"schema":"netcontrol-services/counters/v1"}),move||counters::prepare(dir.clone(),scope_owned.clone()))?;
-                }
+                let dir = self.options.state_directory.clone();
+                let config = c.vnstat.clone();
+                self.insert(
+                    "vnstat",
+                    host.clone(),
+                    json!({"name":"vnstat","scope":"host","schema":counters::SCHEMA}),
+                    move || counters::prepare(dir.clone(), config.clone()),
+                )?;
             }
             let relays: Vec<_> = c
                 .interfaces
@@ -424,14 +427,9 @@ impl Services {
                 json!({"name":"syslog","scope":"host"}),
             ),
             self.row(
-                "vnstat-host",
+                "vnstat",
                 c.vnstat.enabled,
-                json!({"name":"vnstat-host","scope":"host"}),
-            ),
-            self.row(
-                "vnstat-managed",
-                c.vnstat.enabled,
-                json!({"name":"vnstat-managed","scope":"managed"}),
+                json!({"name":"vnstat","scope":"host"}),
             ),
         ];
         let mut base = c.mdns_status.clone();
@@ -546,41 +544,24 @@ impl Services {
             }
             return Ok(json!({"sample":sample,"gateways":gateways}));
         }
-        if path == "/statistics/vnstat" || path.starts_with("/statistics/vnstat/") {
+        if path == "/statistics/vnstat" {
             ensure!(self.config.vnstat.enabled, "vnstat is disabled");
-            let scopes: Vec<_> = if let Some(scope) = path.strip_prefix("/statistics/vnstat/") {
-                ensure!(
-                    ["host", "managed"].contains(&scope),
-                    "invalid traffic scope"
-                );
-                vec![scope]
-            } else {
-                vec!["host", "managed"]
-            };
-            let mut databases = serde_json::Map::new();
-            for scope in scopes {
-                let state = self
-                    .workers
-                    .get(&format!("vnstat-{scope}"))
-                    .context("traffic worker unavailable")?
-                    .snapshot();
-                ensure!(
-                    state["state"] == "running" && state.get("collected_at").is_some(),
-                    "traffic history unavailable: {state}"
-                );
-                let db = counters::Database::load(
-                    &self
-                        .options
-                        .state_directory
-                        .join(format!("traffic-{scope}-v1.json")),
-                    scope,
-                )?;
-                // JSON-safe integer strings for counters, including history.
-                let mut v = serde_json::to_value(db)?;
-                stringify_counts(&mut v);
-                databases.insert(scope.into(), v);
-            }
-            return Ok(json!({"schema":"netcontrol-services/counters/v1","scopes":databases}));
+            let state = self
+                .workers
+                .get("vnstat")
+                .context("traffic worker unavailable")?
+                .snapshot();
+            ensure!(
+                state["state"] == "running" && state["collected_at"].is_string(),
+                "traffic history unavailable: {state}"
+            );
+            let database = counters::Database::load(
+                &self.options.state_directory.join(counters::FILE_NAME),
+                "host",
+            )?;
+            let mut value = serde_json::to_value(database)?;
+            stringify_counts(&mut value);
+            return Ok(value);
         }
         bail!("service statistics endpoint not found: {path}")
     }
@@ -628,7 +609,7 @@ fn expected_workers(c: &Config) -> BTreeSet<String> {
         keys.insert("syslog".to_owned());
     }
     if c.vnstat.enabled {
-        keys.extend(["vnstat-host".to_owned(), "vnstat-managed".to_owned()]);
+        keys.insert("vnstat".to_owned());
     }
     if c.interfaces.iter().any(|i| i.dhcp_relay.enabled) {
         keys.insert("dhcp-relay".to_owned());
@@ -651,7 +632,16 @@ fn stringify_counts(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, value) in map {
-                if ["rx_bytes", "tx_bytes", "rx_packets", "tx_packets"].contains(&key.as_str()) {
+                if [
+                    "rx_bytes",
+                    "tx_bytes",
+                    "rx_packets",
+                    "tx_packets",
+                    "sent_datagrams",
+                    "failed_datagrams",
+                ]
+                .contains(&key.as_str())
+                {
                     if let Some(n) = value.as_u64() {
                         *value = json!(n.to_string());
                     }
@@ -898,12 +888,10 @@ mod tests {
         .unwrap();
         assert!(services.workers_current(&disabled));
         assert!(!services.workers_current(&enabled));
-        for name in ["ntp", "vnstat-host"] {
-            services.workers.insert(name.into(), idle());
-        }
+        services.workers.insert("ntp".into(), idle());
         assert!(!services.workers_current(&enabled));
         assert!(!services.workers_current(&disabled));
-        services.workers.insert("vnstat-managed".into(), idle());
+        services.workers.insert("vnstat".into(), idle());
         assert!(services.workers_current(&enabled));
         services.workers.insert("syslog".into(), idle());
         assert!(!services.workers_current(&enabled));
@@ -968,15 +956,30 @@ mod tests {
                 .contains("disabled")
         );
         services.config.vnstat.enabled = true;
-        for scope in ["host", "managed"] {
-            let db = json!({"schema":"netcontrol-services/counters/v1","scope":scope,"interfaces":{"lan0":{"ifindex":3,"boot_id":"synthetic-boot","namespace_id":"4:4026533000","last":{"rx_bytes":120,"tx_bytes":100,"rx_packets":2,"tx_packets":1},"total":{"rx_bytes":20,"tx_bytes":0,"rx_packets":1,"tx_packets":0},"resets":0,"last_seen":"2026-10-19T06:00:00Z","present":true}},"history":[{"collected_at":"2026-10-19T06:00:00Z","interface":"lan0","delta":{"rx_bytes":20,"tx_bytes":0,"rx_packets":1,"tx_packets":0},"reset":false}]});
+        {
+            let mut db =
+                counters::Database::load(&directory.join(counters::FILE_NAME), "host").unwrap();
+            for bytes in [100, 120] {
+                db.observe(
+                    "synthetic-boot",
+                    "4:4026533000",
+                    "lan0",
+                    3,
+                    counters::Counts {
+                        rx_bytes: bytes,
+                        ..Default::default()
+                    },
+                    "2026-10-19T06:00:00Z",
+                )
+                .unwrap();
+            }
             std::fs::write(
-                directory.join(format!("traffic-{scope}-v1.json")),
+                directory.join(counters::FILE_NAME),
                 serde_json::to_vec(&db).unwrap(),
             )
             .unwrap();
             let worker = Worker::start(
-                format!("vnstat-{scope}"),
+                "vnstat".into(),
                 None,
                 json!({"collected_at":"2026-10-19T06:00:00Z"}),
                 || {
@@ -987,36 +990,20 @@ mod tests {
                 },
             )
             .unwrap();
-            services.workers.insert(format!("vnstat-{scope}"), worker);
+            services.workers.insert("vnstat".into(), worker);
         }
         let both = services
             .statistics("/api/v1/statistics/vnstat", "")
             .unwrap();
-        assert_eq!(both["schema"], "netcontrol-services/counters/v1");
-        assert_eq!(both["scopes"].as_object().unwrap().len(), 2);
-        for scope in ["host", "managed"] {
-            let single = services
-                .statistics(&format!("/api/v1/statistics/vnstat/{scope}"), "")
-                .unwrap();
-            assert_eq!(
-                single,
-                json!({"schema":"netcontrol-services/counters/v1","scopes":{scope:both["scopes"][scope]}})
-            );
-            assert_eq!(
-                single["scopes"][scope]["interfaces"]["lan0"]["last"]["rx_bytes"],
-                "120"
-            );
-            assert_eq!(
-                single["scopes"][scope]["history"][0]["delta"]["rx_packets"],
-                "1"
-            );
-            assert_eq!(
-                single,
-                services
-                    .statistics(&format!("/statistics/vnstat/{scope}"), "")
-                    .unwrap()
-            );
-        }
+        assert_eq!(both["schema"], counters::SCHEMA);
+        assert_eq!(both["scope"], "host");
+        assert_eq!(both["interfaces"]["lan0"]["last"]["rx_bytes"], "120");
+        assert_eq!(
+            both["interfaces"]["lan0"]["day"]["counts"]["rx_bytes"],
+            "20"
+        );
+        assert_eq!(both["sent_datagrams"], "0");
+        assert_eq!(both, services.statistics("/statistics/vnstat", "").unwrap());
         for query in ["scope=host", "limit=1", "?", " "] {
             assert!(
                 services
@@ -1025,6 +1012,8 @@ mod tests {
             );
         }
         for path in [
+            "/api/v1/statistics/vnstat/host",
+            "/api/v1/statistics/vnstat/managed",
             "/api/v1/statistics/vnstat/",
             "/api/v1/statistics/vnstat/invalid",
             "/api/v1/statistics/vnstat/host/extra",

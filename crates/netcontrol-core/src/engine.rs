@@ -855,7 +855,7 @@ impl Engine {
             "syslog" => Some(c.syslog.enabled),
             "mdns" => Some(c.mdns.enabled),
             "bgp" => Some(c.bgp.enabled),
-            "vnstat-host" | "vnstat-managed" => Some(c.vnstat.enabled),
+            "vnstat" => Some(c.vnstat.enabled),
             "dhcp-relay" => Some(c.interfaces.iter().any(|link| link.dhcp_relay.enabled)),
             "dhcp-gateway-monitors" => Some(
                 c.gateway_monitors
@@ -1455,11 +1455,7 @@ impl Engine {
                         .as_array()
                         .ok_or_else(|| service_error("backend returned invalid service statuses"))?
                         .iter()
-                        .filter(|s| {
-                            s["name"] == service
-                                || (service == "vnstat"
-                                    && s["name"].as_str().is_some_and(|n| n.starts_with("vnstat-")))
-                        })
+                        .filter(|s| s["name"] == service)
                         .cloned()
                         .collect::<Vec<_>>();
                     Ok(json!({"instances":statuses,"error":error}))
@@ -1666,8 +1662,6 @@ fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
         "/api/v1/statistics/link-diagnostics",
         "/api/v1/statistics/gateways",
         "/api/v1/statistics/vnstat",
-        "/api/v1/statistics/vnstat/host",
-        "/api/v1/statistics/vnstat/managed",
     ]
     .contains(&path)
     {

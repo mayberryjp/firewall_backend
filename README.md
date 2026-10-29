@@ -34,6 +34,15 @@ its synthetic interfaces, addresses, revision and firewall policy. Govee LAN
 Control must be enabled; discovery does not grant routed device access. This
 runs inside Netcontrol with automatic reconnect/retry, not an external package.
 
+Host-wide traffic accounting uses one Rust worker for every kernel interface,
+including unmanaged, VLAN, tunnel, veth and loopback links. Optional
+`vnstat.collector` sends one `hostname|vnstat --oneline`-format UDP datagram per
+present interface during local 23:59, with daily/monthly/lifetime observed
+totals. Reporting is approximate and best-effort, not a delivery guarantee.
+See the [traffic contract](FRONTEND_SPEC.md#native-traffic-history) and
+[example](examples/appliance-services.json) for configuration and retained-state
+requirements; there is no vnStat daemon, cron or netcat dependency.
+
 Backward compatibility is not a constraint. Invalid or unsupported
 configuration must produce explicit errors rather than permissive defaults or
 successful no-op operations. Existing on-device data must never be deleted to

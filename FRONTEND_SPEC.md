@@ -670,7 +670,7 @@ characters. Exact supported identifiers:
 | Target | Scope and prerequisites |
 | --- | --- |
 | `ntp`, `syslog`, `mdns` | Selected enabled native service worker |
-| `vnstat-host`, `vnstat-managed` | Selected accounting scope; vnStat enabled |
+| `vnstat` | All interfaces in the host namespace; vnStat enabled |
 | `dhcp-relay` | Shared relay worker; at least one enabled relay |
 | `flow:NAME` | One configured enabled flow exporter |
 | `udp-broadcast-relay:ID` | One configured enabled UDP relay instance; global enable required, canonical decimal ID 1..63 |
@@ -1721,11 +1721,11 @@ servers and preserving the actual complete network configuration.
   The Rust worker does not start/stop a system syslog daemon. Describe its actual
   captured sources and unavailable sources explicitly; do not imply complete
   system/kernel/backend delivery merely because a worker is running.
-- vnStat editor: one enabled toggle for **both scopes/all interfaces**, not a
-  selected-interface list. Host and managed namespace have separate native workers
-  and persistent histories. Include unmanaged/loopback and newly created interfaces.
+- vnStat editor: one enabled toggle for **all host interfaces**, not a
+  selected-interface list or scope selector; optional nullable UDP collector.
+  One worker/database includes unmanaged/loopback and newly created interfaces.
   Inventory, sampling and synchronized history publication occur every 5 seconds.
-  Traffic across VLAN/parent/veth/loopback/scopes overlaps: never sum it.
+  Traffic across VLAN/parent/veth/loopback overlaps: never sum it.
 
 Per service in `ntp`, `syslog`, `vnstat`:
 
@@ -1735,8 +1735,8 @@ Per service in `ntp`, `syslog`, `vnstat`:
 | GET | `/api/v1/services/{service}/status` | `{instances: ApplianceServiceStatus[], error: string}` |
 | POST | `/api/v1/services/{service}/reconcile` | No body, `RuntimeState`; all enabled services |
 
-`RuntimeState.appliance_services` always contains `ntp`, `syslog`, `vnstat-host`,
-`vnstat-managed` and `mdns` rows; service-specific status filters to its instances.
+`RuntimeState.appliance_services` always contains `ntp`, `syslog`, `vnstat`
+and `mdns` rows; service-specific status filters to its instances.
 The `mdns` row has the separate typed shape in section 6.1.7.
 Render lifecycle state, scope, optional start time, optional active traffic-history
 database directory and errors. Native workers use `disabled`, `running`, `error`,
@@ -1821,35 +1821,85 @@ even when native networking uses the host namespace. Host-network management alo
 clock adjustment or take ownership from competing services.
 
 Settings persist through transactions/revisions/restart; traffic histories survive
-graceful stop/repair. Managed database identity includes boot/namespace identity;
-a new scope gets a new database. No history is automatically deleted. Abrupt
+graceful stop/repair. Traffic identity includes boot/namespace/interface identity.
+No history is automatically deleted. Abrupt
 kill can lose unsaved samples and leave ownership requiring operator recovery.
 Simulator status is simulated without processes, time changes, or real history.
 
 #### Native traffic history
 
-Authenticated `state.read` GETs:
-
-- `/api/v1/statistics/vnstat`: both `host` and `managed` databases.
-- `/api/v1/statistics/vnstat/host`: only `host`.
-- `/api/v1/statistics/vnstat/managed`: only `managed`.
-
-No query parameters are supported (`400`); unknown scopes/suffixes are `404`,
+Authenticated `state.read` GET `/api/v1/statistics/vnstat` returns one host-wide
+database. The former `/host` and `/managed` suffixes are removed (`404`).
+No query parameters are supported (`400`); unknown suffixes are `404`,
 non-GET methods are `405`. Disabled, failed, not-yet-ready or simulator collectors
-return `503`, never fabricated measured empty data. The response is
-`{schema:"netcontrol-services/counters/v1",scope:string,scopes:{host?:TrafficDatabase,managed?:TrafficDatabase}}`.
-Top-level `scope` is the opaque actual native boot/namespace identity; do not parse
-it as a UI label. Each database contains the same schema, its `"host"|"managed"`
-scope, `interfaces`, and `history`. Interface records contain `ifindex`,
-`boot_id`, `namespace_id`, `last`, `total`, `resets`, `last_seen`, and `present`.
-`last` and `total` contain decimal-string `rx_bytes`, `tx_bytes`, `rx_packets`,
-`tx_packets`; history rows contain timestamp/interface/delta/reset. Preserve
-counter strings losslessly. See the [exact JSON reference](crates/netcontrol-services/README.md#json-field-reference).
+return `503`, never fabricated measured empty data. No `scopes` wrapper or
+opaque native scope decoration remains; `scope` is the literal `"host"`.
+
+```ts
+interface TrafficCounts {
+  rx_bytes: string; tx_bytes: string; rx_packets: string; tx_packets: string;
+}
+interface TrafficPeriod { date: string; counts: TrafficCounts }
+interface TrafficInterface {
+  ifindex: number; boot_id: string; namespace_id: string;
+  last: TrafficCounts; total: TrafficCounts;
+  day: TrafficPeriod; month: TrafficPeriod;
+  resets: number; last_seen: Timestamp; present: boolean;
+}
+interface TrafficDatabase {
+  schema: "netcontrol-services/counters/v2";
+  scope: "host";
+  interfaces: Record<string, TrafficInterface>;
+  history: { collected_at: Timestamp; interface: string; delta: TrafficCounts; reset: boolean }[];
+  last_report_date: string | null;
+  last_report_error: string | null;
+  sent_datagrams: string;
+  failed_datagrams: string;
+}
+```
+
+Counter and datagram strings are unsigned decimal integers; preserve them
+losslessly. Day dates are `YYYY-MM-DD`; month dates are `YYYY-MM` in the host's
+local calendar. Interface discovery samples every host interface every 5 seconds,
+including unmanaged, down, VLAN, tunnel, veth and loopback interfaces. Removed
+interfaces remain with `present:false` and are not exported.
 The first sample establishes a baseline; it is not previous lifetime usage.
 Only the latest 10,000 per-interface history records are retained, while
 cumulative totals persist; removed interfaces and reset boundaries remain visible.
-No calendar aggregation, Go/vnStat database compatibility, or chart-ready rate
-series is supplied. Do not sum overlapping interfaces or scopes.
+Daily/monthly buckets retain the current periods independently of history pruning.
+Polling deltas belong to the calendar period in which they are observed; midnight,
+restart and reset accounting is approximate. Initial/partially observed days are
+not complete historical usage. Do not sum overlapping interfaces.
+
+`vnstat.collector` is null (default: collection only) or a literal IP:port
+UDP destination, port 1..65535. No DNS, multicast, unspecified or IPv4 broadcast
+destinations; IPv6 destinations require global IPv6 enabled. Validate even when
+disabled. Edit only on the owning traffic-accounting service form; preserve
+metadata. Transactions require existing `transactions.write` and `vnstat.write`.
+At the first sample in local **23:59**, attempt one datagram per present interface:
+`hostname|1;interface;YYYY-MM-DD;day_rx;day_tx;day_total;day_rate;YYYY-MM;month_rx;month_tx;month_total;month_rate;total_rx;total_tx;total_bytes\n`.
+This is the 15-field human-readable `vnstat --oneline` version-1 layout, with
+IEC byte units and decimal bit/s rate units. Hostname comes from the appliance;
+each interface is its own UDP datagram. The final minute after sampling is omitted
+from that day's report; accounting continues normally through midnight. The host
+local timezone is used; restart the daemon after host timezone changes to refresh
+libc's timezone cache. No backfill when the reporting minute is missed, no durable
+delivery queue/acknowledgment, and no fabricated zero fallback for unavailable data.
+Genuine observed zero usage is valid. `sent_datagrams` means local socket acceptance,
+not delivery. `last_report_error` is a non-blocking reporting warning; collection
+continues. Socket/setup failures retry within that minute; per-interface send
+failures are counted without blocking other reports. Persisted date suppresses
+repeat daily attempts across normal restart; a crash between send and persistence
+can duplicate a report. Collector deduplication should use hostname/interface/date.
+Datagrams are plaintext and unauthenticated, as with the supplied shell reporter;
+restrict collector/network access. No implicit firewall permits are installed.
+
+Storage is `traffic-host-v2.json` in the existing service-state directory.
+Prior v1 accounting files are retained, not migrated/reset/deleted. If a prior host
+v1 file exists without v2, collection reports an explicit operator-archival error;
+starting a new baseline requires an explicit operator decision, not an automatic
+rewrite. Corrupt/incompatible v2 and unresolved pending snapshots also remain
+explicit errors. This is format-compatible output, not vnStat database compatibility.
 
 ### Platform Health And Active Alerts
 
@@ -4055,10 +4105,8 @@ Paths below are relative to `/api/v1`.
 | GET | `/services/vnstat` | Configured `VNStatConfig` metadata |
 | GET | `/services/ntp/status` | `{instances: ApplianceServiceStatus[], error}` |
 | GET | `/services/syslog/status` | `{instances: ApplianceServiceStatus[], error}` |
-| GET | `/services/vnstat/status` | `{instances: ApplianceServiceStatus[], error}`; two scopes |
-| GET | `/statistics/vnstat` | Native traffic schema, opaque scope and both scope databases |
-| GET | `/statistics/vnstat/host` | Same envelope, only host database |
-| GET | `/statistics/vnstat/managed` | Same envelope, only managed database |
+| GET | `/services/vnstat/status` | `{instances: ApplianceServiceStatus[], error}`; one host-wide worker |
+| GET | `/statistics/vnstat` | `TrafficDatabase`, v2 host-wide calendar accounting |
 | POST | `/services/ntp/reconcile` | No body -> `RuntimeState`; all enabled services |
 | POST | `/services/syslog/reconcile` | No body -> `RuntimeState`; all enabled services |
 | POST | `/services/vnstat/reconcile` | No body -> `RuntimeState`; all enabled services |
@@ -4173,13 +4221,20 @@ interface DynamicDNSConfig {
 interface NTPConfig { enabled: boolean; servers: string[] }
 interface SyslogServer { host: string; port: number; transport: "udp" | "tcp" | "tls" }
 interface SyslogConfig { enabled: boolean; servers: SyslogServer[] }
-interface VNStatConfig { enabled: boolean }
+interface VNStatConfig { enabled: boolean; collector: string | null }
 interface ApplianceServiceStatus {
-  name: "ntp" | "syslog" | "vnstat-host" | "vnstat-managed";
-  scope: "host" | "managed";
+  name: "ntp" | "syslog" | "vnstat";
+  scope: "host";
   state: "disabled" | "simulated" | "running" | "error" | "stopped";
   started_at?: Timestamp;
   database_directory?: string;
+  schema?: "netcontrol-services/counters/v2";
+  interfaces?: Record<string, TrafficInterface>;
+  collector?: string | null;
+  last_report_date?: string | null;
+  last_report_error?: string | null;
+  sent_datagrams?: string;
+  failed_datagrams?: string;
   source?: "journald"; // syslog worker only
   host_source?: "/run/systemd/journal/syslog"; // syslog worker only
   forwarded_records?: number; // nonnegative integer, per syslog worker start
