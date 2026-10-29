@@ -2541,6 +2541,43 @@ interface UDPBroadcastRelayConfig {
   instances: UDPRelayInstance[];
   metadata?: ObjectMetadata;
 }
+interface UDPRelayStatus {
+  name: "udp-broadcast-relay";
+  instance_id: number;
+  scope: "managed";
+  enabled: boolean;
+  port: number;
+  interfaces: string[];
+  multicast_address: string | null;
+  source: UDPRelaySource;
+  state: string;
+  started_at: Timestamp | null;
+  collected_at: Timestamp | null;
+  error?: string | null;
+  last_error?: string | null;
+  retrying?: boolean;
+  restart_count?: number;
+  received_packets: string;
+  transmitted_packets: string;
+  received_bytes: string;
+  transmitted_bytes: string;
+  policy_drops: string;
+  loop_drops: string;
+  rate_limit_drops: string;
+  send_errors: string;
+  last_send_error: string | null;
+  last_send_error_at: Timestamp | null;
+  receive_drops: string | null;
+  statistics_complete: boolean;
+  limits: {
+    interfaces: 32;
+    payload_bytes: 65507;
+    packets_per_second: 200;
+    burst: 400;
+    poll_ms: 100;
+    shutdown_ms: 1000;
+  };
+}
 ```
 
 `config.udp_broadcast_relay` is always serialized; default disabled/empty. Each
@@ -2587,7 +2624,13 @@ counters without conversion to JavaScript number: `received_packets`,
 bytes are payload bytes and successful transmissions count each outgoing link,
 not remote delivery. Nullable `last_send_error`/`last_send_error_at` retain send
 failures, including MTU errors. `receive_drops: null` and
-`statistics_complete: false` mean unknown kernel loss, not zero. `limits` has
+`statistics_complete: false` mean unknown kernel loss, not zero. This expected
+accounting limitation alone does not create an active health alert for UDP
+relay instances. Actual worker errors, unavailable samples, degraded health
+and explicit warnings retain their normal alert behavior. Process health can
+be healthy while a running service reports a warning; it is not proof of
+packet delivery. Runtime validators must accept `UDPRelayStatus` as a distinct
+`appliance_services` member, not require generic or mDNS-only fields. `limits` has
 `interfaces:32`, `payload_bytes:65507`, `packets_per_second:200`, `burst:400`,
 `poll_ms:100`, `shutdown_ms:1000`. Do not show simulated rows as live traffic.
 
@@ -4436,7 +4479,7 @@ interface RuntimeState {
     dhcp_gateway_monitor_address_families: "ipv4"[];
   };
   dhcp_clients?: DHCPClientRuntime;
-  appliance_services: (ApplianceServiceStatus | MDNSStatus)[];
+  appliance_services: (ApplianceServiceStatus | MDNSStatus | UDPRelayStatus)[];
   parent_interfaces: ParentInterface[];
   softflowd: SoftflowdStatus[];
   dhcp_relay: DHCPRelayStatus[];

@@ -66,7 +66,8 @@ impl Monitor {
                             row["health"].as_str(),
                             Some("down" | "degraded" | "unhealthy")
                         )
-                        || row["statistics_complete"] == false
+                        || (row["statistics_complete"] == false
+                            && row["name"] != "udp-broadcast-relay")
                         || row["warnings"]
                             .as_array()
                             .is_some_and(|warnings| !warnings.is_empty())));
@@ -253,6 +254,46 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn udp_relay_unknown_receive_loss_is_not_a_service_failure() {
+        let monitor = super::Monitor::default();
+        let mut row = serde_json::json!({
+            "name":"udp-broadcast-relay", "instance_id":1, "state":"running",
+            "receive_drops":null, "statistics_complete":false, "error":null
+        });
+        monitor.observe(
+            Some(&serde_json::json!({"appliance_services":[row.clone()]})),
+            &[],
+            false,
+        );
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot["active_alerts"], serde_json::json!([]));
+        assert_eq!(snapshot["process_health"]["status"], "healthy");
+
+        row["error"] = serde_json::json!("synthetic relay error");
+        monitor.observe(
+            Some(&serde_json::json!({"appliance_services":[row.clone()]})),
+            &[],
+            false,
+        );
+        assert_eq!(
+            monitor.snapshot()["active_alerts"][0]["code"],
+            "service_warning"
+        );
+
+        row["state"] = serde_json::json!("error");
+        row["retrying"] = serde_json::json!(true);
+        monitor.observe(
+            Some(&serde_json::json!({"appliance_services":[row]})),
+            &[],
+            false,
+        );
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot["process_health"]["status"], "unhealthy");
+        assert_eq!(snapshot["active_alerts"][0]["code"], "worker_unavailable");
+        assert_eq!(snapshot["active_alerts"][0]["retrying"], true);
+    }
+
     #[test]
     fn udp_relay_instances_keep_independent_health_alerts() {
         let monitor = super::Monitor::default();

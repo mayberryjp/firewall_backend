@@ -92,6 +92,13 @@
 
 ### Fixed
 
+- UDP relay health no longer raises a service warning solely because kernel
+  receive-loss accounting is unavailable. Actual worker failures and explicit
+  service warnings remain visible. Corrected the documented runtime status
+  union and added an explicit UDP relay status type for frontend validators.
+  Recommended bump: patch; baseline unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-28-08](docs/frontend-handoffs/2026-10-28.md#2026-10-28-08-udp-relay-health-and-runtime-validation).
+
 - MQTT publishing now reconnects when outstanding QoS-1 publications receive
   no acknowledgement progress for 30 seconds, preventing an otherwise live
   connection from stalling telemetry indefinitely. Existing persistent TCP,
