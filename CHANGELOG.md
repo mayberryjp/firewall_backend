@@ -4,6 +4,16 @@
 
 ### Added
 
+- In-process IPv4 UDP broadcast/multicast relay with pfSense-style global and
+  per-instance controls, selected Ethernet/VLAN interfaces, original/interface
+  source modes and instance-ID DSCP echo suppression. Adds transactional
+  `udp_broadcast_relay`, `udp_broadcast_relay.write`, config/status/reconcile
+  APIs, instance restart, CLI editing and independent supervised recovery/
+  health. Includes Govee and ECHONET Lite examples and routing/firewall setup;
+  does not add implicit permits, a unicast proxy, IPv6 or CARP integration.
+  Recommended bump: minor; baseline unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-28-06](docs/frontend-handoffs/2026-10-28.md#2026-10-28-06-native-udp-broadcast-relay).
+
 - DNS diagnostics accept an optional `server` IPv4/IPv6 literal at
   `POST /api/v1/diagnostics/dns-lookup` to query only that resolver on port 53,
   even without configured DNS. Retains optional explicit interface selection, global
@@ -73,6 +83,12 @@
   [handoff 2026-10-28-05](docs/frontend-handoffs/2026-10-28.md#2026-10-28-05-optional-dns-diagnostic-interface).
 
 ### Fixed
+
+- MQTT publishing now reconnects when outstanding QoS-1 publications receive
+  no acknowledgement progress for 30 seconds, preventing an otherwise live
+  connection from stalling telemetry indefinitely. Existing persistent TCP,
+  five-second retries, fresh discovery/state and confirmed-disable behavior remain.
+  Recommended bump: patch; baseline unknown, Unreleased. No frontend action.
 
 - Disabled/simulated mDNS no longer emits a receive-loss-accounting warning.
   Unmeasured capture statistics remain explicitly incomplete, but no longer

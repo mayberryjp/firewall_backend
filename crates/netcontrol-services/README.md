@@ -51,6 +51,20 @@ drift and durable transaction recovery safeguards remain enforced.
 
 ## Implemented services and boundaries
 
+* **IPv4 UDP broadcast relay:** one supervised managed worker per enabled
+  `udp_broadcast_relay.instances[]`, with an exclusive UDP listener, per-link
+  multicast memberships and device-bound raw IPv4 egress. Relays broadcasts
+  and the optional exact multicast group to selected links except ingress;
+  offers original-source and two interface-source modes. Instance IDs mark
+  DSCP to suppress echoes; ECN, TTL and UDP payload are preserved. CAP_NET_RAW
+  and the normal host-service opt-in apply. No external process, automatic
+  firewall/NAT rule, arbitrary-unicast proxy, IPv6 or CARP tracking. Failed
+  bindings, missing DHCP addresses and link changes report errors and retry
+  independently. Eight string counters report observed payload traffic/drops
+  and send errors; kernel receive loss remains unmeasured. Raw IPv4 packets
+  must fit the outgoing MTU; send errors retain their latest reason. See
+  [contract and device setup](../../docs/UDP_BROADCAST_RELAY_SPEC.md).
+
 * **mDNS/DNS-SD:** one managed singleton, disabled by default, with same-family
   reflection between 2..32 explicitly eligible, up managed Ethernet/VLAN LANs.
   Allow/deny selection never discovers unmanaged links or includes WAN. IPv4

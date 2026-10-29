@@ -1,0 +1,35 @@
+{
+  "base_revision": 0,
+  "confirm_timeout_seconds": 60,
+  "description": "Synthetic Govee and ECHONET Lite discovery; adapt links and firewall before applying",
+  "config": {
+    "interfaces": [
+      {"name": "lan0", "kind": "ethernet", "role": "lan", "mtu": 1500, "up": true, "addresses": ["192.0.2.1/24"]},
+      {"name": "iot0", "kind": "ethernet", "role": "lan", "mtu": 1500, "up": true, "addresses": ["198.51.100.1/24"]}
+    ],
+    "udp_broadcast_relay": {
+      "enabled": true,
+      "metadata": {"display_name": "IoT discovery"},
+      "instances": [
+        {
+          "id": 1,
+          "enabled": true,
+          "port": 4001,
+          "interfaces": ["lan0", "iot0"],
+          "multicast_address": "239.255.255.250",
+          "source": "original",
+          "metadata": {"display_name": "Govee LAN discovery"}
+        },
+        {
+          "id": 2,
+          "enabled": true,
+          "port": 3610,
+          "interfaces": ["lan0", "iot0"],
+          "multicast_address": "224.0.23.0",
+          "source": "original",
+          "metadata": {"display_name": "ECHONET Lite discovery"}
+        }
+      ]
+    }
+  }
+}

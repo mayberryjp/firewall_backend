@@ -215,6 +215,7 @@ configuration, not a separate annotation endpoint.
 | Input interface policy / rule | `firewall.input.interfaces[].metadata`, `firewall.input.interfaces[].rules[].metadata` |
 | NTP / syslog / vnStat settings | `ntp.metadata`, `syslog.metadata`, `vnstat.metadata` |
 | mDNS settings | `mdns.metadata` |
+| UDP broadcast relay / instance | `udp_broadcast_relay.metadata`, `udp_broadcast_relay.instances[].metadata` |
 | Syslog destination | `syslog.servers[].metadata` |
 | Flow exporter / gateway monitor | `softflowd[].metadata`, `gateway_monitors[].metadata` |
 | Azure Dynamic DNS entry | `dynamic_dns[].metadata` |
@@ -611,6 +612,7 @@ Configuration changes additionally require permissions for every changed area:
 | Gateway monitor configuration | `gateway_monitors.write` |
 | NTP server/client settings | `ntp.write` |
 | mDNS reflection/publishing and metadata | `mdns.write` |
+| UDP broadcast/multicast relay and metadata | `udp_broadcast_relay.write` |
 | BGP ASN, router ID, timers, neighbors and import policy | `bgp.write` |
 | Whole-appliance syslog/remote destinations | `syslog.write` |
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
@@ -632,7 +634,8 @@ when any gateway monitor is enabled. Authorization uses the
 current committed/pending configuration under the engine lock, not the draft.
 
 This shared-service permission rule also includes enabled NTP (`ntp.write`),
-syslog (`syslog.write`), vnStat (`vnstat.write`) and mDNS (`mdns.write`) on **all seven** service repair
+syslog (`syslog.write`), vnStat (`vnstat.write`), mDNS (`mdns.write`) and enabled
+UDP broadcast relay (`udp_broadcast_relay.write`) on all eight service repair
 endpoints. Each new endpoint additionally requires its own service write
 permission even when disabled. See section 6.1.3 for host-wide effects.
 
@@ -670,6 +673,7 @@ characters. Exact supported identifiers:
 | `vnstat-host`, `vnstat-managed` | Selected accounting scope; vnStat enabled |
 | `dhcp-relay` | Shared relay worker; at least one enabled relay |
 | `flow:NAME` | One configured enabled flow exporter |
+| `udp-broadcast-relay:ID` | One configured enabled UDP relay instance; global enable required, canonical decimal ID 1..63 |
 | `gateway:NAME` | One configured enabled explicit gateway monitor |
 | `dhcp-client:INTERFACE` | One configured DHCP client on an up interface |
 | `dhcp-gateway-monitors` | Shared DHCP-derived monitor manager; at least one enabled DHCP-mode monitor |
@@ -1991,7 +1995,12 @@ Publisher and deployment contract:
   namespace lab mode rejects enabled streaming. Host routing/DNS, interface-binding
   privileges, broker reachability and firewall permission are operator prerequisites.
 - Persistent MQTT 3.1.1, keepalive 30 seconds, clean session, five-second connection
-  timeout and five-second reconnect delay. `mqtts` requires system trust and valid
+  timeout and five-second reconnect delay, retried indefinitely while enabled.
+  The TCP connection stays open between samples. Outstanding QoS-1 publications
+  with no acknowledgement progress for 30 seconds also trigger reconnect and
+  fresh discovery/state, not offline sample replay. Existing `reconnecting` status
+  and redacted errors apply; no additional frontend controls are required.
+  `mqtts` requires system trust and valid
   certificate/hostname; no insecure bypass. Explicit `mqtt` is plaintext. Upload
   passwords over protected HTTPS or a trusted management channel.
 - Device discovery at `homeassistant/device/netcontrol_<device_id>/config`;
@@ -2508,6 +2517,99 @@ VLAN/nftables/MLD, Apple/Windows/printer/Avahi interoperability, reference-host
 10k-packet/s performance, reboot or production acceptance. Do not claim exact
 Avahi parity. See [build/acceptance spec](docs/MDNS_SPEC.md) and
 [required handoff](docs/frontend-handoffs/2026-10-25.md#2026-10-25-17-native-mdns-implementation).
+
+### Native IPv4 UDP Broadcast Relay
+
+Provide a single **Services > UDP Broadcast Relay** editor using shared staged
+configuration and confirmed transactions. This is implemented backend behavior,
+not a proposal. Canonical details and prerequisites are in the
+[relay contract](docs/UDP_BROADCAST_RELAY_SPEC.md).
+
+```ts
+type UDPRelaySource = "original" | "interface_address" | "interface_address_and_port";
+interface UDPRelayInstance {
+  id: number;
+  enabled: boolean;
+  port: number;
+  interfaces: string[];
+  multicast_address: string | null;
+  source: UDPRelaySource;
+  metadata?: ObjectMetadata;
+}
+interface UDPBroadcastRelayConfig {
+  enabled: boolean;
+  instances: UDPRelayInstance[];
+  metadata?: ObjectMetadata;
+}
+```
+
+`config.udp_broadcast_relay` is always serialized; default disabled/empty. Each
+instance requires `id`, `enabled`, `port`, `interfaces`. Defaults are null group
+and `original` source. Unknown fields/types are rejected. Validate at most 63
+instances; unique IDs 1..63 and unique ports 1..65535 even when disabled; 2..32
+distinct configured up Ethernet/VLAN links with IPv4 prefix <=30 or DHCP. Global
+enable requires an enabled instance. Do not offer loopback/dummy/WireGuard.
+Optional group must be an IPv4 multicast literal. Backend sorts ID/interface
+sets. Both metadata fields follow shared limits and are operationally inert.
+Enabled listener conflicts with mDNS/5353, DHCP relay/67 and DHCP clients/68
+reject configuration; unrelated port owners appear as runtime retry errors.
+
+Edits, confirmation/rollback and restore require `udp_broadcast_relay.write`
+plus existing transaction/other-resource permissions. Preserve the section in
+all complete-config submissions. Every shared-service reconciliation now needs
+this permission when the relay is enabled. The new
+`POST /api/v1/services/udp-broadcast-relay/reconcile` requires its own permission
+even when disabled, plus `state.read`, `transactions.write` and permissions for
+other enabled shared services. It rejects bodies/queries (`400`) and repairs
+the whole shared service set under existing conflict/drift guards.
+
+| Read | Response |
+| --- | --- |
+| `GET /api/v1/services/udp-broadcast-relay` | Committed `UDPBroadcastRelayConfig` |
+| `GET /api/v1/services/udp-broadcast-relay/status` | Applied `{instances: UDPRelayStatus[], error: string}` |
+
+Both require `state.read`, reject queries (`400`) and use standard `401`/`403`.
+Runtime status includes provisional settings, independently of committed reads.
+There is no per-instance CRUD or separate write endpoint. Use existing
+`POST /api/v1/processes/restart` with `target: "udp-broadcast-relay:ID"` and
+`system.restart` for a selected enabled instance. Missing target is `404`,
+disabled/busy is `409`, native success uses the existing `200` restart envelope.
+
+`UDPRelayStatus` is heterogeneous runtime data: `name: "udp-broadcast-relay"`,
+numeric `instance_id`, `scope: "managed"`, effective `enabled`, configured
+`port/interfaces/multicast_address/source`, `state`, nullable `started_at` and
+`collected_at`, optional current `error`, `last_error`, `retrying` and
+`restart_count`. Per-instance health resources are `udp-broadcast-relay:ID`;
+never key these rows by shared `name` alone. Render eight decimal-string
+counters without conversion to JavaScript number: `received_packets`,
+`transmitted_packets`, `received_bytes`, `transmitted_bytes`, `policy_drops`,
+`loop_drops`, `rate_limit_drops`, `send_errors`. Counts reset per socket attempt;
+bytes are payload bytes and successful transmissions count each outgoing link,
+not remote delivery. Nullable `last_send_error`/`last_send_error_at` retain send
+failures, including MTU errors. `receive_drops: null` and
+`statistics_complete: false` mean unknown kernel loss, not zero. `limits` has
+`interfaces:32`, `payload_bytes:65507`, `packets_per_second:200`, `burst:400`,
+`poll_ms:100`, `shutdown_ms:1000`. Do not show simulated rows as live traffic.
+
+Use compact instance rows and one owning editor. Offer Govee (4001,
+239.255.255.250) and ECHONET Lite (3610, 224.0.23.0) presets that populate a
+draft, allocate an unused ID, retain explicit interface selection and never
+auto-enable/push or create firewall rules. Default both to original source.
+Support enabled toggles, numeric ID/port inputs, interface multi-selection,
+optional group, a named source-mode menu and shared metadata. Show current
+worker error/retrying state without disabling valid editing/confirmation.
+
+Operator prerequisites: allow local input UDP to each configured relay port on
+participating links; allow routed unicast device traffic separately. Govee
+requires LAN Control, IoT-to-controller UDP/4002 replies and controller-to-device
+UDP/4003 commands. ECHONET Lite needs UDP/3610 request/reply routing. There is
+no automatic related allowance, NAT or response proxy. Rewritten source modes
+can break direct replies. Raw output cannot fragment; header+payload must fit
+egress MTU (1472 payload with MTU 1500). The fixed per-instance rate bound is
+200 admitted packets/s, burst 400. Backend requires Linux/CAP_NET_RAW and
+existing host-service opt-in. No IPv6, point-to-point, CARP or SSDP/DIAL proxy
+parity. Physical-device, actual VLAN/Wi-Fi and deployment acceptance remains.
+See [required frontend handoff](docs/frontend-handoffs/2026-10-28.md#2026-10-28-06-native-udp-broadcast-relay).
 
 ### Native IPv4 BGP
 

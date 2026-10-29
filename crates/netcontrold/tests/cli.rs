@@ -160,6 +160,33 @@ fn bgp_candidate_status_routes_and_permissions() {
 }
 
 #[test]
+fn udp_relay_cli_stages_commits_and_resets() {
+    let fixture = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    fixture.configure(&mut cli);
+    fixture.ok(&mut cli, r#"set /interfaces [{"name":"lan0","kind":"ethernet","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]},{"name":"iot0","kind":"ethernet","role":"lan","mtu":1500,"up":true,"addresses":["198.51.100.1/24"]}]"#);
+    fixture.ok(&mut cli, r#"udp-broadcast-relay {"enabled":true,"instances":[{"id":1,"enabled":true,"port":4001,"interfaces":["lan0","iot0"],"multicast_address":"239.255.255.250"}]}"#);
+    fixture.ok(&mut cli, "commit check");
+    fixture.ok(&mut cli, "commit confirmed 30");
+    fixture.ok(&mut cli, "confirm");
+    assert_eq!(
+        fixture.request("/api/v1/services/udp-broadcast-relay")["enabled"],
+        true
+    );
+    let status: Value =
+        serde_json::from_str(&fixture.ok(&mut cli, "show udp-broadcast-relay status")).unwrap();
+    assert_eq!(status["instances"][0]["state"], "simulated");
+    fixture.ok(&mut cli, "configure terminal");
+    fixture.ok(&mut cli, "no udp-broadcast-relay");
+    fixture.ok(&mut cli, "commit confirmed 30");
+    fixture.ok(&mut cli, "confirm");
+    assert_eq!(
+        fixture.request("/api/v1/services/udp-broadcast-relay")["enabled"],
+        false
+    );
+}
+
+#[test]
 fn mdns_candidate_show_status_repair_and_permission() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

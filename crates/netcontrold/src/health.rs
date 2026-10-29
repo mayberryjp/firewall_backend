@@ -95,7 +95,11 @@ impl Monitor {
                         .as_str()
                         .or_else(|| row["interface"].as_str())
                         .unwrap_or(group);
-                    inspect(group, resource, row);
+                    let resource = row["instance_id"]
+                        .as_u64()
+                        .map(|id| format!("{resource}:{id}"))
+                        .unwrap_or_else(|| resource.to_owned());
+                    inspect(group, &resource, row);
                 }
             }
             if runtime["error"]
@@ -249,6 +253,25 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn udp_relay_instances_keep_independent_health_alerts() {
+        let monitor = super::Monitor::default();
+        monitor.observe(Some(&serde_json::json!({"appliance_services":[
+            {"name":"udp-broadcast-relay","instance_id":1,"state":"error","retrying":true,"error":"synthetic bind conflict"},
+            {"name":"udp-broadcast-relay","instance_id":2,"state":"error","retrying":true,"error":"synthetic missing IPv4"}
+        ]})), &[], false);
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot["active_alerts"].as_array().unwrap().len(), 2);
+        assert_ne!(
+            snapshot["process_health"]["components"][0]["id"],
+            snapshot["process_health"]["components"][1]["id"]
+        );
+        assert_eq!(
+            snapshot["process_health"]["components"][0]["resource"],
+            "udp-broadcast-relay:1"
+        );
+    }
+
     #[test]
     fn bgp_worker_health_is_independent_of_neighbor_availability() {
         let monitor = super::Monitor::default();

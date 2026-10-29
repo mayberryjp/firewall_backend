@@ -15,6 +15,7 @@ mod mdns;
 mod ntp;
 mod resolve;
 mod syslog;
+mod udp_broadcast_relay;
 mod worker;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -199,6 +200,7 @@ impl Services {
                 || self.options.allow_host_services
                 || !(c.interfaces.iter().any(|i| i.dhcp_relay.enabled)
                     || c.mdns.enabled
+                    || c.udp_broadcast_relay.enabled
                     || c.softflowd.iter().any(|f| f.enabled)
                     || c.gateway_monitors.iter().any(|g| g.enabled)),
             "managed services without an isolated namespace require explicit allow_host_services opt-in"
@@ -217,6 +219,7 @@ impl Services {
         ensure!(
             !c.ntp.enabled
                 && !c.mdns.enabled
+                && !c.udp_broadcast_relay.enabled
                 && !c.syslog.enabled
                 && !c.vnstat.enabled
                 && !c.interfaces.iter().any(|i| i.dhcp_relay.enabled)
@@ -325,6 +328,20 @@ impl Services {
                     managed.clone(),
                     json!({"name":"dhcp-relay","scope":"managed"}),
                     move || dhcp::prepare(relays.clone()),
+                )?;
+            }
+            for instance in c
+                .udp_broadcast_relay
+                .instances
+                .iter()
+                .filter(|instance| c.udp_broadcast_relay.enabled && instance.enabled)
+            {
+                let config = instance.clone();
+                self.insert(
+                    &format!("udp-broadcast-relay:{}", instance.id),
+                    managed.clone(),
+                    instance.status(true, "starting"),
+                    move || udp_broadcast_relay::prepare(config.clone()),
                 )?;
             }
             for f in c.softflowd.iter().filter(|f| f.enabled) {
@@ -443,6 +460,23 @@ impl Services {
                 )
             })
             .collect();
+        for instance in &c.udp_broadcast_relay.instances {
+            appliance.push(
+                self.workers
+                    .get(&format!("udp-broadcast-relay:{}", instance.id))
+                    .map(Worker::snapshot)
+                    .unwrap_or_else(|| {
+                        instance.status(
+                            c.udp_broadcast_relay.enabled && instance.enabled,
+                            if c.udp_broadcast_relay.enabled && instance.enabled {
+                                "stopped"
+                            } else {
+                                "disabled"
+                            },
+                        )
+                    }),
+            );
+        }
         let flows: Vec<_> = c
             .softflowd
             .iter()
@@ -580,6 +614,13 @@ fn expected_workers(c: &Config) -> BTreeSet<String> {
     if c.mdns.enabled {
         keys.insert("mdns".to_owned());
     }
+    keys.extend(
+        c.udp_broadcast_relay
+            .instances
+            .iter()
+            .filter(|instance| c.udp_broadcast_relay.enabled && instance.enabled)
+            .map(|instance| format!("udp-broadcast-relay:{}", instance.id)),
+    );
     if c.ntp.enabled {
         keys.insert("ntp".to_owned());
     }

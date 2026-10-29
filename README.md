@@ -26,6 +26,14 @@ softflowd, syslog-ng, or vnstatd. The operating system's service manager starts
 the single daemon; it is not a protocol implementation. Native syslog requires
 systemd/journald socket activation; it is unavailable under OpenRC.
 
+Native [IPv4 UDP broadcast/multicast relay](docs/UDP_BROADCAST_RELAY_SPEC.md)
+implements the documented pfSense package's selected-interface forwarding,
+multicast membership, three source modes and instance-ID echo suppression.
+Use the [Govee/ECHONET Lite example](examples/udp-broadcast-relay.json), adapting
+its synthetic interfaces, addresses, revision and firewall policy. Govee LAN
+Control must be enabled; discovery does not grant routed device access. This
+runs inside Netcontrol with automatic reconnect/retry, not an external package.
+
 Backward compatibility is not a constraint. Invalid or unsupported
 configuration must produce explicit errors rather than permissive defaults or
 successful no-op operations. Existing on-device data must never be deleted to
@@ -289,6 +297,10 @@ sensor is unknown while package metadata remains the unreleased placeholder
 `0.0.0`. MQTT is telemetry-only. Linux host mode is required; simulator makes no
 connection and namespace lab mode rejects enabled streaming. Binding fails closed;
 hostname resolution still uses the host resolver, not the selected interface.
+The connection stays open between samples and retries failures every five seconds
+while enabled. If outstanding QoS-1 publications make no acknowledgement progress
+for 30 seconds, the publisher reconnects and sends fresh discovery/state; it does
+not replay an offline sample backlog.
 
 Prefer `mqtts://` (port 8883), with a system-trusted certificate and matching
 hostname. Explicit `mqtt://` (1883) sends credentials/data without TLS. Endpoint

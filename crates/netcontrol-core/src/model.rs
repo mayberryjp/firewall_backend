@@ -22,6 +22,7 @@ pub struct Config {
     pub syslog: SyslogConfig,
     pub vnstat: VNStatConfig,
     pub mdns: crate::MDNSConfig,
+    pub udp_broadcast_relay: crate::UDPBroadcastRelayConfig,
     pub bgp: crate::BGPConfig,
     pub mqtt: MQTTConfig,
     pub system: SystemConfig,
@@ -49,6 +50,7 @@ impl Default for Config {
             syslog: Default::default(),
             vnstat: Default::default(),
             mdns: Default::default(),
+            udp_broadcast_relay: Default::default(),
             bgp: Default::default(),
             mqtt: Default::default(),
             system: Default::default(),
@@ -750,6 +752,13 @@ impl Config {
         values.extend(self.softflowd.iter().map(|exporter| &exporter.metadata));
         values.extend(self.dynamic_dns.iter().map(|entry| &entry.metadata));
         values.push(&self.mdns.metadata);
+        values.push(&self.udp_broadcast_relay.metadata);
+        values.extend(
+            self.udp_broadcast_relay
+                .instances
+                .iter()
+                .map(|instance| &instance.metadata),
+        );
         values.extend(
             self.gateway_monitors
                 .iter()
@@ -811,6 +820,7 @@ impl Config {
     pub fn normalize(&mut self) {
         self.bgp.neighbors.sort_by(|a, b| a.name.cmp(&b.name));
         self.mdns.normalize();
+        self.udp_broadcast_relay.normalize();
         self.dynamic_dns.sort_by(|a, b| a.name.cmp(&b.name));
         self.ntp.servers.sort();
         self.syslog
@@ -872,6 +882,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.bgp.validate(self)?;
         self.mdns.validate(self)?;
+        self.udp_broadcast_relay.validate(self)?;
         crate::dynamic_dns::validate(self)?;
         self.system.validate()?;
         let mqtt = &self.mqtt;

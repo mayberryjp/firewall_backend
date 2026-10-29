@@ -448,6 +448,7 @@ impl Manager {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut connected = false;
         let mut pending = 0usize;
+        let mut acknowledgement_deadline = None;
         let mut batch_has_state = false;
         let mut manifest = None::<BTreeSet<String>>;
         let mut previous_discovery = None::<Value>;
@@ -463,6 +464,9 @@ impl Manager {
                 {
                     break;
                 }
+                if pending == 0 {
+                    acknowledgement_deadline = Some(Instant::now() + Duration::from_secs(30));
+                }
                 pending += 1;
                 queue.pop_front();
             }
@@ -473,6 +477,7 @@ impl Manager {
                     if let Ok(engine) = self.engine.try_lock() {
                         if engine.saved_configuration().mqtt != config { break; }
                     }
+                    ensure!(acknowledgement_deadline.is_none_or(|deadline| Instant::now() < deadline), "MQTT publication acknowledgement timed out");
                     if connected && collecting.is_none() && pending == 0 && queue.is_empty() && Instant::now() >= next_sample {
                         let manager = self.clone();
                         let settings = config.clone();
@@ -532,6 +537,7 @@ impl Manager {
                     }
                     Event::Incoming(Packet::PubAck(_)) => {
                         pending = pending.saturating_sub(1);
+                        acknowledgement_deadline = (pending > 0).then(|| Instant::now() + Duration::from_secs(30));
                         if pending == 0 && queue.is_empty() && batch_has_state {
                             if let Some(keys) = manifest.take() {
                                 self.secrets.lock().map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?.save_components(&keys)?;
@@ -1194,7 +1200,7 @@ mod tests {
         use bytes::BytesMut;
         use rumqttc::{ConnAck, ConnectReturnCode, PubAck, Publish, SubAck, SubscribeReasonCode};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for connection in 1..=2 {
+        for connection in 1..=3 {
             let (mut stream, peer) = listener.accept().await?;
             ensure!(
                 peer.ip().to_string() == "198.18.0.1",
@@ -1252,7 +1258,7 @@ mod tests {
                                     publication.payload.to_vec(),
                                 ))
                                 .await?;
-                            if publication.qos == QoS::AtLeastOnce {
+                            if publication.qos == QoS::AtLeastOnce && connection != 2 {
                                 PubAck::new(publication.pkid).write(&mut output)?;
                             }
                             if state {
@@ -1342,9 +1348,16 @@ mod tests {
                 let broker = tokio::spawn(broker_fixture(listener, messages));
                 let mut connections = Vec::new();
                 let mut host_discovered = false;
-                tokio::time::timeout(Duration::from_secs(25), async {
-                    while connections.len() < 3 {
-                        let (connection, topic, payload) = receive.recv().await.context("MQTT broker fixture stopped")?;
+                let mut health_interval = tokio::time::interval(Duration::from_secs(5));
+                tokio::time::timeout(Duration::from_secs(65), async {
+                    while connections.len() < 4 {
+                        let (connection, topic, payload) = tokio::select! {
+                            message = receive.recv() => message.context("MQTT broker fixture stopped")?,
+                            _ = health_interval.tick() => {
+                                manager.health.observe(Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})), &[], false);
+                                continue;
+                            }
+                        };
                         if topic.ends_with("/config") {
                             let value: Value = serde_json::from_slice(&payload)?;
                             let components = &value["components"];
@@ -1362,7 +1375,7 @@ mod tests {
                     Ok::<(), anyhow::Error>(())
                 }).await.with_context(|| format!("MQTT sample sequence incomplete: status={}, connections={connections:?}, broker_finished={}", manager.status().unwrap(), broker.is_finished()))??;
                 ensure!(host_discovered, "host sensors missing from discovery");
-                ensure!(connections == [1, 1, 2], "MQTT connection was not persistent or failed to reconnect");
+                ensure!(connections == [1, 1, 2, 3], "MQTT connection was not persistent or failed to reconnect after disconnect/acknowledgement timeout");
                 config.mqtt.enabled = false;
                 let transaction = submit(&config, 1);
                 ensure!(transaction.status == 202 && confirm(transaction.body["id"].as_str().unwrap()).status == 200, "MQTT disable failed");

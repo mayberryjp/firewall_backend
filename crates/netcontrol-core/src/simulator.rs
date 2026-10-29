@@ -170,6 +170,11 @@ impl Backend for Simulator {
             },
         ));
         let bgp = self.bgp_status(config)?;
+        for instance in &config.udp_broadcast_relay.instances {
+            let enabled = config.udp_broadcast_relay.enabled && instance.enabled;
+            appliance
+                .push(instance.status(enabled, if enabled { "simulated" } else { "disabled" }));
+        }
         appliance.push(bgp.clone());
         Ok(
             json!({"bgp":bgp,"appliance_services":appliance,"gateway_monitors":gateway_samples(config),"dhcp_relay":relays,"parent_interfaces":[],"softflowd":softflowd,

@@ -159,6 +159,7 @@ fn recovery_hold() -> u64 {
 #[serde(default)]
 pub(crate) struct Config {
     pub mdns: netcontrol_core::MDNSConfig,
+    pub udp_broadcast_relay: netcontrol_core::UDPBroadcastRelayConfig,
     #[serde(skip)]
     pub mdns_interfaces: Vec<String>,
     #[serde(skip)]
@@ -176,6 +177,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mdns: Default::default(),
+            udp_broadcast_relay: Default::default(),
             mdns_interfaces: Vec::new(),
             mdns_status: Value::Null,
             ipv6_enabled: true,
@@ -292,6 +294,11 @@ impl Config {
     pub(crate) fn parse(v: &Value) -> Result<Self> {
         ensure!(v.is_object(), "service configuration must be an object");
         let mut c: Self = serde_json::from_value(v.clone()).context("service configuration")?;
+        if v.get("udp_broadcast_relay").is_some() {
+            let config: netcontrol_core::Config =
+                serde_json::from_value(v.clone()).context("UDP relay operational configuration")?;
+            c.udp_broadcast_relay.validate(&config)?;
+        }
         if v.get("mdns").is_some() {
             let config: netcontrol_core::Config = serde_json::from_value(serde_json::json!({
                 "mdns":v["mdns"], "interfaces":v.get("interfaces").cloned().unwrap_or_else(||serde_json::json!([])),

@@ -318,6 +318,8 @@ show candidate-config
 compare
 show state
 show runtime
+show udp-broadcast-relay
+show udp-broadcast-relay status
 show interfaces
 show interfaces discovered
 show routes
@@ -333,7 +335,15 @@ show revisions
 show revision NUMBER
 restore revision NUMBER confirmed 60 DESCRIPTION
 reconcile services ntp
+reconcile services udp-broadcast-relay
 ```
+
+UDP relay candidate editing uses `udp-broadcast-relay JSON` and
+`no udp-broadcast-relay`, then the normal commit-check/confirmed-commit workflow.
+Changes require `udp_broadcast_relay.write` plus transaction and other changed
+resource permissions. See the [synthetic Govee/ECHONET example](../examples/udp-broadcast-relay.json)
+and [relay contract](UDP_BROADCAST_RELAY_SPEC.md) for schema, firewall and route
+prerequisites. Service repair is shared, not a per-instance restart.
 
 `show running-config` reads the committed revision archive without requiring
 healthy live observation. `show state`/resource views retain observation errors;

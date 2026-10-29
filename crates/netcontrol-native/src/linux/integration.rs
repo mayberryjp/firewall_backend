@@ -80,6 +80,476 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and raw sockets"]
+fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::{
+        net::{Ipv4Addr, SocketAddr, UdpSocket},
+        time::{Duration, Instant},
+    };
+    let router = Fixture::new()?;
+    let controller = Fixture::new()?;
+    let device = Fixture::new()?;
+    let outsider = Fixture::new()?;
+    let router_ns = Arc::new(File::open(&router.namespace)?);
+    let controller_ns = Arc::new(File::open(&controller.namespace)?);
+    let device_ns = Arc::new(File::open(&device.namespace)?);
+    let outsider_ns = Arc::new(File::open(&outsider.namespace)?);
+    for (name, peer, namespace, address, gateway) in [
+        (
+            "lan0",
+            "client0",
+            controller_ns.clone(),
+            "192.0.2.2",
+            "192.0.2.1",
+        ),
+        (
+            "iot0",
+            "device0",
+            device_ns.clone(),
+            "198.51.100.2",
+            "198.51.100.1",
+        ),
+        (
+            "other0",
+            "outside0",
+            outsider_ns.clone(),
+            "203.0.113.2",
+            "203.0.113.1",
+        ),
+    ] {
+        let target = namespace.clone();
+        session(router_ns.clone(), move |runtime, handle| {
+            runtime.block_on(async {
+                handle
+                    .link()
+                    .add()
+                    .veth(name.into(), peer.into())
+                    .execute()
+                    .await?;
+                let link = handle
+                    .link()
+                    .get()
+                    .match_name(peer.into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("relay peer missing")?;
+                handle
+                    .link()
+                    .set(link.header.index)
+                    .setns_by_fd(target.as_raw_fd())
+                    .execute()
+                    .await?;
+                Ok(())
+            })
+        })?;
+        session(namespace, move |runtime, handle| {
+            runtime.block_on(async {
+                let link = handle
+                    .link()
+                    .get()
+                    .match_name(peer.into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("relay peer missing")?;
+                handle
+                    .address()
+                    .add(link.header.index, address.parse()?, 24)
+                    .execute()
+                    .await?;
+                handle.link().set(link.header.index).up().execute().await?;
+                handle
+                    .route()
+                    .add()
+                    .v4()
+                    .destination_prefix("0.0.0.0".parse()?, 0)
+                    .gateway(gateway.parse()?)
+                    .output_interface(link.header.index)
+                    .execute()
+                    .await?;
+                Ok(())
+            })
+        })?;
+    }
+    let options = router.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let physical = config(json!({"interfaces":[
+        {"name":"lan0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["192.0.2.1/24"]},
+        {"name":"iot0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["198.51.100.1/24"]},
+        {"name":"other0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["203.0.113.1/24"]}
+    ]}))?;
+    native.apply(&empty, &physical)?;
+    session(router_ns.clone(), |_, _| {
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+        Ok(())
+    })?;
+    let group = Ipv4Addr::new(239, 255, 255, 250);
+    let echonet = Ipv4Addr::new(224, 0, 23, 0);
+    let make_socket =
+        |namespace: Arc<File>, address: &'static str, port: u16, group: Option<Ipv4Addr>| {
+            session(namespace, move |_, _| {
+                let socket =
+                    UdpSocket::bind((if group.is_some() { "0.0.0.0" } else { address }, port))?;
+                socket.set_read_timeout(Some(Duration::from_millis(350)))?;
+                socket.set_broadcast(true)?;
+                if let Some(group) = group {
+                    socket.join_multicast_v4(&group, &address.parse()?)?;
+                }
+                let interface = u32::from_ne_bytes(address.parse::<Ipv4Addr>()?.octets());
+                ensure!(
+                    unsafe {
+                        libc::setsockopt(
+                            socket.as_raw_fd(),
+                            libc::IPPROTO_IP,
+                            libc::IP_MULTICAST_IF,
+                            (&interface as *const u32).cast(),
+                            4,
+                        )
+                    } == 0,
+                    "fixture multicast interface failed"
+                );
+                socket.set_multicast_ttl_v4(1)?;
+                Ok(socket)
+            })
+        };
+    let client = make_socket(controller_ns.clone(), "192.0.2.2", 4002, None)?;
+    let target = make_socket(device_ns.clone(), "198.51.100.2", 4001, Some(group))?;
+    let captured = session(device_ns.clone(), |_, _| {
+        let descriptor = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_UDP,
+            )
+        };
+        ensure!(
+            descriptor >= 0,
+            "open fixture UDP capture: {}",
+            std::io::Error::last_os_error()
+        );
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let timeout = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        ensure!(
+            unsafe {
+                libc::setsockopt(
+                    descriptor.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&timeout as *const libc::timeval).cast(),
+                    std::mem::size_of_val(&timeout) as _,
+                )
+            } == 0,
+            "capture timeout"
+        );
+        Ok(descriptor)
+    })?;
+    let echonet_target = make_socket(device_ns.clone(), "198.51.100.2", 3610, Some(echonet))?;
+    let outside = make_socket(outsider_ns, "203.0.113.2", 4002, None)?;
+    let mut desired = physical.clone();
+    desired.udp_broadcast_relay = serde_json::from_value(json!({"enabled":true,"instances":[
+        {"id":1,"enabled":true,"port":4001,"interfaces":["lan0","iot0"],"multicast_address":"239.255.255.250"},
+        {"id":2,"enabled":true,"port":3610,"interfaces":["lan0","iot0"],"multicast_address":"224.0.23.0"}]}))?;
+    desired.validate()?;
+    native.apply(&physical, &desired)?;
+    let wait_running = |native: &mut Native, desired: &Config| -> Result<()> {
+        let started = Instant::now();
+        loop {
+            let status = native.runtime(desired)?;
+            let rows: Vec<_> = status["appliance_services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["name"] == "udp-broadcast-relay")
+                .collect();
+            if rows.len() == 2 && rows.iter().all(|row| row["state"] == "running") {
+                return Ok(());
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(8),
+                "relay supervisors failed to recover: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_running(&mut native, &desired)?;
+    let scan = br#"{"msg":{"cmd":"scan","data":{"account_topic":"reserve"}}}"#;
+    let mut buffer = [0; 2048];
+    for destination in [
+        "239.255.255.250:4001",
+        "255.255.255.255:4001",
+        "192.0.2.255:4001",
+    ] {
+        client.send_to(scan, destination)?;
+        let (length, source) = target
+            .recv_from(&mut buffer)
+            .context("Govee discovery was not relayed")?;
+        ensure!(
+            source == "192.0.2.2:4002".parse::<SocketAddr>()? && &buffer[..length] == scan,
+            "relay changed original source or payload: {source}"
+        );
+        let mut wire = [0; 2048];
+        let length = unsafe {
+            libc::recv(
+                captured.as_raw_fd(),
+                wire.as_mut_ptr().cast(),
+                wire.len(),
+                0,
+            )
+        };
+        ensure!(
+            length == (28 + scan.len()) as isize
+                && wire[0] == 0x45
+                && wire[1] >> 2 == 1
+                && &wire[28..length as usize] == scan,
+            "forwarded IPv4 DSCP/header/payload mismatch"
+        );
+        let expected = if destination.starts_with("239.") {
+            [239, 255, 255, 250]
+        } else {
+            [198, 51, 100, 255]
+        };
+        ensure!(
+            wire[16..20] == expected,
+            "broadcast destination was not rewritten"
+        );
+        if destination.starts_with("239.") {
+            ensure!(wire[8] == 1, "multicast TTL was changed");
+        }
+        ensure!(
+            target.recv_from(&mut buffer).is_err(),
+            "discovery echoed repeatedly"
+        );
+    }
+    target.send_to(b"synthetic govee response", "192.0.2.2:4002")?;
+    let (length, source) = client.recv_from(&mut buffer)?;
+    ensure!(
+        source.ip().to_string() == "198.51.100.2"
+            && &buffer[..length] == b"synthetic govee response",
+        "Govee routed reply failed"
+    );
+    let echonet_request = [
+        0x10, 0x81, 0, 1, 0x05, 0xff, 1, 0x0e, 0xf0, 1, 0x62, 1, 0xd6, 0,
+    ];
+    client.send_to(&echonet_request, (echonet, 3610))?;
+    let (length, source) = echonet_target.recv_from(&mut buffer)?;
+    ensure!(
+        source.ip().to_string() == "192.0.2.2" && buffer[..length] == echonet_request,
+        "ECHONET discovery changed"
+    );
+    client.send_to(b"unicast must not relay", "192.0.2.1:4001")?;
+    outside.send_to(b"unselected interface", "203.0.113.255:4001")?;
+    ensure!(
+        target.recv_from(&mut buffer).is_err(),
+        "unicast/unselected ingress relayed"
+    );
+    let tag = 4i32;
+    ensure!(
+        unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                (&tag as *const i32).cast(),
+                4,
+            )
+        } == 0,
+        "set fixture DSCP"
+    );
+    client.send_to(b"tagged echo", (group, 4001))?;
+    ensure!(
+        target.recv_from(&mut buffer).is_err(),
+        "instance DSCP echo was relayed"
+    );
+    let tag = 0i32;
+    ensure!(
+        unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                (&tag as *const i32).cast(),
+                4,
+            )
+        } == 0,
+        "clear fixture DSCP"
+    );
+    for source in [
+        netcontrol_core::UDPRelaySource::InterfaceAddress,
+        netcontrol_core::UDPRelaySource::InterfaceAddressAndPort,
+    ] {
+        let before = desired.clone();
+        desired.udp_broadcast_relay.instances[0].source = source;
+        native.apply(&before, &desired)?;
+        wait_running(&mut native, &desired)?;
+        client.send_to(scan, (group, 4001))?;
+        let (_, peer) = target.recv_from(&mut buffer)?;
+        ensure!(
+            peer.ip().to_string() == "198.51.100.1"
+                && peer.port()
+                    == if source == netcontrol_core::UDPRelaySource::InterfaceAddressAndPort {
+                        4001
+                    } else {
+                        4002
+                    },
+            "source rewrite mode failed: {peer}"
+        );
+    }
+    let before = desired.clone();
+    desired.udp_broadcast_relay.instances[0].source = netcontrol_core::UDPRelaySource::Original;
+    native.apply(&before, &desired)?;
+    wait_running(&mut native, &desired)?;
+    native.restart_process(&desired, "udp-broadcast-relay:1")?;
+    wait_running(&mut native, &desired)?;
+    session(router_ns.clone(), |runtime, handle| {
+        runtime.block_on(async {
+            let link = handle
+                .link()
+                .get()
+                .match_name("iot0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("iot0 missing")?;
+            handle
+                .link()
+                .set(link.header.index)
+                .down()
+                .execute()
+                .await?;
+            Ok(())
+        })
+    })?;
+    let started = Instant::now();
+    loop {
+        let status = native.runtime(&desired)?;
+        if status["appliance_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == "udp-broadcast-relay" && row["retrying"] == true)
+        {
+            break;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(3),
+            "relay link failure was not observable"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    session(router_ns.clone(), |runtime, handle| {
+        runtime.block_on(async {
+            let link = handle
+                .link()
+                .get()
+                .match_name("iot0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("iot0 missing")?;
+            handle.link().set(link.header.index).up().execute().await?;
+            Ok(())
+        })
+    })?;
+    wait_running(&mut native, &desired)?;
+    client.send_to(scan, (group, 4001))?;
+    target.recv_from(&mut buffer)?;
+    let mut blocked = desired.clone();
+    blocked.firewall.input = Some(serde_json::from_value(
+        json!({"policy":"drop","interfaces":[]}),
+    )?);
+    native.apply(&desired, &blocked)?;
+    wait_running(&mut native, &blocked)?;
+    client.send_to(scan, (group, 4001))?;
+    ensure!(
+        target.recv_from(&mut buffer).is_err(),
+        "relay bypassed host-input firewall"
+    );
+    native.apply(&blocked, &desired)?;
+    wait_running(&mut native, &desired)?;
+    client.send_to(&[0x5a; 2000], (group, 4001))?;
+    ensure!(
+        target.recv_from(&mut buffer).is_err(),
+        "oversized raw send unexpectedly fragmented"
+    );
+    let status = native.runtime(&desired)?;
+    let row = status["appliance_services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "udp-broadcast-relay" && row["instance_id"] == 1)
+        .context("relay status missing")?;
+    ensure!(
+        row["state"] == "running"
+            && row["send_errors"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|count| count > 0)
+            && row["last_send_error"].is_string(),
+        "MTU send failure was hidden: {row}"
+    );
+    native.apply(&desired, &physical)?;
+    client.send_to(scan, (group, 4001))?;
+    ensure!(
+        target.recv_from(&mut buffer).is_err(),
+        "disabled relay still forwards"
+    );
+    let occupied = session(router_ns.clone(), |_, _| {
+        Ok(UdpSocket::bind("0.0.0.0:4001")?)
+    })?;
+    native.apply(&physical, &desired)?;
+    let started = Instant::now();
+    loop {
+        let status = native.runtime(&desired)?;
+        if status["appliance_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["instance_id"] == 1 && row["retrying"] == true)
+        {
+            break;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(3),
+            "port conflict not observable"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(occupied);
+    wait_running(&mut native, &desired)?;
+    client.send_to(scan, (group, 4001))?;
+    target.recv_from(&mut buffer)?;
+    let stopped = Instant::now();
+    native.services.shutdown()?;
+    ensure!(
+        stopped.elapsed() < Duration::from_secs(1),
+        "relay supervisors did not join promptly"
+    );
+    drop(native);
+    let mut reopened = Native::open(options)?;
+    reopened.repair(&desired)?;
+    wait_running(&mut reopened, &desired)?;
+    client.send_to(scan, (group, 4001))?;
+    target.recv_from(&mut buffer)?;
+    reopened.apply(&desired, &physical)?;
+    client.send_to(scan, (group, 4001))?;
+    ensure!(
+        target.recv_from(&mut buffer).is_err(),
+        "rollback did not stop relay"
+    );
+    reopened.apply(&physical, &empty)?;
+    drop(reopened);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, isolated namespaces/net_admin, forwarding and nft FIB/NAT"]
 fn native_destination_rewrite_packets_filtering_restart_and_rollback() -> Result<()> {
     use futures_util::TryStreamExt;

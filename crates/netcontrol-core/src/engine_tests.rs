@@ -65,6 +65,98 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
 }
 
 #[test]
+fn udp_relay_api_authorization_persistence_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut candidate = config();
+    candidate.interfaces[0].kind = "ethernet".into();
+    let mut second = candidate.interfaces[0].clone();
+    second.name = "iot0".into();
+    second.addresses = vec!["198.51.100.1/24".into()];
+    candidate.interfaces.push(second);
+    candidate.udp_broadcast_relay = serde_json::from_value(json!({"enabled":true,"instances":[{"id":1,"enabled":true,"port":4001,"interfaces":["lan0","iot0"],"multicast_address":"239.255.255.250"}]})).unwrap();
+    let mut permissions = all();
+    permissions.retain(|permission| permission != "udp_broadcast_relay.write");
+    let forbidden = engine.request(
+        "POST",
+        "/api/v1/transactions",
+        "",
+        "operator",
+        &permissions,
+        &serde_json::to_vec(
+            &json!({"base_revision":0,"confirm_timeout_seconds":30,"config":candidate}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(forbidden.status, 403);
+    let transaction = submit(&mut engine, candidate.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    let id = transaction.body["id"].as_str().unwrap();
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    let status = request(
+        &mut engine,
+        "GET",
+        "/api/v1/services/udp-broadcast-relay/status",
+        Value::Null,
+    );
+    assert_eq!(status.status, 200);
+    assert_eq!(status.body["instances"][0]["state"], "simulated");
+    assert_eq!(status.body["instances"][0]["port"], 4001);
+    assert_eq!(
+        request(
+            &mut engine,
+            "GET",
+            "/api/v1/services/udp-broadcast-relay",
+            Value::Null
+        )
+        .body["enabled"],
+        true
+    );
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/services/udp-broadcast-relay/status",
+                "extra=1",
+                "operator",
+                &all(),
+                &[]
+            )
+            .status,
+        400
+    );
+    let mut disabled = candidate.clone();
+    disabled.udp_broadcast_relay.enabled = false;
+    let transaction = submit(&mut engine, disabled);
+    assert_eq!(transaction.status, 202);
+    let id = transaction.body["id"].as_str().unwrap();
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert!(engine.saved_configuration().udp_broadcast_relay.enabled);
+    drop(engine);
+    let mut reopened = fixture.engine();
+    assert!(reopened.saved_configuration().udp_broadcast_relay.enabled);
+    assert_eq!(
+        request(
+            &mut reopened,
+            "GET",
+            "/api/v1/services/udp-broadcast-relay",
+            Value::Null
+        )
+        .body["instances"][0]["id"],
+        1
+    );
+}
+
+#[test]
 fn bgp_api_permissions_transactions_restart_and_route_visibility() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

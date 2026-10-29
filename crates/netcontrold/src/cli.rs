@@ -43,6 +43,9 @@ Configuration commands:
   ntp server HOST / no ntp server HOST / ntp enable|disable
   mdns JSON / no mdns                 Replace/reset native discovery candidate
   show mdns / show mdns status        Committed settings / applied worker
+    udp-broadcast-relay JSON            Replace UDP relay candidate
+    no udp-broadcast-relay              Reset UDP relay candidate
+    show udp-broadcast-relay [status]   Committed settings / applied instances
   bgp JSON / no bgp                   Replace/reset BGP candidate
   show bgp / show bgp status          Committed BGP settings / neighbor status
   show routes bgp                    BGP learned paths and installation status
@@ -307,6 +310,7 @@ impl CliSession {
                             | "gateway-monitoring"
                             | "ntp"
                             | "mdns"
+                            | "udp-broadcast-relay"
                             | "syslog"
                             | "vnstat"
                     ),
@@ -493,6 +497,10 @@ impl CliSession {
             ["state"] => "/api/v1/state".to_owned(),
             ["runtime"] => "/api/v1/runtime".to_owned(),
             ["mdns"] => "/api/v1/services/mdns".to_owned(),
+            ["udp-broadcast-relay"] => "/api/v1/services/udp-broadcast-relay".to_owned(),
+            ["udp-broadcast-relay", "status"] => {
+                "/api/v1/services/udp-broadcast-relay/status".to_owned()
+            }
             ["bgp"] => "/api/v1/services/bgp".to_owned(),
             ["bgp", "status"] => "/api/v1/services/bgp/status".to_owned(),
             ["routes", "bgp"] => "/api/v1/routes/bgp".to_owned(),
@@ -817,6 +825,16 @@ fn check_family(family: &str, prefix: &str) -> Result<()> {
 
 fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
     match words {
+        ["udp-broadcast-relay", ..] => {
+            let relay: netcontrol_core::UDPBroadcastRelayConfig = serde_json::from_str(
+                command_input(line, "udp-broadcast-relay").context("UDP relay JSON required")?,
+            )?;
+            config["udp_broadcast_relay"] = serde_json::to_value(relay)?;
+        }
+        ["no", "udp-broadcast-relay"] => {
+            config["udp_broadcast_relay"] =
+                serde_json::to_value(netcontrol_core::UDPBroadcastRelayConfig::default())?
+        }
         ["bgp", ..] => {
             let bgp: netcontrol_core::BGPConfig =
                 serde_json::from_str(command_input(line, "bgp").context("BGP JSON required")?)?;

@@ -22,6 +22,7 @@ pub const PERMISSIONS: &[&str] = &[
     "gateway_monitors.write",
     "ntp.write",
     "mdns.write",
+    "udp_broadcast_relay.write",
     "bgp.write",
     "syslog.write",
     "vnstat.write",
@@ -226,6 +227,10 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ),
         ("ntp.write", a.ntp != b.ntp),
         ("mdns.write", a.mdns != b.mdns),
+        (
+            "udp_broadcast_relay.write",
+            a.udp_broadcast_relay != b.udp_broadcast_relay,
+        ),
         ("bgp.write", a.bgp != b.bgp),
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
@@ -726,7 +731,9 @@ impl Engine {
             .strip_prefix("/api/v1/services/")
             .and_then(|p| p.strip_suffix("/reconcile"))
         {
-            if service == "mdns" && (!query.is_empty() || !body.is_empty()) {
+            if ["mdns", "udp-broadcast-relay"].contains(&service)
+                && (!query.is_empty() || !body.is_empty())
+            {
                 return Err(ApiError::new(
                     400,
                     "service repair does not accept query parameters or a body",
@@ -734,6 +741,7 @@ impl Engine {
             }
             let permission = match service {
                 "mdns" => "mdns.write",
+                "udp-broadcast-relay" => "udp_broadcast_relay.write",
                 "softflowd" => "softflowd.write",
                 "dhcp-relay" => "interfaces.write",
                 "gateway-monitoring" => "gateway_monitors.write",
@@ -747,6 +755,10 @@ impl Engine {
             let expected = self.expected();
             for (p, enabled) in [
                 ("mdns.write", expected.mdns.enabled),
+                (
+                    "udp_broadcast_relay.write",
+                    expected.udp_broadcast_relay.enabled,
+                ),
                 ("bgp.write", expected.bgp.enabled),
                 ("ntp.write", expected.ntp.enabled),
                 ("syslog.write", expected.syslog.enabled),
@@ -850,6 +862,12 @@ impl Engine {
                     .any(|m| m.enabled && m.mode == crate::GatewayMode::Dhcp),
             ),
             "link-diagnostics" => Some(true),
+            _ if target.starts_with("udp-broadcast-relay:") => c
+                .udp_broadcast_relay
+                .instances
+                .iter()
+                .find(|instance| target == format!("udp-broadcast-relay:{}", instance.id))
+                .map(|instance| c.udp_broadcast_relay.enabled && instance.enabled),
             _ if target.starts_with("flow:") => c
                 .softflowd
                 .iter()
@@ -1382,6 +1400,12 @@ impl Engine {
         let service_status = path
             .strip_prefix("/api/v1/services/")
             .and_then(|s| s.strip_suffix("/status"));
+        if service_status == Some("udp-broadcast-relay") && !query.is_empty() {
+            return Err(ApiError::new(
+                400,
+                "UDP relay status does not accept query parameters",
+            ));
+        }
         if path == "/api/v1/runtime"
             || path == "/api/v1/parent-interfaces"
             || service_status.is_some()
@@ -1390,6 +1414,7 @@ impl Engine {
                 ![
                     "ntp",
                     "mdns",
+                    "udp-broadcast-relay",
                     "syslog",
                     "vnstat",
                     "softflowd",
@@ -1433,6 +1458,15 @@ impl Engine {
                 }
                 _ => Err(ApiError::new(404, "endpoint not found")),
             };
+        }
+        if path == "/api/v1/services/udp-broadcast-relay" {
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "UDP relay configuration does not accept query parameters",
+                ));
+            }
+            return value(&self.state.desired.udp_broadcast_relay);
         }
         if path == "/api/v1/services/mdns" {
             if !query.is_empty() {

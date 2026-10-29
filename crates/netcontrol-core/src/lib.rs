@@ -9,6 +9,9 @@ mod mdns;
 mod model;
 mod simulator;
 mod store;
+mod udp_broadcast_relay;
+
+pub use udp_broadcast_relay::{UDPBroadcastRelayConfig, UDPRelayInstance, UDPRelaySource};
 
 pub use dynamic_dns::{DynamicDNSAddressSource, DynamicDNSConfig};
 pub use engine::{Engine, PERMISSIONS, Reply, TimezoneCheck, Transaction, validate_offline_state};

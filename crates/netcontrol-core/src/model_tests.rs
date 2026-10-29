@@ -1148,6 +1148,7 @@ fn all_current_example_feature_schemas_validate() {
         include_str!("../../../examples/kernel-mixed-conservative.json"),
         include_str!("../../../examples/migration.json"),
         include_str!("../../../examples/mdns.json"),
+        include_str!("../../../examples/udp-broadcast-relay.json"),
         include_str!("../../../examples/vlan-softflowd.json"),
     ] {
         let v: Value = serde_json::from_str(raw).unwrap();
