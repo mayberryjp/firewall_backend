@@ -163,7 +163,7 @@ mod native {
         message.msg_iov = &mut vector;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = mem::size_of_val(&control);
+        message.msg_controllen = mem::size_of_val(&control) as _;
         let length =
             unsafe { libc::recvmsg(descriptor.as_raw_fd(), &mut message, libc::MSG_TRUNC) };
         if length < 0 {
@@ -192,9 +192,8 @@ mod native {
             let mut header = libc::CMSG_FIRSTHDR(&message);
             while !header.is_null() {
                 if (*header).cmsg_level == libc::IPPROTO_IP {
-                    let size = (*header)
-                        .cmsg_len
-                        .saturating_sub(libc::CMSG_LEN(0) as usize);
+                    let size =
+                        ((*header).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
                     match (*header).cmsg_type {
                         libc::IP_PKTINFO if size >= mem::size_of::<libc::in_pktinfo>() => {
                             info = Some(std::ptr::read_unaligned(

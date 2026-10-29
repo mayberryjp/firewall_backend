@@ -92,6 +92,11 @@
 
 ### Fixed
 
+- Fixed static musl package compilation of the UDP relay by handling libc's
+  platform-specific ancillary-data length types. Forwarding behavior and API
+  contracts are unchanged. Recommended bump: patch; baseline unknown,
+  Unreleased. No frontend action.
+
 - UDP relay health no longer raises a service warning solely because kernel
   receive-loss accounting is unavailable. Actual worker failures and explicit
   service warnings remain visible. Corrected the documented runtime status
