@@ -265,7 +265,7 @@ It converts only `desired`, every transaction's `previous`/`candidate`, native
 `ownership_before.committed_config`. Native operational snapshots are re-encoded
 using the current operational model. Other fields, credentials, service counters,
 Ethernet/IPv6 recovery evidence and key material are not edited. Transaction IDs,
-revision numbers, statuses, provenance and timestamps remain; archived configuration
+revision identifiers, statuses, provenance and timestamps remain; archived configuration
 payloads are intentionally converted, with exact originals retained in backup.
 
 Before replacing any source file, the private bundle contains `manifest.json`,
@@ -429,10 +429,16 @@ those host prerequisite changes are not rolled back on later failure.
 
 ### Release Assets
 
-The publisher must explicitly approve the release version; `1.2.3` below is
-illustrative, not an assigned baseline. Version strings are canonical SemVer,
-at most 80 bytes, without a `v` prefix or build metadata. Explicit prerelease
-versions are supported. The matching GitHub release tag is `v1.2.3`.
+Public software versions are canonical `yyyy.mm.dd.iteration`: a real UTC date,
+zero-padded month/day, and iteration 1..4294967295 without leading zeroes.
+The embedded source version is `RELEASE_VERSION` in
+[version.rs](../crates/netcontrol-core/src/version.rs); the first assigned build
+label is `2026.10.29.1`, not a claim that a release has been published.
+Substantive code changes advance that build label once per task. Cargo's
+three-part package version is internal, not software identity.
+Publication still needs explicit approval. The illustrative future version below
+must match the daemon being signed. No prerelease/build suffix or `v` prefix is
+accepted in manifests/API bodies; the GitHub tag is `v2026.10.29.2`.
 
 Build the daemon as a static amd64 Linux musl executable and use the package
 tool's offline asset builder on the publishing machine:
@@ -440,7 +446,7 @@ tool's offline asset builder on the publishing machine:
 ```sh
 netcontrol-package build-update \
   --daemon target/x86_64-unknown-linux-musl/release/netcontrold \
-  --version 1.2.3 \
+  --version 2026.10.29.2 \
   --signing-key signing.key \
   --output-dir ubuntu-update-assets
 ```
@@ -475,20 +481,55 @@ POST /api/v1/system/upgrade
 Authorization: Bearer <API_KEY>
 Content-Type: application/json
 
-{"version":"1.2.3"}
+{"version":"2026.10.29.2"}
 ```
 
 `202` acknowledges a durable queued job, not successful verification/installation.
 `Location` is `/api/v1/system/upgrade`; poll `GET` there with `state.read`.
 The API retains the latest job only. It exposes `last_successful_version`, not
 a claim about the currently running binary: manual deployments can change that
-binary, and there is no established initial version. Requests at or below the
-last successful API-upgrade version are rejected; if no successful receipt exists,
-the version baseline is unknown. There is no force/downgrade/cancel endpoint.
+binary. The current embedded build version is saved at `desired.software.version`
+in API state. Requests at or below either the running version or last successful
+API-upgrade version are rejected. There is no force/downgrade/cancel endpoint.
 Unknown/duplicate JSON fields, malformed versions or query parameters are `400`;
 invalid keys `401`, missing permission `403`, unsupported methods `405`, active
 job/transaction or non-newer version `409`, disabled/preparation failure `503`.
 Asynchronous errors appear in job status, not a later HTTP error from the POST.
+
+### Daily Release Discovery and Configuration Versions
+
+The configured daemon checks GitHub's latest published stable release at startup
+and every 24 hours, asynchronously and without installing it. It reuses the fixed
+repository and optional private token in `--upgrade-config`; no browser-supplied
+repository/token/URL is accepted. HTTPS requests refuse redirects, use a 10-second
+connect/30-second total timeout and limit JSON to 1 MiB. Tags must be canonical
+`vyyyy.mm.dd.iteration`; errors (including no published release or rate limiting)
+are logged and saved, not turned into "no update".
+
+The master configuration's daemon-managed `software` object saves running
+`version`, nullable `repository`, `latest_version`, `update_available`,
+`last_checked_at` and `error`. Null availability means disabled, pending or failed,
+distinguished by repository/time/error; it never means up to date. Metadata is
+reset to the running build at startup and atomically refreshed without a
+configuration revision or network apply. Upgrades still verify all signed assets
+separately. No real release publication/discovery or appliance upgrade is implied
+by tests. See [field/UI details](../FRONTEND_SPEC.md#46-software-version-and-daily-release-checks).
+
+Configuration revision IDs independently use the same UTC date format. Initial
+configuration and each new UTC day's first confirmation allocate iteration 1;
+same-day confirmations increment it. Copy server-issued strings for conflict
+checks and history cursors; use `committed_revision` on confirmed transactions
+rather than adding one. Backward UTC clock movement blocks confirmation explicitly
+but leaves rollback available. Keep the host UTC clock accurate; the configured
+display/host timezone does not affect allocation.
+
+Current network journals use `netcontrol-rust-state-v2`. Numeric-revision v1
+journals are incompatible, rejected unchanged, and are not converted by the
+policy-rule-removal tool. Do not deploy this breaking state contract over a v1
+journal without an explicitly reviewed operator plan and private backup; do not
+delete/reset data or recompute checksums to force loading. No automatic migration
+or compatibility window is provided. Frontend and backend must deploy the new
+string-revision contract together.
 
 The original daemon must be the service's `MainPID`, and its effective `ExecStart`
 must directly name the current regular root-owned executable. New configuration

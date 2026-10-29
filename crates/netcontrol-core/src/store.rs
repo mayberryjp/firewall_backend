@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) const SCHEMA: &str = "netcontrol-rust-state-v1";
+pub(crate) const SCHEMA: &str = "netcontrol-rust-state-v2";
 const MAX_STATE: u64 = 256 * 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct DurabilityError(String);

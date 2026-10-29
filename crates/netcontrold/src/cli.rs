@@ -17,12 +17,12 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   show candidate-config / compare     Show the private candidate / its changes
   show state / runtime / interfaces / routes / firewall / kernel
   show interfaces discovered          Read-only inventory, including unmanaged host NICs
-  show transactions / transaction ID / revisions / revision NUMBER
+  show transactions / transaction ID / revisions / revision yyyy.mm.dd.iteration
     show statistics [host|interfaces|protocols|gateways|link-diagnostics|vnstat]
   commit check                        Normalize and validate; no networking changes
   commit confirmed SECONDS [TEXT]     Apply full candidate; 10..300 seconds to confirm
   confirm [ID] / rollback [ID]         Explicit transaction action; last local ID if omitted
-  restore revision NUMBER confirmed SECONDS [TEXT]
+  restore revision yyyy.mm.dd.iteration confirmed SECONDS [TEXT]
   reconcile services SERVICE          Explicit repair using stored settings, not a draft
   discard                             Discard only this session's candidate
   end / exit                          Leave mode / close session; never confirms
@@ -77,7 +77,7 @@ enum Mode {
 }
 
 struct Candidate {
-    revision: u64,
+    revision: netcontrol_core::Version,
     original: Value,
     config: Value,
 }
@@ -230,11 +230,16 @@ impl CliSession {
                     .candidate
                     .as_ref()
                     .context("no candidate; use configure terminal")?;
+                let mut config = serde_json::to_value(self.validated()?)?;
+                config
+                    .as_object_mut()
+                    .context("candidate must be an object")?
+                    .remove("software");
                 let body = json!({
                     "base_revision":candidate.revision,
                     "confirm_timeout_seconds":seconds,
                     "description":words[3..].join(" "),
-                    "config":self.validated()?
+                    "config":config
                 });
                 let result = request(app, principal, "POST", "/api/v1/transactions", "", &body)?;
                 self.remember(&result)?;
@@ -276,7 +281,7 @@ impl CliSession {
                     self.candidate.is_none(),
                     "discard the private candidate before restoring a revision"
                 );
-                let revision = unsigned(revision)?;
+                let revision: netcontrol_core::Version = revision.parse()?;
                 let seconds = timeout(seconds)?;
                 let (base, _) = running(app, principal)?;
                 let result = request(
@@ -352,9 +357,17 @@ impl CliSession {
             })?;
         } else if let Some(rest) = command_input(line, "set") {
             let (pointer, input) = split_argument(rest)?;
+            ensure!(
+                pointer != "/software" && !pointer.starts_with("/software/"),
+                "software metadata is daemon-managed"
+            );
             let value = serde_json::from_str(input).context("set requires a JSON value")?;
             self.edit(|config| pointer_edit(config, pointer, Some(value)))?;
         } else if let ["delete", pointer] = words.as_slice() {
+            ensure!(
+                *pointer != "/software" && !pointer.starts_with("/software/"),
+                "software metadata is daemon-managed"
+            );
             self.edit(|config| pointer_edit(config, pointer, None))?;
         } else if let Mode::Interface(name) = &self.mode {
             let name = name.clone();
@@ -424,8 +437,16 @@ impl CliSession {
             .context("no candidate; use configure terminal")?;
         let mut changed = candidate.config.clone();
         edit(&mut changed)?;
-        let typed: Config =
+        let supplied_software = changed.get("software").is_some();
+        let mut typed: Config =
             serde_json::from_value(changed).context("invalid configuration schema")?;
+        let software: netcontrol_core::SoftwareMetadata =
+            serde_json::from_value(candidate.original["software"].clone())?;
+        ensure!(
+            !supplied_software || typed.software == software,
+            "software metadata is daemon-managed"
+        );
+        typed.software = software;
         let changed = serde_json::to_value(typed)?;
         ensure!(
             serde_json::to_vec(&changed)?.len() <= CANDIDATE_LIMIT,
@@ -516,7 +537,10 @@ impl CliSession {
                 format!("/api/v1/transactions/{id}")
             }
             ["revisions"] => "/api/v1/revisions".to_owned(),
-            ["revision", number] => format!("/api/v1/revisions/{}", unsigned(number)?),
+            ["revision", number] => format!(
+                "/api/v1/revisions/{}",
+                number.parse::<netcontrol_core::Version>()?
+            ),
             ["statistics"] => "/api/v1/statistics".to_owned(),
             ["statistics", kind]
                 if matches!(
@@ -597,7 +621,7 @@ fn request(
     call(&mut engine, principal, method, path, query, body)
 }
 
-fn running(app: &App, principal: &Credential) -> Result<(u64, Value)> {
+fn running(app: &App, principal: &Credential) -> Result<(netcontrol_core::Version, Value)> {
     let mut engine = app
         .engine
         .lock()
@@ -610,9 +634,9 @@ fn running(app: &App, principal: &Credential) -> Result<(u64, Value)> {
         "limit=1",
         &Value::Null,
     )?;
-    let revision = page["revisions"][0]["revision"]
-        .as_u64()
-        .context("invalid revision response")?;
+    let revision: netcontrol_core::Version =
+        serde_json::from_value(page["revisions"][0]["revision"].clone())
+            .context("invalid revision response")?;
     let detail = call(
         &mut engine,
         principal,

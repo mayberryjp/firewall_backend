@@ -16,6 +16,7 @@ fn accept() -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub software: crate::SoftwareMetadata,
     #[serde(default = "yes")]
     pub ipv6_enabled: bool,
     pub ntp: NTPConfig,
@@ -45,6 +46,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            software: Default::default(),
             ipv6_enabled: true,
             ntp: Default::default(),
             syslog: Default::default(),
@@ -836,6 +838,13 @@ impl Config {
     pub fn empty() -> Self {
         Self::default()
     }
+    pub fn same_settings(&self, other: &Self) -> bool {
+        let mut left = self.normalized();
+        let mut right = other.normalized();
+        left.software = Default::default();
+        right.software = Default::default();
+        left == right
+    }
     pub fn normalize(&mut self) {
         self.bgp.neighbors.sort_by(|a, b| a.name.cmp(&b.name));
         self.mdns.normalize();
@@ -899,6 +908,7 @@ impl Config {
         c
     }
     pub fn validate(&self) -> Result<()> {
+        self.software.validate()?;
         self.bgp.validate(self)?;
         self.mdns.validate(self)?;
         self.udp_broadcast_relay.validate(self)?;

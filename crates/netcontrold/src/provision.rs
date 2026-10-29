@@ -174,8 +174,8 @@ pub async fn apply(engine: &mut Engine, wan: &str, lan: &str, address: &str) -> 
         &[],
     ))?;
     ensure!(
-        state["revision"] == 0 && state.get("active_transaction").is_none(),
-        "appliance provisioning requires an unconfigured revision-zero journal; existing state was not reset"
+        engine.is_initial_configuration() && state.get("active_transaction").is_none(),
+        "appliance provisioning requires an unconfigured initial journal; existing state was not reset"
     );
     let baseline: Config = serde_json::from_value(state["desired"].clone())?;
     ensure!(
@@ -187,8 +187,10 @@ pub async fn apply(engine: &mut Engine, wan: &str, lan: &str, address: &str) -> 
         "appliance provisioning refuses existing role or firewall configuration"
     );
     let config = factory_candidate(&baseline, wan, lan, address)?;
-    let request = serde_json::to_vec(&json!({"base_revision": 0, "confirm_timeout_seconds": 60,
-        "description": "Initial LAN/WAN appliance provisioning", "config": config}))?;
+    let request = serde_json::to_vec(
+        &json!({"base_revision": engine.committed_revision(), "confirm_timeout_seconds": 60,
+        "description": "Initial LAN/WAN appliance provisioning", "config": config}),
+    )?;
     let transaction = checked(engine.request(
         "POST",
         "/api/v1/transactions",

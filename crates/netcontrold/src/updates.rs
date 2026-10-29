@@ -283,6 +283,9 @@ fn validate_config(config: &Config) -> Result<()> {
 }
 
 impl Manager {
+    pub fn release_config(&self) -> Config {
+        self.config.clone()
+    }
     pub fn repository(&self) -> &str {
         &self.config.repository
     }
@@ -369,6 +372,10 @@ impl Manager {
 
     pub fn start(&self, requested: &str) -> Result<Job> {
         let parsed = update::version(requested)?;
+        ensure!(
+            parsed > update::version(netcontrol_core::RELEASE_VERSION)?,
+            "requested version must be newer than the running version"
+        );
         ensure!(!self.active()?, "another upgrade or recovery is active");
         let previous_version = self.job()?.and_then(|job| job.last_successful_version);
         if let Some(previous) = &previous_version {
@@ -486,7 +493,156 @@ impl Manager {
 struct Release {
     tag_name: String,
     draft: bool,
+    prerelease: bool,
     assets: Vec<Asset>,
+}
+
+pub fn initialize_release_check(
+    engine: &mut netcontrol_core::Engine,
+    config: Option<&Config>,
+) -> Result<()> {
+    engine.update_software_metadata(netcontrol_core::SoftwareMetadata {
+        repository: config.map(|config| config.repository.clone()),
+        ..Default::default()
+    })
+}
+
+fn release_metadata(
+    repository: &str,
+    release: &Release,
+) -> Result<netcontrol_core::SoftwareMetadata> {
+    ensure!(
+        !release.draft && !release.prerelease,
+        "latest release must be published and stable"
+    );
+    let latest = update::version(
+        release
+            .tag_name
+            .strip_prefix('v')
+            .context("release tag must start with v")?,
+    )?;
+    let mut metadata = netcontrol_core::SoftwareMetadata::default();
+    metadata.repository = Some(repository.into());
+    metadata.latest_version = Some(latest);
+    metadata.update_available = Some(latest > metadata.version);
+    metadata.last_checked_at = Some(now()?.parse()?);
+    Ok(metadata)
+}
+
+async fn discover_release(config: &Config) -> Result<netcontrol_core::SoftwareMetadata> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static("netcontrol-release-checker"),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
+    );
+    if let Some(path) = &config.token_file {
+        let token = String::from_utf8(read(path, 4096, true)?)?;
+        let mut header =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim()))?;
+        header.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, header);
+    }
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut response = client
+        .get(format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            config.repository
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length <= 1024 * 1024),
+        "release response exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            bytes.len() + chunk.len() <= 1024 * 1024,
+            "release response exceeds size limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let release: Release = serde_json::from_slice(&bytes)?;
+    release_metadata(&config.repository, &release)
+}
+
+pub async fn monitor_releases(
+    engine: std::sync::Arc<std::sync::Mutex<netcontrol_core::Engine>>,
+    config: Option<Config>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let repository = config.as_ref().map(|config| config.repository.clone());
+    run_release_checks(engine, repository, stop, || async {
+        discover_release(
+            config
+                .as_ref()
+                .context("release checker configuration missing")?,
+        )
+        .await
+    })
+    .await
+}
+
+async fn run_release_checks<F, Fut>(
+    engine: std::sync::Arc<std::sync::Mutex<netcontrol_core::Engine>>,
+    repository: Option<String>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut check: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<netcontrol_core::SoftwareMetadata>>,
+{
+    if *stop.borrow() {
+        return Ok(());
+    }
+    let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return Ok(()); }
+            }
+            _ = interval.tick(), if repository.is_some() => {
+                let checked = tokio::select! {
+                    biased;
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() { return Ok(()); }
+                        continue;
+                    }
+                    result = check() => result
+                };
+                let metadata = match checked {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        tracing::warn!(%error, "daily release check failed");
+                        netcontrol_core::SoftwareMetadata {
+                            repository: repository.clone(),
+                            last_checked_at: Some(now()?.parse()?),
+                            error: Some(format!("Release check failed: {error}")),
+                            ..Default::default()
+                        }
+                    }
+                };
+                engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?
+                    .update_software_metadata(metadata)?;
+            }
+        }
+    }
 }
 #[derive(Deserialize)]
 struct Asset {
@@ -540,7 +696,9 @@ impl Manager {
             "application/vnd.github+json",
         )?)?;
         ensure!(
-            !release.draft && release.tag_name == format!("v{}", job.version),
+            !release.draft
+                && !release.prerelease
+                && release.tag_name == format!("v{}", job.version),
             "release tag does not match requested version"
         );
         let asset = |name: &str, limit: usize| -> Result<Vec<u8>> {
@@ -732,7 +890,7 @@ mod tests {
     fn job(status: &str) -> Job {
         Job {
             id: "upgrade_test".into(),
-            version: "1.2.3".into(),
+            version: "2026.10.29.1".into(),
             status: status.into(),
             created_at: "2026-10-24T00:00:00Z".into(),
             updated_at: "2026-10-24T00:00:00Z".into(),
@@ -740,6 +898,160 @@ mod tests {
             last_successful_version: None,
             destination: PathBuf::from("/usr/local/sbin/netcontrold"),
             previous_sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn release_discovery_reports_current_newer_and_invalid_releases() {
+        let release = |tag: &str| Release {
+            tag_name: tag.into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![],
+        };
+        let current = release_metadata(
+            "example/netcontrol",
+            &release(&format!("v{}", netcontrol_core::RELEASE_VERSION)),
+        )
+        .unwrap();
+        assert_eq!(current.update_available, Some(false));
+        assert!(current.last_checked_at.is_some());
+        let newer = release_metadata("example/netcontrol", &release("v9999.12.31.10")).unwrap();
+        assert_eq!(newer.update_available, Some(true));
+        let older = release_metadata("example/netcontrol", &release("v0001.01.01.1")).unwrap();
+        assert_eq!(older.update_available, Some(false));
+        for invalid in ["v1.2.3", "v2026.02.29.1", "2026.10.29.1", "v2026.10.29.01"] {
+            assert!(release_metadata("example/netcontrol", &release(invalid)).is_err());
+        }
+        let mut invalid = release("v9999.12.31.10");
+        invalid.draft = true;
+        assert!(release_metadata("example/netcontrol", &invalid).is_err());
+        invalid.draft = false;
+        invalid.prerelease = true;
+        assert!(release_metadata("example/netcontrol", &invalid).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_checks_run_at_startup_daily_persist_errors_and_stop() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let engine = Arc::new(Mutex::new(
+            netcontrol_core::Engine::open(&path, Box::new(netcontrol_core::Simulator::new()))
+                .unwrap(),
+        ));
+        let initial = engine.lock().unwrap().committed_revision();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run_release_checks(
+            engine.clone(),
+            Some("example/netcontrol".into()),
+            receiver,
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt > 0 {
+                        bail!("synthetic release failure");
+                    }
+                    release_metadata(
+                        "example/netcontrol",
+                        &Release {
+                            tag_name: "v9999.12.31.10".into(),
+                            draft: false,
+                            prerelease: false,
+                            assets: vec![],
+                        },
+                    )
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .saved_configuration()
+                .software
+                .update_available,
+            Some(true)
+        );
+        tokio::time::advance(Duration::from_secs(86_399)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let metadata = engine
+            .lock()
+            .unwrap()
+            .saved_configuration()
+            .software
+            .clone();
+        assert_eq!(metadata.update_available, None);
+        assert_eq!(metadata.latest_version, None);
+        assert!(
+            metadata
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("synthetic release failure")
+        );
+        assert!(metadata.last_checked_at.is_some());
+        assert_eq!(engine.lock().unwrap().committed_revision(), initial);
+        stop.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+        drop(engine);
+        let reopened =
+            netcontrol_core::Engine::open(&path, Box::new(netcontrol_core::Simulator::new()))
+                .unwrap();
+        assert_eq!(reopened.saved_configuration().software, metadata);
+    }
+
+    #[tokio::test]
+    async fn release_checker_cancels_inflight_checks_and_disabled_checks_do_not_run() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for enabled in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let engine = Arc::new(Mutex::new(
+                netcontrol_core::Engine::open(
+                    &directory.path().join("state.json"),
+                    Box::new(netcontrol_core::Simulator::new()),
+                )
+                .unwrap(),
+            ));
+            initialize_release_check(&mut engine.lock().unwrap(), None).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let attempts = calls.clone();
+            let (stop, receiver) = tokio::sync::watch::channel(false);
+            let worker = tokio::spawn(run_release_checks(
+                engine.clone(),
+                enabled.then(|| "example/netcontrol".into()),
+                receiver,
+                move || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Result<netcontrol_core::SoftwareMetadata>>()
+                },
+            ));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(enabled));
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                engine.lock().unwrap().saved_configuration().software,
+                netcontrol_core::SoftwareMetadata::default()
+            );
         }
     }
 
@@ -762,7 +1074,7 @@ mod tests {
     #[test]
     fn public_status_excludes_installation_paths_and_backup_metadata() {
         let value = job("queued").public();
-        assert_eq!(value["version"], "1.2.3");
+        assert_eq!(value["version"], "2026.10.29.1");
         assert!(value.get("destination").is_none());
         assert!(value.get("previous_sha256").is_none());
         assert!(value["last_successful_version"].is_null());

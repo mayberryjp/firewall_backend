@@ -1,3 +1,17 @@
+#[cfg(test)]
+fn test_revision(index: u32) -> netcontrol_core::Version {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}.{:02}.{:02}.{}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        index + 1
+    )
+    .parse()
+    .unwrap()
+}
+
 use netcontrol_core::{Config, Engine, PERMISSIONS, Simulator};
 use netcontrold::{
     cli::{CliSession, CommandResult, LINE_LIMIT},
@@ -250,7 +264,7 @@ fn static_route_delete_accepts_disabled_record_with_metadata() {
             "test",
             &f.principal.permissions,
             &serde_json::to_vec(
-                &json!({"base_revision":0,"confirm_timeout_seconds":30,"config":config}),
+                &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":config}),
             )
             .unwrap(),
         );
@@ -315,7 +329,10 @@ fn blackhole_routes_are_staged_with_ip_route_and_checked_against_the_named_secti
         "no ip route 198.51.100.0/24 blackhole0 direct 254 50",
     );
     f.ok(&mut cli, "commit check");
-    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(0))
+    );
 }
 
 #[test]
@@ -428,7 +445,7 @@ fn candidate_is_private_until_explicit_commit_and_confirmation_is_durable() {
     f.ok(&mut cli, "commit confirmed 30 CLI change");
     assert_eq!(cli.prompt(), "netcontrol# ");
     let state = f.request("/api/v1/state");
-    assert_eq!(state["revision"], 0);
+    assert_eq!(state["revision"], serde_json::json!(test_revision(0)));
     assert!(
         state["desired"]["interfaces"]
             .as_array()
@@ -441,7 +458,10 @@ fn candidate_is_private_until_explicit_commit_and_confirmation_is_durable() {
         "pending_confirmation"
     );
     f.ok(&mut cli, "confirm");
-    assert_eq!(f.request("/api/v1/state")["revision"], 1);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(1))
+    );
     assert!(f.ok(&mut cli, "show running-config").contains("lan0"));
     f.app.engine.lock().unwrap().shutdown().unwrap();
     let path = f.directory.path().join("state.json");
@@ -449,7 +469,7 @@ fn candidate_is_private_until_explicit_commit_and_confirmation_is_durable() {
     let mut reopened = Engine::open(&path, Box::new(Simulator::new())).unwrap();
     let reply = reopened.request(
         "GET",
-        "/api/v1/revisions/1",
+        &format!("/api/v1/revisions/{}", test_revision(1)),
         "",
         "test",
         &["state.read".into()],
@@ -504,7 +524,10 @@ fn disconnect_exit_discard_and_rollback_never_imply_confirmation() {
     f.ok(&mut cli, "commit confirmed 30");
     let result = f.command(&mut cli, "exit");
     assert!(result.exit);
-    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(0))
+    );
     let state = f.request("/api/v1/state");
     let id = state["active_transaction"]["id"].as_str().unwrap();
     let mut recovery = CliSession::new();
@@ -521,7 +544,10 @@ fn disconnect_exit_discard_and_rollback_never_imply_confirmation() {
     f.ok(&mut recovery, "end");
     f.ok(&mut recovery, "discard");
     f.fail(&mut recovery, "show candidate-config", "no candidate");
-    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(0))
+    );
 }
 
 #[test]
@@ -650,6 +676,40 @@ fn ergonomic_interfaces_routes_policies_and_services_preserve_complete_config() 
 }
 
 #[test]
+fn software_metadata_is_readonly_and_daily_changes_do_not_invalidate_candidates() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.fail(
+        &mut cli,
+        "set /software/version \"9999.12.31.1\"",
+        "daemon-managed",
+    );
+    f.fail(&mut cli, "delete /software", "daemon-managed");
+    let metadata = netcontrol_core::SoftwareMetadata {
+        repository: Some("example/netcontrol".into()),
+        latest_version: Some("9999.12.31.10".parse().unwrap()),
+        update_available: Some(true),
+        last_checked_at: Some("2026-10-29T22:00:00Z".parse().unwrap()),
+        ..Default::default()
+    };
+    f.app
+        .engine
+        .lock()
+        .unwrap()
+        .update_software_metadata(metadata.clone())
+        .unwrap();
+    f.ok(&mut cli, "firewall policy drop");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.app.engine.lock().unwrap().saved_configuration().software,
+        metadata
+    );
+}
+
+#[test]
 fn restore_uses_new_transaction_and_requires_explicit_confirmation() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();
@@ -659,11 +719,20 @@ fn restore_uses_new_transaction_and_requires_explicit_confirmation() {
     f.ok(&mut cli, "confirm");
     f.ok(
         &mut cli,
-        "restore revision 0 confirmed 30 return to initial",
+        &format!(
+            "restore revision {} confirmed 30 return to initial",
+            test_revision(0)
+        ),
     );
-    assert_eq!(f.request("/api/v1/state")["revision"], 1);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(1))
+    );
     f.ok(&mut cli, "confirm");
-    assert_eq!(f.request("/api/v1/state")["revision"], 2);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(2))
+    );
     assert_eq!(
         f.request("/api/v1/state")["desired"]["firewall"]["policy"],
         "accept"
@@ -673,7 +742,11 @@ fn restore_uses_new_transaction_and_requires_explicit_confirmation() {
             .contains("restored_from_revision")
     );
     f.ok(&mut cli, "configure terminal");
-    f.fail(&mut cli, "restore revision 0 confirmed 30", "discard");
+    f.fail(
+        &mut cli,
+        &format!("restore revision {} confirmed 30", test_revision(0)),
+        "discard",
+    );
 }
 
 #[test]
@@ -702,7 +775,10 @@ fn commands_are_bounded_and_not_shell_or_immediate_writes() {
         serde_json::from_value::<Config>(json!({})).unwrap(),
         Config::empty()
     );
-    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(0))
+    );
 }
 
 #[test]
@@ -726,7 +802,10 @@ fn every_current_example_can_be_loaded_checked_and_edited_without_live_writes() 
         f.ok(&mut cli, "set /firewall/allow_all_icmp false");
         f.ok(&mut cli, "commit check");
     }
-    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(0))
+    );
 }
 
 #[test]
@@ -780,7 +859,10 @@ fn wireguard_peer_can_be_disabled_and_reenabled_without_losing_its_settings() {
     f.ok(&mut cli, "exit");
     assert_eq!(enabled(&mut cli), false);
     f.ok(&mut cli, "commit check");
-    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(0))
+    );
 }
 
 #[test]
@@ -827,7 +909,10 @@ fn confirmation_timeout_rolls_back_even_after_cli_session_is_dropped() {
         f.request(&format!("/api/v1/transactions/{id}"))["status"],
         "rolled_back"
     );
-    assert_eq!(f.request("/api/v1/state")["revision"], 0);
+    assert_eq!(
+        f.request("/api/v1/state")["revision"],
+        serde_json::json!(test_revision(0))
+    );
     assert!(
         f.request("/api/v1/state")["observed"]["interfaces"]
             .as_array()

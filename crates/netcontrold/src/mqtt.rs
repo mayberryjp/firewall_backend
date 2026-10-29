@@ -1,3 +1,17 @@
+#[cfg(test)]
+fn test_revision(index: u32) -> netcontrol_core::Version {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}.{:02}.{:02}.{}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        index + 1
+    )
+    .parse()
+    .unwrap()
+}
+
 use crate::private_store::{identifier, private_file, read_private, valid_id, write_new_private};
 use anyhow::{Context, Result, ensure};
 use netcontrol_core::{Engine, MQTTConfig};
@@ -607,7 +621,7 @@ pub(crate) fn metric_key(kind: &str, name: &str, field: &str) -> String {
 fn telemetry(
     device_id: &str,
     config: &MQTTConfig,
-    revision: u64,
+    revision: netcontrol_core::Version,
     uptime: u64,
     statistics: &Value,
     host: &crate::mqtt_host::HostSensors,
@@ -649,15 +663,10 @@ fn telemetry(
         Some("s"),
         Some("measurement"),
     );
-    let version = env!("CARGO_PKG_VERSION");
     add(
         "version".into(),
         "Firewall version".into(),
-        if version == "0.0.0" {
-            Value::Null
-        } else {
-            json!(version)
-        },
+        json!(netcontrol_core::RELEASE_VERSION),
         None,
         None,
     );
@@ -1033,7 +1042,7 @@ mod tests {
             app.clone(),
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":0,"confirm_timeout_seconds":30,"config":config}),
+            json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":config}),
             "synthetic-writer-token",
         )
         .await;
@@ -1098,7 +1107,7 @@ mod tests {
                 app.clone(),
                 "POST",
                 "/api/v1/transactions",
-                json!({"base_revision":1,"confirm_timeout_seconds":30,"config":disabled}),
+                json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":disabled}),
                 "synthetic-reader-token"
             )
             .await
@@ -1111,7 +1120,7 @@ mod tests {
                 app.clone(),
                 "POST",
                 "/api/v1/transactions",
-                json!({"base_revision":1,"confirm_timeout_seconds":30,"config":disabled}),
+                json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":disabled}),
                 "synthetic-writer-token"
             )
             .await
@@ -1123,7 +1132,7 @@ mod tests {
             app.clone(),
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":1,"confirm_timeout_seconds":30,"config":disabled}),
+            json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":disabled}),
             "synthetic-writer-token",
         )
         .await;
@@ -1340,7 +1349,7 @@ mod tests {
                 let confirm = |id: &str| engine.lock().unwrap().request("POST", &format!("/api/v1/transactions/{id}/confirm"), "", "fixture", &permissions, &[]);
                 let (stop, receiver) = watch::channel(false);
                 let worker = tokio::spawn(manager.clone().run(receiver));
-                let transaction = submit(&config, 0);
+                let transaction = submit(&config, test_revision(0));
                 ensure!(transaction.status == 202, "MQTT fixture transaction rejected");
                 ensure!(tokio::time::timeout(Duration::from_millis(1200), listener.accept()).await.is_err(), "MQTT connected before confirmation");
                 ensure!(confirm(transaction.body["id"].as_str().unwrap()).status == 200, "MQTT confirmation failed");
@@ -1365,7 +1374,7 @@ mod tests {
                         }
                         if topic.ends_with("/state") {
                             let value: Value = serde_json::from_slice(&payload)?;
-                            ensure!(value["metrics"]["revision"] == 1, "unconfirmed or wrong revision published");
+                            ensure!(value["metrics"]["revision"] == serde_json::json!(test_revision(1)), "unconfirmed or wrong revision published");
                             ensure!(value["process_health"]["status"] == "unhealthy" && value["active_alerts"][0]["retrying"] == true, "health/alerts were not published");
                             ensure!(value["metrics"].get("memory_used_bytes").is_some_and(Value::is_null), "host sensor missing or fabricated by the simulator");
                             connections.push(connection);
@@ -1377,7 +1386,7 @@ mod tests {
                 ensure!(host_discovered, "host sensors missing from discovery");
                 ensure!(connections == [1, 1, 2, 3], "MQTT connection was not persistent or failed to reconnect after disconnect/acknowledgement timeout");
                 config.mqtt.enabled = false;
-                let transaction = submit(&config, 1);
+                let transaction = submit(&config, test_revision(1));
                 ensure!(transaction.status == 202 && confirm(transaction.body["id"].as_str().unwrap()).status == 200, "MQTT disable failed");
                 tokio::time::timeout(Duration::from_secs(6), async {
                     let mut offline = false;
@@ -1458,7 +1467,7 @@ mod tests {
         let (_, state) = telemetry(
             "0123456789abcdef0123456789abcdef",
             &MQTTConfig::default(),
-            0,
+            test_revision(0),
             1,
             &json!({"interfaces":[],"bgp":status}),
             &crate::mqtt_host::HostSensors::default(),
@@ -1477,7 +1486,7 @@ mod tests {
         let (_, state) = telemetry(
             id,
             &MQTTConfig::default(),
-            0,
+            test_revision(0),
             1,
             &stats,
             &crate::mqtt_host::HostSensors::default(),
@@ -1500,7 +1509,7 @@ mod tests {
         let (_, state) = telemetry(
             id,
             &MQTTConfig::default(),
-            0,
+            test_revision(0),
             1,
             &stats,
             &crate::mqtt_host::HostSensors::default(),
@@ -1519,7 +1528,7 @@ mod tests {
         let (discovery, state) = telemetry(
             id,
             &config,
-            42,
+            test_revision(42),
             60,
             &stats,
             &crate::mqtt_host::HostSensors::default(),
@@ -1532,7 +1541,10 @@ mod tests {
         assert!(state["metrics"][metric_key("interface", "wan.1", "tx_bytes")].is_null());
         assert!(state["metrics"][metric_key("gateway", "wan", "rtt_avg_ms")].is_null());
         assert!(state["metrics"][metric_key("gateway", "wan", "health")].is_null());
-        assert_eq!(state["metrics"]["revision"], 42);
+        assert_eq!(
+            state["metrics"]["revision"],
+            serde_json::json!(test_revision(42))
+        );
         assert_eq!(discovery["components"]["revision"]["platform"], "sensor");
         assert_eq!(
             discovery["components"][metric_key("interface", "wan.1", "rx_bytes")]["state_class"],

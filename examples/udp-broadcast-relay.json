@@ -1,5 +1,5 @@
 {
-  "base_revision": 0,
+  "base_revision": "2026.10.29.1",
   "confirm_timeout_seconds": 60,
   "description": "Synthetic Govee and ECHONET Lite discovery; adapt links and firewall before applying",
   "config": {

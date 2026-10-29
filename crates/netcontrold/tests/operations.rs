@@ -1,3 +1,17 @@
+#[cfg(test)]
+fn test_revision(index: u32) -> netcontrol_core::Version {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}.{:02}.{:02}.{}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        index + 1
+    )
+    .parse()
+    .unwrap()
+}
+
 use axum::{
     body::{Body, to_bytes},
     http::Request,
@@ -136,8 +150,11 @@ async fn operational_actions_auth_validation_and_simulated_dns_are_explicit() {
     assert!(value["rtt_ms"].is_null());
     assert_eq!(value["hostname"], "google.com");
     assert_eq!(value["scope"], "simulator");
-    assert_eq!(value["revision"], 0);
-    assert_eq!(f.app.engine.lock().unwrap().committed_revision(), 0);
+    assert_eq!(value["revision"], serde_json::json!(test_revision(0)));
+    assert_eq!(
+        f.app.engine.lock().unwrap().committed_revision(),
+        test_revision(0)
+    );
     for server in [json!("192.0.2.53"), json!("2001:db8::53"), Value::Null] {
         let (status, value) = f
             .request(
@@ -150,7 +167,7 @@ async fn operational_actions_auth_validation_and_simulated_dns_are_explicit() {
         assert_eq!(status, 200, "{value}");
         assert_eq!(value["status"], "simulated");
         assert!(value["server"].is_null());
-        assert_eq!(value["revision"], 0);
+        assert_eq!(value["revision"], serde_json::json!(test_revision(0)));
     }
     for body in [
         json!({"hostname":"example.test","server":"192.0.2.53"}),
@@ -161,7 +178,7 @@ async fn operational_actions_auth_validation_and_simulated_dns_are_explicit() {
         assert_eq!(value["status"], "simulated");
         assert!(value["interface"].is_null());
         assert!(value["rtt_ms"].is_null());
-        assert_eq!(value["revision"], 0);
+        assert_eq!(value["revision"], serde_json::json!(test_revision(0)));
     }
     for body in [
         json!({"hostname":"example.test"}),
@@ -211,7 +228,10 @@ async fn daemon_restart_is_signalled_once_and_blocks_new_mutations() {
             409
         );
     }
-    assert_eq!(f.app.engine.lock().unwrap().committed_revision(), 0);
+    assert_eq!(
+        f.app.engine.lock().unwrap().committed_revision(),
+        test_revision(0)
+    );
 }
 
 #[tokio::test]

@@ -4,6 +4,14 @@
 
 ### Added
 
+- Embedded public software identity and saved daemon-managed master-config
+  `software` metadata, including running/latest versions, nullable update
+  availability, last check time and errors. Configured GitHub release discovery
+  runs at startup and daily without automatic installation. Disabled/pending/
+  failed checks remain explicitly unknown. Initial unreleased build label:
+  `2026.10.29.1`. Required frontend work:
+  [handoff 2026-10-29-01](docs/frontend-handoffs/2026-10-29.md#2026-10-29-01-date-versions-and-daily-release-checks).
+
 - mDNS filters now accept exact service-instance names, including
   `_udp._govee-lan._udp.local.`, with scoped PTR browsing, discovery replies
   and required host records. Unrelated instances remain excluded; canonical
@@ -87,6 +95,20 @@
   [handoff 2026-10-27-04](docs/frontend-handoffs/2026-10-27.md#2026-10-27-04-native-link-diagnostics).
 
 ### Changed
+
+- Software releases, signed-update versions and independent firewall
+  configuration revisions now use UTC `yyyy.mm.dd.iteration`, replacing public
+  SemVer releases and numeric revision counters. Revision fields/cursors are
+  JSON strings; transactions expose nullable `committed_revision`. History,
+  optimistic concurrency, provisional rollback and confirmed restore remain
+  enforced. Current network journal schema is `netcontrol-rust-state-v2`;
+  incompatible prior journals are preserved and refused without automatic
+  conversion/reset. Upgrades must exceed the running and last-successful
+  versions. Agent instructions now advance the embedded software build label
+  on substantive code changes; publication still requires approval.
+  Breaking contract/state impact, unreleased `2026.10.29.1`; Cargo package
+  SemVer remains internal. See
+  [handoff 2026-10-29-01](docs/frontend-handoffs/2026-10-29.md#2026-10-29-01-date-versions-and-daily-release-checks).
 
 - vnStat accounting now uses one host-wide Rust worker covering every interface,
   persisted day/month/lifetime totals and optional nonblocking UDP reports at

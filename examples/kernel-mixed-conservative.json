@@ -1,5 +1,5 @@
 {
-  "base_revision": 0,
+  "base_revision": "2026.10.29.1",
   "confirm_timeout_seconds": 120,
   "description": "Mixed-workload conservative starting point v1; benchmark before deployment",
   "config": {

@@ -1,5 +1,5 @@
 {
-  "base_revision": 0,
+  "base_revision": "2026.10.29.1",
   "confirm_timeout_seconds": 60,
   "description": "Rewrite forwarded Internet-bound DNS to a local resolver; arrange routed replies",
   "config": {

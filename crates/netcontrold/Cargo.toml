@@ -38,6 +38,7 @@ rustls-native-certs = "0.8"
 log = { version = "0.4", features = ["max_level_info"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

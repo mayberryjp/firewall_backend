@@ -15,7 +15,7 @@ use std::{
 mod provision;
 
 #[derive(Parser)]
-#[command(name = "netcontrold", about = "Native Rust network control daemon")]
+#[command(name = "netcontrold", version = netcontrol_core::RELEASE_VERSION, about = "Native Rust network control daemon")]
 struct Options {
     #[arg(long, default_value = "simulator", value_parser = ["simulator", "linux"])]
     backend: String,
@@ -356,6 +356,10 @@ async fn run(options: Options) -> Result<()> {
     if options.appliance {
         provision::enable_forwarding(&mut engine)?;
     }
+    let release_config = updates
+        .as_ref()
+        .map(netcontrold::updates::Manager::release_config);
+    netcontrold::updates::initialize_release_check(&mut engine, release_config.as_ref())?;
     let engine = Arc::new(Mutex::new(engine));
     let mut app = if let Some(updates) = updates {
         updates.mark_ready()?;
@@ -429,6 +433,12 @@ async fn run(options: Options) -> Result<()> {
             .await
     });
     let (mqtt_stop, mqtt_receiver) = tokio::sync::watch::channel(false);
+    let (release_stop, release_receiver) = tokio::sync::watch::channel(false);
+    let release_task = tokio::spawn(netcontrold::updates::monitor_releases(
+        engine.clone(),
+        release_config,
+        release_receiver,
+    ));
     let mqtt_control = controls["mqtt"].clone();
     let mqtt_task = tokio::spawn(async move {
         mqtt_control
@@ -468,6 +478,7 @@ async fn run(options: Options) -> Result<()> {
         ("mqtt", mqtt_task.abort_handle()),
         ("dynamic_dns", dynamic_dns_task.abort_handle()),
         ("system", system_task.abort_handle()),
+        ("release_check", release_task.abort_handle()),
     ];
     let ticker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -585,6 +596,7 @@ async fn run(options: Options) -> Result<()> {
     let _ = mqtt_stop.send(true);
     let _ = dynamic_dns_stop.send(true);
     let _ = system_stop.send(true);
+    let _ = release_stop.send(true);
     signals.abort();
     mqtt_task.await.context("MQTT worker shutdown failed")??;
     system_task
@@ -593,6 +605,9 @@ async fn run(options: Options) -> Result<()> {
     dynamic_dns_task
         .await
         .context("Dynamic DNS worker shutdown failed")??;
+    release_task
+        .await
+        .context("release checker shutdown failed")??;
     let tick_result = ticker.await.context("deadline ticker task");
     let shutdown_result = engine
         .lock()

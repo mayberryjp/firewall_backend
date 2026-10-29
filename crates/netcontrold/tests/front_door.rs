@@ -1,3 +1,17 @@
+#[cfg(test)]
+fn test_revision(index: u32) -> netcontrol_core::Version {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}.{:02}.{:02}.{}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        index + 1
+    )
+    .parse()
+    .unwrap()
+}
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -162,7 +176,7 @@ async fn platform_status_is_authenticated_nonblocking_and_included_with_configur
             assert_eq!(value["active_alerts"], snapshot["active_alerts"]);
             if path == "/api/v1/state" {
                 assert!(value["desired"].get("active_alerts").is_none());
-                assert_eq!(value["revision"], 0);
+                assert_eq!(value["revision"], serde_json::json!(test_revision(0)));
             }
         }
     }
@@ -480,9 +494,25 @@ async fn software_upgrade_requires_permission_and_validates_versions_when_disabl
     assert_eq!(response.0, 200);
     assert_eq!(response.2["enabled"], false);
     assert!(response.2["last_successful_version"].is_null());
+    let latest = fixture
+        .request("GET", "/api/v1/revisions/latest", "", "", "reader", "")
+        .await;
+    assert_eq!(latest.0, 200);
+    assert_eq!(latest.2["revision"], serde_json::json!(test_revision(0)));
+    assert_eq!(
+        latest.2["config"]["software"],
+        serde_json::json!(netcontrol_core::SoftwareMetadata::default())
+    );
     assert_eq!(
         fixture
-            .request("POST", endpoint, r#"{"version":"1.2.3"}"#, "", "reader", "")
+            .request(
+                "POST",
+                endpoint,
+                r#"{"version":"2026.10.29.2"}"#,
+                "",
+                "reader",
+                ""
+            )
             .await
             .0,
         403
@@ -505,6 +535,9 @@ async fn software_upgrade_requires_permission_and_validates_versions_when_disabl
         "",
         "{}",
         r#"{"version":"latest"}"#,
+        r#"{"version":"1.2.3"}"#,
+        r#"{"version":"2026.02.29.1"}"#,
+        r#"{"version":"2026.10.29.0"}"#,
         r#"{"version":"../1.2.3"}"#,
         r#"{"version":"v1.2.3"}"#,
         r#"{"version":"1.2.3","url":"https://example.invalid"}"#,
@@ -523,7 +556,7 @@ async fn software_upgrade_requires_permission_and_validates_versions_when_disabl
             .request(
                 "POST",
                 endpoint,
-                r#"{"version":"1.2.3"}"#,
+                r#"{"version":"2026.10.29.2"}"#,
                 "",
                 "upgrader",
                 ""

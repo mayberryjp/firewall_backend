@@ -138,13 +138,15 @@ The repair precheck verifies network/kernel ownership independently of worker
 health, so a failed enabled worker does not itself block explicit service repair.
 Repair never bypasses networking drift protection.
 
-Network state uses the checksummed `netcontrol-rust-state-v1` envelope with
+Network state uses the checksummed `netcontrol-rust-state-v2` envelope with
 `schema`, `sha256`, and `state` fields, limited to 256 MiB. The state contains
-scope, revision, desired configuration, nullable active transaction ID,
+scope, revision, initial revision, desired configuration, nullable active transaction ID,
 initialization timestamp, and transaction map. Incompatible/corrupt data is
 rejected without import, deletion, or reset. Revisions retain
 `{revisions,next_before_revision?}` and flattened detail metadata plus `config`;
-default list limit 50, range 1..100, exclusive uint64 `before_revision`.
+default list limit 50, range 1..100, exclusive date-version string `before_revision`.
+Numeric-revision v1 journals are incompatible and refused unchanged; no automatic
+conversion or state reset is provided.
 
 Identity and scoped-auth files require their own `schema: 1` JSON roots; these
 are not the network-state envelope. A scoped file is
@@ -784,7 +786,7 @@ is implied.
 Synthetic successful response:
 
 ```json
-{"status":"answered","interface":"wan0","hostname":"example.test","record_type":"A","server":"192.0.2.53","transport":"udp","rcode":0,"addresses":["192.0.2.7"],"rtt_ms":12.5,"elapsed_ms":13.2,"error":null,"attempts":[{"server":"192.0.2.53","transport":"udp","rcode":0,"addresses":["192.0.2.7"],"rtt_ms":12.5,"status":"answered","error":null}],"scope":"host:<opaque>","revision":7}
+{"status":"answered","interface":"wan0","hostname":"example.test","record_type":"A","server":"192.0.2.53","transport":"udp","rcode":0,"addresses":["192.0.2.7"],"rtt_ms":12.5,"elapsed_ms":13.2,"error":null,"attempts":[{"server":"192.0.2.53","transport":"udp","rcode":0,"addresses":["192.0.2.7"],"rtt_ms":12.5,"status":"answered","error":null}],"scope":"host:<opaque>","revision":"2026.10.29.8"}
 ```
 
 `rtt_ms` is a measured numeric DNS request/response time in milliseconds,
@@ -869,9 +871,10 @@ baseline or channel is implied. See [operator setup and artifact contract](docs/
 | `POST /api/v1/system/upgrade` | `system.upgrade` | Submit a specific signed release version; returns `202` job and `Location: /api/v1/system/upgrade` |
 | `GET /api/v1/system/upgrade` | `state.read` | Read configuration-enabled flag and latest durable job; `200` even when disabled |
 
-POST body is exactly `{"version":"1.2.3"}` (synthetic version). Version is
-canonical SemVer, maximum 80 bytes, no `v` prefix or build metadata; explicit
-prerelease versions are accepted. GitHub tag is `v<version>`. No query parameters,
+POST body is exactly `{"version":"2026.10.29.2"}` (synthetic version). Version is
+canonical `yyyy.mm.dd.iteration`, maximum 21 bytes, a real UTC calendar date,
+year 0001..9999, zero-padded month/day, iteration 1..4294967295 without leading
+zeroes. No `v` prefix, prerelease suffix or build metadata. GitHub tag is `v<version>`. No query parameters,
 unknown/duplicate fields, URL/repository/token/key/path, force or downgrade inputs.
 GET accepts no body/query. Standard error envelope `{error, transaction: null}`:
 `400` invalid input, `401` invalid/missing API key, `403` insufficient permission,
@@ -891,7 +894,7 @@ POST returns a job object with string `id`, `version`, `status`, RFC3339
 `last_successful_version`. GET nests that same shape under `job`. Synthetic example:
 
 ```json
-{"id":"upgrade_example","version":"1.2.3","status":"queued","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z","error":null,"last_successful_version":null}
+{"id":"upgrade_example","version":"2026.10.29.2","status":"queued","created_at":"2026-10-29T00:00:00Z","updated_at":"2026-10-29T00:00:00Z","error":null,"last_successful_version":null}
 ```
 
 Statuses: `queued`, `downloading`, `installing`, `checking`, `succeeded`,
@@ -899,8 +902,9 @@ Statuses: `queued`, `downloading`, `installing`, `checking`, `succeeded`,
 `rolled_back` are terminal; recovery-required needs local-console intervention
 and remains write-blocking. `202` does not promise that the release was found,
 signature passed or installation succeeded. A new API upgrade must be newer
-than the last successful API-upgrade version when known; there is no downgrade
-override. The first version baseline remains unknown until successful receipt.
+than both the running version and last successful API-upgrade version when known;
+there is no downgrade override. The running baseline is the embedded public
+software version, independently of upgrade receipts and Cargo package versions.
 
 Frontend tasks: explicit privileged-action confirmation showing requested
 version/repository and expected management/traffic interruption; strict version
@@ -922,7 +926,59 @@ prerequisites or retroactive conntrack counters. No automatic frontend reload,
 release publication, reboot, connection flush, credential reset or compatibility
 migration is added. Actual systemd/power-loss/release/browser acceptance remains
 pending; [handoff 2026-10-24-07](docs/frontend-handoffs/2026-10-24.md#2026-10-24-07-signed-ubuntu-self-upgrade)
-is Pending frontend review.
+is Pending frontend review and its version rules are superseded by the
+[date-version handoff](docs/frontend-handoffs/2026-10-29.md#2026-10-29-01-date-versions-and-daily-release-checks).
+
+### 4.6 Software Version and Daily Release Checks
+
+The saved master configuration contains a daemon-managed `software` object.
+Read it from `GET /api/v1/state` at `desired.software`, or
+`GET /api/v1/revisions/latest` at `config.software` without requiring healthy
+network observation. Existing API-key authentication and `state.read` apply.
+No new HTTP route, permission or manual refresh action is introduced.
+
+Synthetic successful check:
+
+```json
+{"version":"2026.10.29.1","repository":"example/netcontrol","latest_version":"2026.10.29.2","update_available":true,"last_checked_at":"2026-10-29T22:00:00Z","error":null}
+```
+
+`version` is the running binary's embedded public version, always a date-version
+string. `repository`, `latest_version`, `last_checked_at` and `error` are
+`string|null`; `update_available` is `boolean|null`. Time is RFC3339 UTC.
+`repository:null` means checking is disabled. A configured checker is pending
+until its first result (`latest_version`, `update_available`, `last_checked_at`
+and `error` all null). A successful check sets `latest_version` and compares
+numeric date/iteration components against `version`. An older/equal release
+means `update_available:false`, not an available downgrade. A failed check
+sets `last_checked_at` and explicit `error`, clearing latest/availability to
+null; never render it as "up to date" or keep a stale success badge.
+
+When `--upgrade-config` is configured, an in-process async worker queries that
+trusted repository's GitHub `/releases/latest` at startup and every 24 hours.
+Only published stable releases with canonical `v<version>` tags qualify.
+HTTPS verification is mandatory; redirects are refused, connect timeout is
+10 seconds, total request timeout 30 seconds, response limit 1 MiB. No release,
+rate limiting, malformed tags and transport/API errors are explicit failed
+checks; retry is the next scheduled daily check or daemon restart. No automatic
+download/install or publication occurs. Availability is discovery metadata,
+not proof that signed assets exist or that installation will succeed.
+
+Results are atomically saved in the master journal without applying networking,
+allocating a configuration revision or changing a pending transaction.
+Startup resets metadata to the running build and disabled/pending state, then
+checks asynchronously. On `POST /api/v1/transactions`, omit `config.software`
+or echo its current value; nondefault differing supplied metadata returns `422`.
+It is not an editable setting or an authorization bypass. Confirmation and
+historical restore retain current software metadata rather than restoring old
+binary identity/check results. Historical snapshots may contain historical
+metadata; the current revision detail always returns current saved metadata.
+
+Frontend tasks: show running version and separate update availability/error/
+pending/disabled states; keep these fields out of editable drafts and omit
+`software` on transaction submission. Existing normal state polling observes
+new results; do not make reads trigger network checks. Update version forms,
+transaction/history/cursor types and comparison as described below.
 
 ## 5. State and draft model
 
@@ -1046,9 +1102,9 @@ strings; IPv6 fields retain full names under `IPv6`. Preserve unknown fields and
 do not assume identical groups across kernels. Some values are gauges/constants,
 not counters; `Tcp.MaxConn` can be `"-1"`.
 
-**Precision:** Kernel counter/protocol values are quoted decimal strings on the wire,
-unlike revision numbers. Keep them as strings or validated `BigInt`; never route
-them through `Number` or the revision serializer's unquoted-number encoding.
+**Precision:** Kernel counter/protocol values are quoted decimal strings on the wire.
+Keep them as strings or validated `BigInt`; never route them through `Number`.
+Date-version revision strings are a separate type, not kernel counters.
 Use arbitrary-precision deltas before deliberately rounding a displayed rate.
 Gateway window counts/measurements are bounded JSON numbers, with null for
 missing measurements; they must not use the kernel-counter decoder.
@@ -2070,7 +2126,9 @@ Publisher and deployment contract:
   lost/pending/loss percent and RTT min/max/average/stddev/p50/p95/variation.
   These are rolling summaries, not individual probes/cumulative probe totals.
   Counter decimal strings remain lossless; stale/unavailable values are unknown,
-  not zero. Package placeholder `0.0.0` means unknown software version.
+  not zero. Software version is the embedded public date version, independent
+  of Cargo's internal package version. Configuration revision is also a
+  date-version string, not a numeric counter.
 - Host health sensors, read from the same snapshot as `GET /api/v1/statistics/host`
   on each sample (`state.read`; scope is the daemon's host, not the lab namespace):
   fixed entities `memory_total_bytes`, `memory_available_bytes`, `memory_used_bytes`,
@@ -3070,7 +3128,7 @@ configuration ownership rather than deleting a physical port.
 Initial native host inheritance is separate from discovery. A new journal or an
 empty revision-zero journal without transactions inherits supported physical
 NICs with `unassigned` roles; existing configurations are not recaptured. A
-populated interface list at revision zero is therefore valid. This is not WAN
+populated interface list at the initial revision is therefore valid. This is not WAN
 detection, a browser-side import or an automatically confirmed user transaction.
 
 #### DHCPv4 and resolver configuration
@@ -3829,7 +3887,8 @@ and pagination without pretending there is server-side search.
 Detail: status, full raw error/reason, candidate-versus-previous comparison,
 timestamps, provenance, deadline, actor/confirmer, links to base/result revisions,
 and authorized lifecycle actions. Result revision for a committed transaction is
-`base_revision + 1`, not the current server revision.
+the server-supplied nullable `committed_revision`, populated only after commit;
+never compute it from `base_revision` or substitute the latest server revision.
 
 Keep nonterminal states and errors visible after navigation and reconnect.
 There is no backend `failed` terminal status; failed applies normally become
@@ -3839,11 +3898,11 @@ actor field is supplied; do not invent either.
 
 ### 6.12 Committed history and restoration
 
-- Newest revision first, using server pagination and revision-number ordering.
+- Newest revision first, using server pagination and numeric date/iteration ordering.
 - Columns: revision/current badge, description, submitted/committed dates,
   submitted/committed actors, transaction link, restored-from revision.
 - Null dates show **Unknown (legacy record)**. Omitted actor shows **Unknown**.
-  Revision 0 may have only initialization date/system attribution.
+  The initial date-version revision has only initialization date/system attribution.
 - Detail loads full configuration; allow comparison against current committed
   desired or another explicitly selected revision, and config-only export.
 - **Restore this revision** opens a preview against current desired, collects
@@ -3854,8 +3913,8 @@ actor field is supplied; do not invent either.
 - Restoration is provisional and follows normal confirmation/recovery. It creates
   a new revision on confirmation, never rewinds numbering or overwrites history.
 - Explain that historical keys may be unavailable and current restrictions still
-  apply. Restoring revision 0 may remove all owned resources; show the full impact.
-- Preserve explicit `restored_from_revision: 0`; never treat it as absent.
+  apply. Restoring the initial revision may remove all owned resources; show the full impact.
+- Preserve `restored_from_revision` exactly; absence means no restore source.
 
 ## 7. Transaction state machine and reliability
 
@@ -4119,13 +4178,13 @@ Paths below are relative to `/api/v1`.
 | POST | `/services/mdns/reconcile` | No body -> `RuntimeState`; all enabled-service repair permissions; no query/body |
 
 For revision lists, `limit` defaults to 50, accepts 1..100, and
-`before_revision` is an exclusive uint64 cursor. Unknown, duplicated, empty, or
+`before_revision` is an exclusive canonical date-version string cursor. Unknown, duplicated, empty, or
 malformed parameters return `400`. Use `next_before_revision` verbatim for the
 next page; absence means exhausted. Do not calculate cursors from dates.
 
 `GET /api/v1/revisions/latest` requires `state.read` and returns `200` with
-exactly the numbered revision detail shape (flattened metadata plus complete
-`config`), including revision 0 before the first commit. It resolves the current
+exactly the revision detail shape (flattened metadata plus complete
+`config`), including the initialization revision before the first commit. It resolves the current
 committed revision in one request without live observation or configuration
 writes. Pending, rolled-back and failed transactions do not advance the
 returned revision; confirming a restore does. No query parameters are accepted
@@ -4140,7 +4199,7 @@ Complete empty package, useful as a schema illustration, **not a safe default**:
 
 ```json
 {
-  "base_revision": 0,
+  "base_revision": "2026.10.29.1",
   "confirm_timeout_seconds": 120,
   "description": "Remove all owned configuration",
   "config": {
@@ -4160,7 +4219,7 @@ Historical restore body:
 
 ```json
 {
-  "base_revision": 12,
+  "base_revision": "2026.10.29.13",
   "confirm_timeout_seconds": 120,
   "description": "Restore known-good configuration"
 }
@@ -4175,22 +4234,27 @@ The following TypeScript describes the application-level contract, not a generat
 SDK. Optional fields can be absent; timestamp fields explicitly marked nullable
 can be null when specified by the current response contract.
 
-**Revision precision:** The backend emits uint64 values as JSON numbers. Native
-`JSON.parse` can silently round values above `Number.MAX_SAFE_INTEGER`. Use a
-lossless JSON boundary: parse revision/cursor values to validated decimal strings
-and serialize them back as unquoted integer tokens using a tested lossless
-serializer. Ordinary `JSON.stringify` of these application strings is not a valid
-request encoding. Do not use an unsafe `number` cast or regex JSON rewriting.
-Kernel counter/protocol statistics are the deliberate exception: they already
-arrive as quoted decimal strings and must remain quoted; see section 6.1.1.
-Gateway window counts and measurements are ordinary JSON numbers, not uint64
-revision/counter values.
+**Revision format:** All revision/base/restore/result/cursor fields are quoted
+canonical `yyyy.mm.dd.iteration` strings on the wire. Use ordinary JSON string
+serialization; remove uint64/lossless-number revision encoders. Validate a real
+UTC date (year 0001..9999) and iteration 1..4294967295 without leading zeroes.
+Compare numeric components, not lexicographic strings (`.10` is newer than `.9`).
+Initialization allocates iteration 1; further same-day confirmations increment it,
+and the first confirmation on a later UTC day starts at 1. Clock regression or
+iteration exhaustion returns an explicit `503`, without committing or losing the
+pending rollback path. Copy the exact current revision for `base_revision`;
+numeric inputs, missing base revisions and malformed strings return `400`.
+Configuration and software iterations are independent. Rollbacks do not advance
+configuration versions; confirmed restores create a new revision. History is
+not contiguous integer arithmetic. Kernel counters remain decimal strings;
+gateway measurements remain ordinary JSON numbers.
 
 ```ts
-type RevisionNumber = string; // Validated decimal uint64 in application state.
+type RevisionNumber = string; // Canonical yyyy.mm.dd.iteration, quoted on the wire.
 type Timestamp = string; // RFC 3339.
 
 interface Config {
+  software: SoftwareMetadata; // Daemon-managed; omit from write requests.
   ipv6_enabled: boolean;
   ntp: NTPConfig;
   syslog: SyslogConfig;
@@ -4205,6 +4269,15 @@ interface Config {
   firewall: Firewall;
   softflowd: SoftflowdConfig[];
   gateway_monitors: GatewayMonitor[];
+}
+
+interface SoftwareMetadata {
+  version: string; // Canonical yyyy.mm.dd.iteration.
+  repository: string | null;
+  latest_version: string | null;
+  update_available: boolean | null;
+  last_checked_at: Timestamp | null;
+  error: string | null;
 }
 
 interface DynamicDNSConfig {
@@ -4463,6 +4536,7 @@ interface Transaction {
   actor: string;
   status: TransactionStatus;
   base_revision: RevisionNumber;
+  committed_revision: RevisionNumber | null;
   candidate: Config;
   previous: Config;
   confirmation_deadline: Timestamp;
@@ -4584,7 +4658,7 @@ interface RevisionPage {
 interface PackageRequest {
   base_revision: RevisionNumber;
   confirm_timeout_seconds: number;
-  config: Config;
+  config: Omit<Config, "software">;
   description?: string;
 }
 type RestoreRequest = Omit<PackageRequest, "config">;
@@ -4767,7 +4841,7 @@ separately. The release must remain usable without them.
 - Read-only interface/protocol statistics with precision, freshness, and explicit
   unavailable/simulated states; client-derived charts remain optional.
 - Transaction history/detail and failed-recovery retry.
-- Revision history/detail/comparison/restore, including revision 0.
+- Revision history/detail/comparison/restore, including the initialization revision.
 - Config import/export, responsive critical workflows, accessibility.
 - Automated coverage of section 16 and developer deployment/run instructions.
 

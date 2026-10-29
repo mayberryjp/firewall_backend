@@ -1,4 +1,7 @@
-use crate::{Backend, Config, KernelConfig, kernel_catalog, store::Store, valid_interface_name};
+use crate::{
+    Backend, Config, KernelConfig, SoftwareMetadata, Version, kernel_catalog, store::Store,
+    valid_interface_name,
+};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use rand::RngCore;
@@ -43,7 +46,8 @@ pub struct Transaction {
     pub id: String,
     pub actor: String,
     pub status: String,
-    pub base_revision: u64,
+    pub base_revision: Version,
+    pub committed_revision: Option<Version>,
     pub candidate: Config,
     pub previous: Config,
     pub confirmation_deadline: DateTime<Utc>,
@@ -56,13 +60,14 @@ pub struct Transaction {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub committed_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restored_from_revision: Option<u64>,
+    pub restored_from_revision: Option<Version>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
     scope: String,
-    revision: u64,
+    revision: Version,
+    initial_revision: Version,
     desired: Config,
     active_transaction: Option<String>,
     initialized_at: DateTime<Utc>,
@@ -71,8 +76,7 @@ struct State {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SubmitRequest {
-    #[serde(default)]
-    base_revision: u64,
+    base_revision: Version,
     confirm_timeout_seconds: i64,
     config: Config,
     #[serde(default)]
@@ -81,8 +85,7 @@ struct SubmitRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreRequest {
-    #[serde(default)]
-    base_revision: u64,
+    base_revision: Version,
     confirm_timeout_seconds: i64,
     #[serde(default)]
     description: String,
@@ -319,7 +322,7 @@ impl Engine {
                 );
                 validate_state(&s)?;
                 if initialize
-                    && s.revision == 0
+                    && s.revision == s.initial_revision
                     && s.transactions.is_empty()
                     && s.desired == Config::empty()
                 {
@@ -344,12 +347,15 @@ impl Engine {
                 initial
                     .validate()
                     .context("invalid initial backend configuration")?;
+                let initialized_at = Utc::now();
+                let initial_revision = Version::first(initialized_at.date_naive())?;
                 let s = State {
                     scope: scope.clone(),
-                    revision: 0,
+                    revision: initial_revision,
+                    initial_revision,
                     desired: initial,
                     active_transaction: None,
-                    initialized_at: Utc::now(),
+                    initialized_at,
                     transactions: BTreeMap::new(),
                 };
                 store.save(&s).context("initialize durable journal")?;
@@ -654,6 +660,14 @@ impl Engine {
         if path == "/api/v1/transactions" {
             let (r, ignored) = parse_submit(body)?;
             self.check_revision(r.base_revision)?;
+            if r.config.software != SoftwareMetadata::default()
+                && r.config.software != self.state.desired.software
+            {
+                return Err(ApiError::new(
+                    422,
+                    "software metadata is daemon-managed; omit it or submit the current value",
+                ));
+            }
             authorize(permissions, &self.state.desired, &r.config)?;
             let t = self.submit(actor, r, None)?;
             let mut reply_body = value(&t)?;
@@ -799,7 +813,7 @@ impl Engine {
                         service_error(error)
                     }
                 })?;
-            if observed.normalized() != expected.normalized() {
+            if !observed.same_settings(&expected) {
                 return Err(ApiError::new(409, "managed state has drifted"));
             }
             let runtime = self.backend.repair(&expected).map_err(internal_error)?;
@@ -807,8 +821,8 @@ impl Engine {
         }
         Err(ApiError::new(404, "endpoint not found"))
     }
-    fn check_revision(&self, revision: u64) -> ApiResult<()> {
-        if revision != self.state.revision || self.state.revision == u64::MAX {
+    fn check_revision(&self, revision: Version) -> ApiResult<()> {
+        if revision != self.state.revision {
             return Err(ApiError::new(409, "configuration conflict"));
         }
         Ok(())
@@ -817,8 +831,23 @@ impl Engine {
         &self.state.desired
     }
 
-    pub fn committed_revision(&self) -> u64 {
+    pub fn committed_revision(&self) -> Version {
         self.state.revision
+    }
+
+    pub fn is_initial_configuration(&self) -> bool {
+        self.state.revision == self.state.initial_revision && self.state.transactions.is_empty()
+    }
+
+    pub fn update_software_metadata(&mut self, metadata: SoftwareMetadata) -> Result<()> {
+        ensure!(!self.closed, "engine is shut down");
+        metadata.validate()?;
+        let mut next = self.state.clone();
+        next.desired.software = metadata;
+        if next.desired != self.state.desired {
+            self.persist(next)?;
+        }
+        Ok(())
     }
 
     pub fn configuration_busy(&self) -> bool {
@@ -944,7 +973,7 @@ impl Engine {
         &mut self,
         actor: &str,
         r: SubmitRequest,
-        restored: Option<u64>,
+        restored: Option<Version>,
     ) -> ApiResult<Transaction> {
         self.submit_inner(actor, r, restored, false)
     }
@@ -953,10 +982,11 @@ impl Engine {
         &mut self,
         actor: &str,
         mut r: SubmitRequest,
-        restored: Option<u64>,
+        restored: Option<Version>,
         factory_reset: bool,
     ) -> ApiResult<Transaction> {
         r.config.normalize();
+        r.config.software = self.state.desired.software.clone();
         r.description = r.description.trim().into();
         if r.description.len() > 1024 {
             return Err(ApiError::new(422, "description must not exceed 1024 bytes"));
@@ -1023,7 +1053,7 @@ impl Engine {
                 .backend
                 .observe(&self.state.desired)
                 .map_err(internal_error)?;
-            if observed.normalized() != self.state.desired.normalized() {
+            if !observed.same_settings(&self.state.desired) {
                 return Err(ApiError::new(409, "managed state has drifted"));
             }
         }
@@ -1050,6 +1080,7 @@ impl Engine {
             actor: actor.into(),
             status: "applying".into(),
             base_revision: r.base_revision,
+            committed_revision: None,
             candidate: r.config,
             previous: self.state.desired.clone(),
             confirmation_deadline: now + Duration::seconds(r.confirm_timeout_seconds),
@@ -1073,7 +1104,7 @@ impl Engine {
             }
             let actual = self.backend.observe(&t.candidate)?;
             ensure!(
-                actual.normalized() == t.candidate.normalized(),
+                actual.same_settings(&t.candidate),
                 "post-apply verification mismatch"
             );
             ensure!(
@@ -1120,7 +1151,6 @@ impl Engine {
         }
         if self.state.active_transaction.as_deref() != Some(id)
             || t.status != "pending_confirmation"
-            || self.state.revision == u64::MAX
         {
             return Err(ApiError::new(409, "configuration conflict").transaction(t));
         }
@@ -1133,25 +1163,32 @@ impl Engine {
             .backend
             .observe(&t.candidate)
             .map_err(|e| internal_error(e).transaction(t.clone()))?;
-        if observed.normalized() != t.candidate.normalized() {
+        if !observed.same_settings(&t.candidate) {
             return Err(ApiError::new(409, "candidate drifted before confirmation").transaction(t));
         }
-        if self.now() >= t.confirmation_deadline {
+        let committed_at = self.now();
+        if committed_at >= t.confirmation_deadline {
             let _ = self.rollback(id, "confirmation expired during verification");
             return Err(ApiError::new(409, "confirmation expired")
                 .transaction(self.state.transactions.get(id).cloned().unwrap_or(t)));
         }
         let mut next = self.state.clone();
-        next.revision += 1;
+        next.revision = self
+            .state
+            .revision
+            .next(committed_at.date_naive())
+            .map_err(service_error)?;
         next.desired = t.candidate.clone();
+        next.desired.software = self.state.desired.software.clone();
         next.active_transaction = None;
         let committed = next
             .transactions
             .get_mut(id)
             .ok_or_else(|| service_error("transaction disappeared"))?;
         committed.status = "committed".into();
-        committed.committed_at = Some(self.now());
+        committed.committed_at = Some(committed_at);
         committed.committed_by = actor.into();
+        committed.committed_revision = Some(next.revision);
         let result = committed.clone();
         self.persist(next)
             .map_err(|e| internal_error(format!("persist confirmation: {e}")))?;
@@ -1182,7 +1219,7 @@ impl Engine {
             self.backend.apply(&t.candidate, &t.previous)?;
             let observed = self.backend.observe(&t.previous)?;
             ensure!(
-                observed.normalized() == t.previous.normalized(),
+                observed.same_settings(&t.previous),
                 "rollback verification mismatch"
             );
             Ok(())
@@ -1210,30 +1247,30 @@ impl Engine {
         }
         Ok(())
     }
-    fn revision_config(&self, number: u64) -> ApiResult<Config> {
-        if number > self.state.revision {
-            return Err(ApiError::new(404, format!("revision not found: {number}")));
+    fn revision_config(&self, number: Version) -> ApiResult<Config> {
+        if number == self.state.revision {
+            return Ok(self.state.desired.clone());
         }
-        if number == 0 {
+        if number == self.state.initial_revision {
             return Ok(self
                 .state
                 .transactions
                 .values()
-                .find(|t| t.status == "committed" && t.base_revision == 0)
+                .find(|t| t.status == "committed" && t.base_revision == self.state.initial_revision)
                 .map(|t| t.previous.clone())
                 .unwrap_or_else(|| self.state.desired.clone()));
         }
         self.state
             .transactions
             .values()
-            .find(|t| t.status == "committed" && t.base_revision == number - 1)
+            .find(|t| t.status == "committed" && t.committed_revision == Some(number))
             .map(|t| t.candidate.clone())
-            .ok_or_else(|| service_error("revision archive is incomplete"))
+            .ok_or_else(|| ApiError::new(404, format!("revision not found: {number}")))
     }
-    fn revision_metadata(&self, number: u64) -> ApiResult<Value> {
-        if number == 0 {
+    fn revision_metadata(&self, number: Version) -> ApiResult<Value> {
+        if number == self.state.initial_revision {
             return Ok(
-                json!({"revision":0,"current":self.state.revision==0,"submitted_at":null,
+                json!({"revision":number,"current":self.state.revision==number,"submitted_at":null,
             "committed_at":self.state.initialized_at,"committed_by":"system","description":"Initial configuration"}),
             );
         }
@@ -1241,7 +1278,7 @@ impl Engine {
             .state
             .transactions
             .values()
-            .find(|t| t.status == "committed" && t.base_revision == number - 1)
+            .find(|t| t.status == "committed" && t.committed_revision == Some(number))
             .ok_or_else(|| ApiError::new(404, "revision not found"))?;
         let mut v = json!({"revision":number,"current":number==self.state.revision,"transaction_id":t.id,"submitted_at":t.submitted_at,
             "committed_at":t.committed_at,"submitted_by":t.actor,"committed_by":t.committed_by});
@@ -1281,12 +1318,20 @@ impl Engine {
             let (limit, before) = revision_query(query)?;
             let mut result = vec![];
             let mut next = None;
-            for n in (0..=self.state.revision)
-                .rev()
+            let mut revisions: Vec<_> = self
+                .state
+                .transactions
+                .values()
+                .filter_map(|transaction| transaction.committed_revision)
+                .collect();
+            revisions.push(self.state.initial_revision);
+            revisions.sort_unstable_by(|a, b| b.cmp(a));
+            for n in revisions
+                .into_iter()
                 .filter(|n| before.is_none_or(|b| *n < b))
             {
                 if result.len() == limit {
-                    next = result.last().and_then(|v: &Value| v["revision"].as_u64());
+                    next = result.last().map(|v: &Value| v["revision"].clone());
                     break;
                 }
                 result.push(self.revision_metadata(n)?);
@@ -1566,17 +1611,10 @@ impl Engine {
     }
 }
 
-fn parse_revision(s: &str) -> ApiResult<u64> {
-    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(ApiError::new(
-            400,
-            "revision must be an unsigned 64-bit integer",
-        ));
-    }
-    s.parse()
-        .map_err(|_| ApiError::new(400, "revision must be an unsigned 64-bit integer"))
+fn parse_revision(s: &str) -> ApiResult<Version> {
+    s.parse().map_err(|error| ApiError::new(400, error))
 }
-fn revision_query(query: &str) -> ApiResult<(usize, Option<u64>)> {
+fn revision_query(query: &str) -> ApiResult<(usize, Option<Version>)> {
     let mut limit = 50;
     let mut before = None;
     let mut seen = BTreeSet::new();
@@ -1720,10 +1758,14 @@ fn validate_state(s: &State) -> Result<()> {
     let initial = s
         .transactions
         .values()
-        .find(|t| t.status == "committed" && t.base_revision == 0)
+        .find(|t| t.status == "committed" && t.base_revision == s.initial_revision)
         .map(|t| t.previous.clone())
         .unwrap_or_else(|| s.desired.clone());
-    records.insert(0, initial);
+    ensure!(
+        s.initial_revision == Version::first(s.initialized_at.date_naive())?,
+        "invalid initial revision"
+    );
+    records.insert(s.initial_revision, initial);
     let mut active = 0;
     for (id, t) in &s.transactions {
         ensure!(
@@ -1790,13 +1832,18 @@ fn validate_state(s: &State) -> Result<()> {
             );
             ensure!(
                 records
-                    .insert(t.base_revision + 1, t.candidate.clone())
+                    .insert(
+                        t.committed_revision.context("missing committed revision")?,
+                        t.candidate.clone()
+                    )
                     .is_none(),
                 "duplicate committed revision"
             );
         } else {
             ensure!(
-                t.committed_at.is_none() && t.committed_by.is_empty(),
+                t.committed_at.is_none()
+                    && t.committed_by.is_empty()
+                    && t.committed_revision.is_none(),
                 "noncommitted transaction has commitment metadata"
             );
         }
@@ -1805,25 +1852,49 @@ fn validate_state(s: &State) -> Result<()> {
         active == usize::from(s.active_transaction.is_some()),
         "invalid active transaction pointer"
     );
+    let mut previous = s.initial_revision;
+    for (revision, config) in records.iter().skip(1) {
+        let transaction = s
+            .transactions
+            .values()
+            .find(|t| t.committed_revision == Some(*revision))
+            .context("revision archive is incomplete")?;
+        ensure!(
+            transaction.base_revision == previous
+                && previous.next(
+                    transaction
+                        .committed_at
+                        .context("missing commit timestamp")?
+                        .date_naive()
+                )? == *revision,
+            "revision archive is incomplete"
+        );
+        ensure!(
+            config.same_settings(&transaction.candidate),
+            "invalid revision configuration"
+        );
+        previous = *revision;
+    }
+    ensure!(previous == s.revision, "revision archive is incomplete");
     ensure!(
-        u64::try_from(records.len())?
-            == s.revision
-                .checked_add(1)
-                .context("revision counter overflow")?,
-        "revision archive is incomplete"
-    );
-    ensure!(
-        records.get(&s.revision) == Some(&s.desired),
+        records
+            .get(&s.revision)
+            .is_some_and(|config| config.same_settings(&s.desired)),
         "current configuration does not match revision archive"
     );
     for t in s.transactions.values() {
         ensure!(
-            records.get(&t.base_revision) == Some(&t.previous),
+            records
+                .get(&t.base_revision)
+                .is_some_and(|config| config.same_settings(&t.previous)),
             "transaction previous configuration disagrees with base revision"
         );
         if let Some(from) = t.restored_from_revision {
             ensure!(
-                from <= t.base_revision && records.get(&from) == Some(&t.candidate),
+                from <= t.base_revision
+                    && records
+                        .get(&from)
+                        .is_some_and(|config| config.same_settings(&t.candidate)),
                 "inconsistent restoration provenance"
             );
         }

@@ -332,8 +332,8 @@ show statistics vnstat
 show transactions
 show transaction TRANSACTION_ID
 show revisions
-show revision NUMBER
-restore revision NUMBER confirmed 60 DESCRIPTION
+show revision yyyy.mm.dd.iteration
+restore revision yyyy.mm.dd.iteration confirmed 60 DESCRIPTION
 reconcile services ntp
 reconcile services udp-broadcast-relay
 ```
@@ -350,6 +350,14 @@ healthy live observation. `show state`/resource views retain observation errors;
 `show interfaces discovered` reads actual namespace inventory independently of
 configured-state verification and worker health. In native host mode this
 includes unmanaged host NICs; in simulator mode it is simulated inventory only.
+
+Revision arguments and JSON revision fields are canonical UTC
+`yyyy.mm.dd.iteration` strings, not incrementing integers. Use an exact ID from
+`show revisions`; initial allocation and a new day's first confirmed commit use
+iteration 1. Restores create a new revision on confirmation; rollback does not.
+Software uses the same format independently. `show running-config` includes
+daemon-managed `software` identity/daily-update metadata; it is read-only and
+must not be edited or restored as networking settings.
 `show runtime`, transaction reads and rollback are separate diagnostics/actions.
 Restore creates a new provisional transaction and requires confirmation.
 Discard a private candidate before restoring. Service repair acts on stored

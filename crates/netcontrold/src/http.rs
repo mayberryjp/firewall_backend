@@ -980,7 +980,7 @@ fn api(
             Err(_) => {
                 return fail(
                     400,
-                    "version must be canonical SemVer without build metadata or a v prefix",
+                    "version must be canonical yyyy.mm.dd.iteration without a v prefix",
                     true,
                 );
             }
@@ -992,19 +992,24 @@ fn api(
             Ok(job) => job,
             Err(_) => return fail(503, "upgrade state unavailable", true),
         };
-        if current.as_ref().is_some_and(|job| {
-            job.active()
-                || job
-                    .last_successful_version
-                    .as_ref()
-                    .is_some_and(|previous| {
-                        netcontrol_package::update::version(previous)
-                            .is_ok_and(|previous| version <= previous)
-                    })
-        }) {
+        if version
+            <= netcontrol_core::RELEASE_VERSION
+                .parse::<netcontrol_core::Version>()
+                .expect("invalid compiled release version")
+            || current.as_ref().is_some_and(|job| {
+                job.active()
+                    || job
+                        .last_successful_version
+                        .as_ref()
+                        .is_some_and(|previous| {
+                            netcontrol_package::update::version(previous)
+                                .is_ok_and(|previous| version <= previous)
+                        })
+            })
+        {
             return fail(
                 409,
-                "upgrade active or requested version is not newer than the last successful upgrade",
+                "upgrade active or requested version is not newer than the running and last successful versions",
                 true,
             );
         }

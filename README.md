@@ -131,10 +131,26 @@ the current schema; provision keys/underlay and adapt the complete configuration
 before applying it.
 
 Optional Ubuntu amd64 self-upgrade uses `POST /api/v1/system/upgrade` with a
-specific SemVer version and `GET` on the same path for durable job status.
+specific `yyyy.mm.dd.iteration` version and `GET` on the same path for durable job status.
 It is disabled until a trusted release-signing public key and fixed GitHub
 repository are configured. See [signed self-upgrades](docs/BUILD_AND_INSTALL.md#signed-ubuntu-self-upgrade)
 for bootstrap, artifact publishing, recovery and validation limitations.
+
+Software identity comes from `RELEASE_VERSION` in
+[version.rs](crates/netcontrol-core/src/version.rs), not Cargo's internal package
+version. The daemon saves read-only `software` metadata in the master configuration:
+running version, configured release repository, latest release, nullable update
+availability, last check time and explicit error. When self-upgrade is configured,
+it checks GitHub's latest published stable release at startup and every 24 hours;
+no automatic installation occurs. Disabled, pending and failed checks never mean
+"up to date". See the [frontend contract](FRONTEND_SPEC.md#46-software-version-and-daily-release-checks).
+
+Configuration revisions independently use the same UTC date format as JSON strings.
+Initialization and each UTC day's first confirmed commit start at iteration 1;
+further commits that day increment it. History, conflict detection and confirmed
+restore use the exact server-issued revision; never derive it with arithmetic.
+The current journal is `netcontrol-rust-state-v2`. Numeric-revision journals are
+incompatible and are refused without deletion, reset or automatic conversion.
 
 For optional Ubuntu OS footprint reduction, start with `sudo bash hardening.sh`
 to preview the explicit service/package profile. Nothing changes without

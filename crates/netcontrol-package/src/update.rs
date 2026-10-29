@@ -17,14 +17,8 @@ pub struct Manifest {
     pub sha256: String,
 }
 
-pub fn version(input: &str) -> Result<semver::Version> {
-    ensure!(input.len() <= 80, "version exceeds 80 bytes");
-    let parsed = semver::Version::parse(input)?;
-    ensure!(
-        parsed.to_string() == input && parsed.build.is_empty(),
-        "version must be canonical SemVer without build metadata or a v prefix"
-    );
-    Ok(parsed)
+pub fn version(input: &str) -> Result<netcontrol_core::Version> {
+    input.parse()
 }
 
 impl Manifest {
@@ -92,7 +86,7 @@ mod tests {
 
     #[test]
     fn update_versions_are_canonical_not_paths_or_urls() {
-        for valid in ["1.2.3", "0.1.0", "2.0.0-rc.1"] {
+        for valid in ["2026.10.29.1", "2026.01.01.1", "2024.02.29.10"] {
             assert!(version(valid).is_ok());
         }
         for invalid in [
@@ -117,25 +111,36 @@ mod tests {
         binary[18] = 62;
         let mut manifest = Manifest {
             schema: 1,
-            version: "1.2.3".into(),
+            version: "2026.10.29.1".into(),
             target: TARGET.into(),
             size: binary.len() as u64,
             sha256: hex::encode(Sha256::digest(&binary)),
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let signature = key.sign(&bytes).to_bytes();
-        let verified =
-            verify_manifest(&bytes, &signature, &key.verifying_key().to_bytes(), "1.2.3").unwrap();
+        let verified = verify_manifest(
+            &bytes,
+            &signature,
+            &key.verifying_key().to_bytes(),
+            "2026.10.29.1",
+        )
+        .unwrap();
         verify_binary(&binary, &verified).unwrap();
         assert!(
-            verify_manifest(&bytes, &signature, &key.verifying_key().to_bytes(), "1.2.4").is_err()
+            verify_manifest(
+                &bytes,
+                &signature,
+                &key.verifying_key().to_bytes(),
+                "2026.10.29.2"
+            )
+            .is_err()
         );
         assert!(
             verify_manifest(
                 &bytes,
                 &signature,
                 &SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes(),
-                "1.2.3"
+                "2026.10.29.1"
             )
             .is_err()
         );

@@ -310,7 +310,7 @@ impl Plan {
         let original = read_private(&state_path)?;
         let envelope: Envelope = serde_json::from_slice(&original)?;
         ensure!(
-            envelope.schema == "netcontrol-rust-state-v1",
+            envelope.schema == "netcontrol-rust-state-v2",
             "unsupported journal schema"
         );
         ensure!(
@@ -626,7 +626,7 @@ mod tests {
             if history {
                 let permissions: Vec<String> =
                     PERMISSIONS.iter().map(|value| (*value).into()).collect();
-                let request = json!({"base_revision":0,"confirm_timeout_seconds":30,"config":{"interfaces":[{"name":"policy_rules","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"],"metadata":{"description":"policy_rules stays descriptive"}}]}});
+                let request = json!({"base_revision":engine.committed_revision(),"confirm_timeout_seconds":30,"config":{"interfaces":[{"name":"policy_rules","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"],"metadata":{"description":"policy_rules stays descriptive"}}]}});
                 let reply = engine.request(
                     "POST",
                     "/api/v1/transactions",
@@ -680,7 +680,7 @@ mod tests {
 
         fn save_payload(&self, payload: &Value) {
             let bytes = serde_json::to_vec(payload).unwrap();
-            let envelope = json!({"schema":"netcontrol-rust-state-v1","sha256":hex::encode(Sha256::digest(&bytes)),"state":payload});
+            let envelope = json!({"schema":"netcontrol-rust-state-v2","sha256":hex::encode(Sha256::digest(&bytes)),"state":payload});
             fs::write(&self.options.state, serde_json::to_vec(&envelope).unwrap()).unwrap();
         }
 
@@ -723,6 +723,7 @@ mod tests {
     fn preview_and_apply_preserve_history_and_exact_private_backup() {
         let fixture = Fixture::new(true);
         let original = fs::read(&fixture.options.state).unwrap();
+        let original_revision = fixture.payload()["revision"].clone();
         let plan = Plan::prepare(&fixture.options).unwrap();
         assert_eq!(plan.changes.len(), 3);
         assert_eq!(fs::read(&fixture.options.state).unwrap(), original);
@@ -734,7 +735,7 @@ mod tests {
         );
         assert!(fixture.backup().join("completed").exists());
         let payload = fixture.payload();
-        assert_eq!(payload["revision"], 1);
+        assert_eq!(payload["revision"], original_revision);
         assert_eq!(payload["transactions"].as_object().unwrap().len(), 1);
         assert_eq!(payload["desired"]["interfaces"][0]["name"], "policy_rules");
         assert!(payload["desired"].get("policy_rules").is_none());

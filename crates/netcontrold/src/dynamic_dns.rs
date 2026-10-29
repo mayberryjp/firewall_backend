@@ -1,3 +1,17 @@
+#[cfg(test)]
+fn test_revision(index: u32) -> netcontrol_core::Version {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}.{:02}.{:02}.{}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        index + 1
+    )
+    .parse()
+    .unwrap()
+}
+
 use crate::private_store::{identifier, private_file, read_private, valid_id, write_new_private};
 use anyhow::{Context, Result, ensure};
 use netcontrol_core::{DynamicDNSAddressSource, DynamicDNSConfig, Engine};
@@ -1058,7 +1072,7 @@ mod tests {
                 app.clone(),
                 "POST",
                 "/api/v1/transactions",
-                json!({"base_revision":0,"confirm_timeout_seconds":30,"config":config}),
+                json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":config}),
                 "reader-token"
             )
             .await
@@ -1069,7 +1083,7 @@ mod tests {
             app.clone(),
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":0,"confirm_timeout_seconds":30,"config":config}),
+            json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":config}),
             "writer-token",
         )
         .await;
@@ -1135,7 +1149,7 @@ mod tests {
             app.clone(),
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":1,"confirm_timeout_seconds":30,"config":disabled}),
+            json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":disabled}),
             "writer-token",
         )
         .await;
@@ -1167,7 +1181,7 @@ mod tests {
             app.clone(),
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":1,"confirm_timeout_seconds":30,"config":disabled}),
+            json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":disabled}),
             "writer-token",
         )
         .await;

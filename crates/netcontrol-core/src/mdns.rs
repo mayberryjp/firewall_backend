@@ -1,3 +1,10 @@
+#[cfg(test)]
+fn test_revision(index: u32) -> crate::Version {
+    format!("{}.{}", chrono::Utc::now().format("%Y.%m.%d"), index + 1)
+        .parse()
+        .unwrap()
+}
+
 use crate::{Config, ObjectMetadata};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -460,7 +467,7 @@ mod tests {
             .collect::<Vec<_>>();
         let candidate = config();
         let body = serde_json::to_vec(
-            &json!({"base_revision":0,"confirm_timeout_seconds":30,"config":candidate}),
+            &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":candidate}),
         )
         .unwrap();
         assert_eq!(
@@ -570,13 +577,15 @@ mod tests {
         );
         let read = engine.request("GET", "/api/v1/services/mdns", "", "operator", &all, &[]);
         assert_eq!(read.body, serde_json::to_value(&candidate.mdns).unwrap());
-        let body =
-            serde_json::to_vec(&json!({"base_revision":1,"confirm_timeout_seconds":30})).unwrap();
+        let body = serde_json::to_vec(
+            &json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30}),
+        )
+        .unwrap();
         assert_eq!(
             engine
                 .request(
                     "POST",
-                    "/api/v1/revisions/0/restore",
+                    &format!("/api/v1/revisions/{}/restore", test_revision(0)),
                     "",
                     "operator",
                     &restricted,
@@ -587,7 +596,7 @@ mod tests {
         );
         let reply = engine.request(
             "POST",
-            "/api/v1/revisions/0/restore",
+            &format!("/api/v1/revisions/{}/restore", test_revision(0)),
             "",
             "operator",
             &all,

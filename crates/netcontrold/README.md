@@ -211,6 +211,12 @@ preflight accepts only GET/POST and Authorization/Content-Type, returning 204;
 unsupported requested methods/headers return 405/400. Neither credentials mode
 grants cookie authorization to networking routes. `/auth/` never emits CORS.
 
-This is an unreleased breaking persisted-schema/CLI change; recommended bump:
-major once an initial release baseline is approved. No software release version
-is implied by workspace development metadata `0.0.0`.
+This is an unreleased breaking persisted-schema/CLI contract. Public build labels
+and independent configuration revisions use UTC `yyyy.mm.dd.iteration`, not
+Cargo's internal workspace version. The embedded software label is defined by
+`RELEASE_VERSION` in [version.rs](../netcontrol-core/src/version.rs); publication
+still requires approval. The daemon saves `software` identity/update metadata
+inside the master configuration and, when self-upgrade is configured, checks
+GitHub at startup and every 24 hours without installing. See the
+[frontend contract](../../FRONTEND_SPEC.md#46-software-version-and-daily-release-checks)
+and [operator deployment requirements](../../docs/BUILD_AND_INSTALL.md#daily-release-discovery-and-configuration-versions).

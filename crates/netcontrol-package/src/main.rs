@@ -748,7 +748,7 @@ mod tests {
         fs::write(&signing_key, key.to_bytes()).unwrap();
         let command = || Command::BuildUpdate {
             daemon: daemon.clone(),
-            version: "1.2.3".into(),
+            version: "2026.10.29.1".into(),
             signing_key: signing_key.clone(),
             output_dir: output_dir.clone(),
         };
@@ -758,7 +758,7 @@ mod tests {
             &fs::read(output_dir.join("netcontrol-ubuntu-amd64.json")).unwrap(),
             &fs::read(output_dir.join("netcontrol-ubuntu-amd64.sig")).unwrap(),
             &key.verifying_key().to_bytes(),
-            "1.2.3",
+            "2026.10.29.1",
         )
         .unwrap();
         netcontrol_package::update::verify_binary(

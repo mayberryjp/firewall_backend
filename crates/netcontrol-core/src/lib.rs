@@ -10,6 +10,9 @@ mod model;
 mod simulator;
 mod store;
 mod udp_broadcast_relay;
+mod version;
+
+pub use version::{RELEASE_VERSION, SoftwareMetadata, Version};
 
 pub use udp_broadcast_relay::{UDPBroadcastRelayConfig, UDPRelayInstance, UDPRelaySource};
 

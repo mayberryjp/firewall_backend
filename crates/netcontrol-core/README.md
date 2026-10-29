@@ -58,14 +58,14 @@ The state file is a JSON envelope with exactly these fields:
 
 ```json
 {
-  "schema": "netcontrol-rust-state-v1",
+  "schema": "netcontrol-rust-state-v2",
   "sha256": "64 lowercase hexadecimal digits",
   "state": {}
 }
 ```
 
 The illustrated empty `state` is not a valid journal; its actual typed payload
-contains `scope`, `revision`, `desired`, `active_transaction`, `initialized_at`
+contains `scope`, `revision`, `initial_revision`, `desired`, `active_transaction`, `initialized_at`
 and `transactions`. SHA-256 covers the exact JSON bytes of the saved `state`
 value. The writer serializes that value once as compact JSON, then hashes and
 publishes the same payload. Loading verifies those bytes before decoding current
@@ -73,6 +73,20 @@ Rust types, so field ordering/default expansion cannot fabricate corruption.
 Changing whitespace within the saved value changes its checksum; envelope
 whitespace outside that value is not covered. This detects corruption, not an
 attacker able to rewrite the journal and its checksum.
+
+Revisions are canonical `yyyy.mm.dd.iteration` JSON strings, using UTC and a
+positive per-day iteration. Initial provisioning creates that day's iteration 1;
+confirmation increments the same day's iteration or starts the next day's at 1.
+Clock regression and iteration exhaustion fail explicitly. Transactions expose
+nullable `committed_revision`; do not derive it from `base_revision`. Restoration
+creates a new current-day revision, and provisional rollback does not advance it.
+Numeric-revision v1 journals are rejected unchanged, not automatically converted.
+
+`desired.software` is saved daemon-managed metadata, independent of configuration
+revision allocation and backend drift. Daily check updates are atomic journal
+writes without network apply. Transaction clients omit it or echo its exact
+current value; differing supplied metadata returns `422`. Restore never rolls
+software metadata backward, and pending confirmation retains fresh metadata.
 
 The journal rejects unknown fields, malformed/truncated/empty files, checksum
 mismatches, different schemas, scope mismatches, inconsistent active pointers,

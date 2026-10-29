@@ -1,3 +1,10 @@
+#[cfg(test)]
+fn test_revision(index: u32) -> crate::Version {
+    format!("{}.{}", chrono::Utc::now().format("%Y.%m.%d"), index + 1)
+        .parse()
+        .unwrap()
+}
+
 use super::*;
 use crate::{Simulator, SystemConfig};
 use std::{
@@ -84,7 +91,7 @@ fn udp_relay_api_authorization_persistence_and_rollback() {
         "operator",
         &permissions,
         &serde_json::to_vec(
-            &json!({"base_revision":0,"confirm_timeout_seconds":30,"config":candidate}),
+            &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":candidate}),
         )
         .unwrap(),
     );
@@ -252,14 +259,14 @@ fn bgp_api_permissions_transactions_restart_and_route_visibility() {
     assert!(summary.body.get("routes").is_none());
     assert!(summary.body.get("advertised_routes").is_none());
     assert_eq!(engine.restart_process("bgp").body["status"], "simulated");
-    assert_eq!(engine.committed_revision(), 1);
+    assert_eq!(engine.committed_revision(), test_revision(1));
     let stats = request(&mut engine, "GET", "/api/v1/statistics", Value::Null);
     assert_eq!(stats.body["bgp"]["state"], "simulated");
     let mut no_bgp = all();
     no_bgp.retain(|p| p != "bgp.write");
     candidate.bgp.keepalive_seconds = 20;
     let response=engine.request("POST","/api/v1/transactions","","operator",&no_bgp,
-        &serde_json::to_vec(&json!({"base_revision":1,"confirm_timeout_seconds":30,"description":"BGP timers","config":candidate})).unwrap());
+        &serde_json::to_vec(&json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"description":"BGP timers","config":candidate})).unwrap());
     assert_eq!(response.status, 403, "{}", response.body);
 }
 
@@ -292,7 +299,7 @@ fn destination_rewrite_permissions_persistence_and_rollback() {
     );
     let limited: Vec<_> = all().into_iter().filter(|p| p != "nat.write").collect();
     let body = serde_json::to_vec(
-        &json!({"base_revision":1,"confirm_timeout_seconds":30,"config":rewritten}),
+        &json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":rewritten}),
     )
     .unwrap();
     assert_eq!(
@@ -366,7 +373,7 @@ fn destination_rewrite_permissions_persistence_and_rollback() {
         rewritten.operational_value().unwrap()
     );
     let body = serde_json::to_vec(
-        &json!({"base_revision":2,"confirm_timeout_seconds":30,"config":metadata}),
+        &json!({"base_revision":test_revision(2),"confirm_timeout_seconds":30,"config":metadata}),
     )
     .unwrap();
     assert_eq!(
@@ -391,7 +398,7 @@ fn operational_restarts_do_not_change_revision_and_reject_pending_transactions()
     let reply = engine.restart_process("link-diagnostics");
     assert_eq!(reply.status, 200);
     assert_eq!(reply.body["status"], "simulated");
-    assert_eq!(engine.committed_revision(), 0);
+    assert_eq!(engine.committed_revision(), test_revision(0));
     assert_eq!(engine.restart_process("ntp").status, 409);
     assert_eq!(engine.restart_process("flow:missing").status, 404);
     let transaction = submit(&mut engine, config());
@@ -590,7 +597,7 @@ fn static_route_enabled_permission_restart_and_rollback() {
         &mut engine,
         "POST",
         "/api/v1/transactions",
-        json!({"base_revision":0,"confirm_timeout_seconds":30,"config":initial.clone()}),
+        json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":initial.clone()}),
     );
     let initial: Config = serde_json::from_value(initial).unwrap();
     assert!(initial.routes[0].enabled);
@@ -607,7 +614,7 @@ fn static_route_enabled_permission_restart_and_rollback() {
     disabled.routes[0].enabled = false;
     let permissions: Vec<_> = all().into_iter().filter(|p| p != "routes.write").collect();
     let body = serde_json::to_vec(
-        &json!({"base_revision":1,"confirm_timeout_seconds":30,"config":disabled}),
+        &json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":disabled}),
     )
     .unwrap();
     assert_eq!(
@@ -630,7 +637,7 @@ fn static_route_enabled_permission_restart_and_rollback() {
             &mut engine,
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":1,"confirm_timeout_seconds":30,"config":invalid})
+            json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":invalid})
         )
         .status,
         400
@@ -680,7 +687,7 @@ fn global_ipv6_permission_commit_restart_and_rollback() {
         "limited",
         &["transactions.write".into()],
         &serde_json::to_vec(
-            &json!({"base_revision":0,"confirm_timeout_seconds":30,"config":disabled}),
+            &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":disabled}),
         )
         .unwrap(),
     );
@@ -732,7 +739,7 @@ fn descriptive_metadata_requires_resource_permission_and_survives_reopen() {
     described.interfaces[0].metadata.display_name = "Office LAN".into();
     described.interfaces[0].metadata.description = "Operator notes".into();
     let body = serde_json::to_vec(
-        &json!({"base_revision": 1, "confirm_timeout_seconds": 30, "config": described}),
+        &json!({"base_revision": test_revision(1), "confirm_timeout_seconds": 30, "config": described}),
     )
     .unwrap();
     assert_eq!(
@@ -807,8 +814,8 @@ fn every_example_json_is_a_valid_current_transaction_request() {
             path.display()
         );
         assert_eq!(
-            request.base_revision,
-            0,
+            request.base_revision.to_string(),
+            "2026.10.29.1",
             "{}: fresh-state fixture",
             path.display()
         );
@@ -839,7 +846,7 @@ fn long_windows_state_paths_support_atomic_publication_and_restart() {
     assert_eq!(committed.status, 200, "{}", committed.body);
     drop(engine);
     let engine = Engine::open(&path, Box::new(Simulator::new())).unwrap();
-    assert_eq!(engine.state.revision, 1);
+    assert_eq!(engine.state.revision, test_revision(1));
     assert_eq!(engine.state.desired, config().normalized());
 }
 
@@ -855,7 +862,7 @@ fn persistent_envelope_shape_is_explicit_and_rust_only() {
         .map(String::as_str)
         .collect();
     assert_eq!(keys, BTreeSet::from(["schema", "sha256", "state"]));
-    assert_eq!(envelope["schema"], "netcontrol-rust-state-v1");
+    assert_eq!(envelope["schema"], "netcontrol-rust-state-v2");
     assert_eq!(envelope["sha256"].as_str().unwrap().len(), 64);
     let keys: BTreeSet<_> = envelope["state"]
         .as_object()
@@ -868,6 +875,7 @@ fn persistent_envelope_shape_is_explicit_and_rust_only() {
         BTreeSet::from([
             "scope",
             "revision",
+            "initial_revision",
             "desired",
             "active_transaction",
             "initialized_at",
@@ -890,34 +898,42 @@ fn transaction_confirmation_history_restore_and_locations() {
     assert_eq!(r.body["status"], "pending_confirmation");
     assert_eq!(r.body["description"], "Update network");
     let state = request(&mut e, "GET", "/api/v1/state", Value::Null);
-    assert_eq!(state.body["revision"], 0);
+    assert_eq!(state.body["revision"], serde_json::json!(test_revision(0)));
     assert_eq!(state.body["desired"]["interfaces"], json!([]));
     assert_eq!(state.body["observed"]["interfaces"][0]["name"], "lan0");
     assert_eq!(state.body["drift"], false);
     assert_eq!(confirm(&mut e, &id).status, 200);
-    assert_eq!(e.state.revision, 1);
+    assert_eq!(e.state.revision, test_revision(1));
     assert_eq!(confirm(&mut e, &id).status, 200);
-    assert_eq!(e.state.revision, 1);
+    assert_eq!(e.state.revision, test_revision(1));
     let list = request(&mut e, "GET", "/api/v1/revisions", Value::Null);
     assert_eq!(list.body["revisions"].as_array().unwrap().len(), 2);
     assert_eq!(list.body["revisions"][0]["current"], true);
-    let revision = request(&mut e, "GET", "/api/v1/revisions/1", Value::Null);
+    let revision = request(
+        &mut e,
+        "GET",
+        &format!("/api/v1/revisions/{}", test_revision(1)),
+        Value::Null,
+    );
     assert_eq!(revision.body["config"], json!(config().normalized()));
     let restore = request(
         &mut e,
         "POST",
-        "/api/v1/revisions/0/restore",
-        json!({"base_revision":1,"confirm_timeout_seconds":30}),
+        &format!("/api/v1/revisions/{}/restore", test_revision(0)),
+        json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30}),
     );
     assert_eq!(restore.status, 202, "{}", restore.body);
-    assert_eq!(restore.body["restored_from_revision"], 0);
+    assert_eq!(
+        restore.body["restored_from_revision"],
+        serde_json::json!(test_revision(0))
+    );
     let restored_id = restore.body["id"].as_str().unwrap();
     assert_eq!(confirm(&mut e, restored_id).status, 200);
-    assert_eq!(e.state.revision, 2);
+    assert_eq!(e.state.revision, test_revision(2));
     assert_eq!(e.state.desired, Config::empty());
     drop(e);
     let e = f.engine();
-    assert_eq!(e.state.revision, 2);
+    assert_eq!(e.state.revision, test_revision(2));
 }
 #[test]
 fn pending_confirmation_survives_restart_and_expiry_rolls_back() {
@@ -978,7 +994,7 @@ fn rollback_is_idempotent_and_does_not_advance_revision() {
     let path = format!("/api/v1/transactions/{id}/rollback");
     assert_eq!(request(&mut e, "POST", &path, Value::Null).status, 200);
     assert_eq!(request(&mut e, "POST", &path, Value::Null).status, 200);
-    assert_eq!(e.state.revision, 0);
+    assert_eq!(e.state.revision, test_revision(0));
     assert_eq!(confirm(&mut e, id).status, 409);
 }
 #[test]
@@ -1475,7 +1491,7 @@ fn explicit_factory_reset_replaces_saved_configuration_without_pre_reset_repair(
     assert_eq!(reset.status, "committed");
     assert_eq!(reset.actor, "local-factory-reset");
     assert_eq!(engine.state.desired, Config::empty());
-    assert_eq!(engine.state.revision, 2);
+    assert_eq!(engine.state.revision, test_revision(2));
     assert!(engine.state.active_transaction.is_none());
     assert_eq!(engine.state.transactions.len(), 2);
     engine.shutdown().unwrap();
@@ -1495,7 +1511,7 @@ fn failed_factory_reset_rolls_back_and_active_transactions_block_reset() {
     faults.lock().unwrap().fail_applies = 1;
     assert!(engine.factory_reset(Config::empty()).is_err());
     assert_eq!(engine.state.desired, config().normalized());
-    assert_eq!(engine.state.revision, 1);
+    assert_eq!(engine.state.revision, test_revision(1));
     assert!(engine.state.active_transaction.is_none());
     assert_eq!(faults.lock().unwrap().state, config().normalized());
 }
@@ -1527,7 +1543,7 @@ fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
         json!(["127.0.0.1/8", "::1/128"])
     );
     assert_eq!(faults.lock().unwrap().apply_count, 0);
-    assert_eq!(engine.state.revision, 0);
+    assert_eq!(engine.state.revision, test_revision(0));
     assert!(engine.state.desired.interfaces.is_empty());
     let calls = faults.lock().unwrap().discovery_calls;
     assert_eq!(
@@ -1683,7 +1699,7 @@ fn pending_save_failure_triggers_rollback() {
     assert_eq!(r.status, 500);
     assert_eq!(r.body["transaction"]["status"], "rolled_back");
     assert!(e.active().is_none());
-    assert_eq!(e.state.revision, 0);
+    assert_eq!(e.state.revision, test_revision(0));
 }
 #[test]
 fn failed_confirmation_save_preserves_pending_and_is_retryable() {
@@ -1693,10 +1709,10 @@ fn failed_confirmation_save_preserves_pending_and_is_retryable() {
     let id = r.body["id"].as_str().unwrap();
     e.store.fail_after.set(Some(0));
     assert_eq!(confirm(&mut e, id).status, 500);
-    assert_eq!(e.state.revision, 0);
+    assert_eq!(e.state.revision, test_revision(0));
     assert_eq!(e.active().unwrap().status, "pending_confirmation");
     assert_eq!(confirm(&mut e, id).status, 200);
-    assert_eq!(e.state.revision, 1);
+    assert_eq!(e.state.revision, test_revision(1));
 }
 #[test]
 fn failed_rollback_result_save_keeps_durable_recovery_intent() {
@@ -1727,7 +1743,7 @@ fn drift_blocks_submit_and_confirmation() {
     let id = r.body["id"].as_str().unwrap();
     faults.lock().unwrap().state.firewall.allow_all_icmp = false;
     assert_eq!(confirm(&mut e, id).status, 409);
-    assert_eq!(e.state.revision, 0);
+    assert_eq!(e.state.revision, test_revision(0));
     assert!(e.active().is_some());
 }
 #[test]
@@ -1798,7 +1814,7 @@ fn stale_base_active_conflicts_and_invalid_timeout_have_exact_statuses() {
         &mut e,
         "POST",
         "/api/v1/transactions",
-        json!({"base_revision":9,"confirm_timeout_seconds":30,"config":{}}),
+        json!({"base_revision":test_revision(9),"confirm_timeout_seconds":30,"config":{}}),
     );
     assert_eq!(r.status, 409);
     for timeout in [0, 9, 301] {
@@ -1806,7 +1822,7 @@ fn stale_base_active_conflicts_and_invalid_timeout_have_exact_statuses() {
             &mut e,
             "POST",
             "/api/v1/transactions",
-            json!({"confirm_timeout_seconds":timeout,"config":{}}),
+            json!({"base_revision":test_revision(0),"confirm_timeout_seconds":timeout,"config":{}}),
         );
         assert_eq!(r.status, 422);
     }
@@ -1849,7 +1865,10 @@ fn fine_grained_permissions_cover_confirmation_and_restore() {
     let f = Fixture::new();
     let mut e = f.engine();
     let c = config();
-    let body = serde_json::to_vec(&json!({"confirm_timeout_seconds":30,"config":c})).unwrap();
+    let body = serde_json::to_vec(
+        &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":c}),
+    )
+    .unwrap();
     let writer = vec!["transactions.write".into()];
     assert_eq!(
         e.request("POST", "/api/v1/transactions", "", "writer", &writer, &body)
@@ -1875,11 +1894,14 @@ fn fine_grained_permissions_cover_confirmation_and_restore() {
     assert_eq!(confirm(&mut e, id).status, 200);
     let r = e.request(
         "POST",
-        "/api/v1/revisions/0/restore",
+        &format!("/api/v1/revisions/{}/restore", test_revision(0)),
         "",
         "writer",
         &iface,
-        br#"{"base_revision":1,"confirm_timeout_seconds":30}"#,
+        &serde_json::to_vec(
+            &json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30}),
+        )
+        .unwrap(),
     );
     assert_eq!(r.status, 403);
     assert_eq!(
@@ -2081,7 +2103,7 @@ fn reconcile_repairs_failed_workers_without_weakening_normal_observation() {
             request(&mut engine, "GET", "/api/v1/state", Value::Null).status,
             200
         );
-        assert_eq!(engine.state.revision, 0);
+        assert_eq!(engine.state.revision, test_revision(0));
         assert_eq!(engine.state.desired, Config::empty());
     }
 }
@@ -2203,7 +2225,7 @@ fn source_policy_api_removed_and_configuration_field_ignored_without_mutation() 
             &mut e,
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":0,"confirm_timeout_seconds":30,
+            json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,
                 "config":{"policy_rules":rules}}),
         );
         assert_eq!(reply.status, 202, "{}", reply.body);
@@ -2220,7 +2242,7 @@ fn source_policy_api_removed_and_configuration_field_ignored_without_mutation() 
             Value::Null,
         );
         assert_eq!(rolled_back.status, 200, "{}", rolled_back.body);
-        assert_eq!(e.state.revision, 0);
+        assert_eq!(e.state.revision, test_revision(0));
     }
     let state = request(&mut e, "GET", "/api/v1/state", Value::Null);
     for field in ["desired", "observed"] {
@@ -2232,7 +2254,7 @@ fn source_policy_api_removed_and_configuration_field_ignored_without_mutation() 
 fn unknown_configuration_fields_are_dropped_and_reported_but_known_fields_stay_strict() {
     let f = Fixture::new();
     let mut e = f.engine();
-    let body = json!({"base_revision":0,"confirm_timeout_seconds":30,"config":{
+    let body = json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":{
         "future_top_level":{"a":1},
         "mqtt":{"enabled":false,"mqtt":"same-name-as-parent","extra/slash":1},
         "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,
@@ -2269,7 +2291,7 @@ fn unknown_configuration_fields_are_dropped_and_reported_but_known_fields_stay_s
         &mut e,
         "POST",
         "/api/v1/transactions",
-        json!({"base_revision":1,"confirm_timeout_seconds":30,"config":state.body["desired"]}),
+        json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":state.body["desired"]}),
     );
     assert_eq!(clean.status, 202, "{}", clean.body);
     assert_eq!(clean.body["ignored_fields"], json!([]));
@@ -2297,13 +2319,13 @@ fn unknown_configuration_fields_are_dropped_and_reported_but_known_fields_stay_s
             &mut e,
             "POST",
             "/api/v1/transactions",
-            json!({"base_revision":1,"confirm_timeout_seconds":30,"config":config}),
+            json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":config}),
         );
         assert_eq!(reply.status, 400, "{config}: {}", reply.body);
     }
     for body in [
-        json!({"base_revision":1,"confirm_timeout_seconds":30,"config":{},"envelope_extra":1}),
-        json!({"base_revision":1,"config":{}}),
+        json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"config":{},"envelope_extra":1}),
+        json!({"base_revision":test_revision(1),"config":{}}),
     ] {
         assert_eq!(
             request(&mut e, "POST", "/api/v1/transactions", body).status,
@@ -2467,6 +2489,122 @@ fn read_routes_runtime_statistics_and_reconcile_contract() {
     );
 }
 #[test]
+fn calendar_revisions_roll_days_preserve_history_and_reject_clock_regression() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let initial = engine.committed_revision();
+    let tomorrow = Utc::now() + Duration::days(1);
+    engine.now = Some(tomorrow);
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    let committed = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
+    assert_eq!(committed.status, 200, "{}", committed.body);
+    let next_day = Version::first(tomorrow.date_naive()).unwrap();
+    assert_eq!(engine.committed_revision(), next_day);
+    assert_eq!(committed.body["committed_revision"], json!(next_day));
+    drop(engine);
+    let mut engine = fixture.engine();
+    engine.now = Some(tomorrow + Duration::seconds(1));
+    let restored = request(
+        &mut engine,
+        "POST",
+        &format!("/api/v1/revisions/{initial}/restore"),
+        json!({"base_revision":next_day,"confirm_timeout_seconds":30}),
+    );
+    assert_eq!(restored.status, 202, "{}", restored.body);
+    assert_eq!(
+        confirm(&mut engine, restored.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert_eq!(
+        engine.committed_revision(),
+        next_day.next(tomorrow.date_naive()).unwrap()
+    );
+    engine.now = Some(tomorrow - Duration::days(1));
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202);
+    let failed = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
+    assert_eq!(failed.status, 503);
+    assert!(failed.body["error"].as_str().unwrap().contains("UTC clock"));
+    let rolled_back = request(
+        &mut engine,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            transaction.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rolled_back.status, 200);
+}
+
+#[test]
+fn saved_software_metadata_does_not_change_revisions_or_rollback_to_old_software() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let initial = engine.committed_revision();
+    let pending = submit(&mut engine, config());
+    assert_eq!(pending.status, 202);
+    let metadata = SoftwareMetadata {
+        repository: Some("example/netcontrol".into()),
+        latest_version: Some("9999.12.31.10".parse().unwrap()),
+        update_available: Some(true),
+        last_checked_at: Some(Utc::now()),
+        ..Default::default()
+    };
+    engine.update_software_metadata(metadata.clone()).unwrap();
+    assert_eq!(engine.committed_revision(), initial);
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert_eq!(engine.saved_configuration().software, metadata);
+    let current = engine.committed_revision();
+    let latest = request(&mut engine, "GET", "/api/v1/revisions/latest", Value::Null);
+    assert_eq!(latest.body["config"]["software"], json!(metadata));
+    let restore = request(
+        &mut engine,
+        "POST",
+        &format!("/api/v1/revisions/{initial}/restore"),
+        json!({"base_revision":current,"confirm_timeout_seconds":30}),
+    );
+    assert_eq!(restore.status, 202, "{}", restore.body);
+    assert_eq!(
+        confirm(&mut engine, restore.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert_eq!(engine.saved_configuration().software, metadata);
+    let mut forged = engine.saved_configuration().clone();
+    forged.software.update_available = Some(false);
+    assert_eq!(submit(&mut engine, forged).status, 422);
+    drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(engine.saved_configuration().software, metadata);
+    let saved = fs::read(fixture.path()).unwrap();
+    engine.store.fail_after.set(Some(0));
+    assert!(
+        engine
+            .update_software_metadata(SoftwareMetadata::default())
+            .is_err()
+    );
+    assert_eq!(engine.saved_configuration().software, metadata);
+    assert_eq!(fs::read(fixture.path()).unwrap(), saved);
+}
+
+#[test]
+fn old_numeric_revision_state_is_rejected_without_overwriting_data() {
+    let fixture = Fixture::new();
+    let engine = fixture.engine();
+    let mut state = serde_json::to_value(&engine.state).unwrap();
+    state["revision"] = json!(0);
+    engine.store.save(&state).unwrap();
+    let saved = fs::read(fixture.path()).unwrap();
+    drop(engine);
+    assert!(Engine::open(&fixture.path(), Box::new(Simulator::new())).is_err());
+    assert_eq!(fs::read(fixture.path()).unwrap(), saved);
+}
+
+#[test]
 fn latest_revision_tracks_commits_not_provisional_changes_and_survives_restart() {
     let f = Fixture::new();
     let mut e = f.engine();
@@ -2475,9 +2613,18 @@ fn latest_revision_tracks_commits_not_provisional_changes_and_survives_restart()
     assert_eq!(initial.status, 200, "{}", initial.body);
     assert_eq!(
         initial.body,
-        request(&mut e, "GET", "/api/v1/revisions/0", Value::Null).body
+        request(
+            &mut e,
+            "GET",
+            &format!("/api/v1/revisions/{}", test_revision(0)),
+            Value::Null
+        )
+        .body
     );
-    assert_eq!(initial.body["revision"], 0);
+    assert_eq!(
+        initial.body["revision"],
+        serde_json::json!(test_revision(0))
+    );
     assert_eq!(initial.body["current"], true);
     assert_eq!(initial.body["config"], json!(Config::empty()));
 
@@ -2490,9 +2637,18 @@ fn latest_revision_tracks_commits_not_provisional_changes_and_survives_restart()
     assert_eq!(committed.status, 200, "{}", committed.body);
     assert_eq!(
         committed.body,
-        request(&mut e, "GET", "/api/v1/revisions/1", Value::Null).body
+        request(
+            &mut e,
+            "GET",
+            &format!("/api/v1/revisions/{}", test_revision(1)),
+            Value::Null
+        )
+        .body
     );
-    assert_eq!(committed.body["revision"], 1);
+    assert_eq!(
+        committed.body["revision"],
+        serde_json::json!(test_revision(1))
+    );
     assert_eq!(committed.body["current"], true);
     assert_eq!(committed.body["config"], json!(config().normalized()));
 
@@ -2520,8 +2676,8 @@ fn latest_revision_tracks_commits_not_provisional_changes_and_survives_restart()
     let restored = request(
         &mut e,
         "POST",
-        "/api/v1/revisions/0/restore",
-        json!({"base_revision":1,"confirm_timeout_seconds":30}),
+        &format!("/api/v1/revisions/{}/restore", test_revision(0)),
+        json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30}),
     );
     assert_eq!(restored.status, 202, "{}", restored.body);
     assert_eq!(
@@ -2534,8 +2690,11 @@ fn latest_revision_tracks_commits_not_provisional_changes_and_survives_restart()
     );
     let latest = request(&mut e, "GET", path, Value::Null);
     assert_eq!(latest.status, 200, "{}", latest.body);
-    assert_eq!(latest.body["revision"], 2);
-    assert_eq!(latest.body["restored_from_revision"], 0);
+    assert_eq!(latest.body["revision"], serde_json::json!(test_revision(2)));
+    assert_eq!(
+        latest.body["restored_from_revision"],
+        serde_json::json!(test_revision(0))
+    );
     assert_eq!(latest.body["config"], initial.body["config"]);
     drop(e);
     let mut e = f.engine();
@@ -2552,7 +2711,13 @@ fn latest_revision_is_authorized_readonly_and_independent_of_observation() {
         confirm(&mut e, applied.body["id"].as_str().unwrap()).status,
         200
     );
-    let expected = request(&mut e, "GET", "/api/v1/revisions/1", Value::Null).body;
+    let expected = request(
+        &mut e,
+        "GET",
+        &format!("/api/v1/revisions/{}", test_revision(1)),
+        Value::Null,
+    )
+    .body;
     let saved = fs::read(f.path()).unwrap();
     faults.lock().unwrap().fail_observe = true;
     let path = "/api/v1/revisions/latest";
@@ -2590,17 +2755,26 @@ fn revision_pagination_and_strict_queries() {
         assert_eq!(committed.status, 200, "{}", committed.body);
     }
     let r = e.request("GET", "/api/v1/revisions", "limit=2", "reader", &all(), &[]);
-    assert_eq!(r.body["revisions"][0]["revision"], 3);
-    assert_eq!(r.body["next_before_revision"], 2);
+    assert_eq!(
+        r.body["revisions"][0]["revision"],
+        serde_json::json!(test_revision(3))
+    );
+    assert_eq!(
+        r.body["next_before_revision"],
+        serde_json::json!(test_revision(2))
+    );
     let r = e.request(
         "GET",
         "/api/v1/revisions",
-        "limit=2&before_revision=2",
+        &format!("limit=2&before_revision={}", test_revision(2)),
         "reader",
         &all(),
         &[],
     );
-    assert_eq!(r.body["revisions"][0]["revision"], 1);
+    assert_eq!(
+        r.body["revisions"][0]["revision"],
+        serde_json::json!(test_revision(1))
+    );
     assert!(r.body.get("next_before_revision").is_none());
     for query in [
         "limit=0",

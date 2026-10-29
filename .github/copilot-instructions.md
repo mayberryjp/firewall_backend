@@ -27,13 +27,13 @@
 
 ## Versioning and release history
 
-- Use Semantic Versioning (`MAJOR.MINOR.PATCH`) for release labeling: major for breaking public-contract changes, minor for functionality, patch for fixes. Version labels do not create a compatibility obligation during greenfield development.
+- Public software versions and firewall configuration revisions use canonical `yyyy.mm.dd.iteration`: a real UTC calendar date, zero-padded month/day, and an unpadded positive integer iteration starting at 1 each day. Compare numeric components, not strings. Configuration revisions and software versions are independent.
 - Record contract changes across HTTP methods/paths, schemas, validation, errors/status codes, authentication, persisted configuration, and deployment requirements for frontend coordination, not to preserve older behavior.
-- There is no established release baseline. Do not invent a current version, infer a release from a commit, or treat configuration revision IDs as software versions.
+- The software version's single source is `RELEASE_VERSION` in [version.rs](../crates/netcontrol-core/src/version.rs). For every substantive code change, update it once for the completed task: use today's UTC date and iteration 1, or increment the iteration if the date is unchanged. Never move a version backward; stop on a clock/date conflict. This updates the build label, not a published release. Documentation-only changes do not bump it.
 - On the next substantive code or documentation change, create a root `CHANGELOG.md` if absent, with an `Unreleased` section. Group factual entries under applicable headings: Added, Changed, Deprecated, Removed, Fixed, Security. Do not add empty headings.
-- Keep work under `Unreleased` until the user approves a release. Record the recommended bump and its rationale; if the baseline is unknown, say so and request the initial version when a release is requested.
-- Do not bump versions per task. On an approved release, verify the baseline and current contract, agree on the version, move the applicable unreleased entries into a dated `X.Y.Z` section, and leave an `Unreleased` section for future work.
-- Synchronize any version metadata that actually exists. Do not introduce a version endpoint, build metadata mechanism, or release automation unless requested.
+- Keep work under `Unreleased` until the user approves publication. Record the updated software version and whether contract impact is breaking, additive or a fix; historical SemVer bump recommendations do not govern new work.
+- On an approved release, verify the embedded version and current contract, move applicable entries into a dated `yyyy.mm.dd.iteration` section, and leave an `Unreleased` section. GitHub tags use `v<version>`; signed update manifests must match the embedded daemon version.
+- Cargo package versions remain internal three-part SemVer because Cargo cannot accept the public four-part format. Do not use `CARGO_PKG_VERSION` for firewall software identity. Maintain the daemon-managed saved `software` metadata and daily release checks; do not make those metadata fields editable configuration.
 - Never commit, tag, push, publish, or send frontend notifications without explicit user authorization. Instructions and journal entries are not automation or proof of delivery.
 
 ## Daily journal and durable memory
