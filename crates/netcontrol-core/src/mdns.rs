@@ -129,15 +129,19 @@ impl MDNSConfig {
         let mut names = BTreeSet::new();
         for name in &self.interfaces {
             ensure!(names.insert(name), "duplicate mDNS interface {name}");
-            let link = config.interfaces.iter().find(|i| i.name == *name);
-            ensure!(
-                link.is_some_and(|i| matches!(i.kind.as_str(), "ethernet" | "vlan")),
-                "mDNS interface {name} must be a configured Ethernet/VLAN link"
-            );
+            let link = config
+                .interfaces
+                .iter()
+                .find(|i| i.name == *name && matches!(i.kind.as_str(), "ethernet" | "vlan"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mDNS interface {name} must be a configured Ethernet/VLAN link")
+                })?;
             if self.interface_mode == MDNSInterfaceMode::Allow {
                 ensure!(
-                    link.is_some_and(|i| i.up && i.role == "lan"),
-                    "mDNS allow interface {name} must be administratively up with role lan"
+                    link.up && link.role == "lan",
+                    "mDNS allow interface {name} must be administratively up with role lan (candidate up={}, role={:?})",
+                    link.up,
+                    link.role
                 );
             }
         }
@@ -335,6 +339,39 @@ mod tests {
         c.validate().unwrap();
         c.mdns.reflection.filters.push("*.local.".into());
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn vlan_membership_uses_candidate_vlan_fields_not_parent_fields() {
+        let mut candidate = config();
+        let mut vlan = candidate.interfaces[0].clone();
+        vlan.name = "CONSUMER_VLAN".into();
+        vlan.kind = "vlan".into();
+        vlan.vlan = Some(crate::VLAN {
+            parent: "wan".into(),
+            id: 20,
+        });
+        candidate.interfaces.push(vlan);
+        candidate.mdns.interfaces = vec!["CONSUMER_VLAN".into(), "lan1".into()];
+        candidate.validate().unwrap();
+        assert_eq!(
+            candidate.mdns.effective_interfaces(&candidate),
+            ["CONSUMER_VLAN", "lan1"]
+        );
+        let vlan_index = candidate.interfaces.len() - 1;
+        candidate.interfaces[vlan_index].up = false;
+        let error = candidate.validate().unwrap_err().to_string();
+        assert!(error.contains("CONSUMER_VLAN"), "{error}");
+        assert!(
+            error.contains("candidate up=false, role=\"lan\""),
+            "{error}"
+        );
+        candidate.interfaces[vlan_index].up = true;
+        candidate.interfaces[vlan_index].role = "unassigned".into();
+        let error = candidate.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("candidate up=true, role=\"unassigned\""),
+            "{error}"
+        );
     }
     #[test]
     fn service_and_exact_instance_filters_validate() {

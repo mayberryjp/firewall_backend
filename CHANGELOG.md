@@ -99,6 +99,11 @@
 
 ### Fixed
 
+- mDNS allow-interface validation errors now include the candidate's actual
+  `up` and `role` values to distinguish submitted configuration from live
+  link state or VLAN parent settings. Eligibility rules are unchanged.
+  Recommended bump: patch; baseline unknown, Unreleased. No frontend action.
+
 - Fixed static musl package compilation of the UDP relay by handling libc's
   platform-specific ancillary-data length types. Forwarding behavior and API
   contracts are unchanged. Recommended bump: patch; baseline unknown,

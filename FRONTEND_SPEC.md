@@ -2398,7 +2398,10 @@ Membership/validation (`422` semantic errors):
   and dummy links never participate. Allow entries must be eligible; deny
   entries must identify configured Ethernet/VLAN links (excluding WAN is
   allowed but redundant). Names must be unique and references valid even
-  while disabled.
+  while disabled. Eligibility uses each selected interface's own candidate
+  `up`/`role` fields, not live discovery or the VLAN parent's settings.
+  Allow-interface `422` errors include those candidate values in their text;
+  retain that diagnostic context and do not parse error strings as state.
 - Allow mode selects only listed links; empty never means all. Deny mode
   selects eligible links except those listed. Review newly included links when
   other configuration changes expand a deny-mode set.

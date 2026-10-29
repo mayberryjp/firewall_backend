@@ -148,7 +148,10 @@ Rules:
 2. Allow entries must be eligible candidate links. Deny entries must identify
    configured Ethernet/VLAN links; excluding a WAN is permitted but redundant.
    Missing/duplicate names fail. Membership is not inferred from subnet numbers
-   or interface naming conventions.
+  or interface naming conventions. Eligibility uses the selected interface's
+  own candidate `up`/`role` fields, not observed link state or VLAN parent
+  fields. Rejected allow entries include those candidate values in the
+  existing `422` error text.
 3. `config.ipv6_enabled: false` suppresses operational IPv6 transport and AAAA
    publication while retaining the configured mDNS preferences. Effective IPv6
    is `config.ipv6_enabled && mdns.ipv6`. Require at least one effective family.
