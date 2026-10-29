@@ -1899,7 +1899,11 @@ Prior v1 accounting files are retained, not migrated/reset/deleted. If a prior h
 v1 file exists without v2, collection reports an explicit operator-archival error;
 starting a new baseline requires an explicit operator decision, not an automatic
 rewrite. Corrupt/incompatible v2 and unresolved pending snapshots also remain
-explicit errors. This is format-compatible output, not vnStat database compatibility.
+explicit errors in the accounting worker's retrying status, not daemon-startup
+failures or global configuration locks. Disabled accounting does not read these
+files. Retired v1 files are never decoded as v2; a retained managed v1 file does
+not participate in host-only accounting. Existing statistics unavailability
+remains `503`. This is format-compatible output, not vnStat database compatibility.
 
 ### Platform Health And Active Alerts
 

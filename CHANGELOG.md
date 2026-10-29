@@ -110,6 +110,13 @@
 
 ### Fixed
 
+- Daemon startup no longer decodes retained v1 traffic-accounting files with
+  the v2 schema, avoiding the fatal `missing field day` error. Accounting
+  validation remains strict in its supervised worker; invalid state is retained
+  untouched and reported without blocking unrelated configuration. No automatic
+  migration or reset. Recommended bump: patch; baseline unknown, Unreleased.
+  No frontend action.
+
 - mDNS allow-interface validation errors now include the candidate's actual
   `up` and `role` values to distinguish submitted configuration from live
   link state or VLAN parent settings. Eligibility rules are unchanged.

@@ -131,15 +131,6 @@ impl Services {
         } else {
             host_namespace.clone()
         };
-        // Reject incompatible files even when the associated service is disabled.
-        for scope in ["host", "managed"] {
-            counters::Database::load(
-                &options
-                    .state_directory
-                    .join(format!("traffic-{scope}-v1.json")),
-                scope,
-            )?;
-        }
         Ok(Self {
             options,
             config: Config::default(),
@@ -928,6 +919,63 @@ mod tests {
         services.shutdown().unwrap();
         assert!(services.verify(&config).is_err());
         drop(services);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn retained_traffic_files_do_not_block_service_construction() {
+        let directory =
+            std::env::temp_dir().join(format!("services-retained-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let retained = [
+            (
+                "traffic-host-v1.json",
+                b"retained host accounting".as_slice(),
+            ),
+            (
+                "traffic-managed-v1.json",
+                b"retained managed accounting".as_slice(),
+            ),
+            (
+                counters::FILE_NAME,
+                b"invalid current accounting".as_slice(),
+            ),
+        ];
+        for (name, contents) in &retained {
+            std::fs::write(directory.join(name), contents).unwrap();
+        }
+        let mut services = Services::new(ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: true,
+            allow_gateway_monitoring: false,
+        })
+        .unwrap();
+        services.apply(&json!({}), &json!({})).unwrap();
+        services.verify(&json!({})).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let enabled = json!({"vnstat":{"enabled":true}});
+            services.apply(&json!({}), &enabled).unwrap();
+            services.verify(&enabled).unwrap();
+            let status = services.workers["vnstat"].snapshot();
+            assert_eq!(status["state"], "error");
+            assert_eq!(status["retrying"], true);
+            assert!(status["error"].as_str().unwrap().contains("refusing reset"));
+            assert!(
+                services
+                    .statistics("/api/v1/statistics/vnstat", "")
+                    .is_err()
+            );
+            services.apply(&enabled, &json!({})).unwrap();
+            services.verify(&json!({})).unwrap();
+        }
+        services.shutdown().unwrap();
+        drop(services);
+        for (name, contents) in &retained {
+            assert_eq!(std::fs::read(directory.join(name)).unwrap(), *contents);
+        }
+        assert!(counters::Database::load(&directory.join(counters::FILE_NAME), "host").is_err());
+        assert!(!directory.join("traffic-host-v2.pending").exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
