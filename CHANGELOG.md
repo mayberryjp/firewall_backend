@@ -4,6 +4,13 @@
 
 ### Added
 
+- mDNS filters now accept exact service-instance names, including
+  `_udp._govee-lan._udp.local.`, with scoped PTR browsing, discovery replies
+  and required host records. Unrelated instances remain excluded; canonical
+  local names and duplicate/size limits still apply. Recommended bump: minor;
+  baseline unknown, Unreleased. Required frontend validator update:
+  [handoff 2026-10-28-09](docs/frontend-handoffs/2026-10-28.md#2026-10-28-09-mdns-exact-instance-filters).
+
 - `GET /api/v1/routes/bgp/advertised` exposes exact per-neighbor prefix inventory
   tracked by established BGP sessions (`state.read`), with local next hop and
   empty lists after session loss/restart. Distinct from received routes and

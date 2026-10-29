@@ -410,6 +410,7 @@ impl Policy {
     fn enumerated(&self, name: &Name) -> bool {
         self.filters.iter().any(|filter| {
             filter == name
+                || filter.instance_of(name)
                 || (filter.0.len() > 4 && filter.0[1] == b"_sub" && filter.0[2..] == name.0)
         }) || self
             .associations
@@ -428,7 +429,13 @@ impl Policy {
         let provider = self.filters.iter().any(Name::host);
         // Browsing must reach a provider before its SRV target is known.
         // Questions never authorize records; every section is still filtered.
-        (provider && question.name.service() && matches!(question.kind, 12 | 255))
+        ((provider
+            || self
+                .filters
+                .iter()
+                .any(|filter| filter.instance_of(&question.name)))
+            && question.name.service()
+            && matches!(question.kind, 12 | 255))
             || (question.name.instance()
                 && matches!(question.kind, 16 | 33 | 255)
                 && (provider
@@ -524,7 +531,10 @@ impl Policy {
                     } else {
                         self.allowed(target)
                             && (self.filters.contains(&r.name)
-                                || self.associations.contains_key(target))
+                                || self.associations.contains_key(target)
+                                || (self.filters.contains(target)
+                                    && r.name.service()
+                                    && target.instance_of(&r.name)))
                     }
                 }
                 Data::Srv(_, target) => self.allowed(&r.name) && self.allowed(target),
@@ -636,7 +646,11 @@ mod tests {
     }
     #[test]
     fn service_and_provider_filter_mixed_sections_no_leakage() {
-        for filter in ["_ipp._tcp.local.", "printer.local."] {
+        for filter in [
+            "_ipp._tcp.local.",
+            "printer.local.",
+            "printer._ipp._tcp.local.",
+        ] {
             let mut policy = Policy::new(&[filter.into()]);
             let m = discovery();
             let output = policy.filter(&m, Instant::now());
@@ -655,6 +669,63 @@ mod tests {
                 .filter(&orphan, Instant::now() + Duration::from_secs(121))
                 .empty()
         );
+    }
+    #[test]
+    fn exact_govee_instance_browsing_and_discovery_no_leakage() {
+        let now = Instant::now();
+        let mut policy = Policy::new(&["_udp._govee-lan._udp.local.".into()]);
+        let browse = Message {
+            questions: ["_govee-lan._udp.local.", "_ssh._tcp.local."]
+                .map(|name| Question {
+                    name: Name::text(name),
+                    kind: 12,
+                    class: 1,
+                })
+                .to_vec(),
+            ..Message::default()
+        };
+        let outgoing = policy.filter(&browse, now);
+        assert_eq!(outgoing.questions, browse.questions[..1]);
+        assert!(policy.associations.is_empty());
+        let mut response = discovery();
+        response.records[0][..4].clone_from_slice(&[
+            record(
+                "_govee-lan._udp.local.",
+                12,
+                Data::Name(Name::text("_udp._govee-lan._udp.local.")),
+            ),
+            record(
+                "_udp._govee-lan._udp.local.",
+                33,
+                Data::Srv([0, 0, 0, 0, 15, 161], Name::text("govee.local.")),
+            ),
+            record(
+                "_udp._govee-lan._udp.local.",
+                16,
+                Data::Bytes(vec![3, b'a', b'=', b'b']),
+            ),
+            record("govee.local.", 1, Data::Bytes(vec![192, 0, 2, 3])),
+        ]);
+        response.records[1].push(record(
+            "_govee-lan._udp.local.",
+            12,
+            Data::Name(Name::text("other._govee-lan._udp.local.")),
+        ));
+        response.records[2].push(record(
+            "other._govee-lan._udp.local.",
+            33,
+            Data::Srv([0, 0, 0, 0, 15, 161], Name::text("other.local.")),
+        ));
+        response.records[2].push(record(
+            "_services._dns-sd._udp.local.",
+            12,
+            Data::Name(Name::text("_govee-lan._udp.local.")),
+        ));
+        let incoming = policy.filter(&response, now);
+        assert_eq!(incoming.records[0], response.records[0][..4]);
+        assert!(incoming.records[1].is_empty());
+        assert_eq!(incoming.records[2], response.records[2][1..]);
+        assert_eq!(Message::parse(&incoming.encode()).unwrap(), incoming);
     }
     #[test]
     fn provider_only_browsing_solicits_services_without_authorizing_peer_records() {

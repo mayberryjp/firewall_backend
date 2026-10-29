@@ -157,8 +157,11 @@ Rules:
    syntax remain valid. Minimum active-link counts and runtime socket checks
    apply only when enabling the corresponding function.
 5. Filter entries are canonical absolute service-type names such as
-   `_ipp._tcp.local.`, DNS-SD subtype names, or provider host names such as
-   `printer.local.`. DNS comparison is case-insensitive; normalize ASCII case
+  `_ipp._tcp.local.`, DNS-SD subtype names, exact service-instance names such
+  as `_udp._govee-lan._udp.local.`, or provider host names such as
+  `printer.local.`. An instance filter matches only that instance; use
+  `_govee-lan._udp.local.` to select every instance of that service.
+  DNS comparison is case-insensitive; normalize ASCII case
    and require trailing dots. Validate DNS labels/wire length with the chosen
    DNS codec, allowing underscore service labels. No arbitrary regex/glob,
    instance-label substring matching or non-local names.
@@ -285,6 +288,10 @@ With filters, process every DNS section, not just the first question or record:
   Handle subtype queries and `_services._dns-sd._udp.local.` enumeration.
 - Provider-host filters admit that host and discovered services whose SRV
   target is the host. They do not mean every host sharing its IP address.
+- Exact-instance filters admit the parent service's PTR/ANY browse queries,
+  matching PTR replies, the selected instance's SRV/TXT and its referenced
+  host records. Service enumeration may expose the parent service type, not
+  other instances. Questions never authorize response/known-answer records.
 - Build dependency associations per ingress link and family, bounded by RR TTL
   and resource limits. Do not use DNS transaction IDs as service identity.
 - Mixed allowed/disallowed packets must be reconstructed with only permitted

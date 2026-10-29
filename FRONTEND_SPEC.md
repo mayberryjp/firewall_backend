@@ -2414,8 +2414,15 @@ Membership/validation (`422` semantic errors):
 - Filters: empty means all services. At most 64 unique absolute local DNS
   names with a trailing dot, ASCII labels 1..63 bytes, total at most 253 bytes;
   normalize ASCII case. Accept service types such as `_ipp._tcp.local.`,
-  DNS-SD subtype names and provider names such as `printer.local.`. No glob,
-  regex or arbitrary instance-name patterns. Filtering reconstructs mixed
+  DNS-SD subtype names, exact service instances such as
+  `_udp._govee-lan._udp.local.`, and provider names such as `printer.local.`.
+  An instance filter selects only that instance; `_govee-lan._udp.local.`
+  selects all instances of the service. No glob, regex or arbitrary
+  instance-name patterns. Editors may accept shorthand such as `_http._tcp`
+  or `_http._tcp.local`, but must submit `_http._tcp.local.`; the API still
+  requires canonical absolute names. Detect case-insensitive duplicates after
+  editor completion (the same service with/without `.local.` is not unique).
+  Filtering reconstructs mixed
   messages rather than forwarding an entire packet because one service matches.
 - Publishing is separate and off by default. Enabled publishing requires a
   real publication flag. Hostname is a lowercase single hostname label of

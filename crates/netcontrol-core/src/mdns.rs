@@ -161,10 +161,13 @@ impl MDNSConfig {
                 && labels[1] == "_sub"
                 && labels[2].starts_with('_')
                 && matches!(labels[3], "_tcp" | "_udp");
+            let instance = labels.len() >= 4
+                && labels[1].starts_with('_')
+                && matches!(labels[2], "_tcp" | "_udp");
             let host = labels.len() >= 2 && labels.iter().all(|label| !label.contains('_'));
             ensure!(
-                service || subtype || host,
-                "mDNS filter must identify a service type, subtype or provider hostname"
+                service || subtype || instance || host,
+                "mDNS filter must identify a service type, subtype, exact service instance or provider hostname"
             );
             ensure!(filters.insert(lower), "duplicate mDNS filter");
         }
@@ -332,6 +335,45 @@ mod tests {
         c.validate().unwrap();
         c.mdns.reflection.filters.push("*.local.".into());
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn service_and_exact_instance_filters_validate() {
+        let mut candidate = config();
+        candidate.mdns.reflection.filters = [
+            "_googlecast._tcp.local.",
+            "_home-assistant._tcp.local.",
+            "_hap._tcp.local.",
+            "_udp._govee-lan._udp.local.",
+            "_esphomelib._tcp.local.",
+            "_http._tcp.local.",
+            "_airplay._tcp.local.",
+            "_raop._tcp.local.",
+            "_bambu._tcp.local.",
+            "_https._tcp.local.",
+            "_ipp._tcp.local.",
+            "_printer._tcp.local.",
+            "_photo._sub._ipp._tcp.local.",
+            "printer.local.",
+        ]
+        .map(String::from)
+        .to_vec();
+        candidate.validate().unwrap();
+        for invalid in [
+            "*._govee-lan._udp.local.",
+            "_udp._govee-lan._udp.example.",
+            "_udp._govee-lan._udp.local",
+            "_udp._govee-lan.local.",
+        ] {
+            let mut rejected = candidate.clone();
+            rejected.mdns.reflection.filters.push(invalid.into());
+            assert!(rejected.validate().is_err(), "accepted {invalid}");
+        }
+        candidate
+            .mdns
+            .reflection
+            .filters
+            .push("_UDP._GOVEE-LAN._UDP.LOCAL.".into());
+        assert!(candidate.validate().is_err());
     }
     #[test]
     fn publishing_operational_hostname_and_metadata() {
