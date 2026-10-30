@@ -4,6 +4,18 @@
 
 ### Added
 
+- Expanded MQTT monitoring to all exposed link counters, kernel protocol counters,
+  host disk/VM/scheduler/PSI and filesystem-inode statistics, native service and
+  DHCP/WireGuard/BGP metrics, vnStat period/reporting summaries, software release
+  checks and Sando sync summaries. Overall managed-firewall dropped packets/bytes
+  use exact kernel rule/default DROP counters with reset identity; no per-rule
+  sensors, packet logs or bulk inventory/history feeds. Added source-readability
+  flags and bounded partial-source handling. No new HTTP/configuration schema or
+  MQTT control topics. Recommended bump: minor (additive telemetry), baseline
+  unknown, Unreleased; next automatic calendar version, no manual bump.
+  Optional frontend/dashboard work:
+  [handoff 2026-10-30-05](docs/frontend-handoffs/2026-10-30.md#2026-10-30-05-mqtt-statistics-coverage-and-overall-firewall-drops).
+
 - Descriptive `origin` and nullable `import_source` labels on saved filter,
   host/interface/input and NAT rules, preserved through normal configuration
   history and rollback without changing matching/counter identity. Rule-counter
@@ -188,6 +200,16 @@
 
 ### Changed
 
+- vnStat collector datagrams identify the appliance as `hostname.domain`
+  using committed `system` fields instead of always using the raw kernel name.
+  Empty domains send hostname only; unmanaged hostnames use the kernel name,
+  replacing its existing suffix when adding a configured domain. Identity
+  updates do not restart collection, reset history or publish pending settings.
+  Collector device/deduplication keys may change; recommended SemVer bump:
+  major for changed reporting identity, baseline unknown, Unreleased.
+  Required frontend help/collector coordination:
+  [handoff 2026-10-30-04](docs/frontend-handoffs/2026-10-30.md#2026-10-30-04-vnstat-qualified-reporting-name).
+
 - First-install WAN/LAN provisioning and explicit factory reset now enable
   `firewall.allow_all_icmp` instead of disabling it. All IPv4 ICMP is accepted
   to/from/through the appliance, including WAN, before managed drops; ICMPv6
@@ -252,6 +274,12 @@
   [handoff 2026-10-28-05](docs/frontend-handoffs/2026-10-28.md#2026-10-28-05-optional-dns-diagnostic-interface).
 
 ### Fixed
+
+- MQTT now masks cached NetFlow counters/completeness when a worker is no longer
+  running, rather than presenting stale readings as current. Final discovery
+  limits include health/source additions and retained entities; oversized removal
+  payloads fail before publication/manifest changes. Collection uses one engine
+  lock for consistent committed configuration and firewall-drop classification.
 
 - Ubuntu install/full source upgrade no longer requires a nonexistent standalone
   `nft_counter` module on current kernels. Load/persist `nf_tables`, which includes

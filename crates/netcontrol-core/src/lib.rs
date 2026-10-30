@@ -85,6 +85,9 @@ pub trait Backend: Send {
         self.observe(expected)
     }
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()>;
+    fn configure_reporting_identity(&mut self, _system: &SystemConfig) -> Result<()> {
+        Ok(())
+    }
     fn retry_dhcp(&mut self, _config: &Config, _interface: &str) -> Result<()> {
         anyhow::bail!("DHCP retry is not supported by this backend")
     }

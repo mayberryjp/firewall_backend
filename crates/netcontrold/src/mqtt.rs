@@ -181,6 +181,7 @@ pub struct Manager {
     started: Instant,
     device_id: String,
     cpu_baseline: Mutex<Option<crate::mqtt_host::CpuBaseline>>,
+    sando: Mutex<Option<Arc<crate::sando::Manager>>>,
 }
 
 type Publication = (String, Vec<u8>, bool);
@@ -209,7 +210,16 @@ impl Manager {
             started: Instant::now(),
             device_id,
             cpu_baseline: Mutex::new(None),
+            sando: Mutex::new(None),
         }))
+    }
+
+    pub(crate) fn attach_sando(&self, manager: Arc<crate::sando::Manager>) -> Result<()> {
+        *self
+            .sando
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MQTT Sando source unavailable"))? = Some(manager);
+        Ok(())
     }
 
     pub fn status(&self) -> Result<Value> {
@@ -321,47 +331,84 @@ impl Manager {
     }
 
     fn collect(&self, config: &MQTTConfig) -> Result<(Value, Value, Vec<&'static str>)> {
-        let (revision, statistics, statistics_available) = {
+        let (
+            revision,
+            mut statistics,
+            statistics_available,
+            snapshot,
+            runtime,
+            firewall,
+            firewall_readable,
+            software,
+            sando_config,
+        ) = {
             let mut engine = self
                 .engine
                 .lock()
                 .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
             ensure!(!engine.configuration_busy(), "configuration is changing");
             let revision = engine.committed_revision();
-            let reply = engine.request(
-                "GET",
-                "/api/v1/statistics",
-                "",
-                "mqtt-publisher",
-                &["state.read".into()],
-                &[],
-            );
-            let available = reply.status == 200;
+            let software = engine.saved_configuration().software.clone();
+            let sando_config = engine.saved_configuration().sando.clone();
+            let mut read = |path| {
+                let reply = engine.request(
+                    "GET",
+                    path,
+                    "",
+                    "mqtt-publisher",
+                    &["state.read".into()],
+                    &[],
+                );
+                (reply.status == 200).then_some(reply.body)
+            };
+            let statistics = read("/api/v1/statistics");
+            let available = statistics.is_some();
+            let mut statistics =
+                statistics.unwrap_or_else(|| json!({"interfaces":[],"gateways":[]}));
+            if !available && let Some(protocols) = read("/api/v1/statistics/protocols") {
+                statistics["protocols"] = protocols["protocols"].clone();
+            }
+            let runtime = read("/api/v1/runtime");
+            if statistics.get("bgp").is_none()
+                && let Some(bgp) = read("/api/v1/services/bgp/status")
+            {
+                statistics["bgp"] = bgp;
+            }
+            let snapshot = read("/api/v1/statistics/host");
+            let firewall = read("/api/v1/statistics/firewall");
+            let firewall_readable = firewall.is_some();
+            let firewall = crate::mqtt_stats::firewall(
+                firewall.as_ref(),
+                &engine.saved_configuration().firewall,
+            )?;
             (
                 revision,
-                if available {
-                    reply.body
-                } else {
-                    json!({"interfaces":[],"gateways":[]})
-                },
+                statistics,
                 available,
+                snapshot,
+                runtime,
+                firewall,
+                firewall_readable,
+                software,
+                sando_config,
             )
         };
-        // Host health is optional: a failed read leaves its sensors unknown instead of dropping the sample.
-        let snapshot = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
-            let reply = engine.request(
-                "GET",
-                "/api/v1/statistics/host",
-                "",
-                "mqtt-publisher",
-                &["state.read".into()],
-                &[],
-            );
-            (reply.status == 200).then_some(reply.body)
+        // All engine reads share one committed configuration; failed sources remain independent.
+        let sando = self
+            .sando
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MQTT Sando source unavailable"))?
+            .clone();
+        let sando = match sando
+            .as_ref()
+            .map(|manager| manager.mqtt_status(&sando_config))
+        {
+            Some(Ok(status)) => Some(status),
+            Some(Err(_)) => {
+                tracing::warn!("Sando summary unavailable for MQTT");
+                None
+            }
+            None => None,
         };
         let mut host = {
             let mut baseline = self
@@ -373,30 +420,38 @@ impl Manager {
         if !statistics_available {
             host.retained.extend(["interface", "gateway"]);
         }
-        // Flow sensors exist only while an instance is configured; a failed read keeps them unknown.
-        let flow = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
-            if engine.saved_configuration().softflowd.is_empty() {
-                None
-            } else {
-                let reply = engine.request(
-                    "GET",
-                    "/api/v1/services/softflowd/status",
-                    "",
-                    "mqtt-publisher",
-                    &["state.read".into()],
-                    &[],
-                );
-                Some((reply.status == 200).then_some(reply.body))
-            }
-        };
-        if let Some(status) = flow {
-            let flow = crate::mqtt_flow::sensors(status.as_ref());
-            host.sensors.extend(flow.sensors);
-            host.retained.extend(flow.retained);
+        for extra in [
+            crate::mqtt_stats::protocols(&statistics)?,
+            crate::mqtt_stats::services(runtime.as_ref())?,
+            crate::mqtt_stats::bgp(statistics.get("bgp"))?,
+            firewall,
+            crate::mqtt_stats::software(&software),
+            crate::mqtt_stats::sando(sando.as_ref()),
+        ] {
+            host.sensors.extend(extra.sensors);
+            host.retained.extend(extra.retained);
+        }
+        statistics["telemetry_sources"] = json!({
+            "network": statistics_available,
+            "protocols": statistics["protocols"].is_array(),
+            "host": snapshot.is_some(),
+            "services": runtime.is_some(),
+            "bgp": statistics.get("bgp").is_some(),
+            "firewall": firewall_readable,
+            "sando": sando.is_some()
+        });
+        for (source, readable) in statistics["telemetry_sources"]
+            .as_object()
+            .context("MQTT telemetry sources missing")?
+        {
+            crate::mqtt_host::push(
+                &mut host.sensors,
+                format!("source_{source}_readable"),
+                format!("{source} statistics readable"),
+                readable.clone(),
+                None,
+                None,
+            );
         }
         let (mut discovery, mut state) = telemetry(
             &self.device_id,
@@ -410,6 +465,7 @@ impl Manager {
         state["process_health"] = health["process_health"].clone();
         state["active_alerts"] = health["active_alerts"].clone();
         state["statistics_available"] = json!(statistics_available);
+        state["telemetry_sources"] = statistics["telemetry_sources"].clone();
         for (key, name, value) in [
             (
                 "process_health",
@@ -426,11 +482,7 @@ impl Manager {
             discovery["components"][key] = json!({"platform":"sensor","name":name,"unique_id":format!("netcontrol_{}_{key}", self.device_id),
                 "value_template":format!("{{{{ value_json.metrics.get('{key}', 'unknown') }}}}"),"expire_after":config.interval_seconds * 3});
         }
-        ensure!(
-            serde_json::to_vec(&state)?.len() <= 1 << 20
-                && serde_json::to_vec(&discovery)?.len() <= 1 << 20,
-            "MQTT payload limit exceeded"
-        );
+        validate_telemetry(&discovery, &state)?;
         Ok((discovery, state, host.retained))
     }
 
@@ -501,12 +553,17 @@ impl Manager {
                 }
                 result = async { collecting.as_mut().unwrap().await }, if collecting.is_some() => {
                     collecting = None;
-                    match result {
-                        Ok(Ok((mut discovery, state, retained))) => {
+                    match result.context("MQTT statistics worker failed").and_then(|result| result) {
+                        Ok((mut discovery, state, retained)) => {
                             if let Some(previous) = previous_discovery.as_ref().and_then(|previous| previous["components"].as_object()) {
                                 for (key, component) in previous.iter().filter(|(key, _)| retained.iter().any(|kind| key.starts_with(&format!("{kind}_")))) {
                                     discovery["components"][key] = component.clone();
                                 }
+                            }
+                            if validate_telemetry(&discovery, &state).is_err() {
+                                self.state(true, "error", Some("MQTT entity or payload limit exceeded"));
+                                queue.push_back((format!("{base}/availability"), b"offline".to_vec(), true));
+                                continue;
                             }
                             if force_discovery || previous_discovery.as_ref() != Some(&discovery) {
                                 let secrets = self.secrets.lock().map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?;
@@ -520,9 +577,15 @@ impl Manager {
                                     removal["components"][key] = json!({"platform":"sensor"});
                                     removed = true;
                                 }
+                                let removal_payload = serde_json::to_vec(&removal)?;
+                                if removal_payload.len() > 1 << 20 {
+                                    self.state(true, "error", Some("MQTT discovery removal payload limit exceeded"));
+                                    queue.push_back((format!("{base}/availability"), b"offline".to_vec(), true));
+                                    continue;
+                                }
                                 secrets.save_components(&before.union(&after).cloned().collect())?;
                                 if removed {
-                                    queue.push_back((discovery_topic.clone(), serde_json::to_vec(&removal)?, true));
+                                    queue.push_back((discovery_topic.clone(), removal_payload, true));
                                 }
                                 queue.push_back((discovery_topic.clone(), serde_json::to_vec(&discovery)?, true));
                                 manifest = Some(after.union(&kept).cloned().collect());
@@ -533,8 +596,10 @@ impl Manager {
                             queue.push_back((format!("{base}/state"), serde_json::to_vec(&state)?, false));
                             batch_has_state = true;
                         }
-                        _ => {
-                            self.state(true, "error", Some("MQTT statistics collection unavailable"));
+                        Err(error) => {
+                            let message = error.to_string();
+                            let message = if message.starts_with("MQTT ") { &message } else { "MQTT statistics collection unavailable" };
+                            self.state(true, "error", Some(message));
                             queue.push_back((format!("{base}/availability"), b"offline".to_vec(), true));
                         }
                     }
@@ -618,6 +683,23 @@ pub(crate) fn metric_key(kind: &str, name: &str, field: &str) -> String {
     )
 }
 
+fn validate_telemetry(discovery: &Value, state: &Value) -> Result<()> {
+    ensure!(
+        discovery["components"]
+            .as_object()
+            .context("MQTT components missing")?
+            .len()
+            <= 4096,
+        "MQTT entity limit exceeded"
+    );
+    ensure!(
+        serde_json::to_vec(discovery)?.len() <= 1 << 20
+            && serde_json::to_vec(state)?.len() <= 1 << 20,
+        "MQTT payload limit exceeded"
+    );
+    Ok(())
+}
+
 fn telemetry(
     device_id: &str,
     config: &MQTTConfig,
@@ -698,6 +780,23 @@ fn telemetry(
             "tx_errors",
             "rx_dropped",
             "tx_dropped",
+            "multicast",
+            "collisions",
+            "rx_length_errors",
+            "rx_over_errors",
+            "rx_crc_errors",
+            "rx_frame_errors",
+            "rx_fifo_errors",
+            "rx_missed_errors",
+            "tx_aborted_errors",
+            "tx_carrier_errors",
+            "tx_fifo_errors",
+            "tx_heartbeat_errors",
+            "tx_window_errors",
+            "rx_compressed",
+            "tx_compressed",
+            "rx_nohandler",
+            "rx_otherhost_dropped",
         ] {
             add(
                 metric_key("interface", name, field),
@@ -707,11 +806,13 @@ fn telemetry(
                 } else {
                     Value::Null
                 },
-                Some(if field.ends_with("bytes") {
-                    "B"
+                if field.ends_with("bytes") {
+                    Some("B")
+                } else if field == "collisions" {
+                    None
                 } else {
-                    "packets"
-                }),
+                    Some("packets")
+                },
                 Some("total_increasing"),
             );
         }
@@ -728,6 +829,13 @@ fn telemetry(
                 "received",
                 "lost",
                 "pending",
+                "variation_pairs",
+                "restart_count",
+                "retrying",
+                "last_success_at",
+                "health_changed_at",
+                "collected_at",
+                "started_at",
                 "loss_percent",
                 "rtt_min_ms",
                 "rtt_max_ms",
@@ -744,7 +852,18 @@ fn telemetry(
                 } else {
                     None
                 };
-                let value = if available || matches!(field, "sample_status" | "process_state") {
+                let value = if available
+                    || matches!(
+                        field,
+                        "sample_status"
+                            | "process_state"
+                            | "retrying"
+                            | "restart_count"
+                            | "last_success_at"
+                            | "health_changed_at"
+                            | "collected_at"
+                            | "started_at"
+                    ) {
                     gateway[field].clone()
                 } else {
                     Value::Null
@@ -754,7 +873,11 @@ fn telemetry(
                     format!("{name} {field}"),
                     value,
                     unit,
-                    unit.map(|_| "measurement"),
+                    if field == "restart_count" {
+                        Some("total_increasing")
+                    } else {
+                        unit.map(|_| "measurement")
+                    },
                 );
             }
         }
@@ -823,18 +946,13 @@ fn telemetry(
         None,
         Some("measurement"),
     );
-    ensure!(components.len() <= 4096, "MQTT entity limit exceeded");
     let discovery = json!({"device":{"identifiers":[format!("netcontrol_{device_id}")],"name":format!("Netcontrol {}", &device_id[..8]),"manufacturer":"Netcontrol","model":"Firewall"},
         "origin":{"name":"netcontrold"},"components":components,"state_topic":format!("{base}/state"),
         "availability_topic":format!("{base}/availability"),"qos":1});
     let state = json!({"collected_at_unix":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"metrics":metrics,
         "bgp":statistics.get("bgp").cloned().unwrap_or_else(||json!({"state":"unavailable","error":"BGP statistics unavailable","neighbors":[]})),
         "link_diagnostics":statistics.get("link_diagnostics").cloned().unwrap_or_else(|| json!({"status":"unavailable","error":"network statistics unavailable","signals":[]}))});
-    ensure!(
-        serde_json::to_vec(&discovery)?.len() <= 1 << 20
-            && serde_json::to_vec(&state)?.len() <= 1 << 20,
-        "MQTT payload limit exceeded"
-    );
+    validate_telemetry(&discovery, &state)?;
     Ok((discovery, state))
 }
 
@@ -870,6 +988,292 @@ mod tests {
         let status = response.status().as_u16();
         let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mqtt_collects_extended_statistics_and_preserves_partial_sources() {
+        use netcontrol_core::{Backend, Config, Simulator};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Fixture {
+            simulator: Simulator,
+            fail: Arc<AtomicBool>,
+        }
+        impl Backend for Fixture {
+            fn scope(&self) -> Result<String> {
+                self.simulator.scope()
+            }
+            fn observe(&mut self, config: &Config) -> Result<Config> {
+                self.simulator.observe(config)
+            }
+            fn apply(&mut self, before: &Config, after: &Config) -> Result<()> {
+                self.simulator.apply(before, after)
+            }
+            fn repair(&mut self, config: &Config) -> Result<Value> {
+                self.simulator.repair(config)
+            }
+            fn runtime(&mut self, _: &Config) -> Result<Value> {
+                ensure!(
+                    !self.fail.load(Ordering::SeqCst),
+                    "synthetic service failure"
+                );
+                Ok(crate::mqtt_stats::tests::runtime())
+            }
+            fn statistics(&mut self, config: &Config, path: &str, query: &str) -> Result<Value> {
+                let protocols = json!([{"name":"snmp","status":"available","groups":{"Tcp":{"RetransSegs":"9007199254740993"}}}]);
+                match path {
+                    "/api/v1/statistics" => {
+                        ensure!(
+                            !self.fail.load(Ordering::SeqCst),
+                            "synthetic network failure"
+                        );
+                        Ok(json!({"interfaces":[{"name":"lan0","status":"available",
+                            "counters":{"rx_crc_errors":"9007199254740993"}}],"protocols":protocols,
+                            "bgp":{"state":"running","neighbors":[{"name":"edge","state":"established","received_prefixes":4}]}}))
+                    }
+                    "/api/v1/statistics/protocols" => Ok(json!({"protocols":protocols})),
+                    "/api/v1/statistics/firewall" => Ok(
+                        json!({"sample":{"status":"available"},"generation":"fixture",
+                        "rules":[{"id":"omit-private-rule","config_path":"/firewall/policy",
+                        "packets":"9007199254740993","bytes":"18446744073709551615"}]}),
+                    ),
+                    _ => self.simulator.statistics(config, path, query),
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let fail = Arc::new(AtomicBool::new(false));
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(Fixture {
+                    simulator: Simulator::new(),
+                    fail: fail.clone(),
+                }),
+            )
+            .unwrap(),
+        ));
+        let manager = Manager::open(
+            &directory.path().join("mqtt"),
+            engine.clone(),
+            Mode::Simulated,
+        )
+        .unwrap();
+        let permissions: Vec<String> = netcontrol_core::PERMISSIONS
+            .iter()
+            .map(|permission| (*permission).into())
+            .collect();
+        let stage_drop_policy = || {
+            let mut engine = engine.lock().unwrap();
+            let mut candidate = engine.saved_configuration().clone();
+            candidate.firewall.policy = "drop".into();
+            let base = engine.committed_revision();
+            engine.request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "fixture",
+                &permissions,
+                &serde_json::to_vec(
+                    &json!({"base_revision":base,"confirm_timeout_seconds":30,"config":candidate}),
+                )
+                .unwrap(),
+            )
+        };
+        let pending = stage_drop_policy();
+        assert_eq!(pending.status, 202);
+        assert!(manager.collect(&MQTTConfig::default()).is_err());
+        let rolled_back = engine.lock().unwrap().request(
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                pending.body["id"].as_str().unwrap()
+            ),
+            "",
+            "fixture",
+            &permissions,
+            &[],
+        );
+        assert_eq!(rolled_back.status, 200);
+        let (_, rolled_back, _) = manager.collect(&MQTTConfig::default()).unwrap();
+        assert_eq!(
+            rolled_back["metrics"][metric_key("firewall", "accounting", "dropped_packets")],
+            "0"
+        );
+        let pending = stage_drop_policy();
+        assert_eq!(pending.status, 202);
+        let confirmed = engine.lock().unwrap().request(
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/confirm",
+                pending.body["id"].as_str().unwrap()
+            ),
+            "",
+            "fixture",
+            &permissions,
+            &[],
+        );
+        assert_eq!(confirmed.status, 200);
+        let (discovery, state, _) = manager.collect(&MQTTConfig::default()).unwrap();
+        assert_eq!(
+            state["metrics"][metric_key("firewall", "accounting", "dropped_packets")],
+            "9007199254740993"
+        );
+        assert_eq!(
+            state["metrics"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with("firewall_"))
+                .count(),
+            7
+        );
+        for (kind, name, field, value) in [
+            (
+                "interface",
+                "lan0",
+                "rx_crc_errors",
+                json!("9007199254740993"),
+            ),
+            (
+                "protocol",
+                "snmp/Tcp",
+                "RetransSegs",
+                json!("9007199254740993"),
+            ),
+            ("service", "ntp", "offset_ms", json!(-2.5)),
+            (
+                "service",
+                "syslog",
+                "captured_records",
+                json!("18446744073709551615"),
+            ),
+            (
+                "service",
+                "udp-broadcast-relay:7",
+                "received_bytes",
+                json!("9007199254740993"),
+            ),
+            ("traffic", "lan0", "month_tx_packets", json!("6")),
+            ("bgppeer", "edge", "received_prefixes", json!(4)),
+            (
+                "firewall",
+                "accounting",
+                "rule_match_packets",
+                json!("9007199254740993"),
+            ),
+            ("software", "release", "check_state", json!("disabled")),
+            (
+                "wgpeer",
+                "wg0/omit-private-key",
+                "rx_bytes",
+                json!("18446744073709551615"),
+            ),
+        ] {
+            let key = metric_key(kind, name, field);
+            assert_eq!(state["metrics"][&key], value, "{kind}/{name}/{field}");
+            assert_eq!(discovery["components"][&key]["platform"], "sensor");
+        }
+        let payload = serde_json::to_string(&json!([discovery, state])).unwrap();
+        assert!(!payload.contains("omit-private"));
+        assert!(!payload.contains("private_key") && !payload.contains("config_path"));
+        fail.store(true, Ordering::SeqCst);
+        let (_, partial, retained) = manager.collect(&MQTTConfig::default()).unwrap();
+        assert_eq!(partial["telemetry_sources"]["network"], false);
+        assert_eq!(partial["telemetry_sources"]["services"], false);
+        assert_eq!(partial["telemetry_sources"]["protocols"], true);
+        assert_eq!(
+            partial["metrics"][metric_key("protocol", "snmp/Tcp", "RetransSegs")],
+            "9007199254740993"
+        );
+        for kind in [
+            "interface",
+            "gateway",
+            "service",
+            "flow",
+            "traffic",
+            "dhcprelay",
+            "dhcpclient",
+            "wgpeer",
+        ] {
+            assert!(retained.contains(&kind), "{kind}");
+        }
+        assert!(partial.get("process_health").is_some());
+        assert!(
+            partial["metrics"]
+                .get(metric_key("service", "ntp", "offset_ms"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn mqtt_sando_summary_is_attached_in_either_application_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(netcontrol_core::Simulator::new()),
+            )
+            .unwrap(),
+        ));
+        for first in [true, false] {
+            let manager = Manager::open(
+                &directory.path().join(format!("mqtt-{first}")),
+                engine.clone(),
+                Mode::Simulated,
+            )
+            .unwrap();
+            let sando = crate::sando::Manager::open(
+                &directory.path().join(format!("sando-{first}")),
+                engine.clone(),
+            )
+            .unwrap();
+            let mut app = App::new(engine.clone(), Authentication::Scoped(vec![]), false);
+            if first {
+                App::attach_sando(&mut app, sando.clone()).unwrap();
+                App::attach_mqtt(&mut app, manager.clone()).unwrap();
+            } else {
+                App::attach_mqtt(&mut app, manager.clone()).unwrap();
+                App::attach_sando(&mut app, sando.clone()).unwrap();
+            }
+            assert!(Arc::ptr_eq(
+                manager.sando.lock().unwrap().as_ref().unwrap(),
+                &sando
+            ));
+            let (_, state, _) = manager.collect(&MQTTConfig::default()).unwrap();
+            assert_eq!(
+                state["metrics"][metric_key("sando", "sync", "state")],
+                "disabled"
+            );
+            assert_eq!(
+                state["metrics"][metric_key("sando", "sync", "host_count")],
+                0
+            );
+            assert_eq!(state["telemetry_sources"]["sando"], true);
+        }
+    }
+
+    #[test]
+    fn mqtt_final_payload_limits_include_merged_entities_and_exact_size_boundaries() {
+        let mut discovery = json!({"components":{}});
+        for index in 0..4096 {
+            discovery["components"][format!("metric{index}")] = json!({});
+        }
+        assert!(validate_telemetry(&discovery, &json!({})).is_ok());
+        discovery["components"]["retained_previous_entity"] = json!({});
+        assert!(validate_telemetry(&discovery, &json!({})).is_err());
+        let overhead = serde_json::to_vec(&json!({"data":""})).unwrap().len();
+        let state = json!({"data":"a".repeat((1 << 20) - overhead)});
+        assert_eq!(serde_json::to_vec(&state).unwrap().len(), 1 << 20);
+        assert!(validate_telemetry(&json!({"components":{}}), &state).is_ok());
+        let too_large = json!({"data":"a".repeat((1 << 20) - overhead + 1)});
+        assert!(validate_telemetry(&json!({"components":{}}), &too_large).is_err());
+        assert!(
+            validate_telemetry(
+                &json!({"components":{},"data":"a".repeat(1 << 20)}),
+                &json!({})
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1377,6 +1781,8 @@ mod tests {
                             ensure!(value["metrics"]["revision"] == serde_json::json!(test_revision(1)), "unconfirmed or wrong revision published");
                             ensure!(value["process_health"]["status"] == "unhealthy" && value["active_alerts"][0]["retrying"] == true, "health/alerts were not published");
                             ensure!(value["metrics"].get("memory_used_bytes").is_some_and(Value::is_null), "host sensor missing or fabricated by the simulator");
+                            ensure!(value["metrics"][metric_key("software", "release", "check_state")] == "disabled", "release summary missing from broker payload");
+                            ensure!(value["metrics"].get(metric_key("firewall", "accounting", "dropped_packets")).is_some_and(Value::is_null), "unmeasured firewall drops missing or fabricated");
                             connections.push(connection);
                             manager.health.observe(Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})), &[], false);
                         }

@@ -36,9 +36,11 @@ runs inside Netcontrol with automatic reconnect/retry, not an external package.
 
 Host-wide traffic accounting uses one Rust worker for every kernel interface,
 including unmanaged, VLAN, tunnel, veth and loopback links. Optional
-`vnstat.collector` sends one `hostname|vnstat --oneline`-format UDP datagram per
+`vnstat.collector` sends one `hostname.domain|vnstat --oneline`-format UDP datagram per
 present interface during local 23:59, with daily/monthly/lifetime observed
-totals. Reporting is approximate and best-effort, not a delivery guarantee.
+totals. The prefix uses committed `system.hostname` and `system.domain`;
+an empty domain sends hostname only, and an unmanaged hostname uses the kernel
+name. Reporting is approximate and best-effort, not a delivery guarantee.
 See the [traffic contract](FRONTEND_SPEC.md#native-traffic-history) and
 [example](examples/appliance-services.json) for configuration and retained-state
 requirements; there is no vnStat daemon, cron or netcat dependency.
@@ -420,9 +422,26 @@ summaries, interface counters, configuration revision and daemon uptime, plus ho
 health: memory/swap, load, uptime, pressure, **per-core CPU busy percent**, **per
 temperature/fan sensor** (thermal zones and hwmon) and local filesystem space, and
 per-instance NetFlow/IPFIX export state, **dropped capture packets**, active/exported
-flows and excluded/filtered/malformed packet counters. The version
-sensor is unknown while package metadata remains the unreleased placeholder
-`0.0.0`. MQTT is telemetry-only. Linux host mode is required; simulator makes no
+flows and excluded/filtered/malformed packet counters. Coverage also includes
+all interface error counters, IP/TCP/UDP/ICMP kernel counters, disk I/O, VM and
+scheduler counters, all PSI windows, service/NTP/syslog/mDNS/relay statistics,
+DHCP lease summaries, WireGuard peer byte counters/handshakes, BGP neighbor
+gauges, vnStat daily/monthly/lifetime and reporting summaries, software release
+checks and Sando sync summaries. The version sensor uses the embedded calendar
+release version, not Cargo's internal placeholder.
+
+**Overall firewall dropped packets and bytes** sum the managed input/forward
+DROP rules and default policies, using exact kernel counters rather than sampled
+deny logs. These reset with the installed counter generation; unavailable or
+simulated measurements are unknown, not zero. Per-rule sensors, raw connection/
+route/host inventories, packet logs and traffic-history records are not published.
+Aggregate rule-match totals are also available, but are not unique traffic
+totals: one packet can match several accepting/bypass/NAT rules.
+Source-readability flags distinguish partial samples from healthy zero readings.
+Discovery/state remain capped at 4096 entities and 1 MiB each; exceeding limits
+fails collection explicitly. The exact contract below specifies family limits.
+
+MQTT is telemetry-only. Linux host mode is required; simulator makes no
 connection and namespace lab mode rejects enabled streaming. Binding fails closed;
 hostname resolution still uses the host resolver, not the selected interface.
 The connection stays open between samples and retries failures every five seconds
@@ -450,9 +469,10 @@ See the [exact contract](FRONTEND_SPEC.md#614-home-assistant-mqtt-streaming).
 
 ## Host name and time zone
 
-`config.system` holds an optional `hostname`, an optional IANA `timezone` and a cosmetic
-`domain`; empty means unmanaged (the default). The `domain` is only stored and shown by
-clients: it is never applied to the host and never becomes a DNS search domain. Changes use the ordinary confirmed transaction flow
+`config.system` holds an optional `hostname`, an optional IANA `timezone` and a
+display/reporting `domain`; empty means unmanaged/no domain (the default). The
+`domain` supplies the vnStat collector name suffix and can be shown by clients;
+it is never applied to the host and never becomes a DNS search domain. Changes use the ordinary confirmed transaction flow
 with `transactions.write` plus `system.write`, but the daemon applies them itself
 after confirmation, like MQTT: the network is not touched and a rolled-back
 transaction never changes the host. Linux host mode sets the kernel hostname and

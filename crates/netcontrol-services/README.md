@@ -98,7 +98,8 @@ drift and durable transaction recovery safeguards remain enforced.
   Address, opt-in Linux/CPU HINFO, `_workstation._tcp` (conventional port 9)
   and browse-domain records are real publications; SSH/SFTP and arbitrary
   services are not advertised. Explicit hostname or configured system hostname
-  is used, never ambient hostname; cosmetic system domain is irrelevant.
+  is used, never ambient hostname; the system display/reporting domain is
+  irrelevant to mDNS publishing.
   Global IPv6 disable suppresses IPv6 transport and AAAA publication, preserving
   saved preferences. Cross-family flags only select published record types.
   Link/address snapshots are checked every second, not by netlink subscription.
@@ -213,10 +214,18 @@ drift and durable transaction recovery safeguards remain enforced.
   records are never deleted, reset, migrated, or interpreted as Go/vnStat data.
   `vnstat.collector` defaults to null (collection only). A configured literal
   unicast UDP IP:port enables reporting at the first sample during local 23:59.
-  One datagram per present interface contains `hostname|ONELINE\n`; ONELINE
+  One datagram per present interface contains `hostname.domain|ONELINE\n`; ONELINE
   matches the 15-field version-1 human-readable `vnstat --oneline` layout.
   Byte quantities use B/KiB/MiB/GiB/etc.; rates use bit/s and decimal prefixes.
-  The hostname is read from the appliance, not hardcoded. No subprocess,
+  The name uses committed `system.hostname` and `system.domain`; an empty
+  domain sends hostname only. An unmanaged hostname uses the kernel hostname,
+  taking its first label when appending the configured domain. No DNS/NIS
+  domain discovery or hardcoded appliance name is used. The engine publishes
+  committed identity at startup and on ticks through a shared lock; the worker
+  snapshots it once per report, without restarting collection or resetting
+  persisted counts/report dates. Unconfirmed/rolled-back identity edits do not
+  reach reports. The effective name must fit 253 characters; errors remain
+  explicit reporting warnings while collection continues. No subprocess,
   `vnstatd`, netcat, cron job or vnStat database is involved.
   Reporting uses nonblocking UDP, with no acknowledgment/backfill/durable queue.
   A successful send means local acceptance only. Per-interface failures do not

@@ -86,7 +86,11 @@ fn native_counter_worker_persists_history_and_joins() {
             {
                 let directory = directory.clone();
                 move || {
-                    counters::prepare(directory.clone(), netcontrol_core::VNStatConfig::default())
+                    counters::prepare(
+                        directory.clone(),
+                        netcontrol_core::VNStatConfig::default(),
+                        Default::default(),
+                    )
                 }
             },
         )?;
@@ -143,7 +147,11 @@ fn native_counter_worker_persists_history_and_joins() {
             {
                 let directory = directory.clone();
                 move || {
-                    counters::prepare(directory.clone(), netcontrol_core::VNStatConfig::default())
+                    counters::prepare(
+                        directory.clone(),
+                        netcontrol_core::VNStatConfig::default(),
+                        Default::default(),
+                    )
                 }
             },
         )?;

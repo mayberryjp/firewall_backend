@@ -157,9 +157,11 @@ impl App {
         Ok(())
     }
     pub fn attach_sando(app: &mut Arc<Self>, manager: Arc<crate::sando::Manager>) -> Result<()> {
-        Arc::get_mut(app)
-            .context("application is already shared")?
-            .sando = Some(manager);
+        let app = Arc::get_mut(app).context("application is already shared")?;
+        if let Some(mqtt) = &app.mqtt {
+            mqtt.attach_sando(manager.clone())?;
+        }
+        app.sando = Some(manager);
         Ok(())
     }
     pub fn refresh_upgrade_gate(&self) -> Result<()> {
@@ -173,6 +175,9 @@ impl App {
     }
     pub fn attach_mqtt(app: &mut Arc<Self>, mqtt: Arc<crate::mqtt::Manager>) -> Result<()> {
         let app = Arc::get_mut(app).context("application is already shared")?;
+        if let Some(sando) = &app.sando {
+            mqtt.attach_sando(sando.clone())?;
+        }
         app.health = mqtt.health.clone();
         app.mqtt = Some(mqtt);
         Ok(())

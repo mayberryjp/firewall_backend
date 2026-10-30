@@ -107,7 +107,7 @@ impl BlackholeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SystemConfig {
     pub hostname: String,
-    /// Cosmetic label only: never applied to the host, resolver or search domains.
+    /// Display/reporting domain: never applied to the host, resolver or search domains.
     pub domain: String,
     pub timezone: String,
 }

@@ -1444,9 +1444,18 @@ struct Faults {
     deny_log_calls: usize,
     discovery_error: bool,
     discovery_calls: usize,
+    reporting_identities: Vec<SystemConfig>,
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn configure_reporting_identity(&mut self, system: &SystemConfig) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .reporting_identities
+            .push(system.clone());
+        Ok(())
+    }
     fn deny_log(&mut self, _: &crate::DenyLogQuery) -> Result<Value> {
         let mut faults = self.0.lock().unwrap();
         faults.deny_log_calls += 1;
@@ -2504,6 +2513,71 @@ fn sando_api_validates_known_fields_instead_of_dropping_invalid_import_state() {
             crate::SandoConfig::default()
         );
     }
+}
+
+#[test]
+fn reporting_identity_tracks_only_committed_system_settings_including_pending_restart() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    assert_eq!(
+        backend.lock().unwrap().reporting_identities.last(),
+        Some(&SystemConfig::default())
+    );
+    engine.configure_system(Some(Arc::new(|_| true)));
+    let mut candidate = config();
+    candidate.system.hostname = "firewall".into();
+    candidate.system.domain = "example.test".into();
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    engine.tick().unwrap();
+    assert_eq!(
+        backend.lock().unwrap().reporting_identities.last(),
+        Some(&SystemConfig::default())
+    );
+    let id = pending.body["id"].as_str().unwrap();
+    drop(engine);
+    let mut engine =
+        Engine::open(&fixture.path(), Box::new(FaultBackend(backend.clone()))).unwrap();
+    assert_eq!(
+        backend.lock().unwrap().reporting_identities.last(),
+        Some(&SystemConfig::default())
+    );
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    engine.tick().unwrap();
+    assert_eq!(
+        backend.lock().unwrap().reporting_identities.last(),
+        Some(&candidate.system)
+    );
+    let committed = candidate.system.clone();
+    candidate.system.domain = "changed.test".into();
+    let pending = submit(&mut engine, candidate);
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    engine.tick().unwrap();
+    assert_eq!(
+        backend.lock().unwrap().reporting_identities.last(),
+        Some(&committed)
+    );
+    let rollback = request(
+        &mut engine,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            pending.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200, "{}", rollback.body);
+    engine.tick().unwrap();
+    assert_eq!(
+        backend.lock().unwrap().reporting_identities.last(),
+        Some(&committed)
+    );
+    drop(engine);
+    let _engine = Engine::open(&fixture.path(), Box::new(FaultBackend(backend.clone()))).unwrap();
+    assert_eq!(
+        backend.lock().unwrap().reporting_identities.last(),
+        Some(&committed)
+    );
 }
 
 #[test]

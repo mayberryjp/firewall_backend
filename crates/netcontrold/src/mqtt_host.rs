@@ -8,6 +8,7 @@ const MAX_CPUS: usize = 256;
 const MAX_FILESYSTEMS: usize = 64;
 const MAX_THERMAL: usize = 64;
 const MAX_HWMON: usize = 128;
+const MAX_DISKS: usize = 64;
 // Counters that contribute to busy percentage; guest ticks are already inside user/nice.
 const TICK_FIELDS: [&str; 8] = [
     "user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal",
@@ -113,6 +114,22 @@ pub fn sensors(host: Option<&Value>, baseline: &mut Option<CpuBaseline>) -> Host
     ] {
         push(&mut sensors, key, name, value, Some("B"), Some(GAUGE));
     }
+    if let Some(fields) = memory.and_then(|memory| memory["bytes"].as_object()) {
+        for (field, value) in fields.iter().take(128) {
+            if !["MemTotal", "MemAvailable", "SwapTotal"].contains(&field.as_str()) {
+                push(
+                    &mut sensors,
+                    metric_key("memoryfield", field, "bytes"),
+                    format!("Memory {field}"),
+                    scalar(value),
+                    Some("B"),
+                    Some(GAUGE),
+                );
+            }
+        }
+    } else {
+        retained.push("memoryfield");
+    }
 
     let load = data(host, "load");
     for (key, name, field) in [
@@ -133,6 +150,14 @@ pub fn sensors(host: Option<&Value>, baseline: &mut Option<CpuBaseline>) -> Host
         Some("s"),
         Some(GAUGE),
     );
+    push(
+        &mut sensors,
+        "host_idle_seconds",
+        "Host cumulative CPU idle time",
+        data(host, "uptime").map_or(Value::Null, |uptime| scalar(&uptime["idle_seconds"])),
+        Some("s"),
+        Some(COUNTER),
+    );
     let oom = data(host, "vm").map_or(Value::Null, |vm| scalar(&vm["oom_kill"]));
     push(
         &mut sensors,
@@ -142,6 +167,73 @@ pub fn sensors(host: Option<&Value>, baseline: &mut Option<CpuBaseline>) -> Host
         Some("kills"),
         Some(COUNTER),
     );
+    for (field, unit) in [
+        ("pgpgin", "KiB"),
+        ("pgpgout", "KiB"),
+        ("pswpin", "pages"),
+        ("pswpout", "pages"),
+        ("pgfault", "faults"),
+        ("pgmajfault", "faults"),
+    ] {
+        push(
+            &mut sensors,
+            format!("vm_{field}"),
+            format!("VM {field}"),
+            data(host, "vm").map_or(Value::Null, |vm| scalar(&vm[field])),
+            Some(unit),
+            Some(COUNTER),
+        );
+    }
+    for (field, class) in [
+        ("ctxt", COUNTER),
+        ("processes", COUNTER),
+        ("procs_running", GAUGE),
+        ("procs_blocked", GAUGE),
+    ] {
+        push(
+            &mut sensors,
+            format!("scheduler_{field}"),
+            format!("Scheduler {field}"),
+            data(host, "cpu").map_or(Value::Null, |cpu| scalar(&cpu["scheduler"][field])),
+            None,
+            Some(class),
+        );
+    }
+    for field in ["runnable_tasks", "total_tasks"] {
+        push(
+            &mut sensors,
+            format!("load_{field}"),
+            format!("Host {field}"),
+            load.map_or(Value::Null, |load| scalar(&load[field])),
+            Some("tasks"),
+            Some(GAUGE),
+        );
+    }
+    for section in [
+        "cpu",
+        "memory",
+        "load",
+        "uptime",
+        "vm",
+        "disks",
+        "filesystems",
+        "thermal",
+        "hwmon",
+        "pressure_cpu",
+        "pressure_memory",
+        "pressure_io",
+    ] {
+        push(
+            &mut sensors,
+            format!("host_section_{section}_status"),
+            format!("Host {section} statistics status"),
+            host.map_or(Value::Null, |host| {
+                scalar(&host["sections"][section]["status"])
+            }),
+            None,
+            None,
+        );
+    }
 
     for (section, label, categories) in [
         ("pressure_cpu", "CPU", &["some"][..]),
@@ -150,17 +242,77 @@ pub fn sensors(host: Option<&Value>, baseline: &mut Option<CpuBaseline>) -> Host
     ] {
         let pressure = data(host, section);
         for category in categories {
-            let value =
-                pressure.map_or(Value::Null, |pressure| scalar(&pressure[category]["avg10"]));
+            for field in ["avg10", "avg60", "avg300", "total"] {
+                push(
+                    &mut sensors,
+                    format!("{section}_{category}_{field}"),
+                    format!("{label} pressure {category} {field}"),
+                    pressure.map_or(Value::Null, |pressure| scalar(&pressure[category][field])),
+                    Some(if field == "total" { "us" } else { "%" }),
+                    Some(if field == "total" { COUNTER } else { GAUGE }),
+                );
+            }
+        }
+    }
+    match data(host, "disks").and_then(Value::as_array) {
+        Some(rows) => {
             push(
                 &mut sensors,
-                format!("{section}_{category}_avg10"),
-                format!("{label} pressure {category} (10 s)"),
-                value,
-                Some("%"),
-                Some(GAUGE),
+                "disk_statistics_truncated",
+                "Disk statistics truncated",
+                json!(rows.len() > MAX_DISKS),
+                None,
+                None,
             );
+            if rows.len() > MAX_DISKS {
+                retained.push("disk");
+            }
+            for row in rows.iter().take(MAX_DISKS) {
+                let Some(name) = row["name"].as_str() else {
+                    retained.push("disk");
+                    continue;
+                };
+                for field in [
+                    "reads_completed",
+                    "reads_merged",
+                    "sectors_read",
+                    "read_ms",
+                    "writes_completed",
+                    "writes_merged",
+                    "sectors_written",
+                    "write_ms",
+                    "io_in_progress",
+                    "io_ms",
+                    "weighted_io_ms",
+                    "discards_completed",
+                    "discards_merged",
+                    "sectors_discarded",
+                    "discard_ms",
+                    "flushes_completed",
+                    "flush_ms",
+                ] {
+                    push(
+                        &mut sensors,
+                        metric_key("disk", name, field),
+                        format!("{name} disk {field}"),
+                        scalar(&row["counters"][field]),
+                        if field.ends_with("_ms") {
+                            Some("ms")
+                        } else if field.starts_with("sectors_") {
+                            Some("sectors")
+                        } else {
+                            None
+                        },
+                        Some(if field == "io_in_progress" {
+                            GAUGE
+                        } else {
+                            COUNTER
+                        }),
+                    );
+                }
+            }
         }
+        None => retained.push("disk"),
     }
 
     let boot_id = host
@@ -284,9 +436,20 @@ pub fn sensors(host: Option<&Value>, baseline: &mut Option<CpuBaseline>) -> Host
                     ("total_bytes", "total"),
                     ("used_bytes", "used"),
                     ("available_bytes", "available"),
+                    ("free_bytes", "free"),
+                    ("total_inodes", "total inodes"),
+                    ("free_inodes", "free inodes"),
+                    ("available_inodes", "available inodes"),
+                    ("read_only", "read only"),
                 ] {
                     let value = if usage["status"] == "available" {
-                        scalar(&usage["data"][field])
+                        if field == "read_only" {
+                            usage["data"][field]
+                                .as_bool()
+                                .map_or(Value::Null, Value::Bool)
+                        } else {
+                            scalar(&usage["data"][field])
+                        }
                     } else {
                         Value::Null
                     };
@@ -295,8 +458,14 @@ pub fn sensors(host: Option<&Value>, baseline: &mut Option<CpuBaseline>) -> Host
                         metric_key("fs", mount, field),
                         format!("{mount} {label}"),
                         value,
-                        Some("B"),
-                        Some(GAUGE),
+                        if field.ends_with("_bytes") {
+                            Some("B")
+                        } else if field.ends_with("_inodes") {
+                            Some("inodes")
+                        } else {
+                            None
+                        },
+                        (field != "read_only").then_some(GAUGE),
                     );
                 }
             }
@@ -320,6 +489,7 @@ mod tests {
             "load":{"status":"available","error":null,"data":{"one":0.5,"five":0.25,"fifteen":0.1}},
             "uptime":{"status":"available","error":null,"data":{"uptime_seconds":123.5,"idle_seconds":9.0}},
             "vm":{"status":"available","error":null,"data":{"oom_kill":"3"}},
+            "disks":{"status":"available","error":null,"data":[]},
             "pressure_cpu":{"status":"available","error":null,"data":{"some":{"avg10":1.5}}},
             "pressure_memory":{"status":"unavailable","error":"no PSI","data":null},
             "pressure_io":{"status":"available","error":null,"data":{"some":{"avg10":2.0},"full":{"avg10":0.5}}},
@@ -342,6 +512,78 @@ mod tests {
             .unwrap_or_else(|| panic!("missing {key}"))
             .value
             .clone()
+    }
+
+    #[test]
+    fn mqtt_extended_host_statistics_cover_disk_vm_scheduler_memory_and_pressure() {
+        let mut host = snapshot(1, 1);
+        host["sections"]["memory"]["data"]["bytes"]["Cached"] = json!("9007199254740993");
+        host["sections"]["cpu"]["data"]["scheduler"] = json!({"ctxt":"18446744073709551615","processes":"5","procs_running":"2","procs_blocked":"0"});
+        host["sections"]["vm"]["data"]["pgmajfault"] = json!("9");
+        host["sections"]["load"]["data"]["total_tasks"] = json!("88");
+        host["sections"]["filesystems"]["data"][0]["usage"]["data"]["total_inodes"] =
+            json!("9007199254740993");
+        host["sections"]["filesystems"]["data"][0]["usage"]["data"]["read_only"] = json!(true);
+        host["sections"]["pressure_io"]["data"]["full"]["avg60"] = json!(2.5);
+        host["sections"]["pressure_io"]["data"]["full"]["total"] = json!("18446744073709551615");
+        let disk = json!({"name":"sda","counters":{"reads_completed":"18446744073709551615",
+            "sectors_read":"9007199254740993","read_ms":"7","io_in_progress":"0"}});
+        host["sections"]["disks"] = json!({"status":"available","data":[disk]});
+        let out = sensors(Some(&host), &mut None);
+        for (key, expected) in [
+            (
+                metric_key("memoryfield", "Cached", "bytes"),
+                json!("9007199254740993"),
+            ),
+            ("scheduler_ctxt".into(), json!("18446744073709551615")),
+            ("scheduler_procs_blocked".into(), json!("0")),
+            ("vm_pgmajfault".into(), json!("9")),
+            ("load_total_tasks".into(), json!("88")),
+            ("host_idle_seconds".into(), json!(9.0)),
+            (
+                metric_key("fs", "/", "total_inodes"),
+                json!("9007199254740993"),
+            ),
+            (metric_key("fs", "/", "read_only"), json!(true)),
+            ("pressure_io_full_avg60".into(), json!(2.5)),
+            (
+                "pressure_io_full_total".into(),
+                json!("18446744073709551615"),
+            ),
+            (
+                metric_key("disk", "sda", "sectors_read"),
+                json!("9007199254740993"),
+            ),
+            (metric_key("disk", "sda", "io_in_progress"), json!("0")),
+        ] {
+            assert_eq!(value(&out, &key), expected, "{key}");
+        }
+        let disk = out
+            .sensors
+            .iter()
+            .find(|sensor| sensor.key == metric_key("disk", "sda", "io_in_progress"))
+            .unwrap();
+        assert_eq!(disk.class, Some(GAUGE));
+        let sectors = out
+            .sensors
+            .iter()
+            .find(|sensor| sensor.key == metric_key("disk", "sda", "sectors_read"))
+            .unwrap();
+        assert_eq!(sectors.unit, Some("sectors"));
+        assert_eq!(sectors.class, Some(COUNTER));
+        assert!(value(&out, &metric_key("disk", "sda", "flush_ms")).is_null());
+        assert!(sensors(None, &mut None).retained.contains(&"disk"));
+        host["sections"]["disks"]["data"] = json!([]);
+        assert!(!sensors(Some(&host), &mut None).retained.contains(&"disk"));
+        host["sections"]["disks"]["data"] = json!(
+            (0..65)
+                .map(|id| json!({"name":format!("disk{id}"),"counters":{}}))
+                .collect::<Vec<_>>()
+        );
+        let capped = sensors(Some(&host), &mut None);
+        assert_eq!(value(&capped, "disk_statistics_truncated"), true);
+        assert!(capped.retained.contains(&"disk"));
+        assert_eq!(capped.sensors.iter().filter(|sensor| sensor.key.starts_with("disk_") && sensor.key.ends_with("_read_ms")).count(), 64);
     }
 
     #[test]
@@ -441,7 +683,10 @@ mod tests {
         let mut baseline = None;
         let host = sensors(None, &mut baseline);
         assert!(host.sensors.iter().all(|sensor| sensor.value.is_null()));
-        assert_eq!(host.retained, ["cpu", "thermal", "hwmon", "fs"]);
+        assert_eq!(
+            host.retained,
+            ["memoryfield", "disk", "cpu", "thermal", "hwmon", "fs"]
+        );
         let mut partial = snapshot(1, 1);
         partial["sections"]["hwmon"]["data"]
             .as_array_mut()

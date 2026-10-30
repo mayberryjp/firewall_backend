@@ -66,6 +66,7 @@ pub struct Services {
     config: Config,
     workers: BTreeMap<String, Worker>,
     error: Option<String>,
+    reporting_identity: std::sync::Arc<std::sync::RwLock<netcontrol_core::SystemConfig>>,
     #[cfg(target_os = "linux")]
     _ownership: std::fs::File,
     #[cfg(target_os = "linux")]
@@ -136,6 +137,7 @@ impl Services {
             config: Config::default(),
             workers: BTreeMap::new(),
             error: None,
+            reporting_identity: Default::default(),
             #[cfg(target_os = "linux")]
             _ownership: ownership,
             #[cfg(target_os = "linux")]
@@ -146,6 +148,20 @@ impl Services {
             syslog_socket: syslog::JournalSocket::activated()
                 .context("receive systemd syslog socket")?,
         })
+    }
+    pub fn configure_reporting_identity(
+        &mut self,
+        system: &netcontrol_core::SystemConfig,
+    ) -> Result<()> {
+        system.validate()?;
+        let mut current = self
+            .reporting_identity
+            .write()
+            .map_err(|_| anyhow::anyhow!("traffic reporting identity lock poisoned"))?;
+        if *current != *system {
+            current.clone_from(system);
+        }
+        Ok(())
     }
     pub fn validate(&self, value: &Value) -> Result<()> {
         self.preflight(&Config::parse(value)?)
@@ -295,11 +311,12 @@ impl Services {
             if c.vnstat.enabled {
                 let dir = self.options.state_directory.clone();
                 let config = c.vnstat.clone();
+                let identity = self.reporting_identity.clone();
                 self.insert(
                     "vnstat",
                     host.clone(),
                     json!({"name":"vnstat","scope":"host","schema":counters::SCHEMA}),
-                    move || counters::prepare(dir.clone(), config.clone()),
+                    move || counters::prepare(dir.clone(), config.clone(), identity.clone()),
                 )?;
             }
             let relays: Vec<_> = c
@@ -921,6 +938,48 @@ mod tests {
         drop(services);
         std::fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn reporting_identity_changes_without_restarting_workers_or_resetting_history() {
+        let directory =
+            std::env::temp_dir().join(format!("services-reporting-{}", rand::random::<u64>()));
+        let mut services = Services::new(ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: true,
+            allow_gateway_monitoring: false,
+        })
+        .unwrap();
+        let history = directory.join(counters::FILE_NAME);
+        std::fs::write(&history, b"retained accounting").unwrap();
+        services.workers.insert(
+            "vnstat".into(),
+            Worker::start("vnstat".into(), None, json!({"name":"vnstat"}), || {
+                Err(anyhow::anyhow!("synthetic reporting worker retry"))
+            })
+            .unwrap(),
+        );
+        let before = services.workers["vnstat"].snapshot();
+        let shared = services.reporting_identity.clone();
+        let system = netcontrol_core::SystemConfig {
+            hostname: "firewall".into(),
+            domain: "example.test".into(),
+            timezone: String::new(),
+        };
+        services.configure_reporting_identity(&system).unwrap();
+        assert_eq!(*shared.read().unwrap(), system);
+        assert_eq!(services.workers["vnstat"].snapshot(), before);
+        let invalid = netcontrol_core::SystemConfig {
+            domain: "bad|domain".into(),
+            ..system.clone()
+        };
+        assert!(services.configure_reporting_identity(&invalid).is_err());
+        assert_eq!(*shared.read().unwrap(), system);
+        assert_eq!(std::fs::read(&history).unwrap(), b"retained accounting");
+        services.shutdown().unwrap();
+        drop(services);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn retained_traffic_files_do_not_block_service_construction() {
         let directory =

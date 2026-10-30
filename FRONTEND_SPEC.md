@@ -2014,10 +2014,22 @@ destinations; IPv6 destinations require global IPv6 enabled. Validate even when
 disabled. Edit only on the owning traffic-accounting service form; preserve
 metadata. Transactions require existing `transactions.write` and `vnstat.write`.
 At the first sample in local **23:59**, attempt one datagram per present interface:
-`hostname|1;interface;YYYY-MM-DD;day_rx;day_tx;day_total;day_rate;YYYY-MM;month_rx;month_tx;month_total;month_rate;total_rx;total_tx;total_bytes\n`.
+`hostname.domain|1;interface;YYYY-MM-DD;day_rx;day_tx;day_total;day_rate;YYYY-MM;month_rx;month_tx;month_total;month_rate;total_rx;total_tx;total_bytes\n`.
 This is the 15-field human-readable `vnstat --oneline` version-1 layout, with
-IEC byte units and decimal bit/s rate units. Hostname comes from the appliance;
-each interface is its own UDP datagram. The final minute after sampling is omitted
+IEC byte units and decimal bit/s rate units. The prefix uses committed
+`system.hostname` and `system.domain`: for example, `firewall` and `example.test`
+produce `firewall.example.test|`. An empty domain sends hostname only, without
+a trailing dot. When hostname is empty/unmanaged, use the current kernel
+hostname; if appending a configured domain, use its first label so an existing
+OS suffix is replaced rather than duplicated. No resolver lookup or kernel/NIS
+domain is used. Domain/name changes reach the existing worker on the next engine
+tick (normally within about a second), only after confirmation, including after
+restart with a pending transaction. They do not restart accounting, reset
+counters/history or trigger an extra daily report. All interfaces in one attempt
+use a single identity snapshot. The final name is limited to 253 characters;
+invalid/overlong effective kernel-name/domain combinations produce an explicit
+non-blocking `last_report_error`, not a truncated name or hostname-only fallback.
+Each interface is its own UDP datagram. The final minute after sampling is omitted
 from that day's report; accounting continues normally through midnight. The host
 local timezone is used; restart the daemon after host timezone changes to refresh
 libc's timezone cache. No backfill when the reporting minute is missed, no durable
@@ -2027,7 +2039,10 @@ not delivery. `last_report_error` is a non-blocking reporting warning; collectio
 continues. Socket/setup failures retry within that minute; per-interface send
 failures are counted without blocking other reports. Persisted date suppresses
 repeat daily attempts across normal restart; a crash between send and persistence
-can duplicate a report. Collector deduplication should use hostname/interface/date.
+can duplicate a report. Collector deduplication should use reported name/interface/date;
+adding/changing a domain changes that identity and may create a new collector
+device. Preserve existing collector history; no backend migration or duplicate
+short-name report is provided.
 Datagrams are plaintext and unauthenticated, as with the supplied shell reporter;
 restrict collector/network access. No implicit firewall permits are installed.
 
@@ -2202,8 +2217,12 @@ Publisher and deployment contract:
   five seconds when idle. LWT is retained `offline`; graceful stop/disable attempts
   offline/disconnect within three seconds. Broken sockets rely on broker LWT.
 - Stable name-hashed sensor IDs and durable component-removal manifest. Entities:
-  configuration revision, uptime, version; interface link state and RX/TX bytes/
-  packets/errors/drops; gateway health/process/sample state, window sent/received/
+  configuration revision, uptime, version; interface link state and all exported
+  64-bit link counters (RX/TX bytes/packets/errors/drops, multicast, collisions,
+  RX length/overrun/CRC/frame/FIFO/missed/no-handler/other-host drops, TX aborted/
+  carrier/FIFO/heartbeat/window errors and RX/TX compressed packets); gateway
+  health/process/sample state, retry/restart counts, start/sample/last success/
+  health-change timestamps, variation-pair counts, window sent/received/
   lost/pending/loss percent and RTT min/max/average/stddev/p50/p95/variation.
   These are rolling summaries, not individual probes/cumulative probe totals.
   Counter decimal strings remain lossless; stale/unavailable values are unknown,
@@ -2229,9 +2248,32 @@ Publisher and deployment contract:
   unknown, never zero. When a whole section cannot be enumerated its existing
   entities are kept (unknown, expiring) rather than removed. Caps: 256 CPU rows,
   64 thermal zones, 128 hwmon sensors, 64 filesystems (first in snapshot order);
-  extras are ignored. Not published: disks, per-disk I/O, VM counters other than
-  OOM kills, and scheduler gauges. A host snapshot that fails to read leaves these
-  sensors unknown without failing the sample.
+  extras are ignored. A host snapshot that fails to read leaves these
+  sensors unknown without failing the sample. Additional host metrics:
+  - Other exported memory byte gauges (`memoryfield`, up to 128 memory fields
+    examined, including free/cache/buffers/slab/dirty/writeback); existing total/
+    available/swap-total aliases are not duplicated.
+  - `vm_pgpgin`/`vm_pgpgout` (KiB), `vm_pswpin`/`vm_pswpout` (pages),
+    `vm_pgfault`/`vm_pgmajfault` (faults), cumulative, alongside `oom_kills`.
+  - `scheduler_ctxt` and `scheduler_processes` (cumulative), plus
+    `scheduler_procs_running`/`scheduler_procs_blocked` (gauges), and
+    `load_runnable_tasks`/`load_total_tasks` (task gauges).
+  - `host_idle_seconds` (cumulative CPU idle time across cores, s), filesystem
+    `free_bytes`, total/free/available inode gauges and `read_only` state, in
+    addition to the existing filesystem total/used/available bytes.
+  - All supported PSI categories now include `avg10`/`avg60`/`avg300` (%) and
+    cumulative `total` (microseconds), with keys `<section>_<category>_<field>`.
+  - Per-disk (`disk`, disk name identity) reads/writes/discards/flushes completed,
+    merged reads/writes/discards, sectors read/written/discarded, read/write/
+    discard/flush milliseconds, I/O milliseconds and weighted I/O milliseconds
+    (cumulative), and `io_in_progress` (gauge). Linux sectors are 512 bytes, not
+    device logical-block sizes; MQTT preserves sectors rather than silently
+    converting them. Optional kernel fields stay unknown when absent. Cap:
+    first 64 disk rows; `disk_statistics_truncated` reports overflow, retaining
+    any existing omitted disk entities as unknown rather than removing them.
+  - `host_section_<section>_status` preserves available/partial/unavailable/
+    simulated section status. Unsupported/read-failed sections are not measured
+    zero. Additional memory/disk entities are retained on enumeration failure.
 - NetFlow/IPFIX sensors, one set per **configured** `softflowd` instance (enabled or
   not), read from `GET /api/v1/services/softflowd/status` on each sample and keyed
   by a hash of the instance name: `state` (`running`, `stopped`, `disabled`, `error`,
@@ -2246,6 +2288,85 @@ Publisher and deployment contract:
   are kept (unknown, expiring). Names are `<name> flow dropped packets` etc. Cap:
   64 instances. `running` is local worker health, not collector delivery; see
   [docs/NETFLOW_IPFIX_SPEC.md](docs/NETFLOW_IPFIX_SPEC.md) section 5.
+- Additional bounded monitoring families use the same discovery/state topics,
+  QoS, expiry and credentials. IDs are `<kind>_<sha256(identity)>_<field>`:
+  - **Kernel protocols** (`protocol`, identity `<source>/<group>`): all numeric
+    SNMP/netstat/SNMP6 counters, including IPv4/IPv6, TCP/TCP extensions, UDP and
+    ICMP/type counters. Exact decimal strings, cumulative; TCP `CurrEstab` is a
+    gauge and octet counters use B. Configuration constants (`Forwarding`,
+    `DefaultTTL`, `RtoAlgorithm`, `RtoMin`, `RtoMax`, `MaxConn`) are excluded.
+    Per-source status has identity `<source>`, field `status`.
+  - **Native services** (`service`, identity service name, or
+    `udp-broadcast-relay:<instance_id>`): process state, retry/restart metadata,
+    start/sample timestamps, sample status where supported and `error_present`
+    (presence of a reported current/last error, not an assurance of health).
+    NTP exposes discipline and available offset/delay/requested-slew/uncorrected
+    offset in ms. Syslog exposes cumulative captured/forwarded/failed-delivery
+    counts and a destination-error count, not messages or destination details.
+    mDNS/UDP relay expose their supported receive/transmit packet/byte, policy/
+    loop/duplicate/hop-limit/queue/oversize/unsupported-record/malformed/
+    rate-limit/receive-drop/send-error
+    counters and `statistics_complete`. Unsupported receive-loss accounting is
+    null/false, not proof of no loss. Worker counters are unknown unless running;
+    mDNS/UDP relay additionally require a completed sample. Failed NTP sampling
+    masks prior offsets rather than publishing stale good values.
+  - **DHCP**: `dhcprelay` identities are interface names, with state/retry/restart/
+    start metadata. `dhcpclient` identifies each interface with an observed lease
+    or error: `lease_valid`, `error_present`, `acquired_at` (Unix s), `lifetime`,
+    `renewal`, `rebinding` (s) and `expires_at_unix` (Unix s). No leased addresses,
+    DNS/search-domain values, DHCP packet inventory or error strings are copied.
+  - **WireGuard** (`wgpeer`): per-interface `peer_count`; per-peer `rx_bytes`/
+    `tx_bytes` (exact cumulative strings) and `last_handshake_unix_seconds`
+    (nullable Unix s). Peer identity is `<interface>/<public_key>` before hashing;
+    display names use the interface and a short hash. No key material, endpoints
+    or allowed-prefix inventories are published.
+  - **BGP**: `bgp` identity `bgp` exposes state/health, installed-prefix count,
+    connected-prefix count, neighbor count and established-neighbor count.
+    `bgppeer` identifies neighbor
+    names: state, received/advertised prefix gauges, cumulative rejected-prefix
+    count and nullable negotiated hold seconds. Transient/starting failures retain
+    prior peer discovery with unknown measurements. The existing raw BGP summary
+    remains; route/advertised-route tables are not added.
+  - **vnStat**: the existing cached vnStat worker status supplies summaries without
+    reading/serializing its persisted history. `traffic` identifies interface
+    names: `present`, `last_seen`, cumulative `resets`, `total_rx_bytes`/
+    `total_tx_bytes`/`total_rx_packets`/`total_tx_packets`, and matching `day_`/
+    `month_` metrics plus `day_date`/`month_date`. Day/month totals are gauges,
+    labeled by the worker's local calendar buckets, not running lifetime counters
+    or a new MQTT history feed. Absent interfaces or unavailable workers have
+    unknown totals. `service` identity `vnstat` also exposes cumulative
+    `sent_datagrams`/`failed_datagrams`, `last_report_date` and `error_present`.
+    Counters/report state retain the existing worker/persistence/reset semantics;
+    sent datagrams do not prove external collector delivery.
+  - **Software** (`software`, identity `release`): `latest_version`,
+    `update_available` (nullable boolean), `last_checked_at` and `check_state`
+    (`disabled|pending|succeeded|error`), from committed daemon-managed software
+    metadata. Disabled/pending/failed checks remain unknown, not "up to date".
+  - **Sando** (`sando`, identity `sync`): `enabled`, `state`, `last_attempt_at`,
+    `last_success_at`, `next_sync_at`, `host_count`, `skipped_hosts`. Read-only
+    projection of the current configured source's sync state: no source URL,
+    errors, names, icons, classification, scores, addresses or raw hosts. The
+    counts describe cached results, not a live network census; last success
+    determines freshness. Disabled/failed sync can retain prior counts, while a
+    source change hides the old source's results. The normal Sando API and hourly
+    synchronization are unchanged.
+  - **Firewall aggregate accounting only** (`firewall`, identity `accounting`):
+    `generation`, `ruleset_id`, `logical_rule_count`, `rule_match_packets`,
+    `rule_match_bytes`, **`dropped_packets` and `dropped_bytes`**. The latter sum
+    actual managed input/forward DROP rules and global/host/input default DROP
+    policies from `GET /api/v1/statistics/firewall`, classified against the same
+    committed configuration captured under the engine lock. Accept/bypass/ICMP
+    and NAT matches are not drops; deny-log rate limits/loss do not affect these
+    kernel counters. Packet/byte values are exact decimal strings; counters reset
+    on installed generation changes. They do not cover NIC errors, external
+    firewall tables, other Linux drop sites or historical generations. Rule-match
+    totals sum all accounted rows and can count a packet more than once; they are
+    not unique traffic totals. No per-rule sensor, action/path/label inventory or
+    raw rule-counter array is published. Unavailable/simulated counters are null.
+  - Family limits fail collection explicitly: 1024 protocol counter fields,
+    256 appliance-service rows, 256 DHCP relay/client identities, 128 BGP
+    neighbors, 128 traffic-history interfaces and 128 WireGuard peers total.
+    Existing host/NetFlow caps and the overall payload/entity limits also apply.
 - MQTT state payloads additionally carry the exact shared `process_health` object
   and `active_alerts` array. Home Assistant sensor metrics/discovery add
   `process_health` (`healthy|unhealthy|unknown`) and numeric `active_alert_count`.
@@ -2256,10 +2377,25 @@ Publisher and deployment contract:
   statistics fail. Health/alerts and other available sensors still publish;
   existing interface/gateway entities are preserved to expire/appear unknown,
   not removed or fabricated as zero. A host-sensor failure remains unknown.
+- `telemetry_sources` contains read-success booleans `network`, `protocols`,
+  `host`, `services`, `bgp`, `firewall`, `sando`, mirrored by
+  `source_<name>_readable` sensors. True means the source could be read, not that
+  its workers/measurements are healthy or available (simulated/disabled/partial
+  section states remain explicit). Independent failures do not suppress other
+  available families/health/alerts; existing dynamic entities from failed
+  enumerations are kept unknown, while authoritative empty enumerations remove
+  obsolete entities. Protocol/BGP reads are independently attempted if aggregate
+  network statistics fail. Engine-backed reads share one committed configuration
+  lock; source timestamps are still independent, not an atomic kernel snapshot.
 - Samples expire after three publication intervals. Active configuration/maintenance
   and unrecoverable collection failures pause samples with offline availability;
   the next successful sample restores availability. No offline backlog or command topics. Limits:
   4096 entities and 1 MiB per discovery/state payload; excess fails collection.
+  Limits include health/source additions and merged retained discovery; oversized
+  removal payloads are rejected before publishing/updating the durable manifest.
+  Raw connections, deny records, route tables, Sando inventory, secrets and vnStat
+  history records are not added. No MQTT controls or automatic upgrades/sync
+  triggers are introduced.
 - Back up `<state>.mqtt` with the journal, preserving ownership/owner-only files,
   stable ID, passwords and manifest. Default
   `/var/lib/netcontrol/native-state.json.mqtt`. Never reset missing credentials,
@@ -2407,14 +2543,14 @@ Deployment/operator requirements:
 ### 6.1.6 Host name and time zone
 
 `config.system` manages two appliance host settings (host name and time zone) and
-stores one cosmetic label (domain). It is part of the shared
+stores one display/reporting label (domain). It is part of the shared
 configuration draft and is always present in `GET /api/v1/state`, transactions and
 revisions:
 
 ```ts
 interface SystemConfig {
   hostname: string; // "" = unmanaged, else a lowercase RFC 1123 label
-  domain: string;   // "" = none, else a lowercase DNS name; cosmetic, never applied
+  domain: string;   // "" = none, else a lowercase DNS name for display/vnStat, not OS DNS
   timezone: string; // "" = unmanaged, else an IANA zone name
 }
 ```
@@ -2460,8 +2596,9 @@ it and leaves the host as it is**; it does not restore the previous name or zone
 
 Host effects:
 
-- `domain`: **cosmetic only.** It is stored and returned with the configuration so the UI
-  can show a full name (`hostname.domain`), but the daemon never applies it: no host
+- `domain`: **display/reporting label.** It is stored and returned with the configuration so the UI
+  can show a full name (`hostname.domain`), and supplies the vnStat collector
+  report suffix described above. The daemon never applies it to OS settings: no host
   file, kernel domain name, resolver or DNS search domain is changed. It needs no host
   support, is accepted on any backend, and a change to it needs only `system.write`.
   Search domains remain `dns[interface].domains` and `dhcp_clients[].use_domains`.
@@ -4334,7 +4471,11 @@ counters are unavailable. Optional per-rule counter UI should fetch only while
 visible/on refresh, avoid overlapping requests, show freshness/reset/error
 states, and keep samples out of browser persistence/config exports/general
 state polling. No counter form fields or write transaction are needed.
-Counters are not embedded in aggregate statistics, runtime, MQTT or health.
+Per-rule counters are not embedded in aggregate statistics, runtime, MQTT or health.
+MQTT alone publishes a bounded aggregate summary, including overall managed
+firewall dropped packets/bytes and reset identity; see
+[MQTT streaming](#614-home-assistant-mqtt-streaming). This does not publish per-rule
+rows or replace the on-demand counter API.
 Native deployment requires `CONFIG_NF_TABLES` (`nf_tables` or built-in),
 alongside the existing NFLOG prerequisites and namespace/net_admin privileges.
 Current kernels include counter expressions in `nf_tables`, not a separate

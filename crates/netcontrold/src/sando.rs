@@ -234,6 +234,18 @@ impl Manager {
             .lock()
             .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
         let config = &engine.saved_configuration().sando;
+        self.status_for(config, true)
+    }
+
+    pub(crate) fn mqtt_status(&self, config: &netcontrol_core::SandoConfig) -> Result<Value> {
+        self.status_for(config, false)
+    }
+
+    fn status_for(
+        &self,
+        config: &netcontrol_core::SandoConfig,
+        include_hosts: bool,
+    ) -> Result<Value> {
         let state = self
             .state
             .lock()
@@ -258,7 +270,16 @@ impl Manager {
         } else {
             "pending"
         };
-        let mut result = serde_json::to_value(snapshot)?;
+        let mut result = if include_hosts {
+            serde_json::to_value(snapshot)?
+        } else {
+            json!({
+                "last_attempt_at":snapshot.last_attempt_at,
+                "last_success_at":snapshot.last_success_at,
+                "host_count":snapshot.hosts.len(),
+                "skipped_hosts":snapshot.skipped_hosts
+            })
+        };
         result["enabled"] = json!(config.sync_enabled);
         result["state"] = json!(status);
         result["sync_interval_seconds"] = json!(SYNC_INTERVAL.as_secs());
@@ -577,6 +598,15 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.status().unwrap()["state"], "succeeded");
         assert_eq!(manager.status().unwrap()["hosts"][0]["threat_score"], -1);
+        let summary = manager.mqtt_status(&before.sando).unwrap();
+        assert_eq!(summary["state"], "succeeded");
+        assert_eq!(
+            summary["host_count"],
+            manager.status().unwrap()["hosts"].as_array().unwrap().len()
+        );
+        assert!(summary.get("hosts").is_none());
+        assert!(summary.get("source_url").is_none());
+        assert!(summary.get("error").is_none());
         tokio::time::advance(SYNC_INTERVAL - Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);

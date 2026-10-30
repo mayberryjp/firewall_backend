@@ -272,18 +272,25 @@ impl Database {
                 .is_none_or(|date| date < now.date().to_string().as_str())
     }
     #[cfg(target_os = "linux")]
-    fn report(&mut self, collector: &str, now: time::OffsetDateTime) -> Result<()> {
+    fn report(
+        &mut self,
+        collector: &str,
+        identity: &std::sync::RwLock<netcontrol_core::SystemConfig>,
+        now: time::OffsetDateTime,
+    ) -> Result<()> {
         let address: std::net::SocketAddr = collector.parse()?;
-        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")?;
-        let hostname = hostname.trim();
-        ensure!(
-            !hostname.is_empty()
-                && hostname.len() <= 253
-                && hostname
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)),
-            "invalid reporting hostname"
-        );
+        let system = identity
+            .read()
+            .map_err(|_| anyhow::anyhow!("traffic reporting identity lock poisoned"))?
+            .clone();
+        let hostname = if system.hostname.is_empty() {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")?
+                .trim()
+                .to_owned()
+        } else {
+            system.hostname.clone()
+        };
+        let hostname = qualified_name(&hostname, &system.domain)?;
         let socket = std::net::UdpSocket::bind(if address.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -316,6 +323,35 @@ impl Database {
         self.last_report_date = Some(now.date().to_string());
         Ok(())
     }
+}
+#[cfg(any(test, target_os = "linux"))]
+fn qualified_name(hostname: &str, domain: &str) -> Result<String> {
+    ensure!(
+        !hostname.is_empty()
+            && hostname.len() <= 253
+            && hostname
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)),
+        "invalid reporting hostname"
+    );
+    ensure!(
+        domain.is_empty() || netcontrol_core::valid_domain_name(domain),
+        "invalid reporting domain"
+    );
+    if domain.is_empty() {
+        return Ok(hostname.to_owned());
+    }
+    let hostname = hostname
+        .split('.')
+        .next()
+        .context("missing reporting hostname")?;
+    ensure!(!hostname.is_empty(), "invalid reporting hostname");
+    let name = format!("{hostname}.{domain}");
+    ensure!(
+        name.len() <= 253,
+        "reporting hostname and domain exceed 253 characters"
+    );
+    Ok(name)
 }
 fn amount(value: u128) -> String {
     if value < 1024 {
@@ -426,6 +462,7 @@ fn read() -> Result<BTreeMap<String, (u32, Counts)>> {
 pub(crate) fn prepare(
     directory: PathBuf,
     config: netcontrol_core::VNStatConfig,
+    reporting_identity: std::sync::Arc<std::sync::RwLock<netcontrol_core::SystemConfig>>,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     let path = directory.join(FILE_NAME);
     ensure!(
@@ -456,7 +493,7 @@ pub(crate) fn prepare(
             }
             if let Some(collector) = &config.collector {
                 if database.report_due(calendar) {
-                    if let Err(error) = database.report(collector, calendar) {
+                    if let Err(error) = database.report(collector, &reporting_identity, calendar) {
                         database.last_report_error = Some(format!("{error:#}"));
                         database.failed_datagrams = database.failed_datagrams.saturating_add(1);
                     }
@@ -629,6 +666,114 @@ mod tests {
         assert!(database.report_due(calendar + time::Duration::days(1)));
     }
     #[test]
+    fn reporting_name_combines_configured_domain_without_duplicate_os_suffix() {
+        for (hostname, domain, expected) in [
+            ("firewall", "example.test", "firewall.example.test"),
+            ("firewall", "", "firewall"),
+            (
+                "firewall.example.test",
+                "example.test",
+                "firewall.example.test",
+            ),
+            ("firewall.old.test", "example.test", "firewall.example.test"),
+            ("firewall.old.test", "", "firewall.old.test"),
+        ] {
+            assert_eq!(qualified_name(hostname, domain).unwrap(), expected);
+        }
+        for (hostname, domain) in [
+            ("", "example.test"),
+            ("bad|name", "example.test"),
+            ("bad\nname", ""),
+            ("firewall", "bad|domain"),
+            ("firewall", "example.test."),
+            (".invalid", "example.test"),
+        ] {
+            assert!(qualified_name(hostname, domain).is_err());
+        }
+        let domain = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert!(netcontrol_core::valid_domain_name(&domain));
+        assert!(qualified_name("fw", &domain).is_err());
+        assert_eq!(qualified_name("fw", &domain[..250]).unwrap().len(), 253);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn udp_reporting_uses_updated_identity_and_unmanaged_hostname_fallback() {
+        let mut database = Database {
+            schema: SCHEMA.into(),
+            scope: "host".into(),
+            interfaces: BTreeMap::new(),
+            history: vec![],
+            last_report_date: None,
+            last_report_error: None,
+            sent_datagrams: 0,
+            failed_datagrams: 0,
+        };
+        let now = time::OffsetDateTime::parse(
+            "2026-10-30T23:59:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        database
+            .observe(
+                "boot",
+                "ns",
+                "lo",
+                1,
+                Counts::default(),
+                "2026-10-30T23:59:00Z",
+            )
+            .unwrap();
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let destination = receiver.local_addr().unwrap().to_string();
+        let identity = std::sync::RwLock::new(netcontrol_core::SystemConfig::default());
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        let kernel = kernel.trim();
+        for (day, (hostname, domain, expected)) in [
+            (
+                "firewall",
+                "example.test",
+                "firewall.example.test".to_owned(),
+            ),
+            ("renamed", "", "renamed".to_owned()),
+            (
+                "",
+                "example.test",
+                format!("{}.example.test", kernel.split('.').next().unwrap()),
+            ),
+            ("", "", kernel.to_owned()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            *identity.write().unwrap() = netcontrol_core::SystemConfig {
+                hostname: hostname.into(),
+                domain: domain.into(),
+                timezone: String::new(),
+            };
+            let calendar = now + time::Duration::days(day as i64);
+            assert!(database.report_due(calendar));
+            database.report(&destination, &identity, calendar).unwrap();
+            let mut buffer = [0; 2048];
+            let length = receiver.recv(&mut buffer).unwrap();
+            let wire = std::str::from_utf8(&buffer[..length]).unwrap();
+            assert!(wire.starts_with(&format!("{expected}|1;lo;")));
+            assert!(!database.report_due(calendar));
+        }
+        assert_eq!(database.sent_datagrams, 4);
+        assert_eq!(database.failed_datagrams, 0);
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn udp_reporting_persists_date_and_does_not_invent_zero_records() {
         let directory =
@@ -646,22 +791,34 @@ mod tests {
         let calendar =
             time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)
                 .unwrap();
-        assert!(database.report("not-a-socket", calendar).is_err());
+        let identity = std::sync::RwLock::new(netcontrol_core::SystemConfig {
+            hostname: "firewall".into(),
+            domain: "example.test".into(),
+            timezone: String::new(),
+        });
+        assert!(
+            database
+                .report("not-a-socket", &identity, calendar)
+                .is_err()
+        );
         assert!(database.report_due(calendar));
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         receiver
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
         database
-            .report(&receiver.local_addr().unwrap().to_string(), calendar)
+            .report(
+                &receiver.local_addr().unwrap().to_string(),
+                &identity,
+                calendar,
+            )
             .unwrap();
-        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
         let mut received = Vec::new();
         for _ in 0..2 {
             let mut buffer = [0; 2048];
             let length = receiver.recv(&mut buffer).unwrap();
             let wire = std::str::from_utf8(&buffer[..length]).unwrap();
-            assert!(wire.starts_with(&format!("{}|1;", hostname.trim())));
+            assert!(wire.starts_with("firewall.example.test|1;"));
             assert!(wire.ends_with('\n'));
             let fields: Vec<_> = wire
                 .trim_end()
@@ -699,10 +856,14 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let prior = directory.join("traffic-host-v1.json");
         std::fs::write(&prior, b"retained accounting").unwrap();
-        let error = prepare(directory.clone(), netcontrol_core::VNStatConfig::default())
-            .err()
-            .unwrap()
-            .to_string();
+        let error = prepare(
+            directory.clone(),
+            netcontrol_core::VNStatConfig::default(),
+            Default::default(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(error.contains("operator archival"));
         assert_eq!(std::fs::read(&prior).unwrap(), b"retained accounting");
         assert!(!directory.join(FILE_NAME).exists());

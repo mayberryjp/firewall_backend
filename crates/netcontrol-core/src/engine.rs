@@ -419,6 +419,9 @@ impl Engine {
             scope
         );
         validate_state(&state)?;
+        backend
+            .configure_reporting_identity(&state.desired.system)
+            .context("configure committed reporting identity")?;
         let mut e = Self {
             store,
             state,
@@ -499,6 +502,9 @@ impl Engine {
                 self.rollback(&id, "confirmation timeout")?;
             }
         }
+        self.backend
+            .configure_reporting_identity(&self.state.desired.system)
+            .context("configure committed reporting identity")?;
         Ok(())
     }
     /// Leaves pending confirmations durable for deadline-aware restart recovery.

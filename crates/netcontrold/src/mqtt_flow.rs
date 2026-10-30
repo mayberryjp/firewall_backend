@@ -18,6 +18,7 @@ pub fn sensors(status: Option<&Value>) -> HostSensors {
             continue;
         };
         let key = |field: &str| metric_key("flow", name, field);
+        let running = row["state"] == "running";
         push(
             &mut out.sensors,
             key("state"),
@@ -32,9 +33,13 @@ pub fn sensors(status: Option<&Value>) -> HostSensors {
             &mut out.sensors,
             key("statistics_complete"),
             format!("{name} flow capture statistics complete"),
-            row["statistics_complete"]
-                .as_bool()
-                .map_or(Value::Null, Value::Bool),
+            if running {
+                row["statistics_complete"]
+                    .as_bool()
+                    .map_or(Value::Null, Value::Bool)
+            } else {
+                Value::Null
+            },
             None,
             None,
         );
@@ -50,7 +55,11 @@ pub fn sensors(status: Option<&Value>) -> HostSensors {
                 &mut out.sensors,
                 key(field),
                 format!("{name} flow {label}"),
-                scalar(&row[field]),
+                if running {
+                    scalar(&row[field])
+                } else {
+                    Value::Null
+                },
                 Some(unit),
                 Some(class),
             );
@@ -83,7 +92,7 @@ mod tests {
         let status = json!({"error":"","instances":[
             {"name":"office","state":"running","dropped_packets":"18446744073709551615","statistics_complete":false,
              "active_flows":4,"exported_flows":9,"excluded_packets":1,"filtered_packets":2,"malformed_packets":0},
-            {"name":"lab","state":"stopped"},
+            {"name":"lab","state":"stopped","active_flows":"9","dropped_packets":"7","statistics_complete":true},
             {"name":"off","state":"disabled"}]});
         let sensors = sensors(Some(&status));
         assert!(sensors.retained.is_empty());

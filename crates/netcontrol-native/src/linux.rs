@@ -1134,6 +1134,13 @@ impl Backend for Native {
         Ok(expected.clone())
     }
 
+    fn configure_reporting_identity(
+        &mut self,
+        system: &netcontrol_core::SystemConfig,
+    ) -> Result<()> {
+        self.services.configure_reporting_identity(system)
+    }
+
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()> {
         self.recover()?;
         let before = before.operational_value()?;

@@ -7,6 +7,7 @@ pub mod identity;
 pub mod mqtt;
 mod mqtt_flow;
 mod mqtt_host;
+mod mqtt_stats;
 mod private_store;
 pub mod processes;
 pub mod sando;
