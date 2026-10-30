@@ -4,6 +4,15 @@
 
 ### Added
 
+- Automatic stable GitHub Releases and immutable version tags for each validated
+  default-branch first-parent commit, including docs-only and multi-commit pushes.
+  Publishes both Ubuntu update assets only after native/Rust/static-package
+  checks, draft upload and GitHub digest verification. Reruns reuse tags/releases;
+  serialized latest promotion prevents completion-order downgrades.
+  PR/other-branch validation never publishes. Signed development-package uploads
+  remain manual. Required deployment coordination:
+  [handoff 2026-10-29-06](docs/frontend-handoffs/2026-10-29.md#2026-10-29-06-per-commit-stable-releases).
+
 - Automatic private GitHub update configuration on standard Ubuntu installation
   and source upgrades, preserving valid operator settings and existing service
   arguments. Release checks now run by default independently of installation;
@@ -128,6 +137,16 @@
   [handoff 2026-10-27-04](docs/frontend-handoffs/2026-10-27.md#2026-10-27-04-native-link-diagnostics).
 
 ### Changed
+
+- Software versions now derive at compile time from full Git first-parent
+  history and an immutable `2026.10.30.6` seed, advancing for every commit and
+  resetting iteration on a new UTC commit day. No per-task manual bump or
+  version-bump commit. Git/full history are now source-build requirements;
+  archive/shallow builds, changed seed, clock regression and overflow fail
+  explicitly. Cargo versions/configuration revision allocation remain unchanged.
+  Breaking build/deployment requirement; no HTTP field/permission changes.
+  Seed is an unreleased development label until its first commit is validated
+  and actually published.
 
 - Ubuntu API self-upgrades now trust the operator-configured GitHub repository
   over HTTPS without publisher signatures, as explicitly approved. The current

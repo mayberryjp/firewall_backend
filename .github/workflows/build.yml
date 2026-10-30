@@ -6,145 +6,73 @@ on:
   workflow_dispatch:
     inputs:
       upload_packages:
-        description: "Upload development packages only after reviewing distribution licensing, including rustables GPL-3.0-or-later"
+        description: "Upload development packages after distribution licensing review, including rustables GPL-3.0-or-later"
         type: boolean
         default: false
+      from_commit:
+        description: "Optional full SHA before a default-branch replay range (exclusive)"
+        type: string
+      to_commit:
+        description: "Optional full SHA ending a default-branch replay range (inclusive)"
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-${{ github.workflow }}-${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 jobs:
-  checks:
-    name: Rust checks (Ubuntu x86-64)
+  plan:
+    name: Select commits
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      publish: ${{ steps.plan.outputs.publish }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
-      - run: cargo +stable fmt --all -- --check
-      - run: cargo +stable test --workspace --locked
-      - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo +stable build --workspace --release --locked
-      - name: Check service units and installer
-        run: |
-          sh -n packaging/native/netcontrold.initd
-          sh -n packaging/native/netcontrold.confd
-          bash -n install.sh
-          bash -n upgrade.sh
-          bash packaging/native/install_tests.sh
-          sudo install -m 0755 target/release/netcontrold /usr/local/sbin/netcontrold
-          systemd-analyze verify packaging/native/netcontrold.service 2>unit-check.log || { cat unit-check.log; exit 1; }
+      - id: plan
+        run: python3 .github/scripts/releases.py plan
 
-  native:
-    name: Privileged native Rust integration
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
-      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
-      - name: Prepare kernel modules
-        run: |
-          for module in dummy 8021q wireguard nf_tables nf_conntrack nf_nat; do
-            sudo modprobe "$module"
-          done
-      - run: cargo +stable test -p netcontrol-native -p netcontrol-services --locked --no-run
-      - name: Test native kernel and protocol workers
-        run: |
-          sudo env "PATH=$PATH" NETCONTROL_INTEGRATION=1 \
-            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
-            cargo +stable test -p netcontrol-native -p netcontrol-services --locked -- --ignored
+  commits:
+    name: Validate commit
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    uses: ./.github/workflows/validate.yml
+    permissions:
+      contents: write
+      actions: read
+    with:
+      commit: ${{ matrix.commit }}
+      publish: ${{ needs.plan.outputs.publish == 'true' }}
+      upload_packages: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_packages }}
 
-  package:
-    name: Signed native package (Ubuntu x86-64)
-    needs: [checks, native]
+  latest:
+    name: Promote newest successful release
+    needs: [plan, commits]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.publish == 'true' && needs.plan.outputs.count != '0' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: netcontrol-stable-latest
+      cancel-in-progress: false
     env:
-      TARGET: x86_64-unknown-linux-musl
-      ARCH: x86_64
-    timeout-minutes: 40
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
-      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y musl-tools libclang-dev linux-libc-dev
-      - name: Build static native binaries
-        env:
-          RUSTFLAGS: "-C linker=rust-lld -C link-self-contained=yes"
-        run: |
-          export "CC_${TARGET//-/_}=musl-gcc"
-          export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/$ARCH-linux-musl -I/usr/include -I/usr/include/$ARCH-linux-gnu"
-          cargo +stable build --release --locked --target "$TARGET" -p netcontrold -p netcontrol-package
-      - name: Create, verify and installation-test custom package
-        run: |
-          set -eu
-          mkdir -p dist
-          temporary="$(mktemp -d)"
-          trap 'rm -f "$temporary/signing.key"; rmdir "$temporary"' EXIT
-          package_tool="target/$TARGET/release/netcontrol-package"
-          "$package_tool" keygen --private-key "$temporary/signing.key" --public-key dist/signing.pub
-          "$package_tool" build \
-            --daemon "target/$TARGET/release/netcontrold" \
-            --installer "$package_tool" \
-            --target "$TARGET" --signing-key "$temporary/signing.key" \
-            --output "dist/netcontrol-$TARGET-${GITHUB_SHA}.ncpkg"
-          "$package_tool" verify "dist/netcontrol-$TARGET-${GITHUB_SHA}.ncpkg" \
-            --public-key dist/signing.pub
-          staging="$(mktemp -d)"
-          "$package_tool" install "dist/netcontrol-$TARGET-${GITHUB_SHA}.ncpkg" \
-            --public-key dist/signing.pub --root "$staging"
-          "$staging/usr/sbin/netcontrold" --help
-          cp "$package_tool" dist/
-          printf '{"commit":"%s","target":"%s","release":null}\n' "$GITHUB_SHA" "$TARGET" > dist/BUILDINFO.json
-          (cd dist && sha256sum *.ncpkg signing.pub netcontrol-package BUILDINFO.json > SHA256SUMS)
-      - name: Prepare prebuilt Ubuntu installer artifacts
-        run: |
-          set -eu
-          mkdir -p ubuntu-dist
-          cp "target/$TARGET/release/netcontrold" ubuntu-dist/netcontrold
-          cp packaging/native/netcontrold.service ubuntu-dist/netcontrold.service
-          (cd ubuntu-dist && sha256sum --binary netcontrold netcontrold.service > SHA256SUMS)
-      - name: Prepare unsigned Ubuntu HTTPS update assets
-        run: |
-          set -eu
-          version="$(target/$TARGET/release/netcontrold --version)"
-          version="${version#netcontrold }"
-          "target/$TARGET/release/netcontrol-package" build-update \
-            --daemon "target/$TARGET/release/netcontrold" \
-            --version "$version" --output-dir ubuntu-update-assets
-      - name: Upload Ubuntu HTTPS update assets
-        if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: netcontrol-ubuntu-updates-${{ github.sha }}
-          path: ubuntu-update-assets/
-          if-no-files-found: error
-          retention-days: 14
-      - name: Upload prebuilt Ubuntu daemon and systemd unit
-        if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: netcontrol-ubuntu-amd64-${{ github.sha }}
-          path: ubuntu-dist/
-          if-no-files-found: error
-          retention-days: 14
-      - name: Upload custom package, installer, public key and provenance
-        if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: netcontrol-native-x86_64-${{ github.sha }}
-          path: dist/
-          if-no-files-found: error
-          retention-days: 14
+      - run: python3 .github/scripts/releases.py latest

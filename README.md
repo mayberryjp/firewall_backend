@@ -62,7 +62,9 @@ in the [frontend contract](FRONTEND_SPEC.md#sando-one-time-imports).
 ## Build and validate
 
 Use stable Rust. The workspace toolchain file selects rustfmt and clippy;
-Cargo.lock pins dependencies. A supported native C toolchain is needed for TLS
+Cargo.lock pins dependencies. Source builds require Git and a full checkout
+(not a shallow clone or source archive) to derive the commit version.
+A supported native C toolchain is needed for TLS
 cryptography; Linux builds also require libclang and Linux UAPI headers for the
 direct nftables bindings. See the [build prerequisites](docs/BUILD_AND_INSTALL.md#build).
 
@@ -152,8 +154,15 @@ See [Ubuntu self-upgrades](docs/BUILD_AND_INSTALL.md#ubuntu-self-upgrade)
 for bootstrap, artifact publishing, recovery and validation limitations.
 
 Software identity comes from `RELEASE_VERSION` in
-[version.rs](crates/netcontrol-core/src/version.rs), not Cargo's internal package
-version. The daemon saves read-only `software` metadata in the master configuration:
+[version.rs](crates/netcontrol-core/src/version.rs), generated from Git by
+[build.rs](crates/netcontrol-core/build.rs), not Cargo's package version.
+Starting with the immutable [seed](crates/netcontrol-core/release-version),
+each first-parent commit advances `yyyy.mm.dd.iteration` using its UTC commit
+date, including documentation-only commits. No manual version bump is needed.
+CI validates every new default-branch mainline commit and publishes its version
+tag and two Ubuntu update assets as a stable GitHub Release; PRs and other
+branches never publish. See [automatic releases](docs/BUILD_AND_INSTALL.md#automatic-builds-and-releases).
+The daemon saves read-only `software` metadata in the master configuration:
 running version, configured release repository, latest release, nullable update
 availability, last check time and explicit error. It checks the fixed default
 `mayberryjp/firewall_backend` repository at startup and every 24 hours even without
@@ -643,8 +652,11 @@ No DHCP/DNS server or DHCPv6 relay is provided.
 
 The native backend links GPL-3.0-or-later `rustables`. No project distribution
 license has been assigned. Review combined-work licensing, notices and
-corresponding-source obligations before distributing binaries. CI package
-upload is disabled by default and requires explicit manual opt-in.
+corresponding-source obligations before distributing binaries, including before
+pushing the workflow that activates automatic public Ubuntu releases. The user
+has authorized automatic Ubuntu update publication; that is not a licensing
+review or a new project license. Separate signed development-package and
+prebuilt-installer artifact uploads still require manual opt-in.
 
 ## Change memory and frontend coordination
 
@@ -654,7 +666,7 @@ upload is disabled by default and requires explicit manual opt-in.
 - [Rust cutover handoff](docs/frontend-handoffs/2026-10-18.md)
 - [Repository development instructions](.github/copilot-instructions.md)
 
-No release baseline is assigned. Cargo workspace version `0.0.0` is only
-unassigned development metadata. A build, successful test, or journal entry
-does not mean a release was approved, changes were pushed, or a frontend
-notification was delivered.
+The commit-version seed is not proof of publication. Cargo workspace version
+`0.0.0` remains internal development metadata. Only actual GitHub Releases
+establish publication; a local build, test or journal entry does not prove CI
+ran, code was pushed, a device was upgraded or a frontend handoff was delivered.

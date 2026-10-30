@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 [dependencies]
 url = "2"
 anyhow.workspace = true
@@ -18,3 +21,6 @@ hex.workspace = true
 fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "now"] }
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

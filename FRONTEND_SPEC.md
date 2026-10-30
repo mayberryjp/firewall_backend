@@ -940,9 +940,9 @@ saved configuration, and attempts previous-binary restoration on install/startup
 failure. A required boot recovery unit handles interrupted install/check phases.
 It also applies existing conntrack accounting/checksum prerequisites. Browser
 code must not claim full state rollback, guaranteed connectivity, atomic host
-prerequisites or retroactive conntrack counters. No automatic frontend reload,
+prerequisites or retroactive conntrack counters. The daemon performs no automatic frontend reload,
 release publication, reboot, connection flush, credential reset or compatibility
-migration is added. Actual systemd/power-loss/release/browser acceptance remains
+migration. Actual systemd/power-loss/release/browser acceptance remains
 pending; [handoff 2026-10-24-07](docs/frontend-handoffs/2026-10-24.md#2026-10-24-07-signed-ubuntu-self-upgrade)
 is Pending frontend review and its version rules are superseded by the
 [date-version handoff](docs/frontend-handoffs/2026-10-29.md#2026-10-29-01-date-versions-and-daily-release-checks).
@@ -965,7 +965,15 @@ Synthetic successful check:
 ```
 
 `version` is the running binary's embedded public version, always a date-version
-string. `repository`, `latest_version`, `last_checked_at` and `error` are
+string. Software versions now derive from UTC first-parent Git commit dates
+and an immutable seed; CI publishes each validated default-branch mainline
+commit, including docs-only changes, as a stable version. Clients must not
+infer versions from build completion times, assume gap-free iterations or
+conflate them with independent configuration revisions. No client field changes.
+Source deployments require Git and full history; prebuilt runtime does not.
+[Handoff 2026-10-29-06](docs/frontend-handoffs/2026-10-29.md#2026-10-29-06-per-commit-stable-releases)
+is Pending frontend review for deployment coordination and optional wording.
+`repository`, `latest_version`, `last_checked_at` and `error` are
 `string|null`; `update_available` is `boolean|null`. Time is RFC3339 UTC.
 `repository:null` means checking is disabled. A configured checker is pending
 until its first result (`latest_version`, `update_available`, `last_checked_at`
@@ -986,8 +994,10 @@ Only published stable releases with canonical `v<version>` tags qualify.
 HTTPS verification is mandatory; redirects are refused, connect timeout is
 10 seconds, total request timeout 30 seconds, response limit 1 MiB. No release,
 rate limiting, malformed tags and transport/API errors are explicit failed
-checks; retry with the manual action below, the next daily check or daemon restart. No automatic
-download/install or publication occurs. Availability is discovery metadata,
+checks; retry with the manual action below, the next daily check or daemon restart.
+The daemon never automatically downloads/installs or publishes. CI publication
+is separate and occurs only after each default-branch commit's checks and
+artifact verification succeed. Availability is discovery metadata,
 not proof that the required binary/manifest assets exist or that installation will succeed.
 
 Results are atomically saved in the master journal without applying networking,

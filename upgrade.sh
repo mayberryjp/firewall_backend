@@ -146,7 +146,7 @@ main() {
     local repository binary executable destination
     repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
     cd "$repository"
-    for executable in cargo rustup flock; do
+    for executable in cargo rustup flock git; do
         command -v "$executable" >/dev/null || { printf 'Missing prerequisite: %s. See docs/BUILD_AND_INSTALL.md.\n' "$executable" >&2; return 1; }
     done
     [[ -f Cargo.lock ]] || { printf 'The committed Cargo.lock is required.\n' >&2; return 1; }
