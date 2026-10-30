@@ -19,6 +19,7 @@ pub const PERMISSIONS: &[&str] = &[
     "interfaces.write",
     "routes.write",
     "firewall.write",
+    "firewall.logs.read",
     "nat.write",
     "wireguard.write",
     "softflowd.write",
@@ -517,6 +518,24 @@ impl Engine {
                 "configuration writes are blocked during software upgrade",
             ));
         }
+        if path == "/api/v1/firewall/deny-log" {
+            require(permissions, "firewall.logs.read")?;
+            if method != "GET" {
+                return Err(ApiError::new(405, "method not allowed"));
+            }
+            if !body.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "deny-log retrieval does not accept a body",
+                ));
+            }
+            let query = crate::DenyLogQuery::parse(query).map_err(|e| ApiError::new(400, e))?;
+            return self
+                .backend
+                .deny_log(&query)
+                .map(|v| Reply::value(200, v))
+                .map_err(service_error);
+        }
         if path == "/api/v1/connections" || path.starts_with("/api/v1/connections/") {
             if method != "DELETE" {
                 return Err(ApiError::new(405, "method not allowed"));
@@ -690,6 +709,12 @@ impl Engine {
         }
         if method == "GET" {
             require(permissions, "state.read")?;
+            if path == "/api/v1/statistics/firewall" && !body.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "firewall counters accept no request body",
+                ));
+            }
             return self.get(path, query).map(|v| Reply::value(200, v));
         }
         if method != "POST" {
@@ -1445,7 +1470,7 @@ impl Engine {
         if path == "/api/v1/statistics" || path.starts_with("/api/v1/statistics/") {
             validate_statistics(path, query)?;
             let config = self.expected();
-            return self.backend.statistics(&config, path, query).map_err(|e| {
+            let mut response = self.backend.statistics(&config, path, query).map_err(|e| {
                 if [
                     "statistics interface not found",
                     "gateway monitor not found",
@@ -1456,7 +1481,16 @@ impl Engine {
                 } else {
                     service_error(e)
                 }
-            });
+            })?;
+            if path == "/api/v1/statistics/firewall" {
+                if !response.is_object() {
+                    return Err(service_error("backend returned invalid firewall counters"));
+                }
+                response["config_revision"] = value(self.state.revision)?;
+                response["transaction_id"] =
+                    value(self.active().map(|transaction| &transaction.id))?;
+            }
+            return Ok(response);
         }
         if [
             "/api/v1/services/bgp",
@@ -1755,6 +1789,7 @@ fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
         "/api/v1/statistics/interfaces",
         "/api/v1/statistics/protocols",
         "/api/v1/statistics/host",
+        "/api/v1/statistics/firewall",
         "/api/v1/statistics/link-diagnostics",
         "/api/v1/statistics/gateways",
         "/api/v1/statistics/vnstat",

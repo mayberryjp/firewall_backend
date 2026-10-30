@@ -35,7 +35,12 @@ fn compare(value: &[u8]) -> Vec<u8> {
     )
 }
 
-fn rule(item: &DestinationRewriteRule, sequence: u32) -> Result<Vec<u8>> {
+fn rule(
+    item: &DestinationRewriteRule,
+    sequence: u32,
+    generation: &str,
+    index: usize,
+) -> Result<Vec<u8>> {
     let target: IpAddr = item.target_address.parse()?;
     let (family, address) = match target {
         IpAddr::V4(ip) => (libc::NFPROTO_IPV4 as u32, ip.octets().to_vec()),
@@ -90,6 +95,14 @@ fn rule(item: &DestinationRewriteRule, sequence: u32) -> Result<Vec<u8>> {
         ),
         compare(&interface),
         expression(
+            "counter",
+            [
+                attribute(NFTA_COUNTER_BYTES, &0u64.to_be_bytes()),
+                attribute(NFTA_COUNTER_PACKETS, &0u64.to_be_bytes()),
+            ]
+            .concat(),
+        ),
+        expression(
             "immediate",
             [
                 number(NFTA_IMMEDIATE_DREG, NFT_REG_1),
@@ -115,6 +128,13 @@ fn rule(item: &DestinationRewriteRule, sequence: u32) -> Result<Vec<u8>> {
         attribute(NFTA_RULE_TABLE, b"netcontrol\0"),
         attribute(NFTA_RULE_CHAIN, b"destination_rewrite\0"),
         attribute(NFTA_RULE_EXPRESSIONS | 0x8000, &expressions),
+        attribute(
+            NFTA_RULE_USERDATA,
+            &crate::firewall_counters::userdata(
+                generation,
+                &format!("/firewall/nat/destination_rewrite/{index}"),
+            )?,
+        ),
     ]
     .concat();
     let mut message = Vec::new();
@@ -129,13 +149,13 @@ fn rule(item: &DestinationRewriteRule, sequence: u32) -> Result<Vec<u8>> {
     Ok(message)
 }
 
-pub fn send(batch: Batch, rules: &[DestinationRewriteRule]) -> Result<()> {
+pub fn send(batch: Batch, rules: &[DestinationRewriteRule], generation: &str) -> Result<()> {
     let mut bytes = batch.finalize();
     ensure!(bytes.len() >= 40, "short nftables batch");
     let mut end = bytes.split_off(bytes.len() - 20);
     let mut sequence = u32::from_ne_bytes(end[8..12].try_into()?);
-    for item in rules {
-        bytes.extend(rule(item, sequence)?);
+    for (index, item) in rules.iter().enumerate() {
+        bytes.extend(rule(item, sequence, generation, index)?);
         sequence += 1;
     }
     end[8..12].copy_from_slice(&sequence.to_ne_bytes());

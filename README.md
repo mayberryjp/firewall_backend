@@ -60,7 +60,42 @@ normal `202` pending transaction: changes are provisionally applied and must be
 explicitly confirmed, otherwise rollback restores the original state. This is
 not a factory reset or a literal empty kernel ruleset. Review the
 [complete scope and safeguards](FRONTEND_SPEC.md#bulk-deletion-of-firewall-hosts-and-forwarding-rules).
-Per-connection accounting is available; per-rule match counters are not yet exposed.
+Per-connection accounting and dedicated per-rule match counters are available.
+
+## Firewall rule accounting
+
+`GET /api/v1/statistics/firewall` (`state.read`, no query/body) reads live
+native nftables packet/byte counters. Expanded address/family/port matches are
+summed into each configured host, interface, legacy, input or NAT rule. Defaults,
+established/related bypass and the IPv4 ICMP exception have separate rows.
+Counts are exact decimal strings, not JavaScript numbers or unique connections.
+NAT counters measure initial rule evaluation, not established-flow throughput.
+
+Use the returned scope, ruleset identity and generation before calculating
+deltas or joining rows to the applied configuration. Applying/rolling back a
+network ruleset, startup/service repair or reboot resets counters; metadata-only
+changes need not. No persistence/reset endpoint or changes to configuration
+exports. Reads preserve ownership and ignore only changing numeric counter
+values for drift inspection; drift/unavailable reads are errors, never fake zeros.
+Ubuntu install/full upgrade provisions `nft_counter`; other Linux installations
+must enable `CONFIG_NFT_COUNTER`. See the
+[complete API/reset contract](FRONTEND_SPEC.md#firewall-rule-match-counters).
+
+## Firewall deny history
+
+Native Linux continuously records managed input/forwarding rule and default-policy
+drops in a private, persistent rotating log, separate from configuration, revisions,
+backend audit logs and syslog. Retrieve retained metadata on demand with
+`GET /api/v1/firewall/deny-log?limit=100`, using an API key granted
+`firewall.logs.read`. Filter by address, numeric IP protocol, chain and Unix
+millisecond time range; page newest-first using `next_before_id`.
+
+Retention is at most 4096 records in eight bounded segments; collection retains
+at most 100 records/second and reports loss/error indicators. This is best-effort
+diagnostic history, not a complete security audit or packet capture. Accepted
+traffic, other firewall owners and non-firewall drops are excluded.
+See the [API contract](FRONTEND_SPEC.md#firewall-deny-log) and
+[kernel/storage prerequisites](docs/BUILD_AND_INSTALL.md#firewall-deny-logging).
 
 ## Sando imports
 

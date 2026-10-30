@@ -196,6 +196,12 @@ impl Backend for Simulator {
             query.is_empty(),
             "statistics endpoints do not accept query parameters"
         );
+        if path == "/api/v1/statistics/firewall" {
+            return Ok(json!({
+                "schema":"netcontrol-firewall-counters/v1","generation":null,"ruleset_id":null,"rules":[],
+                "sample":{"scope":"simulator","started_at":Utc::now(),"collected_at":Utc::now(),"status":"simulated"}
+            }));
+        }
         if path == "/api/v1/statistics/host" {
             let mut sections = serde_json::Map::new();
             for name in [

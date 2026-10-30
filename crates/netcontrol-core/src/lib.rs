@@ -1,7 +1,9 @@
 //! Typed networking domain, durable transactions, and deterministic simulator.
 mod bgp;
+mod deny_log;
 mod diagnostics;
 pub use bgp::{BGPConfig, BGPNeighbor};
+pub use deny_log::{DenyLogQuery, DenyRecord};
 mod dynamic_dns;
 pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;
@@ -41,6 +43,9 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    fn deny_log(&mut self, _query: &DenyLogQuery) -> Result<Value> {
+        anyhow::bail!("firewall deny logging requires the native Linux backend")
+    }
     fn bgp_status(&mut self, config: &Config) -> Result<Value> {
         let runtime = self.runtime(config)?;
         runtime

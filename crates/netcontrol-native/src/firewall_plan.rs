@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, net::IpAddr};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Match {
+    pub counter_key: String,
     pub source: String,
     pub destination: String,
     pub ingress: String,
@@ -96,30 +97,46 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
             action(string(host, "policy"))?;
         }
         output.push(Match {
+            counter_key: "generated/forward/established_related".into(),
             action: "accept".into(),
             established_related: true,
             ..Match::default()
         });
-        for interface in array(policies, "interfaces")? {
+        for (index, interface) in array(policies, "interfaces")?.iter().enumerate() {
             let ingress = string(interface, "interface");
             ensure!(
                 crate::safe_name(ingress, 15),
                 "invalid firewall ingress interface"
             );
-            for rule in array(interface, "rules")? {
-                expand(&mut output, rule, &["".into()], ingress, &hosts)?;
+            for (rule_index, rule) in array(interface, "rules")?.iter().enumerate() {
+                expand(
+                    &mut output,
+                    rule,
+                    &["".into()],
+                    ingress,
+                    &hosts,
+                    &format!("/firewall/policies/interfaces/{index}/rules/{rule_index}"),
+                )?;
             }
         }
-        for host in array(policies, "hosts")? {
+        for (index, host) in array(policies, "hosts")?.iter().enumerate() {
             let sources = array(host, "addresses")?
                 .iter()
                 .map(|a| host_prefix(a.as_str().context("host address must be string")?))
                 .collect::<Result<Vec<_>>>()?;
-            for rule in array(host, "rules")? {
-                expand(&mut output, rule, &sources, "", &hosts)?;
+            for (rule_index, rule) in array(host, "rules")?.iter().enumerate() {
+                expand(
+                    &mut output,
+                    rule,
+                    &sources,
+                    "",
+                    &hosts,
+                    &format!("/firewall/policies/hosts/{index}/rules/{rule_index}"),
+                )?;
             }
             for source in sources {
                 output.push(Match {
+                    counter_key: format!("/firewall/policies/hosts/{index}/policy"),
                     source,
                     action: string(host, "policy").into(),
                     ..Match::default()
@@ -128,7 +145,7 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
             ensure!(output.len() <= 4096, "firewall expands beyond 4096 rules");
         }
     } else {
-        for rule in rules {
+        for (index, rule) in rules.iter().enumerate() {
             let source = string(rule, "source").to_string();
             let destination = string(rule, "destination").to_string();
             for prefix in [&source, &destination]
@@ -146,6 +163,7 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
             }
             action(string(rule, "action"))?;
             output.push(Match {
+                counter_key: format!("/firewall/rules/{index}"),
                 source,
                 destination,
                 action: string(rule, "action").into(),
@@ -194,9 +212,21 @@ pub fn compile_input(firewall: &Value) -> Result<Vec<Match>> {
         "nat": {"masquerade": []},
         "policies": {"hosts": [], "interfaces": input["interfaces"]}
     }))?;
+    for plan in &mut plans {
+        plan.counter_key = if plan.established_related {
+            "generated/input/established_related".into()
+        } else {
+            plan.counter_key.replacen(
+                "/firewall/policies/interfaces/",
+                "/firewall/input/interfaces/",
+                1,
+            )
+        };
+    }
     plans.insert(
         0,
         Match {
+            counter_key: "generated/input/loopback".into(),
             ingress: "lo".into(),
             action: "accept".into(),
             ..Match::default()
@@ -211,6 +241,7 @@ fn expand(
     sources: &[String],
     ingress: &str,
     hosts: &BTreeMap<&str, &Value>,
+    counter_key: &str,
 ) -> Result<()> {
     action(string(rule, "action"))?;
     let egress = string(rule, "out_interface");
@@ -267,6 +298,7 @@ fn expand(
             }
             for port in &ports {
                 output.push(Match {
+                    counter_key: counter_key.into(),
                     source: source.clone(),
                     destination: destination.clone(),
                     ingress: ingress.into(),
@@ -284,6 +316,49 @@ fn expand(
         bail!("host policy destinations have no common source address family");
     }
     Ok(())
+}
+
+pub fn counter_layout(firewall: &Value) -> Result<BTreeMap<(String, String), usize>> {
+    let mut layout = BTreeMap::new();
+    let mut add = |chain: &str, key: &str| {
+        *layout
+            .entry((chain.to_owned(), key.to_owned()))
+            .or_insert(0) += 1;
+    };
+    for plan in compile(firewall)? {
+        add("forward", &plan.counter_key);
+    }
+    add("forward", "/firewall/policy");
+    let input = compile_input(firewall)?;
+    if !input.is_empty() || firewall["allow_all_icmp"] == true {
+        for plan in input {
+            add("input", &plan.counter_key);
+        }
+        add(
+            "input",
+            if firewall.get("input").is_some_and(|v| !v.is_null()) {
+                "/firewall/input/policy"
+            } else {
+                "generated/input/policy"
+            },
+        );
+    }
+    if firewall["allow_all_icmp"] == true {
+        for chain in ["forward", "input", "output"] {
+            add(chain, "/firewall/allow_all_icmp");
+        }
+        add("output", "generated/output/policy");
+    }
+    for (index, _) in array(&firewall["nat"], "masquerade")?.iter().enumerate() {
+        add("postrouting", &format!("/firewall/nat/masquerade/{index}"));
+    }
+    for (index, _) in destination_rewrites(firewall)?.iter().enumerate() {
+        add(
+            "destination_rewrite",
+            &format!("/firewall/nat/destination_rewrite/{index}"),
+        );
+    }
+    Ok(layout)
 }
 
 #[cfg(test)]
@@ -342,5 +417,62 @@ mod tests {
         assert_eq!(rules[1].egress, "wan0");
         firewall["policies"]["interfaces"][0]["rules"][0]["out_interface"] = json!("bad/name");
         assert!(compile(&firewall).is_err());
+    }
+
+    #[test]
+    fn counter_layout_maps_logical_rules_expansions_defaults_and_generated_rules() {
+        let mut f = serde_json::to_value(netcontrol_core::Firewall::default()).unwrap();
+        f["policies"] = json!({
+            "hosts":[{"id":"client","addresses":["192.0.2.2","2001:db8::2"],
+                "policy":"drop","rules":[{"protocol":"tcp","destination_ports":[80,443],"action":"accept"}]}],
+            "interfaces":[{"interface":"lan0","rules":[{"action":"drop"}]}]
+        });
+        f["input"] = json!({"policy":"drop","interfaces":[
+            {"interface":"lan0","rules":[{"protocol":"tcp","destination_ports":[22,443],"action":"accept"}]}
+        ]});
+        f["nat"]["masquerade"] = json!([{"family":"ipv4","out_interface":"wan0"}]);
+        f["nat"]["destination_rewrite"] = json!([{
+            "out_interface":"wan0","target_interface":"lan0","target_address":"192.0.2.53",
+            "protocol":"udp","destination_port":53
+        }]);
+        let layout = counter_layout(&f).unwrap();
+        for (chain, key, count) in [
+            ("forward", "/firewall/policies/hosts/0/rules/0", 4),
+            ("forward", "/firewall/policies/hosts/0/policy", 2),
+            ("forward", "/firewall/policies/interfaces/0/rules/0", 1),
+            ("forward", "/firewall/policy", 1),
+            ("input", "/firewall/input/interfaces/0/rules/0", 2),
+            ("input", "generated/input/loopback", 1),
+            ("input", "generated/input/established_related", 1),
+            ("input", "/firewall/input/policy", 1),
+            ("output", "generated/output/policy", 1),
+            ("postrouting", "/firewall/nat/masquerade/0", 1),
+            (
+                "destination_rewrite",
+                "/firewall/nat/destination_rewrite/0",
+                1,
+            ),
+        ] {
+            assert_eq!(
+                layout.get(&(chain.into(), key.into())),
+                Some(&count),
+                "{chain}:{key}"
+            );
+        }
+        for chain in ["forward", "input", "output"] {
+            assert_eq!(
+                layout[&(chain.into(), "/firewall/allow_all_icmp".into())],
+                1
+            );
+        }
+        let f = json!({"policy":"drop","allow_all_icmp":false,"rules":[{"action":"drop"}],
+            "nat":{"masquerade":[]}});
+        assert_eq!(
+            counter_layout(&f).unwrap(),
+            BTreeMap::from([
+                (("forward".into(), "/firewall/rules/0".into()), 1),
+                (("forward".into(), "/firewall/policy".into()), 1)
+            ])
+        );
     }
 }

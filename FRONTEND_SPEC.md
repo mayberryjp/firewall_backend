@@ -607,6 +607,9 @@ do not grant configuration editing. Device-account
 API keys have all permissions,
 including upgrade authority when the operator explicitly enables self-upgrade;
 scoped credential files must grant `system.upgrade` explicitly.
+Firewall deny history has the separate `firewall.logs.read` permission; neither
+`state.read` nor `firewall.write` grants traffic-log access. Device-account keys
+include it; scoped keys must explicitly grant it.
 Configuration changes additionally require permissions for every changed area:
 
 | Change | Additional permission |
@@ -1151,6 +1154,7 @@ accept no query parameters:
 | `/api/v1/statistics/interfaces/{name}` | `{sample, interface}` |
 | `/api/v1/statistics/protocols` | `{sample, protocols}` |
 | `/api/v1/statistics/connections` | Connection snapshot with filters/paging; `netcontrol-connections/v1` |
+| `/api/v1/statistics/firewall` | Live logical-rule match counters; `netcontrol-firewall-counters/v1` |
 | `/api/v1/statistics/host` | Host health snapshot; `netcontrol-host-health/v1` (see below) |
 | `/api/v1/statistics/link-diagnostics` | Cached native link observations; `netcontrol-link-diagnostics/v1` |
 | `/api/v1/statistics/gateways` | `{sample, monitors}` |
@@ -1573,8 +1577,9 @@ drafts. Keep only ephemeral monitoring state. Deletion is a separately authorize
 action described below; reads never delete state. Prefer ID plus zone/tuple
 identity over array position for row keys.
 Existing `GET /api/v1/firewall/rules` and desired firewall configuration remain
-the rule-definition sources. This feature does not add per-rule counters,
-rule-to-connection attribution, packet logs, guaranteed visibility of rejected
+the rule-definition sources. Per-rule counters use the separate
+[rule accounting endpoint](#firewall-rule-match-counters), not connection sums.
+The connection endpoint does not add rule-to-connection attribution, packet logs, guaranteed visibility of rejected
 or NOTRACK traffic, historical connections, or automatic policy changes.
 
 #### Connection state deletion
@@ -3912,8 +3917,123 @@ or discard rules. Host-only, interface-only, and combined configurations are val
 
 Never sort rules before sending. Host inventory and port lists may be sorted.
 Require review acknowledgement for drop defaults and catch-all drops. Provide
-managed egress selection, but do not add arbitrary protocol choices, port ranges, logging, or configurable
+managed egress selection, but do not add arbitrary protocol choices, port ranges, per-rule logging controls, or configurable
 conntrack controls: these are not implemented.
+
+#### Firewall deny log
+
+Native Linux continuously captures owned input/forwarding **drops**, including
+explicit rules, generated host-policy defaults and chain default Drop policies.
+Records are runtime telemetry, not firewall configuration: no log flags in rule
+forms, no transactions/revisions on reads/capture, and no records in configuration
+exports, aggregate state/statistics or MQTT. Backend audit/syslog remains separate.
+Capture does not depend on a browser or request and cannot reconstruct prior
+unrecorded traffic. Existing acceptance, ICMP and established/related precedence
+is unchanged; accepted packets are not deny records.
+
+`GET /api/v1/firewall/deny-log` requires API-key authentication and
+**`firewall.logs.read` only** (not `state.read` or write permissions).
+It takes no body; other methods return `405`. Query parameters:
+
+| Parameter | Type/default | Validation/meaning |
+| --- | --- | --- |
+| `limit` | decimal integer, 100 | 1..500 |
+| `before_id` | optional decimal ID string | Exclusive positive u64 cursor; use `next_before_id` unchanged |
+| `since_ms`, `until_ms` | optional decimal integers | Inclusive Unix UTC milliseconds, 0..253402300799999; since <= until |
+| `address` | optional string | Canonical IPv4/IPv6 literal, matches source OR destination |
+| `protocol` | optional decimal integer | IP protocol number 0..255; e.g. TCP 6, UDP 17, ICMP 1, ICMPv6 58 |
+| `chain` | optional string | Exactly `input` or `forward` |
+
+Filters combine with AND. Query maximum 4096 bytes; unknown/duplicate parameters,
+noncanonical numbers (including leading zeros/signs), invalid IPs/ranges and
+bodies return `400`. Authentication/permission errors are `401`/`403`.
+Simulator, unavailable engine or native scope/read failures return `503`, not an
+empty successful simulated log. Errors use the normal `{error, transaction}`
+envelope. All replies are `Cache-Control: no-store`.
+
+Synthetic `200` response (not actual appliance traffic):
+
+```json
+{
+  "records": [{
+    "id": "42", "timestamp_ms": 1793336400000,
+    "chain": "forward", "reason": "rule", "compiled_rule_index": 2,
+    "ruleset_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": "192.0.2.2", "destination": "198.51.100.9", "protocol": 17,
+    "source_port": 12345, "destination_port": 53,
+    "ingress_index": 2, "egress_index": 3, "ingress": "lan0", "egress": "wan0",
+    "packet_length": 64
+  }],
+  "next_before_id": null, "oldest_id": "42", "newest_id": "42",
+  "cursor_expired": false,
+  "retention": {"max_records": 4096, "max_segment_bytes": 524288, "segments": 8},
+  "capture": {
+    "status": "capturing", "error": null, "group": 100, "rate_limit_per_second": 100,
+    "discarded_records": "0", "malformed_records": "0",
+    "overflow_events": "0", "sequence_gaps": "0",
+    "counters_scope": "daemon_session", "loss_count_exact": false
+  }
+}
+```
+
+Records are newest **ID** first, independent of clock changes. IDs and loss
+counters are decimal strings, not JavaScript numbers. IDs survive normal daemon
+restart and are not configuration revisions. `oldest_id`/`newest_id` are global
+retention boundaries, unaffected by filters, and null for empty history.
+`next_before_id:string|null` is the exclusive cursor for another matching page;
+null means no older retained match. New capture does not shift earlier pages.
+`cursor_expired:true` means the cursor reached/passed evicted history; render an
+explicit retention-gap notice rather than claiming the entire history was read.
+
+Every record serializes all fields. Timestamp is a millisecond integer; source/
+destination are canonical IP strings; protocol is an integer. Ports are integers
+0..65535 or null for non-port protocols, noninitial fragments or headers outside
+the 128-byte capture bound. Interface indexes are positive integers or null;
+names are strings or null when unavailable/removed/unrepresentable. Do not
+replace a historical null name using the current device at a reused index.
+`packet_length` is the IP-header-advertised byte length (IPv4 total length or
+IPv6 base payload length plus 40; not Ethernet bytes or a flow total).
+No packet payload is persisted or returned.
+
+`reason` is `rule` or `policy`; `policy` means a chain default Drop, with
+`compiled_rule_index:null`. A generated host default is a `rule` drop.
+Rule indexes are zero-based **compiled** positions (including generated rules),
+not user-facing array indexes/stable IDs. Show them only alongside the 64-character
+lowercase SHA-256 `ruleset_id` identifying the actual applied operational firewall,
+including provisional/rolled-back rulesets. Never attribute old records to the
+current draft's rule at the same numeric position.
+
+Capture status is `starting`, `capturing`, `error` or `stopped`; `error` is
+nullable text and can also contain the last malformed-record warning while
+capture continues. `200` with capture error still exposes retained history, not
+healthy current collection. Fatal I/O/capture errors stop collection until
+operator repair and daemon restart. Counters reset per daemon session:
+`discarded_records` counts valid records exceeding the 100-record/one-second
+worker-window persistence cap; `malformed_records` counts rejected messages;
+`overflow_events` counts socket ENOBUFS notifications; `sequence_gaps` counts
+missing per-group kernel sequence positions. These indicators can overlap and
+do not give an exact lost-packet total; do not sum them as such.
+
+History is private persistent rotating storage, at most eight 512-record/512-KiB
+segments (4096 records maximum; segment rotation can retain fewer). There is no
+guaranteed time horizon, log configuration or clear endpoint. Normal shutdown
+flushes the pending batch; crashes can lose up to the pending one-second batch
+and kernel-buffered records. Metadata remains sensitive: do not persist it in
+browser storage, analytics or config exports. Retention and capture errors never
+clear drafts or change policies.
+
+Frontend action: recognize the new permission and distinguish unsupported,
+unauthorized, healthy-empty, capture-error, rate-loss and retention-gap states.
+A dedicated **Deny log** viewer with refresh, filters and Load older is optional;
+if implemented, use this endpoint only while visible/on explicit request rather
+than adding traffic records to general polling. Display timestamps with units/
+timezone, nullable ports/interfaces, protocol and attribution; never claim an
+empty/limited log proves traffic was allowed. It excludes other firewall owners,
+route blackholes, qdisc/checksum drops and accepted/established traffic.
+Deployment requires NFLOG/nft_log kernel support, exclusive group 100, current
+native privileges and private writable storage; no syslog enablement or external
+daemon. See [operator requirements](docs/BUILD_AND_INSTALL.md#firewall-deny-logging)
+and [handoff 2026-10-29-09](docs/frontend-handoffs/2026-10-29.md#2026-10-29-09-firewall-deny-history).
 
 #### Bulk deletion of firewall hosts and forwarding rules
 
@@ -3988,8 +4108,131 @@ the firewall must not silently reimport discoveries. Do not label preserved NAT/
 input rules as deleted. See
 [handoff 2026-10-29-08](docs/frontend-handoffs/2026-10-29.md#2026-10-29-08-bulk-firewall-host-and-forward-rule-deletion).
 
-Per-rule packet/byte match counters remain unavailable. Existing connection
-accounting cannot be interpreted as cumulative hits on these rule definitions.
+Per-rule packet/byte match counters use the dedicated endpoint below. Existing
+connection accounting cannot be interpreted as cumulative rule hits.
+
+#### Firewall rule match counters
+
+`GET /api/v1/statistics/firewall` requires API-key authentication and `state.read`.
+It accepts no nonempty query or request body (`400`). Only GET is supported
+(`405`); invalid/missing credentials are `401`, missing permission `403`, and
+unknown GET suffixes `404`. Reads do not apply configuration, clear counters,
+flush connections, start logging or allocate revisions/transactions.
+
+Native success is `200`, schema `netcontrol-firewall-counters/v1`:
+
+```json
+{
+  "schema": "netcontrol-firewall-counters/v1",
+  "sample": {
+    "scope": "example-namespace",
+    "status": "available",
+    "started_at": "2026-10-30T06:00:00Z",
+    "collected_at": "2026-10-30T06:00:00.010Z"
+  },
+  "config_revision": "2026.10.30.1",
+  "transaction_id": null,
+  "ruleset_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "generation": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "rules": [{
+    "id": "forward:/firewall/policies/hosts/0/rules/0",
+    "chain": "forward",
+    "config_path": "/firewall/policies/hosts/0/rules/0",
+    "expanded_rules": 4,
+    "packets": "9007199254740993",
+    "bytes": "576460752303423552"
+  }]
+}
+```
+
+This is a synthetic shortened example, not measured traffic. Native returns
+all instrumented logical rows, including measured zeros, ordered by chain/key.
+`sample.scope` is opaque; timestamps are UTC RFC3339 and bracket collection,
+not an atomic global measurement instant. `ruleset_id` is the lowercase SHA-256
+of the applied operational firewall, matching deny-log ruleset identity.
+`generation` is a lowercase SHA-256 token incorporating a fresh ruleset-installation
+UUID and physical chain/handle set; treat it as opaque, not a software/config version.
+`config_revision` is the currently committed canonical calendar revision.
+`transaction_id` is the active provisional transaction ID or null. During a
+transaction, counters describe its **applied candidate**, not the saved revision;
+after confirmation/rollback refresh both metadata and the relevant config.
+
+Each row has a unique `id` (`chain:logical-key`), `chain` string, nullable
+`config_path` JSON pointer into that applied normalized configuration, positive
+integer `expanded_rules`, and nonnegative decimal-string `packets`/`bytes`.
+Use BigInt/exact integer arithmetic: physical u64 counters are summed as u128,
+which can exceed both JavaScript safe integers and u64. There are no
+per-second fields, historical totals, unique-connection counts or rule names
+in these rows. Resolve names/actions from the matching applied config.
+
+Supported configured paths:
+
+- Forward: `/firewall/rules/{index}`,
+  `/firewall/policies/interfaces/{index}/rules/{rule_index}`,
+  `/firewall/policies/hosts/{index}/rules/{rule_index}`,
+  `/firewall/policies/hosts/{index}/policy`, `/firewall/policy`.
+- Input: `/firewall/input/interfaces/{index}/rules/{rule_index}`,
+  `/firewall/input/policy`.
+- NAT: `/firewall/nat/masquerade/{index}` (`postrouting`) and
+  `/firewall/nat/destination_rewrite/{index}` (`destination_rewrite`).
+- The IPv4 ICMP exception has `/firewall/allow_all_icmp` in each of
+  `forward`, `input` and `output` when enabled. Distinguish these by chain/ID.
+
+Generated keys have `config_path:null`: `generated/forward/established_related`
+in host-policy mode, `generated/input/loopback` and
+`generated/input/established_related` with configured input,
+`generated/input/policy` for the ICMP-only generated input chain, and
+`generated/output/policy` for the ICMP output chain. Their IDs still contain
+the generated key. Chains/rules absent from the compiled firewall have no rows.
+Empty rule lists still have their instrumented terminal default.
+
+All physical address, destination-host, family and port expansions for one
+logical key/chain are summed. A counter increments **after matching**, before
+logging/verdict/NAT. Evaluation order and accept/drop precedence are unchanged.
+Established/related acceptance in host/input mode, loopback and ICMP bypasses
+can prevent later user rules from seeing traffic; those generated/exception
+rows count separately. Counters do not retroactively attribute bypass traffic.
+NAT evaluates initial packets of new conntrack mappings, not every established
+packet. Bytes are nftables packet lengths, not Ethernet/interface/application
+throughput; other firewall owners and non-nftables drops are excluded.
+
+Ruleset replacement resets counters on network apply, rollback, startup/service
+repair, compiler refresh and reboot. Even unchanged firewall definitions can
+reset during other network changes; metadata-only changes may preserve them.
+Closing/reopening the native backend alone preserves the kernel generation,
+but normal daemon startup runs repair and refreshes it. Nothing is persisted
+or restored from configuration history; no reset API is provided.
+
+Before calculating rates, require matching scope, generation, ruleset identity
+and row ID, exact nondecreasing values and elapsed collection time. Discard
+deltas after change/decrease/error/row disappearance, or on first/simulated
+samples. Array indexes are not durable rule IDs. Do not join old samples or
+deny-log compiled indices to current rows solely by array position.
+
+Reads verify owned configuration/fingerprint before and after the dump.
+Only numeric counter values are excluded from drift fingerprints; identity,
+matches, log/verdict expressions, ordering and other attributes remain checked.
+Malformed, interrupted, mismatched-generation/layout, unsupported, missing-owned-
+firewall, drift or over-limit reads return `503` with `{error, transaction:null}`,
+not partial rows or available zeros. Bounds: 16384 physical rules, 64 MiB per
+dump, five-second receive budget per dump and 1 MiB maximum datagram; decoding
+and the multiple ownership-verification dumps add overhead.
+
+Simulator returns the same schema with `sample.status:"simulated"`,
+scope `"simulator"`, UTC timestamps, `generation:null`, `ruleset_id:null`, and
+`rules:[]`; config revision/transaction identity still reflect the engine.
+This is explicitly unmeasured, not an available empty kernel snapshot.
+
+Frontend action: add the client types/endpoint and replace claims that rule
+counters are unavailable. Optional per-rule counter UI should fetch only while
+visible/on refresh, avoid overlapping requests, show freshness/reset/error
+states, and keep samples out of browser persistence/config exports/general
+state polling. No counter form fields or write transaction are needed.
+Counters are not embedded in aggregate statistics, runtime, MQTT or health.
+Native deployment requires `CONFIG_NFT_COUNTER` (`nft_counter` or built-in),
+alongside the existing NFLOG prerequisites and namespace/net_admin privileges.
+Ubuntu install/full upgrade loads/persists it; build-only does not.
+See [handoff 2026-10-29-10](docs/frontend-handoffs/2026-10-29.md#2026-10-29-10-firewall-rule-match-counters).
 
 ### 6.6.1 Host input filtering
 
@@ -4539,6 +4782,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/services/bgp` | Committed `BGPConfig` |
 | GET | `/services/bgp/status` | Applied BGP worker and neighbor summary |
 | GET | `/firewall/rules` | Entire observed `Firewall`, including policy and NAT |
+| GET | `/firewall/deny-log` | Filtered persistent deny history, capture/loss/retention status; `firewall.logs.read` |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
 | GET | `/firewall/nat` | Observed `{ "masquerade": [...], "destination_rewrite": [...] }` |

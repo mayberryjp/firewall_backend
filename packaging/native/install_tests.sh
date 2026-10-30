@@ -119,6 +119,46 @@ for diagnostics_scenario in success repeat module_failure persist_failure symlin
 done
 printf 'Native link diagnostics module setup and failure tests passed (mocked kernel commands).\n'
 
+for deny_scenario in success repeat module_failure counter_failure persist_failure symlink_file; do
+    deny_directory="$temporary/deny-log-$deny_scenario"
+    mkdir -p "$deny_directory"
+    printf 'unrelated\n' > "$deny_directory/other.conf"
+    if [[ $deny_scenario == symlink_file ]]; then
+        ln -s other.conf "$deny_directory/netcontrol-deny-log.conf"
+    fi
+    if (
+        modprobe() {
+            printf '%s\n' "$*" >> "$deny_directory/commands"
+            [[ $deny_scenario != module_failure && ( $deny_scenario != counter_failure || $1 != nft_counter ) ]]
+        }
+        install() {
+            [[ $deny_scenario != persist_failure ]] || return 1
+            local -a arguments=()
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    -o|-g) shift 2 ;;
+                    *) arguments+=("$1"); shift ;;
+                esac
+            done
+            command install "${arguments[@]}"
+        }
+        configure_deny_logging "$deny_directory" || exit 1
+        if [[ $deny_scenario == repeat ]]; then
+            configure_deny_logging "$deny_directory" || exit 1
+        fi
+    ); then
+        [[ $deny_scenario == success || $deny_scenario == repeat ]] || exit 1
+        [[ $(< "$deny_directory/netcontrol-deny-log.conf") == $'nfnetlink_log\nnft_log\nnft_counter' ]]
+        [[ $(head -n 3 "$deny_directory/commands") == $'nfnetlink_log\nnft_log\nnft_counter' ]]
+    else
+        [[ $deny_scenario != success && $deny_scenario != repeat ]] || exit 1
+        [[ ! -f $deny_directory/netcontrol-deny-log.conf ||
+           -L $deny_directory/netcontrol-deny-log.conf ]] || exit 1
+    fi
+    [[ $(< "$deny_directory/other.conf") == unrelated ]]
+done
+printf 'Firewall deny-log module setup and failure tests passed (mocked kernel commands).\n'
+
 for service_scenario in success repeat directory_failure chmod_failure publish_failure symlink_file symlink_directory file_directory nonregular_target; do
     service_directory="$temporary/service-opt-ins-$service_scenario"
     mkdir -p "$service_directory/drop-ins"
@@ -442,7 +482,7 @@ for deployment_scenario in success setup_failure deploy_failure; do
         deployment_trace=''
         root_command() {
             [[ $# -eq 5 && $1 == bash && $2 == -c &&
-                $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
+                $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
             deployment_trace+='setup;'
             [[ $deployment_scenario != setup_failure ]]
         }
@@ -474,6 +514,10 @@ configure_link_diagnostics() {
     printf 'link-diagnostics\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != diagnostics_failure ]]
 }
+configure_deny_logging() {
+    printf 'deny-log\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != deny_log_failure ]]
+}
 configure_appliance_services() {
     printf 'services\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != services_failure ]]
@@ -488,7 +532,7 @@ systemctl() {
     [[ $SETUP_SCENARIO != reload_failure ]]
 }
 EOF
-for setup_scenario in success conntrack_failure diagnostics_failure services_failure logging_units_failure reload_failure; do
+for setup_scenario in success conntrack_failure diagnostics_failure deny_log_failure services_failure logging_units_failure reload_failure; do
     (
         export SETUP_SCENARIO=$setup_scenario SETUP_TRACE="$temporary/setup-$setup_scenario.trace"
         root_command() { "$@"; }
@@ -499,12 +543,13 @@ for setup_scenario in success conntrack_failure diagnostics_failure services_fai
             [[ $setup_scenario != success ]] || exit 1
         fi
         case $setup_scenario in
-            success) expected=$'conntrack\nlink-diagnostics\nservices\nlogging-units\nreload\ndeploy' ;;
+            success) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices\nlogging-units\nreload\ndeploy' ;;
             conntrack_failure) expected=conntrack ;;
             diagnostics_failure) expected=$'conntrack\nlink-diagnostics' ;;
-            services_failure) expected=$'conntrack\nlink-diagnostics\nservices' ;;
-            logging_units_failure) expected=$'conntrack\nlink-diagnostics\nservices\nlogging-units' ;;
-            reload_failure) expected=$'conntrack\nlink-diagnostics\nservices\nlogging-units\nreload' ;;
+            deny_log_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log' ;;
+            services_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices' ;;
+            logging_units_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices\nlogging-units' ;;
+            reload_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices\nlogging-units\nreload' ;;
         esac
         [[ $(< "$SETUP_TRACE") == "$expected" ]]
     )
@@ -572,7 +617,7 @@ for scenario in success fail_stage fail_bootstrap fail_logging fail_restart fail
                         grep -q "^systemctl stop netcontrold.service$" "$UPGRADE_TEST_DIRECTORY/commands" || return 1
                         [[ $UPGRADE_TEST_SCENARIO != fail_logging ]]
                     else
-                        [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
+                        [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
                     fi ;;
                 install)
                     [[ $UPGRADE_TEST_SCENARIO != fail_stage ]] || return 1

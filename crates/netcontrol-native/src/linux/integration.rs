@@ -79,6 +79,15 @@ fn config(value: Value) -> Result<Config> {
     Ok(serde_json::from_value(value)?)
 }
 
+fn firewall_counter<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value> {
+    snapshot["rules"]
+        .as_array()
+        .context("counter rows missing")?
+        .iter()
+        .find(|row| row["id"] == id)
+        .with_context(|| format!("counter {id} missing: {snapshot}"))
+}
+
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and raw sockets"]
 fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()> {
@@ -791,15 +800,30 @@ fn native_destination_rewrite_packets_filtering_restart_and_rollback() -> Result
     no_rewrite(router_ns.clone(), "9.9.9.9:53")?;
     // A LAN-routed destination on the same port must remain local, not hit this server.
     no_rewrite(client_ns.clone(), "198.51.100.99:53")?;
-    let fingerprint = session(router_ns.clone(), |_, _| netfilter::fingerprint())?;
+    let before = native.statistics(&desired, "/api/v1/statistics/firewall", "")?;
+    for (index, minimum) in [(0, 2u128), (1, 1), (2, 1)] {
+        let row = firewall_counter(
+            &before,
+            &format!("destination_rewrite:/firewall/nat/destination_rewrite/{index}"),
+        )?;
+        ensure!(
+            row["packets"]
+                .as_str()
+                .context("packet count missing")?
+                .parse::<u128>()?
+                >= minimum,
+            "DNAT counter missed traffic: {row}"
+        );
+    }
     native.observe(&desired)?;
     drop(native);
     let mut native = Native::open(options)?;
     native.repair(&desired)?;
     native.observe(&desired)?;
     ensure!(
-        session(router_ns.clone(), |_, _| netfilter::fingerprint())? == fingerprint,
-        "restart changed firewall"
+        native.statistics(&desired, "/api/v1/statistics/firewall", "")?["generation"]
+            != before["generation"],
+        "startup repair must refresh firewall counter generation"
     );
     exchange("1.1.1.1:53")?;
     let mut blocked = desired.clone();
@@ -1538,6 +1562,244 @@ fn global_ipv6_managed_addresses_routes_and_interrupted_disable_recover() -> Res
     assert!(!native.state.join("intent.json").exists());
     native.observe(&dual)?;
     assert_eq!(native.runtime(&dual)?["ipv6"]["drift"], false);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated namespaces/net_admin, raw sockets and nft counter/log modules"]
+fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use std::{
+        net::UdpSocket,
+        os::fd::FromRawFd,
+        time::{Duration, Instant},
+    };
+    let router = Fixture::new()?;
+    let client = Fixture::new()?;
+    let router_ns = Arc::new(File::open(&router.namespace)?);
+    let client_ns = Arc::new(File::open(&client.namespace)?);
+    let peer = client_ns.clone();
+    session(router_ns.clone(), move |rt, handle| {
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .veth("lan0".into(), "client0".into())
+                .execute()
+                .await?;
+            let link = handle
+                .link()
+                .get()
+                .match_name("client0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("counter peer missing")?;
+            handle
+                .link()
+                .set(link.header.index)
+                .setns_by_fd(peer.as_raw_fd())
+                .execute()
+                .await?;
+            Ok(())
+        })
+    })?;
+    session(client_ns.clone(), |rt, handle| {
+        rt.block_on(async {
+            let link = handle
+                .link()
+                .get()
+                .match_name("client0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("counter peer missing")?;
+            for address in ["192.0.2.2", "192.0.2.4"] {
+                handle
+                    .address()
+                    .add(link.header.index, address.parse()?, 24)
+                    .execute()
+                    .await?;
+            }
+            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .route()
+                .add()
+                .v4()
+                .destination_prefix("0.0.0.0".parse()?, 0)
+                .gateway("192.0.2.1".parse()?)
+                .output_interface(link.header.index)
+                .execute()
+                .await?;
+            Ok(())
+        })
+    })?;
+    let options = router.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let desired = config(json!({
+        "interfaces":[
+            {"name":"lan0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["192.0.2.1/24"]},
+            {"name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,"addresses":["198.51.100.1/24"]}
+        ],
+        "firewall":{"policy":"drop","allow_all_icmp":true,
+            "policies":{
+                "interfaces":[{"interface":"lan0","rules":[{"protocol":"udp","destination_ports":[9000],"action":"drop"}]}],
+                "hosts":[{"id":"client","name":"Client","addresses":["192.0.2.2","192.0.2.3"],"policy":"drop",
+                    "rules":[{"protocol":"udp","destination_ports":[8080,8081],"action":"accept"}]}]
+            },
+            "input":{"policy":"drop","interfaces":[{"interface":"lan0","rules":[
+                {"protocol":"udp","destination_ports":[7070],"action":"accept"},
+                {"protocol":"udp","destination_ports":[7071],"action":"drop"}
+            ]}]},
+            "nat":{"masquerade":[{"family":"ipv4","out_interface":"wan0"}]}
+        }
+    }))?;
+    desired.validate()?;
+    native.apply(&empty, &desired)?;
+    session(router_ns.clone(), |_, _| {
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+        Ok(())
+    })?;
+    let path = "/api/v1/statistics/firewall";
+    let initial = native.statistics(&desired, path, "")?;
+    let ownership = fs::read(native.state.join("ownership.json"))?;
+    let fingerprint = session(router_ns.clone(), |_, _| netfilter::fingerprint())?;
+    let listener = session(router_ns.clone(), |_, _| {
+        let socket = UdpSocket::bind("192.0.2.1:7070")?;
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        Ok(socket)
+    })?;
+    session(client_ns.clone(), |_, _| {
+        let socket = UdpSocket::bind("192.0.2.2:0")?;
+        for port in [8080, 8081, 8082, 9000] {
+            socket.send_to(b"counter", format!("198.51.100.2:{port}"))?;
+        }
+        let other = UdpSocket::bind("192.0.2.4:0")?;
+        other.send_to(b"counter", "198.51.100.2:8080")?;
+        for port in [7070, 7071, 7072] {
+            socket.send_to(b"counter", format!("192.0.2.1:{port}"))?;
+        }
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_ICMP,
+            )
+        };
+        ensure!(
+            fd >= 0,
+            "ICMP test socket failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+        for address in ["192.0.2.1:0", "198.51.100.2:0"] {
+            socket.send_to(&[8, 0, 0xe5, 0xca, 0x12, 0x34, 0, 1], address)?;
+        }
+        Ok(())
+    })?;
+    assert_eq!(listener.recv(&mut [0; 32])?, 7);
+    let count = |snapshot: &Value, id: &str| -> Result<u128> {
+        Ok(firewall_counter(snapshot, id)?["packets"]
+            .as_str()
+            .context("packet count missing")?
+            .parse()?)
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let measured = loop {
+        let snapshot = native.statistics(&desired, path, "")?;
+        if count(&snapshot, "forward:/firewall/policies/hosts/0/rules/0")? >= 2
+            && count(&snapshot, "input:/firewall/input/policy")? >= 1
+        {
+            break snapshot;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "counter traffic not observed: {snapshot}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for id in [
+        "forward:/firewall/policies/interfaces/0/rules/0",
+        "forward:/firewall/policies/hosts/0/policy",
+        "forward:/firewall/policy",
+        "input:/firewall/input/interfaces/0/rules/0",
+        "input:/firewall/input/interfaces/0/rules/1",
+        "input:/firewall/input/policy",
+        "forward:/firewall/allow_all_icmp",
+        "input:/firewall/allow_all_icmp",
+        "output:/firewall/allow_all_icmp",
+        "postrouting:/firewall/nat/masquerade/0",
+    ] {
+        ensure!(
+            count(&measured, id)? > 0,
+            "counter did not match traffic: {id}: {measured}"
+        );
+    }
+    let accepted = firewall_counter(&measured, "forward:/firewall/policies/hosts/0/rules/0")?;
+    assert_eq!(accepted["expanded_rules"], 4);
+    assert_eq!(accepted["packets"], "2");
+    assert_eq!(accepted["bytes"], "70");
+    assert_eq!(initial["generation"], measured["generation"]);
+    assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
+    assert_eq!(
+        session(router_ns.clone(), |_, _| netfilter::fingerprint())?,
+        fingerprint
+    );
+    native.observe(&desired)?;
+    assert_eq!(
+        native.statistics(&desired, path, "")?["generation"],
+        measured["generation"]
+    );
+    drop(native);
+    let mut native = Native::open(options)?;
+    assert_eq!(
+        native.statistics(&desired, path, "")?["generation"],
+        measured["generation"]
+    );
+    native.repair(&desired)?;
+    let repaired = native.statistics(&desired, path, "")?;
+    assert_ne!(repaired["generation"], measured["generation"]);
+    assert_eq!(
+        count(&repaired, "forward:/firewall/policies/hosts/0/rules/0")?,
+        0
+    );
+    let mut candidate = desired.clone();
+    candidate.firewall.policies = None;
+    candidate.firewall.rules =
+        serde_json::from_value(json!([{"source":"192.0.2.2/32","action":"accept"}]))?;
+    native.apply(&desired, &candidate)?;
+    let applied = native.statistics(&candidate, path, "")?;
+    assert_ne!(applied["generation"], repaired["generation"]);
+    session(client_ns.clone(), |_, _| {
+        UdpSocket::bind("192.0.2.2:0")?.send_to(b"legacy", "198.51.100.2:9090")?;
+        Ok(())
+    })?;
+    ensure!(
+        count(
+            &native.statistics(&candidate, path, "")?,
+            "forward:/firewall/rules/0"
+        )? > 0,
+        "legacy rule did not count traffic"
+    );
+    native.apply(&candidate, &desired)?;
+    let rolled_back = native.statistics(&desired, path, "")?;
+    assert_ne!(rolled_back["generation"], applied["generation"]);
+    assert_eq!(
+        count(&rolled_back, "forward:/firewall/policies/hosts/0/rules/0")?,
+        0
+    );
+    session(router_ns, |_, _| {
+        use rustables::{Batch, Chain, ProtocolFamily, Rule, Table};
+        let table = Table::new(ProtocolFamily::Inet).with_name("netcontrol");
+        let chain = Chain::new(&table).with_name("forward");
+        let mut batch = Batch::new();
+        Rule::new(&chain)?.accept().add_to_batch(&mut batch);
+        batch.send()?;
+        Ok(())
+    })?;
+    assert!(native.statistics(&desired, path, "").is_err());
     Ok(())
 }
 

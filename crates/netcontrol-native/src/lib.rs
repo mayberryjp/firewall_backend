@@ -37,6 +37,11 @@ mod conntrack;
     any(not(target_os = "linux"), not(feature = "nftables")),
     allow(dead_code)
 )]
+mod firewall_counters;
+#[cfg_attr(
+    any(not(target_os = "linux"), not(feature = "nftables")),
+    allow(dead_code)
+)]
 mod firewall_plan;
 #[cfg(target_os = "linux")]
 mod host_health;

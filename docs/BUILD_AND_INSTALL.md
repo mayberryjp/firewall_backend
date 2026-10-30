@@ -48,6 +48,55 @@ Use an aarch64 Linux host and the aarch64 target for ARM64 builds unless an
 appropriate cross-linker is explicitly configured. Merely adding a Rust target
 does not install a cross-architecture linker.
 
+## Firewall deny logging
+
+Native mode requires Linux `CONFIG_NETFILTER_NETLINK_LOG`, `CONFIG_NFT_LOG`
+and `CONFIG_NFT_COUNTER` (modules `nfnetlink_log`, `nft_log`, `nft_counter`,
+or built-in equivalents). Standard Ubuntu installation and full source upgrades
+load all three and persist
+`/etc/modules-load.d/netcontrol-deny-log.conf`; build-only does not modify the host.
+Other deployments must provision them before starting the daemon. Missing kernel
+support, privileges or an already-owned NFLOG group 100 in the managed namespace
+causes explicit native startup failure. No external logging daemon or
+systemd/journald dependency is introduced; this works independently of syslog.
+
+The always-on in-process receiver runs in the managed network namespace and
+requires the existing `CAP_NET_ADMIN` and namespace-entry privileges. Do not bind
+another collector to group 100 there. Only Netcontrol's owned input/forwarding
+drops are included, not other tables, route blackholes, qdisc/checksum drops or
+accepted packets. Rules are refreshed through the ordinary scoped native intent
+on startup/service repair, preserving drift guards, rollback and config revisions.
+This refresh resets live per-rule counters and changes their generation.
+Rule accounting is read-only at `GET /api/v1/statistics/firewall` (`state.read`),
+separate from persistent deny records and per-connection accounting. Neither
+counter reads nor counting require enabling syslog or `nf_conntrack_acct`.
+NAT still uses conntrack normally. Rule counts have no historical persistence;
+see the [counter semantics](../FRONTEND_SPEC.md#firewall-rule-match-counters).
+
+Logs are private metadata at
+`<services-state-dir>/native/deny-log/deny-{0..7}.json`, not desired configuration,
+revision exports, the backend audit file or remote syslog. Eight atomic segments
+hold at most 512 records each, each at most 512 KiB (4 MiB total plus one temporary
+segment during replacement). Rotation overwrites the oldest segment; this is a
+record-count bound, not a retention-time guarantee. Provision a writable durable
+filesystem with space for atomic staging; files are 0600 under a 0700 directory.
+No packet payload is persisted. Source/destination metadata is still sensitive:
+restrict backups, filesystem access and `firewall.logs.read` credentials.
+
+At most 100 records per one-second worker window are persisted. Socket pressure,
+rate discards and malformed records are visible in the retrieval response; lost
+packet totals are not exact and an empty log never proves no drops occurred.
+IDs/history survive normal restart; counters reset per daemon session. Normal
+shutdown flushes the pending batch; crashes/power loss may lose that batch and
+kernel-buffered records. Read requests do not start collection or change settings.
+Fatal socket/storage errors stop capture, expose an error with retained history,
+and require operator repair plus daemon restart. Corrupt, linked or nonprivate
+saved segments fail startup unchanged. Investigate and explicitly archive affected
+logs before starting a new history; do not delete/reset configuration or journals
+to resolve telemetry failures. There is no HTTP clear or settings endpoint.
+
+See the [filtered retrieval contract](../FRONTEND_SPEC.md#firewall-deny-log).
+
 ## Incremental Ubuntu development upgrades
 
 [upgrade.sh](../upgrade.sh) builds the current checkout on an

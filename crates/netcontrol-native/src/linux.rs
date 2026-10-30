@@ -38,9 +38,13 @@ mod firewall {
     pub fn remove_owned(_: &str) -> Result<()> {
         bail!("native backend was built without nftables support")
     }
+    pub fn counters(_: &Value, _: &Option<Value>, _: &str) -> Result<Value> {
+        bail!("native backend was built without nftables support")
+    }
 }
 mod adoption;
 mod bgp;
+mod deny_log;
 #[cfg(feature = "nftables")]
 mod destination_rewrite;
 mod dhcp_client;
@@ -69,6 +73,7 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 pub struct Native {
     bgp: bgp::Manager,
     link_monitor: link_monitor::Monitor,
+    deny_log: deny_log::Monitor,
     options: NativeOptions,
     namespace: Arc<File>,
     namespace_path: PathBuf,
@@ -329,6 +334,7 @@ impl Native {
         let mut native = Self {
             bgp: bgp::Manager::new(namespace.clone(), state.clone())?,
             link_monitor: link_monitor::Monitor::new(namespace.clone())?,
+            deny_log: deny_log::Monitor::new(namespace.clone(), state.join("deny-log"))?,
             dhcp,
             dhcp_monitors,
             options,
@@ -911,6 +917,10 @@ impl Native {
 }
 
 impl Backend for Native {
+    fn deny_log(&mut self, query: &netcontrol_core::DenyLogQuery) -> Result<Value> {
+        self.check_scope()?;
+        self.deny_log.snapshot(query)
+    }
     fn bgp_status(&mut self, _: &Config) -> Result<Value> {
         self.check_scope()?;
         let mut value = self.bgp.snapshot()?;
@@ -1395,6 +1405,25 @@ impl Backend for Native {
             return crate::host_health::snapshot();
         }
         self.check_scope()?;
+        if path == "/api/v1/statistics/firewall" {
+            let started_at = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)?;
+            let ownership = self.ownership()?;
+            let fingerprint = ownership
+                .firewall_fingerprint
+                .context("firewall counters unavailable; no owned firewall is installed")?;
+            let value = config.operational_value()?["firewall"].clone();
+            let mut response = session(self.namespace.clone(), move |_, _| {
+                firewall::counters(&value, &ownership.firewall_config, &fingerprint)
+            })?;
+            response["sample"] = json!({
+                "scope":self.identity, "started_at":started_at,
+                "collected_at":time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)?,
+                "status":"available"
+            });
+            return Ok(response);
+        }
         if path == "/api/v1/statistics/link-diagnostics" {
             let mut value = self.link_monitor.snapshot()?;
             value["scope"] = json!(self.identity);
@@ -1477,8 +1506,8 @@ impl Backend for Native {
                 return Err(error);
             }
         }
-        // Empty initial state has no owned nftables table yet. Bootstrap only the verified
-        // current firewall; never overwrite a foreign table or repair unrelated drift.
+        // Refresh the verified firewall through a recovery intent so startup installs
+        // the current compiler's telemetry without changing configuration revisions.
         let mut ownership = self.ownership()?;
         if self.options.namespace.is_empty()
             && ownership.firewall_fingerprint.is_none()
@@ -1491,7 +1520,7 @@ impl Backend for Native {
             self.apply(config, config)?;
             ownership = self.ownership()?;
         }
-        if ownership.firewall_fingerprint.is_none() {
+        {
             let firewall = Network::parse(&value)?.firewall;
             let captured = self.capture_kernel(&value, &value)?;
             let intent = Intent {
@@ -1505,8 +1534,21 @@ impl Backend for Native {
                 ipv6_before: self.capture_ipv6(&value)?,
             };
             write_json(&self.state.join("intent.json"), &intent)?;
-            self.network_apply(&value, &value, captured, &mut ownership)
-                .context("initial firewall bootstrap failed; scoped recovery intent retained")?;
+            if ownership.firewall_fingerprint.is_none() {
+                self.network_apply(&value, &value, captured, &mut ownership)
+                    .context(
+                        "initial firewall bootstrap failed; scoped recovery intent retained",
+                    )?;
+            } else {
+                let target = firewall.clone();
+                ownership.firewall_fingerprint = Some(
+                    session(self.namespace.clone(), move |_, _| {
+                        firewall::apply(&target)?;
+                        netfilter::fingerprint()
+                    })
+                    .context("firewall compiler refresh failed; scoped recovery intent retained")?,
+                );
+            }
             ownership.scope = self.identity.clone();
             ownership.firewall_config = Some(firewall);
             self.save_ownership(&ownership)?;
@@ -1527,6 +1569,9 @@ impl Backend for Native {
 
 impl Drop for Native {
     fn drop(&mut self) {
+        if let Err(error) = self.deny_log.shutdown() {
+            eprintln!("deny-log shutdown failed: {error:#}");
+        }
         if let Err(error) = self.bgp.shutdown() {
             eprintln!("BGP shutdown failed: {error:#}");
         }

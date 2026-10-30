@@ -111,6 +111,68 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn deny_log_http_auth_permission_validation_and_no_store() {
+    use netcontrold::http::Credential;
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        &directory.path().join("state.json"),
+        Box::new(Simulator::new()),
+    )
+    .unwrap();
+    let service = router(App::new(
+        Arc::new(Mutex::new(engine)),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+            Credential {
+                name: "logger".into(),
+                token_sha256: netcontrold::identity::digest("logger"),
+                permissions: vec!["firewall.logs.read".into()],
+            },
+        ]),
+        false,
+    ));
+    for (method, path, body, token, expected) in [
+        ("GET", "/api/v1/firewall/deny-log", "", "invalid", 401),
+        ("GET", "/api/v1/firewall/deny-log", "", "reader", 403),
+        ("POST", "/api/v1/firewall/deny-log", "", "logger", 405),
+        (
+            "GET",
+            "/api/v1/firewall/deny-log?unknown=1",
+            "",
+            "logger",
+            400,
+        ),
+        ("GET", "/api/v1/firewall/deny-log", "{}", "logger", 400),
+        (
+            "GET",
+            "/api/v1/firewall/deny-log?limit=500&address=192.0.2.1",
+            "",
+            "logger",
+            503,
+        ),
+    ] {
+        let response = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected, "{method} {path}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+}
+
+#[tokio::test]
 async fn platform_status_is_authenticated_nonblocking_and_included_with_configuration() {
     use netcontrold::http::Credential;
     let directory = tempfile::tempdir().unwrap();
@@ -315,7 +377,7 @@ async fn mdns_http_contract_authentication_permissions_queries_and_repair() {
 }
 
 #[tokio::test]
-async fn host_health_http_authentication_permissions_and_cors() {
+async fn host_and_firewall_statistics_http_authentication_permissions_and_cors() {
     use netcontrold::http::Credential;
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(
@@ -345,6 +407,11 @@ async fn host_health_http_authentication_permissions_and_cors() {
         ("GET", "/api/v1/statistics/host?unused=1", "reader", 400),
         ("POST", "/api/v1/statistics/host", "reader", 405),
         ("GET", "/api/v1/statistics/host", "reader", 200),
+        ("GET", "/api/v1/statistics/firewall", "", 401),
+        ("GET", "/api/v1/statistics/firewall", "writer", 403),
+        ("GET", "/api/v1/statistics/firewall?unused=1", "reader", 400),
+        ("POST", "/api/v1/statistics/firewall", "reader", 405),
+        ("GET", "/api/v1/statistics/firewall", "reader", 200),
     ] {
         let response = app
             .clone()
@@ -364,7 +431,14 @@ async fn host_health_http_authentication_permissions_and_cors() {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         if expected == 200 {
-            assert_eq!(body["schema"], "netcontrol-host-health/v1");
+            assert_eq!(
+                body["schema"],
+                if path.ends_with("firewall") {
+                    "netcontrol-firewall-counters/v1"
+                } else {
+                    "netcontrol-host-health/v1"
+                }
+            );
             assert_eq!(body["sample"]["status"], "simulated");
         } else {
             assert!(body["error"].is_string());

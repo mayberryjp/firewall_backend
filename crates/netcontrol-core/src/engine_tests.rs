@@ -41,6 +41,101 @@ impl Drop for Fixture {
 fn all() -> Vec<String> {
     PERMISSIONS.iter().map(|s| s.to_string()).collect()
 }
+
+#[test]
+fn deny_log_retrieval_is_separate_authorized_validated_and_read_only() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let expected = json!({"records":[],"capture":{"status":"capturing","error":null}});
+    faults.lock().unwrap().deny_log_response = Some(expected.clone());
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let bytes = fs::read(fixture.path()).unwrap();
+    for (actor, permissions, method, query, body, status) in [
+        ("", vec!["firewall.logs.read".into()], "GET", "", "", 401),
+        ("reader", vec!["state.read".into()], "GET", "", "", 403),
+        ("writer", vec!["firewall.write".into()], "GET", "", "", 403),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "DELETE",
+            "",
+            "",
+            405,
+        ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
+            "limit=501",
+            "",
+            400,
+        ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
+            "",
+            "{}",
+            400,
+        ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
+            "limit=1&chain=input",
+            "",
+            200,
+        ),
+    ] {
+        let reply = engine.request(
+            method,
+            "/api/v1/firewall/deny-log",
+            query,
+            actor,
+            &permissions,
+            body.as_bytes(),
+        );
+        assert_eq!(reply.status, status);
+        if status == 200 {
+            assert_eq!(reply.body, expected);
+        }
+    }
+    assert_eq!(faults.lock().unwrap().deny_log_calls, 1);
+    assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    faults.lock().unwrap().deny_log_response = None;
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/firewall/deny-log",
+                "",
+                "logger",
+                &["firewall.logs.read".into()],
+                &[]
+            )
+            .status,
+        503
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    let simulator_fixture = Fixture::new();
+    let mut simulator = simulator_fixture.engine();
+    let reply = simulator.request(
+        "GET",
+        "/api/v1/firewall/deny-log",
+        "",
+        "logger",
+        &["firewall.logs.read".into()],
+        &[],
+    );
+    assert_eq!(reply.status, 503);
+    assert!(
+        reply.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("native Linux")
+    );
+}
+
 fn config() -> Config {
     serde_json::from_value(json!({"interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}]})).unwrap()
 }
@@ -1345,11 +1440,21 @@ struct Faults {
     traffic_response: Option<Value>,
     traffic_error: Option<String>,
     statistics_calls: Vec<(String, String)>,
+    deny_log_response: Option<Value>,
+    deny_log_calls: usize,
     discovery_error: bool,
     discovery_calls: usize,
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn deny_log(&mut self, _: &crate::DenyLogQuery) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.deny_log_calls += 1;
+        faults
+            .deny_log_response
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("injected deny-log unavailable"))
+    }
     fn bgp_status(&mut self, _: &Config) -> Result<Value> {
         self.0
             .lock()
@@ -3324,6 +3429,89 @@ fn simulator_kernel_removal_and_rollback_restore_original_values() {
     assert_eq!(
         kernel.body["effective"]["namespace"]["net.core.somaxconn"],
         "8192"
+    );
+}
+
+#[test]
+fn firewall_counters_are_authorized_readonly_and_identify_provisional_configuration() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let path = "/api/v1/statistics/firewall";
+    let get = |engine: &mut Engine| {
+        engine.request("GET", path, "", "reader", &["state.read".into()], &[])
+    };
+    let before = fs::read(fixture.path()).unwrap();
+    for (actor, permissions, method, query, body, status) in [
+        ("", vec!["state.read".into()], "GET", "", "", 401),
+        ("writer", vec!["firewall.write".into()], "GET", "", "", 403),
+        ("reader", vec!["state.read".into()], "POST", "", "", 405),
+        ("reader", vec!["state.read".into()], "GET", "x=1", "", 400),
+        ("reader", vec!["state.read".into()], "GET", "", "{}", 400),
+        ("reader", vec!["state.read".into()], "GET", "", "", 200),
+    ] {
+        let response = engine.request(method, path, query, actor, &permissions, body.as_bytes());
+        assert_eq!(response.status, status, "{}", response.body);
+        if status == 200 {
+            assert_eq!(response.body["schema"], "netcontrol-firewall-counters/v1");
+            assert_eq!(response.body["sample"]["status"], "simulated");
+            assert!(response.body["generation"].is_null());
+            assert!(response.body["ruleset_id"].is_null());
+            assert_eq!(response.body["rules"], json!([]));
+            assert_eq!(
+                response.body["config_revision"],
+                json!(engine.committed_revision())
+            );
+            assert!(response.body["transaction_id"].is_null());
+        }
+    }
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    let revision = engine.committed_revision();
+    let mut candidate = engine.saved_configuration().clone();
+    candidate.firewall.policy = "drop".into();
+    let transaction = submit(&mut engine, candidate);
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    let bytes = fs::read(fixture.path()).unwrap();
+    let response = get(&mut engine);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body["transaction_id"], transaction.body["id"]);
+    assert_eq!(response.body["config_revision"], json!(revision));
+    assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let response = get(&mut engine);
+    assert_ne!(response.body["config_revision"], json!(revision));
+    assert!(response.body["transaction_id"].is_null());
+}
+
+#[test]
+fn firewall_counter_backend_errors_are_unavailable_not_successful_zeroes() {
+    let fixture = Fixture::new();
+    let (mut engine, backend) = faulty(&fixture);
+    let path = "/api/v1/statistics/firewall";
+    let get = |engine: &mut Engine| {
+        engine.request("GET", path, "", "reader", &["state.read".into()], &[])
+    };
+    assert_eq!(get(&mut engine).status, 503);
+    backend.lock().unwrap().traffic_response = Some(json!(0));
+    assert_eq!(get(&mut engine).status, 503);
+    backend.lock().unwrap().traffic_response = Some(json!({
+        "schema":"netcontrol-firewall-counters/v1","rules":[{"packets":"18446744073709551615","bytes":"36893488147419103230"}]
+    }));
+    let response = get(&mut engine);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body["rules"][0]["packets"], "18446744073709551615");
+    assert_eq!(response.body["rules"][0]["bytes"], "36893488147419103230");
+    assert_eq!(
+        request(
+            &mut engine,
+            "GET",
+            "/api/v1/statistics/firewall/extra",
+            Value::Null
+        )
+        .status,
+        404
     );
 }
 

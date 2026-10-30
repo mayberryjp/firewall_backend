@@ -4,6 +4,27 @@
 
 ### Added
 
+- Live native firewall rule packet/byte accounting at
+  `GET /api/v1/statistics/firewall` (`state.read`), aggregating kernel expansions
+  for host/interface/legacy/input/NAT rules and exposing separate defaults and
+  bypasses. Exact decimal strings, applied-ruleset/provisional identity and reset
+  generations prevent misleading attribution; moving counters do not trigger
+  firewall drift. Ubuntu install/full upgrade provisions `nft_counter`.
+  No historical persistence, automatic policy changes or manual reset API.
+  Recommended SemVer bump: minor (additive), baseline unknown; next automatic
+  calendar version, no manual bump. Required client-contract/deployment review;
+  optional UI: [handoff 2026-10-29-10](docs/frontend-handoffs/2026-10-29.md#2026-10-29-10-firewall-rule-match-counters).
+
+- Persistent, bounded native firewall deny history, separate from configuration,
+  revisions and syslog. In-process NFLOG captures input/forwarding rule and
+  default-policy drops, with ruleset attribution, metadata-only records, rotation,
+  rate/loss reporting and authenticated filtered/cursor retrieval at
+  `GET /api/v1/firewall/deny-log` (`firewall.logs.read`). Ubuntu install/full
+  upgrade provisions the required kernel modules. Recommended SemVer bump:
+  minor (additive API/functionality); baseline unknown, Unreleased.
+  Required frontend permission/error/loss handling; optional viewer:
+  [handoff 2026-10-29-09](docs/frontend-handoffs/2026-10-29.md#2026-10-29-09-firewall-deny-history).
+
 - `DELETE /api/v1/firewall/hosts-and-rules` clears configured firewall hosts and
   all forwarding rules through an explicitly acknowledged, revision-checked,
   confirmable transaction. Preserves NAT, management input, global policies,

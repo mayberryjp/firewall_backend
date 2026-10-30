@@ -69,6 +69,13 @@ pub fn fingerprint() -> Result<String> {
                 if dynamic {
                     continue;
                 }
+                let normalized;
+                let value = if message == 7 && base == 4 {
+                    normalized = crate::firewall_counters::normalize_expressions(value)?;
+                    &normalized
+                } else {
+                    value
+                };
                 record.extend(kind.to_ne_bytes());
                 record.extend((value.len() as u32).to_ne_bytes());
                 record.extend(value);
@@ -108,6 +115,11 @@ fn dump(message: u16, filter_table: bool) -> Result<Vec<Vec<u8>>> {
         attrs.push(0);
     }
     dump_messages(10, message, libc::NFPROTO_INET as u8, &attrs)
+}
+
+#[cfg(feature = "nftables")]
+pub fn rules() -> Result<Vec<Vec<u8>>> {
+    dump(7, true)
 }
 
 pub fn connections() -> Result<Vec<Vec<u8>>> {
