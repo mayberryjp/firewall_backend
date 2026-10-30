@@ -175,6 +175,13 @@
 
 ### Fixed
 
+- Startup no longer rejects large installed source/debug executables with
+  `update file exceeds size limit` after update configuration is enabled.
+  Local readiness, helper, backup and rollback paths now stream hashing/copying
+  with bounded memory; download/manifest limits, ownership and digest checks
+  remain. File-size errors identify the path and byte limit. Patch-level fix,
+  unreleased build `2026.10.30.5`; no frontend contract/action change.
+
 - Daemon startup no longer decodes retained v1 traffic-accounting files with
   the v2 schema, avoiding the fatal `missing field day` error. Accounting
   validation remains strict in its supervised worker; invalid state is retained

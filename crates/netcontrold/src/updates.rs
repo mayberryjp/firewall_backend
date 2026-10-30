@@ -111,7 +111,11 @@ fn read(path: &Path, limit: usize, private: bool) -> Result<Vec<u8>> {
     File::open(path)?
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= limit, "update file exceeds size limit");
+    ensure!(
+        bytes.len() <= limit,
+        "update file {} exceeds {limit} byte limit",
+        path.display()
+    );
     Ok(bytes)
 }
 
@@ -142,6 +146,17 @@ fn directory(path: &Path) -> Result<()> {
 }
 
 fn atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+    atomic_write(path, executable, |file| {
+        file.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+fn atomic_write(
+    path: &Path,
+    executable: bool,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
     let parent = path.parent().context("update path has no parent")?;
     let temporary = parent.join(format!(".netcontrol-{}", crate::identity::secret("")?));
     let result = (|| {
@@ -155,7 +170,7 @@ fn atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
         #[cfg(not(unix))]
         let _ = executable;
         let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
+        write(&mut file)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -177,8 +192,43 @@ fn atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     result
 }
 
+#[cfg(test)]
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn copy_and_hash(mut source: impl Read, destination: &mut impl Write) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let length = source.read(&mut buffer)?;
+        if length == 0 {
+            return Ok(hex::encode(digest.finalize()));
+        }
+        destination.write_all(&buffer[..length])?;
+        digest.update(&buffer[..length]);
+    }
+}
+
+fn executable_digest(path: &Path) -> Result<String> {
+    regular(path, false)?;
+    copy_and_hash(File::open(path)?, &mut std::io::sink())
+        .with_context(|| format!("hash installed executable {}", path.display()))
+}
+
+fn atomic_executable(path: &Path, source: &Path, expected: Option<&str>) -> Result<String> {
+    regular(source, false)?;
+    let mut digest = String::new();
+    atomic_write(path, true, |file| {
+        digest = copy_and_hash(File::open(source)?, file)?;
+        ensure!(
+            expected.is_none_or(|expected| digest == expected),
+            "executable digest does not match expected backup"
+        );
+        Ok(())
+    })
+    .with_context(|| format!("copy executable {} to {}", source.display(), path.display()))?;
+    Ok(digest)
 }
 
 fn command(program: &str, arguments: &[&str]) -> Result<String> {
@@ -469,8 +519,7 @@ impl Manager {
             ),
             "upgrade worker is already active"
         );
-        let current = read(&destination, update::BINARY_LIMIT as usize, false)?;
-        atomic(&self.root.join("helper"), &current, true)?;
+        let previous_sha256 = atomic_executable(&self.root.join("helper"), &destination, None)?;
         atomic(
             &self.root.join("config.json"),
             &serde_json::to_vec(&self.config)?,
@@ -511,7 +560,7 @@ impl Manager {
             error: None,
             last_successful_version: previous_version,
             destination,
-            previous_sha256: hash(&current),
+            previous_sha256,
         };
         self.save(&mut job, "queued", None)?;
         let launched = command(
@@ -539,11 +588,10 @@ impl Manager {
     }
 
     pub fn mark_ready(&self) -> Result<()> {
+        let digest = executable_digest(&std::env::current_exe()?)?;
         atomic(
             &self.root.join("ready.json"),
-            &serde_json::to_vec(
-                &serde_json::json!({"pid":std::process::id(),"sha256":hash(&read(&std::env::current_exe()?, update::BINARY_LIMIT as usize, false)?)}),
-            )?,
+            &serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"sha256":digest}))?,
             false,
         )
     }
@@ -838,26 +886,16 @@ impl Manager {
     }
 
     fn restore(&self, job: &mut Job, restart: bool) -> Result<()> {
-        let previous = read(
-            &self.root.join("previous"),
-            update::BINARY_LIMIT as usize,
-            false,
-        )?;
+        let previous = self.root.join("previous");
         ensure!(
-            hash(&previous) == job.previous_sha256,
+            executable_digest(&previous)? == job.previous_sha256,
             "previous executable backup is invalid"
         );
         if restart {
             systemctl(&["stop", SERVICE])?;
         }
-        regular(&job.destination, false)?;
-        if hash(&read(
-            &job.destination,
-            update::BINARY_LIMIT as usize,
-            false,
-        )?) != job.previous_sha256
-        {
-            atomic(&job.destination, &previous, true)?;
+        if executable_digest(&job.destination)? != job.previous_sha256 {
+            atomic_executable(&job.destination, &previous, Some(&job.previous_sha256))?;
         }
         if restart {
             systemctl(&["start", SERVICE])?;
@@ -879,13 +917,16 @@ impl Manager {
                 == format!("netcontrold {}", manifest.version),
             "replacement embedded version does not match manifest"
         );
-        let previous = read(&job.destination, update::BINARY_LIMIT as usize, false)?;
         ensure!(
-            hash(&previous) == job.previous_sha256,
+            executable_digest(&job.destination)? == job.previous_sha256,
             "installed executable changed during download"
         );
         prepare_conntrack()?;
-        atomic(&self.root.join("previous"), &previous, true)?;
+        atomic_executable(
+            &self.root.join("previous"),
+            &job.destination,
+            Some(&job.previous_sha256),
+        )?;
         self.save(job, "installing", None)?;
         systemctl(&["stop", SERVICE])?;
         atomic(&job.destination, &binary, true)?;
@@ -1000,6 +1041,54 @@ pub fn helper(recover: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_executable_streaming_exceeds_download_limit_with_bounded_buffers() {
+        #[derive(Default)]
+        struct Counter {
+            bytes: u64,
+            largest_write: usize,
+        }
+        impl Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes += bytes.len() as u64;
+                self.largest_write = self.largest_write.max(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let length = update::BINARY_LIMIT + 1;
+        let mut destination = Counter::default();
+        let digest = copy_and_hash(std::io::repeat(0).take(length), &mut destination).unwrap();
+        let mut expected = Sha256::new();
+        for _ in 0..update::BINARY_LIMIT / 4096 {
+            expected.update([0; 4096]);
+        }
+        expected.update([0]);
+        assert_eq!(digest, hex::encode(expected.finalize()));
+        assert_eq!(destination.bytes, length);
+        assert!(destination.largest_write <= 64 * 1024);
+    }
+
+    #[test]
+    fn executable_streaming_preserves_bytes_and_propagates_io_failures() {
+        struct BrokenReader;
+        impl Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        let mut destination = Vec::new();
+        assert_eq!(
+            copy_and_hash(&b"executable fixture"[..], &mut destination).unwrap(),
+            hash(b"executable fixture")
+        );
+        assert_eq!(destination, b"executable fixture");
+        assert!(copy_and_hash(BrokenReader, &mut std::io::sink()).is_err());
+        assert!(copy_and_hash(&b"fixture"[..], &mut &mut [][..]).is_err());
+    }
 
     fn job(status: &str) -> Job {
         Job {
@@ -1483,5 +1572,112 @@ mod tests {
             read(&state.destination, 1024, false).unwrap(),
             b"replacement executable fixture"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root and a private fixture under /var/lib; no systemd or networking"]
+    fn large_installed_executable_readiness_copy_and_recovery_preserve_verified_bytes() {
+        const READINESS_CHILD: &str = "NETCONTROL_LARGE_EXECUTABLE_READINESS_CHILD";
+        if let Some(root) = std::env::var_os(READINESS_CHILD) {
+            Manager {
+                config: Config::default(),
+                root: root.into(),
+            }
+            .mark_ready()
+            .unwrap();
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .prefix("netcontrol-large-executable-test-")
+            .tempdir_in("/var/lib")
+            .unwrap();
+        let manager = Manager {
+            config: Config::default(),
+            root: root.path().to_owned(),
+        };
+        let destination = root.path().join("netcontrold");
+        atomic(&destination, b"large source executable fixture", true).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .unwrap()
+            .set_len(update::BINARY_LIMIT + 1)
+            .unwrap();
+        let digest = executable_digest(&destination).unwrap();
+        let helper = root.path().join("helper");
+        assert_eq!(
+            atomic_executable(&helper, &destination, None).unwrap(),
+            digest
+        );
+        assert!(atomic_executable(&helper, &destination, Some(&"0".repeat(64))).is_err());
+        assert_eq!(executable_digest(&helper).unwrap(), digest);
+        assert!(fs::read_dir(root.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".netcontrol-")
+        }));
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        assert!(atomic_executable(&helper, &link, None).is_err());
+        let error = read(&destination, 1024, false).unwrap_err().to_string();
+        assert!(error.contains("netcontrold") && error.contains("1024 byte limit"));
+        atomic_executable(&root.path().join("previous"), &destination, Some(&digest)).unwrap();
+        let mut state = job("checking");
+        state.destination = destination.clone();
+        state.previous_sha256 = digest.clone();
+        atomic(&destination, b"replacement executable fixture", true).unwrap();
+        manager.save(&mut state, "checking", None).unwrap();
+        manager.restore(&mut state, false).unwrap();
+        assert_eq!(
+            fs::metadata(&destination).unwrap().len(),
+            update::BINARY_LIMIT + 1
+        );
+        assert_eq!(executable_digest(&destination).unwrap(), digest);
+        assert_eq!(manager.job().unwrap().unwrap().status, "rolled_back");
+
+        let probe = root.path().join("readiness-probe");
+        fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let length = fs::metadata(&probe)
+            .unwrap()
+            .len()
+            .max(update::BINARY_LIMIT + 1);
+        OpenOptions::new()
+            .write(true)
+            .open(&probe)
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+        let child = Command::new(&probe)
+            .args([
+                "--exact",
+                "updates::tests::large_installed_executable_readiness_copy_and_recovery_preserve_verified_bytes",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(READINESS_CHILD, root.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "readiness subprocess failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ready: serde_json::Value =
+            serde_json::from_slice(&read(&root.path().join("ready.json"), 4096, true).unwrap())
+                .unwrap();
+        assert_eq!(ready["pid"], pid);
+        assert_eq!(ready["sha256"], executable_digest(&probe).unwrap());
     }
 }

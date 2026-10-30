@@ -633,8 +633,12 @@ tools do not share this API's maintenance gate.
 
 Private state lives at `/var/lib/netcontrol-updates`: latest `job.json`, copied
 helper/configuration, candidate, previous executable and readiness information.
-Allow disk/memory for multiple bounded binary copies; staging/backup failure
-does not intentionally replace the installed executable. An independent transient
+Downloaded release binaries remain limited to 256 MiB. Installed source/debug
+executables can be larger: readiness hashing and local helper/backup/recovery
+copies stream through a 64 KiB buffer rather than applying the download cap or
+loading the entire file into memory. Allow disk space for multiple full local
+copies as well as downloaded candidates; staging/backup failure does not
+intentionally replace the installed executable. An independent transient
 systemd worker verifies/downloads first, applies conntrack prerequisites, durably
 backs up the executable, records installation intent, stops the daemon, atomically
 replaces the binary beside its existing destination, and starts the same service.

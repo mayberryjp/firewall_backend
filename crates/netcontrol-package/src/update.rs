@@ -119,6 +119,13 @@ mod tests {
         assert!(parse_manifest(&vec![b' '; MANIFEST_LIMIT + 1], "2026.10.29.1").is_err());
         binary[63] ^= 1;
         assert!(verify_binary(&binary, &verified).is_err());
+        manifest.size = BINARY_LIMIT;
+        assert!(manifest.validate().is_ok());
+        for invalid in [0, 63, BINARY_LIMIT + 1] {
+            manifest.size = invalid;
+            assert!(manifest.validate().is_err());
+        }
+        manifest.size = 64;
         manifest.target = "other".into();
         assert!(manifest.validate().is_err());
     }
