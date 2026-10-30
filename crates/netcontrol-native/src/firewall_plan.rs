@@ -73,6 +73,27 @@ fn host_prefix(value: &str) -> Result<String> {
     Ok(format!("{ip}/{}", if ip.is_ipv4() { 32 } else { 128 }))
 }
 
+fn ports(rule: &Value, protocol: netcontrol_core::FilterProtocol) -> Result<Vec<u16>> {
+    let values = match rule.get("destination_ports") {
+        None => vec![],
+        Some(value) => value
+            .as_array()
+            .context("destination_ports must be an array")?
+            .iter()
+            .map(|value| value.as_i64().context("invalid destination port"))
+            .collect::<Result<Vec<_>>>()?,
+    };
+    protocol.validate_ports(&values)?;
+    if values.is_empty() {
+        Ok(vec![0])
+    } else {
+        values
+            .into_iter()
+            .map(|port| Ok(u16::try_from(port)?))
+            .collect()
+    }
+}
+
 pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
     destination_rewrites(firewall)?;
     action(string(firewall, "policy"))?;
@@ -148,11 +169,16 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
         for (index, rule) in rules.iter().enumerate() {
             let source = string(rule, "source").to_string();
             let destination = string(rule, "destination").to_string();
+            let protocol = netcontrol_core::FilterProtocol::parse(string(rule, "protocol"))?;
+            let ports = ports(rule, protocol)?;
             for prefix in [&source, &destination]
                 .into_iter()
                 .filter(|v| !v.is_empty())
             {
-                crate::model::parse_prefix(prefix, true)?;
+                ensure!(
+                    protocol.matches_family(crate::model::parse_prefix(prefix, true)?.0),
+                    "firewall protocol and address family disagree"
+                );
             }
             if !source.is_empty() && !destination.is_empty() {
                 ensure!(
@@ -162,13 +188,18 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
                 );
             }
             action(string(rule, "action"))?;
-            output.push(Match {
-                counter_key: format!("/firewall/rules/{index}"),
-                source,
-                destination,
-                action: string(rule, "action").into(),
-                ..Match::default()
-            });
+            for port in ports {
+                output.push(Match {
+                    counter_key: format!("/firewall/rules/{index}"),
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    protocol: string(rule, "protocol").into(),
+                    port,
+                    action: string(rule, "action").into(),
+                    ..Match::default()
+                });
+                ensure!(output.len() <= 4096, "firewall expands beyond 4096 rules");
+            }
         }
     }
     for nat in array(&firewall["nat"], "masquerade")? {
@@ -250,10 +281,7 @@ fn expand(
         "invalid firewall outgoing interface"
     );
     let protocol = string(rule, "protocol");
-    ensure!(
-        matches!(protocol, "" | "tcp" | "udp"),
-        "unsupported host policy protocol"
-    );
+    let parsed_protocol = netcontrol_core::FilterProtocol::parse(protocol)?;
     let destinations = if !string(rule, "destination_host").is_empty() {
         ensure!(
             string(rule, "destination").is_empty(),
@@ -273,22 +301,18 @@ fn expand(
         }
         vec![value]
     };
-    let ports = match rule.get("destination_ports").and_then(Value::as_array) {
-        Some(v) if !v.is_empty() => {
-            ensure!(!protocol.is_empty(), "destination ports require protocol");
-            v.iter()
-                .map(|v| {
-                    let port = u16::try_from(v.as_u64().context("invalid destination port")?)?;
-                    ensure!(port != 0, "destination port zero is not allowed");
-                    Ok(port)
-                })
-                .collect::<Result<Vec<_>>>()?
-        }
-        _ => vec![0],
-    };
+    let ports = ports(rule, parsed_protocol)?;
     let before = output.len();
     for source in sources {
         for destination in &destinations {
+            if (!source.is_empty()
+                && !parsed_protocol.matches_family(crate::model::parse_prefix(source, true)?.0))
+                || (!destination.is_empty()
+                    && !parsed_protocol
+                        .matches_family(crate::model::parse_prefix(destination, true)?.0))
+            {
+                continue;
+            }
             if !source.is_empty()
                 && !destination.is_empty()
                 && crate::model::parse_prefix(source, true)?.0.is_ipv4()
@@ -313,7 +337,7 @@ fn expand(
         }
     }
     if output.len() == before {
-        bail!("host policy destinations have no common source address family");
+        bail!("host policy protocol/source/destination have no compatible address family");
     }
     Ok(())
 }
@@ -385,6 +409,86 @@ mod tests {
         assert!(compile_input(&firewall).is_err());
         assert!(compile_input(&json!({})).unwrap().is_empty());
     }
+    #[test]
+    fn icmp_filters_expand_only_compatible_families_in_all_scopes() {
+        let mut firewall = json!({"policy":"drop","allow_all_icmp":false,"rules":[],"nat":{"masquerade":[]},
+            "policies":{"hosts":[
+                {"id":"client","addresses":["192.0.2.2","2001:db8::2"],"policy":"drop","rules":[
+                    {"protocol":"icmp","destination_host":"server","action":"accept"},
+                    {"protocol":"icmpv6","destination_host":"server","action":"drop"}]},
+                {"id":"server","addresses":["198.51.100.2","2001:db8:1::2"],"policy":"drop","rules":[]}],
+                "interfaces":[{"interface":"lan0","rules":[{"protocol":"icmpv6","action":"drop"}]}]},
+            "input":{"policy":"drop","interfaces":[{"interface":"lan0","rules":[
+                {"protocol":"icmp","action":"drop"},{"protocol":"icmpv6","action":"accept"}]}]}});
+        let plans = compile(&firewall).unwrap();
+        let matches: Vec<_> = plans
+            .iter()
+            .filter(|rule| rule.counter_key.contains("/hosts/0/rules/"))
+            .collect();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(
+            (&matches[0].source, &matches[0].destination, matches[0].port),
+            (
+                &"192.0.2.2/32".to_string(),
+                &"198.51.100.2/32".to_string(),
+                0
+            )
+        );
+        assert_eq!(
+            (&matches[1].source, &matches[1].destination),
+            (
+                &"2001:db8::2/128".to_string(),
+                &"2001:db8:1::2/128".to_string()
+            )
+        );
+        assert_eq!(plans[1].protocol, "icmpv6");
+        let input = compile_input(&firewall).unwrap();
+        assert_eq!(input[2].protocol, "icmp");
+        assert_eq!(input[3].protocol, "icmpv6");
+        let layout = counter_layout(&firewall).unwrap();
+        assert_eq!(
+            layout[&(
+                "forward".into(),
+                "/firewall/policies/hosts/0/rules/0".into()
+            )],
+            1
+        );
+        firewall["policies"]["hosts"][0]["rules"][0]["destination_ports"] = json!([80]);
+        assert!(compile(&firewall).is_err());
+        firewall["policies"]["hosts"][0]["rules"][0] =
+            json!({"protocol":"icmpv6","destination":"192.0.2.0/24","action":"accept"});
+        assert!(compile(&firewall).is_err());
+    }
+
+    #[test]
+    fn legacy_protocol_port_expansion_preserves_order_and_counter_identity() {
+        let mut firewall = json!({"policy":"drop","allow_all_icmp":false,"nat":{"masquerade":[]},"rules":[
+            {"protocol":"tcp","destination_ports":[80,443],"action":"drop"},
+            {"protocol":"icmp","action":"accept"},{"protocol":"icmpv6","action":"drop"}]});
+        let plans = compile(&firewall).unwrap();
+        assert_eq!(plans.len(), 4);
+        assert_eq!((plans[0].port, plans[1].port), (80, 443));
+        assert_eq!(plans[0].counter_key, plans[1].counter_key);
+        assert_eq!(
+            (&plans[2].protocol, &plans[3].protocol),
+            (&"icmp".into(), &"icmpv6".into())
+        );
+        assert_eq!(
+            counter_layout(&firewall).unwrap()[&("forward".into(), "/firewall/rules/0".into())],
+            2
+        );
+        for rule in [
+            json!({"protocol":"icmp","destination":"2001:db8::/32","action":"accept"}),
+            json!({"protocol":"icmpv6","source":"192.0.2.0/24","action":"accept"}),
+            json!({"protocol":"icmp","destination_ports":[80],"action":"accept"}),
+            json!({"protocol":"sctp","action":"accept"}),
+            json!({"protocol":"udp","destination_ports":[80,80],"action":"accept"}),
+        ] {
+            firewall["rules"] = json!([rule]);
+            assert!(compile(&firewall).is_err(), "{firewall}");
+        }
+    }
+
     #[test]
     fn ordered_rules_are_not_sorted_by_action() {
         let f = json!({"policy":"drop","allow_all_icmp":true,"rules":[{"action":"drop","source":"192.0.2.0/24"},{"action":"accept"}],"nat":{"masquerade":[]}});

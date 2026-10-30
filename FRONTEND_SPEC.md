@@ -36,7 +36,8 @@ Support:
 - Unicast routes; source-policy routing is not user-configurable.
 - Ordered forward-chain source/destination accept/drop rules and default policy.
 - Named IP-based outbound host policies, ingress-interface rule overrides,
-  optional managed egress-interface matches, TCP/UDP destination ports, and
+  optional managed egress-interface matches, Any/TCP/UDP/ICMP/ICMPv6 protocols,
+  TCP/UDP destination ports, and
   automatic established/related return traffic.
 - IPv4/IPv6 masquerading.
 - Exact-port IPv4/IPv6 destination rewrite of forwarded traffic originally
@@ -2355,8 +2356,9 @@ Publisher and deployment contract:
     `rule_match_bytes`, **`dropped_packets` and `dropped_bytes`**. The latter sum
     actual managed input/forward DROP rules and global/host/input default DROP
     policies from `GET /api/v1/statistics/firewall`, classified against the same
-    committed configuration captured under the engine lock. Accept/bypass/ICMP
-    and NAT matches are not drops; deny-log rate limits/loss do not affect these
+    committed configuration captured under the engine lock. Accepts, bypasses,
+    generated IPv4 ICMP exceptions and NAT matches are not drops; configured
+    ICMP/ICMPv6 DROP rules do contribute. Deny-log rate limits/loss do not affect these
     kernel counters. Packet/byte values are exact decimal strings; counters reset
     on installed generation changes. They do not cover NIC errors, external
     firewall tables, other Linux drop sites or historical generations. Rule-match
@@ -3511,8 +3513,9 @@ not proof that existing firewall hosts/rules should be deleted.
 3. **Import rules** fetches candidate ignorelist entries for selected hosts.
    Only entries whose source matches the selected host can suggest that host's
    outbound rules. Do not reverse inbound entries into outbound permits. Map
-   only explicitly supported TCP/UDP protocol, literal destination and port
-   values into existing host-policy fields; skip/report ambiguous, wildcard or
+   only explicitly supported TCP/UDP/ICMP/ICMPv6 protocols and literal
+   destinations into existing host-policy fields. Ports apply only to TCP/UDP;
+   ICMP suggestions must have no ports and a compatible family. Skip/report ambiguous, wildcard or
    unsupported entries rather than broadening them. Do not import universal
    allow rules from suppression settings. Review and deduplicate suggested
    accept rules; preserve manual rules and require explicit policy choices.
@@ -4058,7 +4061,22 @@ devices; do not nest them under an interface. IP-based identity is not
 authenticated identity and does not track DHCP/MAC changes automatically.
 
 Rules: destination Any, another host by ID, or a canonical network; protocol Any,
-TCP, or UDP; optional explicit destination ports for TCP/UDP; Accept/Drop.
+TCP, UDP, ICMP, or ICMPv6; optional explicit destination ports for TCP/UDP; Accept/Drop.
+These same five choices apply to host, ingress-interface, management-input and
+legacy ordered filter rules. Wire values are omitted/empty string for Any,
+`tcp`, `udp`, `icmp`, `icmpv6`; null, aliases, numbers and other names are invalid.
+Any matches every IP protocol, not just the four named choices.
+
+ICMP matches IPv4 protocol 1; ICMPv6 matches IPv6 upper-layer protocol 58,
+including packets with IPv6 extension headers. These match all types/codes:
+no per-type/code selector is implemented. Both forbid destination ports.
+ICMPv6 requires `ipv6_enabled: true`, including wildcard rules. Explicit
+prefixes must agree with the protocol family. Dual-stack source/destination
+hosts expand only compatible address pairs; at least one pair must exist.
+Disable/clear port controls for Any/ICMP/ICMPv6 and prevent incompatible family
+selections. Warn that blocking ICMPv6 can break neighbor discovery and IPv6
+error reporting. The global Allow all IPv4 ICMP exception still precedes IPv4
+ICMP drop rules; it does not permit ICMPv6.
 Host and interface rules also accept optional `out_interface`: an empty/omitted
 string matches any egress; otherwise it must name a managed draft interface
 (maximum 15 characters, using the interface-name validation). Null is invalid.
@@ -4090,13 +4108,18 @@ host-input policy; the global ICMP exception also covers input/output.
 NAT remains separate.
 
 Include explicit **Legacy ordered rules** mode for existing configurations:
-source/destination prefixes or Any, Accept/Drop, and global default; stateless
+source/destination prefixes or Any, the same protocol choices and optional
+TCP/UDP destination ports, Accept/Drop, and global default; stateless
 after the optional global ICMP exception.
 It is selected by absent/null `firewall.policies`. New host/interface mode sends
 `policies` and an empty legacy `rules` list; never mix the models. Switching models
 must show the full difference and require acknowledgement, not silently translate
 or discard rules. Host-only, interface-only, and combined configurations are valid.
 
+Legacy `protocol` and `destination_ports` default to empty/Any and an empty list;
+normalized responses omit empty fields. All filter scopes limit ports to 32
+unique integers 1..65535; legacy port expansion is limited to 4096 rules.
+Each expanded legacy port retains its logical rule's counter identity.
 Never sort rules before sending. Host inventory and port lists may be sorted.
 Require review acknowledgement for drop defaults and catch-all drops. Provide
 managed egress selection, but do not add arbitrary protocol choices, port ranges, per-rule logging controls, or configurable
@@ -4490,7 +4513,7 @@ input filter (apart from the global ICMP exception); normalized reads omit it
 when absent. A configured object requires `policy: "accept" | "drop"` and
 accepts `interfaces` (omitted defaults to an empty array). Each ingress policy
 requires a managed `interface` and ordered `rules` (omitted defaults empty).
-Input rules reuse destination prefix, TCP/UDP protocol, destination-port list
+Input rules reuse destination prefix, Any/TCP/UDP/ICMP/ICMPv6 protocol, destination-port list
 and action from host policy rules; nonempty `out_interface` and
 `destination_host` are rejected. Input does not support host identity matches.
 Types/null-in-nonnullable-fields/unknown-field errors are 400; invalid policy,
@@ -4949,7 +4972,9 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Filter prefixes | Optional canonical source/destination networks; same family when both supplied; both may be empty |
 | Host inventory | At most 128; unique ID `^[a-zA-Z0-9_-]{1,64}$`; unique nonblank name <=80 bytes, no outer whitespace/control characters |
 | Host addresses/default | 1..16 canonical unicast IPv4/IPv6 addresses, globally unique across hosts; no CIDR, mapped IPv6, zones, loopback or link-local; required accept/drop default |
-| Host/interface rules | At most 64 ordered rules per host/interface; Any or TCP/UDP; accept/drop |
+| Filter protocols | Omitted/empty Any, `tcp`, `udp`, `icmp` (IPv4 only), `icmpv6` (IPv6 only, requires ipv6_enabled); all types/codes; incompatible families rejected |
+| Host/interface rules | At most 64 ordered rules per host/interface; the five filter protocol choices; accept/drop |
+| Legacy ordered rules | Same protocol/port contract; at most 4096 port-expanded entries; preserve order |
 | Policy destination | Omitted = Any; existing `destination_host` ID or canonical `destination` network, mutually exclusive; host rule needs at least one compatible source/destination family |
 | Destination ports | Optional <=32 unique integers 1..65535; requires TCP/UDP |
 | Interface overrides | <=32 unique valid ingress names, managed in draft or operator-adopted; no interface default/final verdict for unmatched traffic |
@@ -5359,10 +5384,18 @@ interface RuleSource {
   import_source: string | null;
 }
 
+type FilterProtocol = "" | "tcp" | "udp" | "icmp" | "icmpv6";
+
 interface Firewall {
   allow_all_icmp: boolean; // Omitted input defaults to true; null is invalid.
   policy: "accept" | "drop";
-  rules: Array<RuleSource & { source?: string; destination?: string; action: "accept" | "drop" }>;
+  rules: Array<RuleSource & {
+    source?: string;
+    destination?: string;
+    protocol?: FilterProtocol;
+    destination_ports?: number[];
+    action: "accept" | "drop";
+  }>;
   nat: { masquerade: MasqueradeRule[]; destination_rewrite: DestinationRewriteRule[] };
   policies?: { hosts: FirewallHost[]; interfaces: InterfacePolicy[] } | null;
   input?: InputFirewall | null;
@@ -5393,7 +5426,7 @@ interface HostPolicyRule extends RuleSource {
   out_interface?: string;
   destination_host?: string;
   destination?: string;
-  protocol?: "tcp" | "udp";
+  protocol?: FilterProtocol;
   destination_ports?: number[];
   action: "accept" | "drop";
 }
@@ -5794,7 +5827,8 @@ networking or real softflowd delivery.
 | A18-host | Host policy and interface override | Interface first-match verdict overrides host; unmatched interface rules fall back to source-host rules/default; destination host's outbound default is ignored |
 | A18-state | Stateful policy update | Established/related return traffic remains allowed after applying a new block; UI warns that existing sessions are not terminated |
 | A18-address | Host address edit and references | Stable host-ID references follow updated IPv4/IPv6 addresses; duplicate addresses and dangling references are rejected; history/restore retain inventory |
-| A18-legacy | Firewall model switch | Absent/null policies preserve stateless legacy behavior; nonempty legacy rules cannot mix with host/interface policies |
+| A18-legacy | Firewall model switch | Absent/null policies preserve stateless legacy behavior; nonempty legacy rules cannot mix with host/interface policies; legacy protocol and TCP/UDP ports survive drafts/history/rollback |
+| A18-protocols | Filter protocol choices | Any/TCP/UDP/ICMP/ICMPv6 work in host/interface/input/legacy scopes; ports only TCP/UDP; family and IPv6-enable violations rejected; global IPv4 ICMP exception retains precedence |
 | A19 | Address versus network input | Host address `/24` retained; non-network selector rejected with suggested correction |
 | A20 | IPv6 and numeric endpoints | Canonicalization, brackets, zones, mapped addresses and family checks exercised |
 | A21 | VLAN cycles/duplicate identity/MTU mismatch | Linked local errors; invalid package not submitted |

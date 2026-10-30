@@ -209,12 +209,88 @@ fn firewall_clear_config(host_policies: bool) -> Config {
         ]))
         .unwrap();
     }
+
     candidate.sando.api_url = "http://sando.example.test".into();
     candidate.sando.sync_enabled = true;
     candidate.validate().unwrap();
     candidate
 }
 
+#[test]
+fn filter_protocol_api_validation_persistence_and_restart_rollback() {
+    for host_policies in [false, true] {
+        let fixture = Fixture::new();
+        let mut engine = fixture.engine();
+        let mut candidate = firewall_clear_config(host_policies);
+        candidate.ipv6_enabled = true;
+        candidate.firewall.input.as_mut().unwrap().interfaces[0].rules =
+            serde_json::from_value(json!([{"protocol":"icmpv6","action":"drop"}])).unwrap();
+        if let Some(policies) = &mut candidate.firewall.policies {
+            policies.hosts[0].rules =
+                serde_json::from_value(json!([{"protocol":"icmp","action":"accept"}])).unwrap();
+            policies.interfaces[0].rules =
+                serde_json::from_value(json!([{"protocol":"icmpv6","action":"drop"}])).unwrap();
+        } else {
+            candidate.firewall.rules = serde_json::from_value(json!([
+                {"protocol":"icmp","action":"accept"},{"protocol":"icmpv6","action":"drop"},
+                {"protocol":"udp","destination_ports":[53,123],"action":"accept"}
+            ]))
+            .unwrap();
+        }
+        let pending = submit(&mut engine, candidate.clone());
+        assert_eq!(pending.status, 202, "{}", pending.body);
+        assert_eq!(
+            confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+            200
+        );
+        let saved = engine.saved_configuration().clone();
+        assert_eq!(saved.firewall, candidate.normalized().firewall);
+        let mut changed = saved.clone();
+        changed.firewall.input.as_mut().unwrap().interfaces[0].rules[0].protocol = "icmp".into();
+        let pending = submit(&mut engine, changed);
+        assert_eq!(pending.status, 202, "{}", pending.body);
+        let id = pending.body["id"].as_str().unwrap().to_string();
+        drop(engine);
+        let mut engine = fixture.engine();
+        assert_eq!(
+            request(
+                &mut engine,
+                "POST",
+                &format!("/api/v1/transactions/{id}/rollback"),
+                Value::Null
+            )
+            .status,
+            200
+        );
+        assert_eq!(engine.saved_configuration().firewall, saved.firewall);
+        assert_eq!(
+            request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body,
+            json!(saved.firewall)
+        );
+        for (protocol, ports, status) in [
+            (json!("icmp"), json!([80]), 422),
+            (json!("icmp6"), json!([]), 422),
+            (json!(58), json!([]), 400),
+            (Value::Null, json!([]), 400),
+            (json!("icmpv6"), Value::Null, 400),
+        ] {
+            let mut config = json!(saved);
+            config["firewall"]["input"]["interfaces"][0]["rules"][0]["protocol"] = protocol;
+            config["firewall"]["input"]["interfaces"][0]["rules"][0]["destination_ports"] = ports;
+            let revision = engine.committed_revision();
+            let reply = request(
+                &mut engine,
+                "POST",
+                "/api/v1/transactions",
+                json!({"base_revision":revision,"confirm_timeout_seconds":30,"config":config}),
+            );
+            assert_eq!(reply.status, status, "{}", reply.body);
+        }
+        let mut ipv4_only = saved;
+        ipv4_only.ipv6_enabled = false;
+        assert_eq!(submit(&mut engine, ipv4_only).status, 422);
+    }
+}
 #[test]
 fn firewall_bulk_clear_confirms_only_hosts_and_forward_rules_and_survives_restart() {
     for host_policies in [false, true] {

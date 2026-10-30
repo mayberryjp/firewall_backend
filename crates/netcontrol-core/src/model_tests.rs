@@ -911,6 +911,8 @@ fn normalization_preserves_ordered_policy_semantics() {
         metadata: Default::default(),
         source: String::new(),
         destination: String::new(),
+        protocol: String::new(),
+        destination_ports: vec![],
         action: "drop".into(),
     });
     other = c.clone();
@@ -1228,6 +1230,132 @@ fn kernel_catalog_and_canonical_values() {
     assert!(c.validate().is_err());
 }
 #[test]
+fn filter_protocols_and_ports_validate_in_every_filter_scope() {
+    for scope in ["legacy", "host", "interface", "input"] {
+        let build = |rule: Value| {
+            let mut c = candidate();
+            c.ipv6_enabled = true;
+            let mut firewall = json!({"policy":"drop","allow_all_icmp":false});
+            match scope {
+                "legacy" => firewall["rules"] = json!([rule]),
+                "host" => {
+                    firewall["policies"] = json!({"hosts":[{
+                    "id":"client","name":"Client","addresses":["192.0.2.2","2001:db8::2"],
+                    "policy":"drop","rules":[rule]}]})
+                }
+                "interface" => {
+                    firewall["policies"] =
+                        json!({"interfaces":[{"interface":"lan0","rules":[rule]}]})
+                }
+                "input" => {
+                    firewall["input"] =
+                        json!({"policy":"drop","interfaces":[{"interface":"lan0","rules":[rule]}]})
+                }
+                _ => unreachable!(),
+            }
+            c.firewall = serde_json::from_value(firewall).unwrap();
+            c
+        };
+        for protocol in ["", "tcp", "udp", "icmp", "icmpv6"] {
+            let mut rule = json!({"protocol":protocol,"action":"accept"});
+            build(rule.clone()).validate().unwrap();
+            rule["destination_ports"] = json!([1, 65535]);
+            assert_eq!(
+                build(rule.clone()).validate().is_ok(),
+                matches!(protocol, "tcp" | "udp"),
+                "{scope}: {rule}"
+            );
+            for ports in [
+                json!([0]),
+                json!([65536]),
+                json!([-1]),
+                json!([80, 80]),
+                json!((1..=33).collect::<Vec<_>>()),
+            ] {
+                rule["destination_ports"] = ports;
+                assert!(build(rule.clone()).validate().is_err(), "{scope}: {rule}");
+            }
+        }
+        for protocol in ["any", "icmp6", "ICMP", "sctp", "gre", "58"] {
+            assert!(
+                build(json!({"protocol":protocol,"action":"accept"}))
+                    .validate()
+                    .is_err(),
+                "{scope}: {protocol}"
+            );
+        }
+        for (protocol, destination) in [("icmp", "2001:db8:1::/64"), ("icmpv6", "198.51.100.0/24")]
+        {
+            assert!(
+                build(json!({"protocol":protocol,"destination":destination,"action":"accept"}))
+                    .validate()
+                    .is_err(),
+                "{scope}: {protocol}"
+            );
+        }
+        let mut ipv4_only = build(json!({"protocol":"icmpv6","action":"accept"}));
+        ipv4_only.ipv6_enabled = false;
+        assert!(
+            ipv4_only
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ICMPv6"),
+            "{scope}"
+        );
+        let mut c = build(json!({"protocol":"tcp","destination_ports":[443,80],"action":"accept"}));
+        let encoded = serde_json::to_value(c.normalized()).unwrap();
+        let rules = match scope {
+            "legacy" => &encoded["firewall"]["rules"],
+            "host" => &encoded["firewall"]["policies"]["hosts"][0]["rules"],
+            "interface" => &encoded["firewall"]["policies"]["interfaces"][0]["rules"],
+            "input" => &encoded["firewall"]["input"]["interfaces"][0]["rules"],
+            _ => unreachable!(),
+        };
+        assert_eq!(rules[0]["destination_ports"], json!([80, 443]));
+        c.interfaces.push(
+            serde_json::from_value(json!({
+                "name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,
+                "addresses":["198.51.100.1/24"]
+            }))
+            .unwrap(),
+        );
+        c.firewall.nat.destination_rewrite = serde_json::from_value(json!([{
+            "out_interface":"wan0","protocol":"udp","destination_port":80,
+            "target_interface":"lan0","target_address":"192.0.2.2"
+        }]))
+        .unwrap();
+        c.validate().unwrap();
+        c.firewall.nat.destination_rewrite[0].protocol = "icmp".into();
+        assert!(c.validate().is_err());
+    }
+}
+
+#[test]
+fn icmp_destination_hosts_and_legacy_expansion_limits() {
+    let mut c = candidate();
+    c.firewall.rules.clear();
+    c.firewall.policies = Some(serde_json::from_value(json!({"hosts":[
+        {"id":"client","name":"Client","addresses":["192.0.2.2","2001:db8::2"],"policy":"drop",
+            "rules":[{"protocol":"icmp","destination_host":"server","action":"accept"},
+                {"protocol":"icmpv6","destination_host":"server","action":"accept"}]},
+        {"id":"server","name":"Server","addresses":["198.51.100.2","2001:db8:1::2"],"policy":"drop"}
+    ]})).unwrap());
+    c.ipv6_enabled = true;
+    c.validate().unwrap();
+    c.firewall.policies.as_mut().unwrap().hosts[1].addresses = vec!["198.51.100.2".into()];
+    assert!(c.validate().is_err());
+    c.firewall.policies = None;
+    let rule: FirewallRule = serde_json::from_value(json!({"protocol":"tcp",
+        "destination_ports":(1..=32).collect::<Vec<_>>(),"action":"accept"}))
+    .unwrap();
+    c.firewall.rules = vec![rule.clone(); 128];
+    c.validate().unwrap();
+    c.firewall.rules.push(rule);
+    assert!(c.validate().unwrap_err().to_string().contains("4096"));
+}
+
+#[test]
 fn policy_references_ports_expansion_and_family() {
     let mut c = candidate();
     c.firewall.rules.clear();
@@ -1282,6 +1410,8 @@ fn policy_references_ports_expansion_and_family() {
         metadata: Default::default(),
         source: "".into(),
         destination: "".into(),
+        protocol: "".into(),
+        destination_ports: vec![],
         action: "drop".into(),
     });
     assert!(bad.validate().is_err());

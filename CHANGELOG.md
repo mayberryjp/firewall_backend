@@ -4,6 +4,16 @@
 
 ### Added
 
+- ICMP and ICMPv6 protocol choices for host, interface, management-input and
+  legacy ordered firewall filters, with strict family/port validation and
+  extension-header-aware ICMPv6 matching. Legacy rules now also support the
+  existing TCP/UDP individual-port contract, aggregating expansions into the
+  original rule counter. Global IPv4 ICMP precedence and TCP/UDP-only NAT are
+  unchanged. Recommended bump: minor (additive feature), baseline unknown,
+  Unreleased; next automatic calendar version, no manual bump.
+  Required frontend work:
+  [handoff 2026-10-30-06](docs/frontend-handoffs/2026-10-30.md#2026-10-30-06-icmp-and-icmpv6-firewall-filters).
+
 - Expanded MQTT monitoring to all exposed link counters, kernel protocol counters,
   host disk/VM/scheduler/PSI and filesystem-inode statistics, native service and
   DHCP/WireGuard/BGP metrics, vnStat period/reporting summaries, software release

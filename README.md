@@ -64,6 +64,23 @@ not a factory reset or a literal empty kernel ruleset. Review the
 [complete scope and safeguards](FRONTEND_SPEC.md#bulk-deletion-of-firewall-hosts-and-forwarding-rules).
 Per-connection accounting and dedicated per-rule match counters are available.
 
+## Firewall filter protocols
+
+Host, ingress-interface, management-input and legacy ordered filter rules
+support Any, TCP, UDP, ICMP and ICMPv6. Omit `protocol` (or use `""`) for Any;
+otherwise use `tcp`, `udp`, `icmp` or `icmpv6`. Only TCP/UDP accept
+`destination_ports`: up to 32 unique individual ports, 1..65535.
+ICMP is IPv4-only; ICMPv6 is IPv6-only, requires global IPv6 enablement and
+matches through IPv6 extension headers. Both cover all types/codes.
+Incompatible families and port combinations are explicit validation errors.
+Dual-stack host rules expand only compatible addresses.
+
+The global `allow_all_icmp` IPv4 exception still precedes configured drops;
+disable it to enforce IPv4 ICMP drop rules. ICMPv6 has no such exception.
+NAT destination rewriting remains TCP/UDP only; no port ranges, arbitrary
+numeric protocols or ICMP type/code selectors were added.
+See the [filter contract](FRONTEND_SPEC.md#66-firewall-forwarding).
+
 ## Firewall rule accounting
 
 `GET /api/v1/statistics/firewall` (`state.read`, no query/body) reads live

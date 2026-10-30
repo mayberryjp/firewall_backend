@@ -449,7 +449,67 @@ pub struct FirewallRule {
     pub source: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub destination: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_ports: Vec<i64>,
     pub action: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterProtocol {
+    Any,
+    Tcp,
+    Udp,
+    Icmp,
+    Icmpv6,
+}
+
+impl FilterProtocol {
+    pub fn parse(value: &str) -> Result<Self> {
+        Ok(match value {
+            "" => Self::Any,
+            "tcp" => Self::Tcp,
+            "udp" => Self::Udp,
+            "icmp" => Self::Icmp,
+            "icmpv6" => Self::Icmpv6,
+            _ => anyhow::bail!("filter protocol must be empty, tcp, udp, icmp or icmpv6"),
+        })
+    }
+
+    pub fn number(self) -> Option<u8> {
+        match self {
+            Self::Any => None,
+            Self::Tcp => Some(6),
+            Self::Udp => Some(17),
+            Self::Icmp => Some(1),
+            Self::Icmpv6 => Some(58),
+        }
+    }
+
+    pub fn matches_family(self, address: IpAddr) -> bool {
+        match self {
+            Self::Icmp => address.is_ipv4(),
+            Self::Icmpv6 => address.is_ipv6(),
+            _ => true,
+        }
+    }
+
+    pub fn validate_ports(self, ports: &[i64]) -> Result<()> {
+        ensure!(ports.len() <= 32, "at most 32 destination ports");
+        ensure!(
+            ports.is_empty() || matches!(self, Self::Tcp | Self::Udp),
+            "destination ports require tcp/udp"
+        );
+        let mut unique = BTreeSet::new();
+        for port in ports {
+            ensure!(
+                (1..=65535).contains(port) && unique.insert(port),
+                "invalid or duplicate destination port"
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -931,6 +991,9 @@ impl Config {
         self.interfaces.sort_by(|a, b| a.name.cmp(&b.name));
         self.routes
             .sort_by_key(|r| format!("{}/{}/{}", r.table, r.destination, r.metric));
+        for rule in &mut self.firewall.rules {
+            rule.destination_ports.sort();
+        }
         if let Some(p) = &mut self.firewall.policies {
             p.hosts.sort_by(|a, b| a.id.cmp(&b.id));
             p.interfaces.sort_by(|a, b| a.interface.cmp(&b.interface));
@@ -1264,9 +1327,13 @@ impl Config {
             action(&self.firewall.policy),
             "firewall policy must be accept or drop"
         );
+        let mut legacy_expansions = 0usize;
         for r in &self.firewall.rules {
             r.origin.validate_source(r.import_source.as_deref())?;
             ensure!(action(&r.action), "invalid firewall action");
+            let protocol = FilterProtocol::parse(&r.protocol)?;
+            protocol.validate_ports(&r.destination_ports)?;
+            legacy_expansions += r.destination_ports.len().max(1);
             let a = if r.source.is_empty() {
                 None
             } else {
@@ -1281,7 +1348,17 @@ impl Config {
                 !matches!((a,b),(Some(a),Some(b)) if a.is_ipv4()!=b.is_ipv4()),
                 "firewall address family mismatch"
             );
+            ensure!(
+                a.into_iter()
+                    .chain(b)
+                    .all(|address| protocol.matches_family(address)),
+                "firewall protocol and address family disagree"
+            );
         }
+        ensure!(
+            legacy_expansions <= 4096,
+            "firewall expands beyond 4096 rules"
+        );
         if let Some(p) = &self.firewall.policies {
             ensure!(
                 self.firewall.rules.is_empty(),
@@ -1458,6 +1535,10 @@ impl Config {
             literals.push(&route.gateway);
         }
         for rule in &self.firewall.rules {
+            ensure!(
+                rule.protocol != "icmpv6",
+                "ICMPv6 rules require ipv6_enabled"
+            );
             prefixes.extend([rule.source.as_str(), rule.destination.as_str()]);
         }
         let mut policy_rules = Vec::new();
@@ -1479,6 +1560,10 @@ impl Config {
             policy_rules
                 .iter()
                 .map(|r: &&HostPolicyRule| r.destination.as_str()),
+        );
+        ensure!(
+            policy_rules.iter().all(|rule| rule.protocol != "icmpv6"),
+            "ICMPv6 rules require ipv6_enabled"
         );
         for nat in &self.firewall.nat.masquerade {
             ensure!(
@@ -1836,10 +1921,9 @@ impl FirewallPolicies {
                     r.out_interface.is_empty() || valid_interface_name(&r.out_interface),
                     "invalid policy outgoing interface"
                 );
-                ensure!(
-                    action(&r.action) && ["", "tcp", "udp"].contains(&r.protocol.as_str()),
-                    "invalid policy action/protocol"
-                );
+                ensure!(action(&r.action), "invalid policy action");
+                let protocol = FilterProtocol::parse(&r.protocol)?;
+                protocol.validate_ports(&r.destination_ports)?;
                 ensure!(
                     r.destination_host.is_empty()
                         || (r.destination.is_empty() && hosts.contains_key(&r.destination_host)),
@@ -1856,37 +1940,37 @@ impl FirewallPolicies {
                 } else {
                     vec![]
                 };
-                ensure!(
-                    r.destination_ports.len() <= 32
-                        && (r.destination_ports.is_empty() || !r.protocol.is_empty()),
-                    "ports require tcp/udp, maximum 32"
-                );
-                let mut ports = BTreeSet::new();
-                for p in &r.destination_ports {
-                    ensure!(
-                        (1..=65535).contains(p) && ports.insert(p),
-                        "invalid or duplicate destination port"
-                    );
-                }
                 let mut pairs = 0;
                 if let Some(h) = source {
                     for a in &h.addresses {
                         let ip = canonical_ip(a)?;
+                        if !protocol.matches_family(ip) {
+                            continue;
+                        }
                         pairs += if destinations.is_empty() {
                             1
                         } else {
                             destinations
                                 .iter()
-                                .filter(|d| d.is_ipv4() == ip.is_ipv4())
+                                .filter(|d| {
+                                    d.is_ipv4() == ip.is_ipv4() && protocol.matches_family(**d)
+                                })
                                 .count()
                         };
                     }
                 } else {
-                    pairs = destinations.len().max(1);
+                    pairs = if destinations.is_empty() {
+                        1
+                    } else {
+                        destinations
+                            .iter()
+                            .filter(|address| protocol.matches_family(**address))
+                            .count()
+                    };
                 }
                 ensure!(
                     pairs > 0,
-                    "policy destination has no family in common with source host"
+                    "policy protocol/source/destination have no compatible address family"
                 );
                 count += pairs * r.destination_ports.len().max(1);
             }

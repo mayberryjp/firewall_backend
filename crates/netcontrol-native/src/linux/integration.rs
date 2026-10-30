@@ -1567,6 +1567,311 @@ fn global_ipv6_managed_addresses_routes_and_interrupted_disable_recover() -> Res
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, isolated namespaces/net_admin, raw sockets and nft counter/log modules"]
+fn native_icmp_filters_match_both_families_extension_headers_and_rollback() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use std::{
+        net::UdpSocket,
+        os::fd::FromRawFd,
+        time::{Duration, Instant},
+    };
+    let router = Fixture::new()?;
+    let client = Fixture::new()?;
+    let router_ns = Arc::new(File::open(&router.namespace)?);
+    let client_ns = Arc::new(File::open(&client.namespace)?);
+    let peer = client_ns.clone();
+    session(router_ns.clone(), move |rt, handle| {
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .veth("lan0".into(), "client0".into())
+                .execute()
+                .await?;
+            let link = handle
+                .link()
+                .get()
+                .match_name("client0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("ICMP peer missing")?;
+            handle
+                .link()
+                .set(link.header.index)
+                .setns_by_fd(peer.as_raw_fd())
+                .execute()
+                .await?;
+            fs::write("/proc/sys/net/ipv6/conf/lan0/accept_dad", "0")?;
+            Ok(())
+        })
+    })?;
+    session(client_ns.clone(), |rt, handle| {
+        rt.block_on(async {
+            let link = handle
+                .link()
+                .get()
+                .match_name("client0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("ICMP peer missing")?;
+            fs::write("/proc/sys/net/ipv6/conf/client0/accept_dad", "0")?;
+            handle
+                .address()
+                .add(link.header.index, "192.0.2.2".parse()?, 24)
+                .execute()
+                .await?;
+            handle
+                .address()
+                .add(link.header.index, "2001:db8::2".parse()?, 64)
+                .execute()
+                .await?;
+            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .route()
+                .add()
+                .v4()
+                .destination_prefix("0.0.0.0".parse()?, 0)
+                .gateway("192.0.2.1".parse()?)
+                .output_interface(link.header.index)
+                .execute()
+                .await?;
+            handle
+                .route()
+                .add()
+                .v6()
+                .destination_prefix("::".parse()?, 0)
+                .gateway("2001:db8::1".parse()?)
+                .output_interface(link.header.index)
+                .execute()
+                .await?;
+            Ok(())
+        })
+    })?;
+    let empty = Config::empty();
+    let mut native = Native::open(router.options())?;
+    native.repair(&empty)?;
+    let desired = config(json!({
+        "ipv6_enabled":true,
+        "interfaces":[
+            {"name":"lan0","kind":"ethernet","role":"lan","up":true,"mtu":1500,
+                "addresses":["192.0.2.1/24","2001:db8::1/64"]},
+            {"name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,
+                "addresses":["198.51.100.1/24","2001:db8:1::1/64"]}
+        ],
+        "firewall":{"policy":"drop","allow_all_icmp":false,
+            "policies":{
+                "hosts":[{"id":"client","name":"Client","addresses":["192.0.2.2","2001:db8::2"],
+                    "policy":"drop","rules":[{"protocol":"icmp","action":"drop"}]}],
+                "interfaces":[{"interface":"lan0","rules":[
+                    {"protocol":"icmpv6","destination":"2001:db8:1::2/128","action":"drop"}]}]
+            },
+            "input":{"policy":"accept","interfaces":[{"interface":"lan0","rules":[
+                {"protocol":"icmp","destination":"192.0.2.1/32","action":"drop"},
+                {"protocol":"icmpv6","destination":"2001:db8::1/128","action":"drop"}
+            ]}]}
+        }
+    }))?;
+    desired.validate()?;
+    native.apply(&empty, &desired)?;
+    session(router_ns.clone(), |_, _| {
+        fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+        fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")?;
+        Ok(())
+    })?;
+    let send = |expect_reply: bool| {
+        session(client_ns.clone(), move |_, _| {
+            for ipv6 in [false, true] {
+                let fd = unsafe {
+                    libc::socket(
+                        if ipv6 { libc::AF_INET6 } else { libc::AF_INET },
+                        libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                        if ipv6 {
+                            libc::IPPROTO_ICMPV6
+                        } else {
+                            libc::IPPROTO_ICMP
+                        },
+                    )
+                };
+                ensure!(fd >= 0, "ICMP socket: {}", std::io::Error::last_os_error());
+                let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+                let (packet, addresses) = if ipv6 {
+                    (
+                        [128, 0, 0, 0, 0x12, 0x34, 0, 1],
+                        ["[2001:db8::1]:0", "[2001:db8:1::2]:0"],
+                    )
+                } else {
+                    (
+                        [8, 0, 0xe5, 0xca, 0x12, 0x34, 0, 1],
+                        ["192.0.2.1:0", "198.51.100.2:0"],
+                    )
+                };
+                for address in addresses {
+                    socket.send_to(&packet, address)?;
+                }
+                if ipv6 {
+                    let options = [58u8, 0, 1, 4, 0, 0, 0, 0];
+                    let result = unsafe {
+                        libc::setsockopt(
+                            fd,
+                            libc::IPPROTO_IPV6,
+                            libc::IPV6_DSTOPTS,
+                            options.as_ptr().cast(),
+                            options.len() as libc::socklen_t,
+                        )
+                    };
+                    ensure!(
+                        result == 0,
+                        "IPv6 destination options: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    for address in addresses {
+                        socket.send_to(&packet, address)?;
+                    }
+                }
+                socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let mut replied = false;
+                loop {
+                    let mut bytes = [0; 2048];
+                    match socket.recv(&mut bytes) {
+                        Ok(size) => {
+                            let offset = if ipv6 {
+                                0
+                            } else {
+                                usize::from(bytes[0] & 15) * 4
+                            };
+                            replied |=
+                                bytes[..size].get(offset) == Some(&if ipv6 { 129 } else { 0 });
+                            ensure!(
+                                Instant::now() < deadline,
+                                "ICMP receive did not become idle"
+                            );
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                ensure!(
+                    replied == expect_reply,
+                    "unexpected ICMP echo reply state: IPv6={ipv6}, reply={replied}"
+                );
+            }
+            let socket = UdpSocket::bind("192.0.2.2:0")?;
+            for port in [9000, 9001, 9002] {
+                socket.send_to(b"ports", format!("198.51.100.2:{port}"))?;
+            }
+            Ok(())
+        })
+    };
+    let count = |snapshot: &Value, id: &str| -> Result<u128> {
+        Ok(firewall_counter(snapshot, id)?["packets"]
+            .as_str()
+            .context("missing packets")?
+            .parse()?)
+    };
+    let mut legacy = desired.clone();
+    legacy.firewall.policies = None;
+    legacy.firewall.rules = serde_json::from_value(json!([
+        {"protocol":"icmp","action":"drop"}, {"protocol":"icmpv6","action":"drop"},
+        {"protocol":"udp","destination_ports":[9000,9002],"action":"drop"}
+    ]))?;
+    let mut previous_generation = None;
+    for (index, (current, expected)) in [
+        (
+            &desired,
+            [
+                ("forward:/firewall/policies/hosts/0/rules/0", 1),
+                ("forward:/firewall/policies/interfaces/0/rules/0", 2),
+            ],
+        ),
+        (
+            &legacy,
+            [
+                ("forward:/firewall/rules/0", 1),
+                ("forward:/firewall/rules/1", 2),
+            ],
+        ),
+        (
+            &desired,
+            [
+                ("forward:/firewall/policies/hosts/0/rules/0", 1),
+                ("forward:/firewall/policies/interfaces/0/rules/0", 2),
+            ],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        send(false)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let measured = loop {
+            let snapshot = native.statistics(current, "/api/v1/statistics/firewall", "")?;
+            if count(&snapshot, expected[0].0)? >= expected[0].1
+                && count(&snapshot, expected[1].0)? >= expected[1].1
+                && count(&snapshot, "input:/firewall/input/interfaces/0/rules/1")? >= 2
+            {
+                break snapshot;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "ICMP counters missing: {snapshot}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(count(&measured, expected[0].0)?, 1);
+        assert_eq!(count(&measured, expected[1].0)?, 2);
+        assert!(count(&measured, "input:/firewall/input/interfaces/0/rules/0")? >= 1);
+        if current.firewall.policies.is_none() {
+            assert_eq!(count(&measured, "forward:/firewall/rules/2")?, 2);
+            assert_eq!(
+                firewall_counter(&measured, "forward:/firewall/rules/2")?["expanded_rules"],
+                2
+            );
+        }
+        if let Some(generation) = &previous_generation {
+            assert_ne!(generation, &measured["generation"]);
+        }
+        previous_generation = Some(measured["generation"].clone());
+        native.observe(current)?;
+        if index < 2 {
+            let next = if current.firewall.policies.is_some() {
+                &legacy
+            } else {
+                &desired
+            };
+            native.apply(current, next)?;
+        }
+    }
+    let mut accepting = desired.clone();
+    for rule in &mut accepting.firewall.input.as_mut().unwrap().interfaces[0].rules {
+        rule.action = "accept".into();
+    }
+    native.apply(&desired, &accepting)?;
+    send(true)?;
+    let accepted = native.statistics(&accepting, "/api/v1/statistics/firewall", "")?;
+    for index in 0..2 {
+        ensure!(
+            count(
+                &accepted,
+                &format!("input:/firewall/input/interfaces/0/rules/{index}")
+            )? > 0,
+            "explicit ICMP accept did not match"
+        );
+    }
+    native.observe(&accepting)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux network namespaces and NET_ADMIN"]
 fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift() -> Result<()> {
     use futures_util::TryStreamExt;
     use std::{
@@ -1621,6 +1926,7 @@ fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift(
                     .execute()
                     .await?;
             }
+
             handle.link().set(link.header.index).up().execute().await?;
             handle
                 .route()

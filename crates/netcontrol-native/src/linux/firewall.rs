@@ -82,16 +82,37 @@ fn matching(
     if !plan.egress.is_empty() {
         rule = rule.oiface(&plan.egress)?;
     }
-    if !plan.protocol.is_empty() {
-        let protocol = if plan.protocol == "tcp" {
+    let protocol = netcontrol_core::FilterProtocol::parse(&plan.protocol)?;
+    if matches!(
+        protocol,
+        netcontrol_core::FilterProtocol::Icmp | netcontrol_core::FilterProtocol::Icmpv6
+    ) {
+        anyhow::ensure!(plan.port == 0, "ICMP rules cannot match destination ports");
+        let family = if protocol == netcontrol_core::FilterProtocol::Icmp {
+            libc::NFPROTO_IPV4
+        } else {
+            libc::NFPROTO_IPV6
+        };
+        rule = rule
+            .with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [family as u8]))
+            .with_expr(Meta::new(MetaType::L4Proto))
+            .with_expr(Cmp::new(
+                CmpOp::Eq,
+                [protocol
+                    .number()
+                    .ok_or_else(|| anyhow::anyhow!("missing ICMP protocol number"))?],
+            ));
+    } else if protocol != netcontrol_core::FilterProtocol::Any {
+        let transport = if protocol == netcontrol_core::FilterProtocol::Tcp {
             Protocol::TCP
         } else {
             Protocol::UDP
         };
         rule = if plan.port != 0 {
-            rule.dport(plan.port, protocol)
+            rule.dport(plan.port, transport)
         } else {
-            rule.protocol(protocol)
+            rule.protocol(transport)
         };
     }
     rule = rule.with_expr(Counter::default());
