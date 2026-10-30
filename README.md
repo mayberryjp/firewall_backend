@@ -77,8 +77,9 @@ network ruleset, startup/service repair or reboot resets counters; metadata-only
 changes need not. No persistence/reset endpoint or changes to configuration
 exports. Reads preserve ownership and ignore only changing numeric counter
 values for drift inspection; drift/unavailable reads are errors, never fake zeros.
-Ubuntu install/full upgrade provisions `nft_counter`; other Linux installations
-must enable `CONFIG_NFT_COUNTER`. See the
+Ubuntu install/full upgrade provisions `nf_tables`, which includes counter
+expressions on current kernels; there is no separate `nft_counter` requirement.
+Other Linux installations must enable `CONFIG_NF_TABLES`. See the
 [complete API/reset contract](FRONTEND_SPEC.md#firewall-rule-match-counters).
 
 ## Firewall deny history

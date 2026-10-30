@@ -50,9 +50,11 @@ does not install a cross-architecture linker.
 
 ## Firewall deny logging
 
-Native mode requires Linux `CONFIG_NETFILTER_NETLINK_LOG`, `CONFIG_NFT_LOG`
-and `CONFIG_NFT_COUNTER` (modules `nfnetlink_log`, `nft_log`, `nft_counter`,
-or built-in equivalents). Standard Ubuntu installation and full source upgrades
+Native mode requires Linux `CONFIG_NF_TABLES`, `CONFIG_NETFILTER_NETLINK_LOG`
+and `CONFIG_NFT_LOG` (modules `nf_tables`, `nfnetlink_log`, `nft_log`,
+or built-in equivalents). Current kernels compile counter expressions into
+`nf_tables`; no separate `nft_counter` module or `CONFIG_NFT_COUNTER` is required.
+Standard Ubuntu installation and full source upgrades
 load all three and persist
 `/etc/modules-load.d/netcontrol-deny-log.conf`; build-only does not modify the host.
 Other deployments must provision them before starting the daemon. Missing kernel

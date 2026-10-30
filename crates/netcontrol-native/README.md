@@ -71,9 +71,11 @@ batch. Fatal I/O/capture errors stop collection and remain visible alongside
 retained history until daemon restart. Invalid/unsafe saved logs fail startup
 unchanged rather than silently resetting traffic history.
 
-Require `CONFIG_NETFILTER_NETLINK_LOG`, `CONFIG_NFT_LOG`, `CONFIG_NFT_COUNTER`, `CAP_NET_ADMIN`,
+Require `CONFIG_NF_TABLES`, `CONFIG_NETFILTER_NETLINK_LOG`, `CONFIG_NFT_LOG`, `CAP_NET_ADMIN`,
 exclusive group ownership and writable private storage. Standard Ubuntu
-install/full-upgrade loads/persists `nfnetlink_log`, `nft_log` and `nft_counter`.
+install/full-upgrade loads/persists `nf_tables`, `nfnetlink_log` and `nft_log`.
+Counter expressions are included in current `nf_tables`, not a separate
+`nft_counter` module.
 See [deployment details](../../docs/BUILD_AND_INSTALL.md#firewall-deny-logging)
 and [API/limitations](../../FRONTEND_SPEC.md#firewall-deny-log).
 
@@ -97,7 +99,7 @@ Native network apply/rollback, startup/service repair, compiler refresh and
 reboot reset counts; simple backend reopen without repair preserves them.
 Metadata-only changes can preserve them. Counters are not saved/restored or
 included in aggregate statistics/MQTT. Existing native privileges and
-`CONFIG_NFT_COUNTER` suffice; no external collector or new dependency.
+`CONFIG_NF_TABLES` suffice; no external collector or new dependency.
 See the [canonical API/reset contract](../../FRONTEND_SPEC.md#firewall-rule-match-counters).
 
 ## Native IPv4 BGP

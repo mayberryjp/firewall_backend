@@ -70,15 +70,15 @@ configure_deny_logging() (
         printf 'Refusing non-regular deny-log module configuration: %s\n' "$destination" >&2
         exit 1
     }
-    for module in nfnetlink_log nft_log nft_counter; do
+    for module in nf_tables nfnetlink_log nft_log; do
         modprobe "$module" || {
-            printf 'Firewall telemetry requires CONFIG_NETFILTER_NETLINK_LOG, CONFIG_NFT_LOG and CONFIG_NFT_COUNTER (failed: %s).\n' "$module" >&2
+            printf 'Firewall telemetry requires CONFIG_NF_TABLES (including counter expressions), CONFIG_NETFILTER_NETLINK_LOG and CONFIG_NFT_LOG (failed: %s).\n' "$module" >&2
             exit 1
         }
     done
     work=$(mktemp -d) || exit 1
     trap 'rm -rf -- "$work"' EXIT
-    printf 'nfnetlink_log\nnft_log\nnft_counter\n' > "$work/modules" || exit 1
+    printf 'nf_tables\nnfnetlink_log\nnft_log\n' > "$work/modules" || exit 1
     install -d -m 0755 "$directory" || exit 1
     install -o root -g root -m 0644 "$work/modules" "$destination" || exit 1
     printf 'Firewall deny-log and rule-accounting kernel modules enabled for boot; telemetry remains separate from configuration.\n'

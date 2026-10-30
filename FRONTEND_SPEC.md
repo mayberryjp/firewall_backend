@@ -4335,9 +4335,11 @@ visible/on refresh, avoid overlapping requests, show freshness/reset/error
 states, and keep samples out of browser persistence/config exports/general
 state polling. No counter form fields or write transaction are needed.
 Counters are not embedded in aggregate statistics, runtime, MQTT or health.
-Native deployment requires `CONFIG_NFT_COUNTER` (`nft_counter` or built-in),
+Native deployment requires `CONFIG_NF_TABLES` (`nf_tables` or built-in),
 alongside the existing NFLOG prerequisites and namespace/net_admin privileges.
-Ubuntu install/full upgrade loads/persists it; build-only does not.
+Current kernels include counter expressions in `nf_tables`, not a separate
+`nft_counter` module. Ubuntu install/full upgrade loads/persists the core
+provider; build-only does not.
 See [handoff 2026-10-29-10](docs/frontend-handoffs/2026-10-29.md#2026-10-29-10-firewall-rule-match-counters).
 
 ### 6.6.1 Host input filtering

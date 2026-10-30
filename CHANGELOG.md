@@ -19,7 +19,8 @@
   for host/interface/legacy/input/NAT rules and exposing separate defaults and
   bypasses. Exact decimal strings, applied-ruleset/provisional identity and reset
   generations prevent misleading attribution; moving counters do not trigger
-  firewall drift. Ubuntu install/full upgrade provisions `nft_counter`.
+  firewall drift. Ubuntu install/full upgrade provisions the `nf_tables`
+  counter-expression provider.
   No historical persistence, automatic policy changes or manual reset API.
   Recommended SemVer bump: minor (additive), baseline unknown; next automatic
   calendar version, no manual bump. Required client-contract/deployment review;
@@ -251,6 +252,14 @@
   [handoff 2026-10-28-05](docs/frontend-handoffs/2026-10-28.md#2026-10-28-05-optional-dns-diagnostic-interface).
 
 ### Fixed
+
+- Ubuntu install/full source upgrade no longer requires a nonexistent standalone
+  `nft_counter` module on current kernels. Load/persist `nf_tables`, which includes
+  counter expressions, alongside the existing NFLOG modules. Genuine provider
+  failures still abort before service stop/binary replacement; prerequisite failure
+  preserves existing managed module settings. Recommended bump: patch,
+  Unreleased; no API/schema change. Deployment correction:
+  [handoff 2026-10-30-03](docs/frontend-handoffs/2026-10-30.md#2026-10-30-03-firewall-counter-kernel-provider-correction).
 
 - Startup no longer rejects large installed source/debug executables with
   `update file exceeds size limit` after update configuration is enabled.

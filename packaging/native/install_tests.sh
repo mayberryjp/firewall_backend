@@ -119,17 +119,22 @@ for diagnostics_scenario in success repeat module_failure persist_failure symlin
 done
 printf 'Native link diagnostics module setup and failure tests passed (mocked kernel commands).\n'
 
-for deny_scenario in success repeat module_failure counter_failure persist_failure symlink_file; do
+for deny_scenario in success repeat counter_in_core tables_failure nfnetlink_failure log_failure persist_failure symlink_file; do
     deny_directory="$temporary/deny-log-$deny_scenario"
     mkdir -p "$deny_directory"
     printf 'unrelated\n' > "$deny_directory/other.conf"
     if [[ $deny_scenario == symlink_file ]]; then
         ln -s other.conf "$deny_directory/netcontrol-deny-log.conf"
+    else
+        printf 'previous modules\n' > "$deny_directory/netcontrol-deny-log.conf"
     fi
     if (
         modprobe() {
             printf '%s\n' "$*" >> "$deny_directory/commands"
-            [[ $deny_scenario != module_failure && ( $deny_scenario != counter_failure || $1 != nft_counter ) ]]
+            [[ ( $deny_scenario != tables_failure || $1 != nf_tables ) &&
+               ( $deny_scenario != nfnetlink_failure || $1 != nfnetlink_log ) &&
+               ( $deny_scenario != log_failure || $1 != nft_log ) &&
+               ( $deny_scenario != counter_in_core || $1 != nft_counter ) ]]
         }
         install() {
             [[ $deny_scenario != persist_failure ]] || return 1
@@ -147,17 +152,21 @@ for deny_scenario in success repeat module_failure counter_failure persist_failu
             configure_deny_logging "$deny_directory" || exit 1
         fi
     ); then
-        [[ $deny_scenario == success || $deny_scenario == repeat ]] || exit 1
-        [[ $(< "$deny_directory/netcontrol-deny-log.conf") == $'nfnetlink_log\nnft_log\nnft_counter' ]]
-        [[ $(head -n 3 "$deny_directory/commands") == $'nfnetlink_log\nnft_log\nnft_counter' ]]
+        [[ $deny_scenario == success || $deny_scenario == repeat || $deny_scenario == counter_in_core ]] || exit 1
+        [[ $(< "$deny_directory/netcontrol-deny-log.conf") == $'nf_tables\nnfnetlink_log\nnft_log' ]]
+        deny_commands=$'nf_tables\nnfnetlink_log\nnft_log'
+        if [[ $deny_scenario == repeat ]]; then
+            deny_commands+=$'\nnf_tables\nnfnetlink_log\nnft_log'
+        fi
+        [[ $(< "$deny_directory/commands") == "$deny_commands" ]]
     else
-        [[ $deny_scenario != success && $deny_scenario != repeat ]] || exit 1
-        [[ ! -f $deny_directory/netcontrol-deny-log.conf ||
-           -L $deny_directory/netcontrol-deny-log.conf ]] || exit 1
+        [[ $deny_scenario != success && $deny_scenario != repeat && $deny_scenario != counter_in_core ]] || exit 1
+        [[ -L $deny_directory/netcontrol-deny-log.conf ||
+           $(< "$deny_directory/netcontrol-deny-log.conf") == 'previous modules' ]] || exit 1
     fi
     [[ $(< "$deny_directory/other.conf") == unrelated ]]
 done
-printf 'Firewall deny-log module setup and failure tests passed (mocked kernel commands).\n'
+printf 'Firewall telemetry provider, core counter support and prerequisite/publication failure tests passed (mocked kernel commands).\n'
 
 for service_scenario in success repeat directory_failure chmod_failure publish_failure symlink_file symlink_directory file_directory nonregular_target; do
     service_directory="$temporary/service-opt-ins-$service_scenario"
