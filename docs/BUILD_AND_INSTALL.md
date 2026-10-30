@@ -203,6 +203,70 @@ sudo systemctl start netcontrold.service
 sudo journalctl -u netcontrold.service -n 50 --no-pager
 ```
 
+## Offline Date-Revision State Conversion
+
+If deployment reports `incompatible state schema "netcontrol-rust-state-v1"`,
+the saved journal still uses numeric revisions. The daemon requires date-based
+v2 state. IPv6 `IFLA_INET6_CONF` size warnings are separate and do not cause this
+schema failure. Do **not** delete configuration or rename the schema string:
+transaction bases, committed revisions and restore provenance must also change.
+
+The explicitly authorized `netcontrol-state-convert --date-revisions` operation
+converts valid numeric v1 state offline, preserving desired configuration and
+every historical transaction/configuration. It uses initialization/commit UTC
+dates and the current date-version allocator, mapping numeric revision 0 to the
+initial date's iteration 1. Subsequent commits increment on the same UTC day or
+start at iteration 1 on a later day. Transaction IDs, actors, statuses and
+timestamps remain; base/committed/restore revision references become strings.
+The preview and private backup manifest include the exact revision mapping.
+No old numeric aliases, normal-startup compatibility path or automatic reset
+is introduced. Already-v2 input with this flag is rejected.
+
+Use the reviewed updated checkout on the appliance and a local console or
+independent OS SSH. Inspect the effective unit paths first; examples below use
+the supplied unit's defaults. Build before stopping, then preview offline:
+
+```sh
+bash upgrade.sh --build-only
+sudo systemctl stop netcontrold.service
+sudo target/in-place-upgrade/x86_64-unknown-linux-gnu/debug/netcontrol-state-convert \
+  --state /var/lib/netcontrol/native-state.json \
+  --services-state-dir /var/lib/netcontrol/services --date-revisions
+```
+
+Preview never writes source data. Review the mapping and affected file paths
+privately. A valid preview can then be applied with a **new** private backup
+directory (the command prompts for `CONVERT`):
+
+```sh
+sudo target/in-place-upgrade/x86_64-unknown-linux-gnu/debug/netcontrol-state-convert \
+  --state /var/lib/netcontrol/native-state.json \
+  --services-state-dir /var/lib/netcontrol/services --date-revisions \
+  --apply --backup-dir /var/lib/netcontrol/date-revisions-backup
+bash upgrade.sh
+sudo systemctl status netcontrold.service --no-pager
+sudo journalctl -u netcontrold.service -n 50 --no-pager
+```
+
+Keep the service stopped between conversion and installing the matching new
+binary. Do not start the previous binary against converted v2 state. Because
+the upgrade starts from a stopped service, a failed deployment leaves the old
+installation stopped rather than claiming a working rollback. If replacement
+startup fails, stop it, preserve diagnostics, restore **all** originals from the
+conversion bundle as described below, and only then start the matching previous
+binary. A binary rollback by itself does not roll back this offline conversion.
+
+The shared converter holds journal/native locks, verifies original checksums,
+validates all history and current native ownership/adoption, backs up every
+affected file before publication and refuses changed sources. It rejects active
+transactions/native intents, incomplete history, backward UTC commit dates,
+unknown fields, nonempty retired policy rules and scope/config mismatches.
+Finish/recover pending work with the previous binary first; do not bypass the
+checks or discard history. The same explicit operation can remove **empty**
+retired `policy_rules` fields if present; it never removes nonempty rules.
+Credentials, host identities, service counters and unrelated files are not reset.
+See the [shared backup/publication/recovery details](#offline-policy-rule-state-conversion).
+
 ## Offline Policy-Rule State Conversion
 
 The explicitly authorized `netcontrol-state-convert` tool removes retired empty
@@ -267,6 +331,8 @@ using the current operational model. Other fields, credentials, service counters
 Ethernet/IPv6 recovery evidence and key material are not edited. Transaction IDs,
 revision identifiers, statuses, provenance and timestamps remain; archived configuration
 payloads are intentionally converted, with exact originals retained in backup.
+The separate explicit `--date-revisions` operation described above additionally
+rewrites revision identifiers/references; its manifest operation is `date-revisions`.
 
 Before replacing any source file, the private bundle contains `manifest.json`,
 numbered `*.original` byte-for-byte backups and `*.converted` replacements, with
@@ -535,8 +601,9 @@ display/host timezone does not affect allocation.
 
 Current network journals use `netcontrol-rust-state-v2`. Numeric-revision v1
 journals are incompatible, rejected unchanged, and are not converted by the
-policy-rule-removal tool. Do not deploy this breaking state contract over a v1
-journal without an explicitly reviewed operator plan and private backup; do not
+default policy-rule-removal operation. Use the explicitly authorized
+[offline date conversion](#offline-date-revision-state-conversion) before
+deploying this state contract over a v1 journal, with private backups; do not
 delete/reset data or recompute checksums to force loading. No automatic migration
 or compatibility window is provided. Frontend and backend must deploy the new
 string-revision contract together.

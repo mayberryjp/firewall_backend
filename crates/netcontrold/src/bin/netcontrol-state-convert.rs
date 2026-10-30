@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use fs2::FileExt;
-use netcontrol_core::{Config, validate_offline_state};
+use netcontrol_core::{Config, Version, validate_offline_state};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -14,12 +15,15 @@ use std::{
 const MAX_FILE: u64 = 256 * 1024 * 1024;
 
 #[derive(Parser)]
-#[command(
-    about = "Offline, explicit removal of empty retired policy_rules fields; preview by default"
-)]
+#[command(about = "Offline state conversion with private backups; preview by default")]
 struct Options {
     #[arg(long)]
     state: PathBuf,
+    #[arg(
+        long,
+        help = "Explicitly convert numeric v1 journal revisions to date-based v2 revisions"
+    )]
+    date_revisions: bool,
     #[arg(
         long,
         help = "Native service state root; defaults to /var/lib/netcontrol/services for Linux journals"
@@ -64,6 +68,7 @@ struct Replacement {
 struct Plan {
     files: Vec<Replacement>,
     changes: Vec<Change>,
+    revisions: BTreeMap<u64, Version>,
     _locks: Vec<File>,
 }
 
@@ -284,6 +289,111 @@ fn remove_field(
     Ok(())
 }
 
+fn convert_revisions(payload: &mut Value) -> Result<BTreeMap<u64, Version>> {
+    let state = payload.as_object_mut().context("state must be an object")?;
+    ensure!(
+        !state.contains_key("initial_revision"),
+        "v1 must not contain initial_revision"
+    );
+    let revision = state
+        .get("revision")
+        .and_then(Value::as_u64)
+        .context("v1 revision must be an unsigned integer")?;
+    let initialized: chrono::DateTime<chrono::Utc> = serde_json::from_value(
+        state
+            .get("initialized_at")
+            .context("missing initialization time")?
+            .clone(),
+    )?;
+    let first = Version::first(initialized.date_naive())?;
+    let transactions = state
+        .get_mut("transactions")
+        .and_then(Value::as_object_mut)
+        .context("missing transaction map")?;
+    let mut commits = BTreeMap::new();
+    for transaction in transactions.values() {
+        let transaction = transaction
+            .as_object()
+            .context("transaction must be an object")?;
+        ensure!(
+            !transaction.contains_key("committed_revision"),
+            "v1 must not contain committed_revision"
+        );
+        let status = transaction
+            .get("status")
+            .and_then(Value::as_str)
+            .context("missing transaction status")?;
+        if status == "committed" {
+            let base = transaction
+                .get("base_revision")
+                .and_then(Value::as_u64)
+                .context("invalid numeric base revision")?;
+            let at: chrono::DateTime<chrono::Utc> = serde_json::from_value(
+                transaction
+                    .get("committed_at")
+                    .context("missing commit time")?
+                    .clone(),
+            )?;
+            ensure!(
+                commits
+                    .insert(
+                        base.checked_add(1).context("numeric revision overflow")?,
+                        at
+                    )
+                    .is_none(),
+                "duplicate committed revision"
+            );
+        }
+    }
+    let mut revisions = BTreeMap::from([(0, first)]);
+    let mut previous = first;
+    for (number, at) in commits {
+        ensure!(
+            number == u64::try_from(revisions.len())?,
+            "numeric revision archive is incomplete"
+        );
+        previous = previous.next(at.date_naive())?;
+        revisions.insert(number, previous);
+    }
+    ensure!(
+        revision == u64::try_from(revisions.len() - 1)?,
+        "numeric revision archive is incomplete"
+    );
+    for transaction in transactions.values_mut() {
+        let transaction = transaction
+            .as_object_mut()
+            .context("transaction must be an object")?;
+        let base = transaction
+            .get("base_revision")
+            .and_then(Value::as_u64)
+            .context("invalid numeric base revision")?;
+        transaction.insert(
+            "base_revision".into(),
+            json!(revisions.get(&base).context("unknown base revision")?),
+        );
+        let committed = if transaction.get("status").and_then(Value::as_str) == Some("committed") {
+            json!(
+                revisions
+                    .get(&base.checked_add(1).context("numeric revision overflow")?)
+                    .context("unknown committed revision")?
+            )
+        } else {
+            Value::Null
+        };
+        transaction.insert("committed_revision".into(), committed);
+        if let Some(from) = transaction
+            .get_mut("restored_from_revision")
+            .filter(|from| !from.is_null())
+        {
+            let number = from.as_u64().context("invalid numeric restore revision")?;
+            *from = json!(revisions.get(&number).context("unknown restore revision")?);
+        }
+    }
+    state.insert("initial_revision".into(), json!(first));
+    state.insert("revision".into(), json!(revisions[&revision]));
+    Ok(revisions)
+}
+
 fn ownership_config(value: &mut Value, location: &str, changes: &mut Vec<Change>) -> Result<()> {
     if let Some(config) = value
         .get_mut("committed_config")
@@ -310,14 +420,24 @@ impl Plan {
         let original = read_private(&state_path)?;
         let envelope: Envelope = serde_json::from_slice(&original)?;
         ensure!(
-            envelope.schema == "netcontrol-rust-state-v2",
-            "unsupported journal schema"
+            envelope.schema
+                == if options.date_revisions {
+                    "netcontrol-rust-state-v1"
+                } else {
+                    "netcontrol-rust-state-v2"
+                },
+            "unsupported journal schema; --date-revisions is required specifically for numeric v1 state"
         );
         ensure!(
             hex::encode(Sha256::digest(envelope.state.get().as_bytes())) == envelope.sha256,
             "state checksum mismatch; conversion cannot repair corruption"
         );
         let mut payload = parse_json(envelope.state.get().as_bytes())?;
+        let revisions = if options.date_revisions {
+            convert_revisions(&mut payload)?
+        } else {
+            BTreeMap::new()
+        };
         let scope = payload["scope"]
             .as_str()
             .context("missing journal scope")?
@@ -422,8 +542,12 @@ impl Plan {
         }
         let bytes = serde_json::to_vec(&payload)?;
         let converted = serde_json::to_vec(
-            &json!({"schema": envelope.schema, "sha256": hex::encode(Sha256::digest(&bytes)), "state": payload}),
+            &json!({"schema": "netcontrol-rust-state-v2", "sha256": hex::encode(Sha256::digest(&bytes)), "state": payload}),
         )?;
+        ensure!(
+            converted.len() as u64 <= MAX_FILE,
+            "converted state exceeds size limit"
+        );
         files.push(Replacement {
             path: state_path,
             original,
@@ -432,6 +556,7 @@ impl Plan {
         Ok(Self {
             files,
             changes,
+            revisions,
             _locks: locks,
         })
     }
@@ -446,8 +571,8 @@ impl Plan {
         mut publish_file: impl FnMut(&Path, &[u8]) -> Result<()>,
     ) -> Result<()> {
         ensure!(
-            !self.changes.is_empty(),
-            "no retired fields found; no conversion needed"
+            !self.changes.is_empty() || !self.revisions.is_empty(),
+            "no state conversion needed"
         );
         ensure!(
             self.changes.iter().all(|change| change.rules == 0),
@@ -488,7 +613,7 @@ impl Plan {
         write_new(
             &directory.join("manifest.json"),
             &serde_json::to_vec_pretty(
-                &json!({"schema":1,"operation":"remove-empty-policy-rules","files":entries,"changes":self.changes}),
+                &json!({"schema":1,"operation":if self.revisions.is_empty() {"remove-empty-policy-rules"} else {"date-revisions"},"files":entries,"changes":self.changes,"revision_mapping":self.revisions}),
             )?,
         )?;
         sync_directory(&directory)?;
@@ -556,13 +681,16 @@ fn run(options: Options) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &json!({"changes":plan.changes,"files":plan.files.iter().map(|file| &file.path).collect::<Vec<_>>(),"nonempty_rules_block_apply":plan.changes.iter().any(|change|change.rules>0)})
+            &json!({"changes":plan.changes,"revision_mapping":plan.revisions,"files":plan.files.iter().map(|file| &file.path).collect::<Vec<_>>(),"nonempty_rules_block_apply":plan.changes.iter().any(|change|change.rules>0)})
         )?
     );
     if !options.apply {
         return Ok(());
     }
-    ensure!(!plan.changes.is_empty(), "no conversion needed");
+    ensure!(
+        !plan.changes.is_empty() || !plan.revisions.is_empty(),
+        "no conversion needed"
+    );
     ensure!(
         plan.changes.iter().all(|change| change.rules == 0),
         "non-empty policy rules block conversion; use the previous binary for review"
@@ -585,7 +713,15 @@ fn run(options: Options) -> Result<()> {
     }
     let directory = options.backup_dir.unwrap_or_else(|| {
         let mut path = options.state.as_os_str().to_os_string();
-        path.push(format!(".policy-removal-{:032x}", rand::random::<u128>()));
+        path.push(format!(
+            ".{}-{:032x}",
+            if options.date_revisions {
+                "date-revisions"
+            } else {
+                "policy-removal"
+            },
+            rand::random::<u128>()
+        ));
         PathBuf::from(path)
     });
     plan.apply(&directory)?;
@@ -652,6 +788,7 @@ mod tests {
             drop(engine);
             let options = Options {
                 state,
+                date_revisions: false,
                 services_state_dir: None,
                 apply: false,
                 yes: false,
@@ -686,6 +823,51 @@ mod tests {
 
         fn backup(&self) -> PathBuf {
             self.directory.path().join("backup")
+        }
+
+        fn numeric(&mut self) {
+            let mut payload = self.payload();
+            payload.as_object_mut().unwrap().remove("initial_revision");
+            payload["initialized_at"] = json!("2026-10-28T23:59:00Z");
+            payload["revision"] = json!(payload["transactions"].as_object().unwrap().len());
+            for field in ["policy_rules", "software", "sando"] {
+                payload["desired"].as_object_mut().unwrap().remove(field);
+            }
+            for transaction in payload["transactions"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                transaction["base_revision"] = json!(0);
+                transaction
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("committed_revision");
+                transaction["submitted_at"] = json!("2026-10-28T23:59:01Z");
+                transaction["committed_at"] = json!("2026-10-28T23:59:02Z");
+                transaction["confirmation_deadline"] = json!("2026-10-28T23:59:31Z");
+                for field in ["previous", "candidate"] {
+                    for removed in ["policy_rules", "software", "sando"] {
+                        transaction[field].as_object_mut().unwrap().remove(removed);
+                    }
+                }
+            }
+            self.save_numeric(&payload);
+            self.options.date_revisions = true;
+        }
+
+        fn save_numeric(&self, payload: &Value) {
+            let bytes = serde_json::to_vec(payload).unwrap();
+            fs::write(
+                &self.options.state,
+                serde_json::to_vec(&json!({
+                    "schema":"netcontrol-rust-state-v1",
+                    "sha256":hex::encode(Sha256::digest(&bytes)),
+                    "state":payload
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         }
 
         fn native(&mut self) -> PathBuf {
@@ -752,6 +934,188 @@ mod tests {
                 .apply(&fixture.directory.path().join("repeat"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn numeric_initial_state_requires_explicit_flag_and_preserves_backup() {
+        let mut fixture = Fixture::new(false);
+        fixture.numeric();
+        let original = fs::read(&fixture.options.state).unwrap();
+        fixture.options.date_revisions = false;
+        assert!(Plan::prepare(&fixture.options).is_err());
+        fixture.options.date_revisions = true;
+        let plan = Plan::prepare(&fixture.options).unwrap();
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.revisions[&0].to_string(), "2026.10.28.1");
+        assert_eq!(fs::read(&fixture.options.state).unwrap(), original);
+        plan.apply(&fixture.backup()).unwrap();
+        assert_eq!(
+            fs::read(fixture.backup().join("0.original")).unwrap(),
+            original
+        );
+        assert!(fixture.backup().join("completed").exists());
+        drop(plan);
+        let engine = Engine::open(&fixture.options.state, Box::new(Simulator::new())).unwrap();
+        assert_eq!(engine.committed_revision().to_string(), "2026.10.28.1");
+        drop(engine);
+        assert!(Plan::prepare(&fixture.options).is_err());
+    }
+
+    #[test]
+    fn numeric_history_restore_and_rollback_map_dates_without_losing_configuration() {
+        let mut fixture = Fixture::new(true);
+        fixture.numeric();
+        let mut payload = fixture.payload();
+        let original = payload["transactions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let first = original["candidate"].clone();
+        let initial = original["previous"].clone();
+        let mut restored = original.clone();
+        restored["id"] = json!("b".repeat(32));
+        restored["base_revision"] = json!(1);
+        restored["restored_from_revision"] = json!(0);
+        restored["previous"] = first.clone();
+        restored["candidate"] = initial.clone();
+        restored["submitted_at"] = json!("2026-10-29T00:00:00Z");
+        restored["committed_at"] = json!("2026-10-29T00:00:01Z");
+        restored["confirmation_deadline"] = json!("2026-10-29T00:00:30Z");
+        payload["transactions"]["b".repeat(32)] = restored.clone();
+        restored["id"] = json!("c".repeat(32));
+        restored["base_revision"] = json!(2);
+        restored["restored_from_revision"] = json!(1);
+        restored["previous"] = initial;
+        restored["candidate"] = first.clone();
+        restored["submitted_at"] = json!("2026-10-29T00:01:00Z");
+        restored["committed_at"] = json!("2026-10-29T00:01:01Z");
+        restored["confirmation_deadline"] = json!("2026-10-29T00:01:30Z");
+        payload["transactions"]["c".repeat(32)] = restored.clone();
+        restored["id"] = json!("d".repeat(32));
+        restored["status"] = json!("rolled_back");
+        restored["committed_at"] = Value::Null;
+        restored["committed_by"] = json!("");
+        payload["transactions"]["d".repeat(32)] = restored;
+        payload["desired"] = first.clone();
+        payload["revision"] = json!(3);
+        fixture.save_numeric(&payload);
+        let plan = Plan::prepare(&fixture.options).unwrap();
+        assert_eq!(
+            json!(plan.revisions),
+            json!({
+                "0":"2026.10.28.1","1":"2026.10.28.2","2":"2026.10.29.1","3":"2026.10.29.2"
+            })
+        );
+        plan.apply(&fixture.backup()).unwrap();
+        drop(plan);
+        let saved = fixture.payload();
+        assert_eq!(saved["desired"], first);
+        assert_eq!(saved["transactions"].as_object().unwrap().len(), 4);
+        assert_eq!(
+            saved["transactions"]["b".repeat(32)]["restored_from_revision"],
+            "2026.10.28.1"
+        );
+        assert_eq!(
+            saved["transactions"]["c".repeat(32)]["committed_revision"],
+            "2026.10.29.2"
+        );
+        assert!(saved["transactions"]["d".repeat(32)]["committed_revision"].is_null());
+        assert_eq!(
+            saved["transactions"]["d".repeat(32)]["base_revision"],
+            "2026.10.29.1"
+        );
+        let engine = Engine::open(&fixture.options.state, Box::new(Simulator::new())).unwrap();
+        assert_eq!(engine.committed_revision().to_string(), "2026.10.29.2");
+    }
+
+    #[test]
+    fn numeric_conversion_refuses_invalid_history_and_active_transactions_without_writes() {
+        for case in [
+            "gap",
+            "overflow",
+            "regression",
+            "mixed",
+            "unknown",
+            "restore",
+            "active",
+            "preconverted",
+        ] {
+            let mut fixture = Fixture::new(true);
+            fixture.numeric();
+            let mut payload = fixture.payload();
+            let id = payload["transactions"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            match case {
+                "gap" => payload["revision"] = json!(2),
+                "overflow" => payload["transactions"][&id]["base_revision"] = json!(u64::MAX),
+                "regression" => {
+                    payload["transactions"][&id]["committed_at"] = json!("2026-10-27T23:59:02Z")
+                }
+                "mixed" => payload["transactions"][&id]["base_revision"] = json!("0"),
+                "unknown" => payload["unknown"] = json!(true),
+                "restore" => payload["transactions"][&id]["restored_from_revision"] = json!(9),
+                "preconverted" => payload["transactions"][&id]["committed_revision"] = Value::Null,
+                "active" => {
+                    payload["revision"] = json!(0);
+                    payload["desired"] = payload["transactions"][&id]["previous"].clone();
+                    payload["active_transaction"] = json!(id);
+                    payload["transactions"][&id]["status"] = json!("pending_confirmation");
+                    payload["transactions"][&id]["committed_at"] = Value::Null;
+                    payload["transactions"][&id]["committed_by"] = json!("");
+                }
+                _ => unreachable!(),
+            }
+            fixture.save_numeric(&payload);
+            let original = fs::read(&fixture.options.state).unwrap();
+            assert!(Plan::prepare(&fixture.options).is_err(), "{case}");
+            assert_eq!(fs::read(&fixture.options.state).unwrap(), original);
+            assert!(!fixture.backup().exists());
+        }
+    }
+
+    #[test]
+    fn numeric_conversion_preserves_native_bundle_and_mapping_manifest() {
+        let mut fixture = Fixture::new(true);
+        let native = fixture.native();
+        fixture.numeric();
+        let plan = Plan::prepare(&fixture.options).unwrap();
+        assert_eq!(plan.files.len(), 3);
+        plan.apply(&fixture.backup()).unwrap();
+        for (index, file) in plan.files.iter().enumerate() {
+            assert_eq!(
+                fs::read(fixture.backup().join(format!("{index}.original"))).unwrap(),
+                file.original
+            );
+        }
+        let manifest =
+            parse_json(&fs::read(fixture.backup().join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["operation"], "date-revisions");
+        assert_eq!(manifest["revision_mapping"]["1"], "2026.10.28.2");
+        let ownership = parse_json(&fs::read(native.join("ownership.json")).unwrap()).unwrap();
+        let adoption = parse_json(&fs::read(native.join("adoption.json")).unwrap()).unwrap();
+        netcontrol_native::validate_offline_native_state(&ownership, Some(&adoption)).unwrap();
+        let state = fixture.payload();
+        validate_offline_state(&serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn numeric_conversion_refuses_a_locked_journal() {
+        let mut fixture = Fixture::new(false);
+        fixture.numeric();
+        let original = fs::read(&fixture.options.state).unwrap();
+        let mut path = fixture.options.state.as_os_str().to_os_string();
+        path.push(".lock");
+        let _held = lock(Path::new(&path)).unwrap();
+        assert!(Plan::prepare(&fixture.options).is_err());
+        assert_eq!(fs::read(&fixture.options.state).unwrap(), original);
     }
 
     #[test]
@@ -856,6 +1220,7 @@ mod tests {
         let original = fs::read(&fixture.options.state).unwrap();
         run(Options {
             state: fixture.options.state.clone(),
+            date_revisions: false,
             services_state_dir: None,
             apply: false,
             yes: false,
@@ -887,6 +1252,7 @@ mod tests {
         symlink(&fixture.options.state, &alias).unwrap();
         let options = Options {
             state: alias.clone(),
+            date_revisions: false,
             services_state_dir: None,
             apply: false,
             yes: false,

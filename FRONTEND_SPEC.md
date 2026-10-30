@@ -146,7 +146,12 @@ rejected without import, deletion, or reset. Revisions retain
 `{revisions,next_before_revision?}` and flattened detail metadata plus `config`;
 default list limit 50, range 1..100, exclusive date-version string `before_revision`.
 Numeric-revision v1 journals are incompatible and refused unchanged; no automatic
-conversion or state reset is provided.
+conversion or state reset is provided. An explicitly operator-run
+[offline date-revision conversion](docs/BUILD_AND_INSTALL.md#offline-date-revision-state-conversion)
+is available with private backups and a numeric-to-date revision mapping.
+It preserves configuration/history, rejects active or invalid state and does
+not add numeric aliases to the API. After conversion, refetch current state and
+history; invalidate cached numeric revision IDs/cursors and re-review stale drafts.
 
 Identity and scoped-auth files require their own `schema: 1` JSON roots; these
 are not the network-state envelope. A scoped file is

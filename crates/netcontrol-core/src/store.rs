@@ -104,8 +104,9 @@ impl Store {
                 .context("invalid/incompatible Rust state; Go journals are not accepted")?;
         ensure!(
             envelope.schema == SCHEMA,
-            "incompatible state schema {:?}; no automatic conversion",
-            envelope.schema
+            "incompatible state schema {:?}; expected {:?}; no automatic conversion. For numeric v1 state, stop the daemon and preview netcontrol-state-convert --date-revisions; see docs/BUILD_AND_INSTALL.md",
+            envelope.schema,
+            SCHEMA
         );
         let hash = hex::encode(Sha256::digest(envelope.state.get().as_bytes()));
         ensure!(

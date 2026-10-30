@@ -160,6 +160,10 @@ result. An existing queued/running check returns `409`, disabled/unavailable
 checking `503`. See the [frontend contract](FRONTEND_SPEC.md#check-now).
 
 Configuration revisions independently use the same UTC date format as JSON strings.
+An existing numeric-v1 journal requires the explicit
+[offline conversion](docs/BUILD_AND_INSTALL.md#offline-date-revision-state-conversion)
+before deploying the date-version daemon; configuration/history are preserved
+with private backups rather than discarded.
 Initialization and each UTC day's first confirmed commit start at iteration 1;
 further commits that day increment it. History, conflict detection and confirmed
 restore use the exact server-issued revision; never derive it with arithmetic.

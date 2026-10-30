@@ -4,6 +4,14 @@
 
 ### Added
 
+- Explicit offline `netcontrol-state-convert --date-revisions` recovery for
+  numeric-v1 journals, preserving configuration/history and native metadata
+  with private originals, mapping manifest, source validation and locking.
+  Normal startup still rejects incompatible state; no reset or automatic
+  migration. Fixes the reported deployment blocker with an authorized operator
+  conversion; unreleased build `2026.10.30.3`. Required deployment coordination:
+  [handoff 2026-10-29-04](docs/frontend-handoffs/2026-10-29.md#2026-10-29-04-offline-date-revision-recovery).
+
 - Authenticated `POST /api/v1/system/upgrade/check` to request immediate release
   discovery without restarting or installing. Reuses `system.upgrade` and the
   single-flight startup/daily worker; returns `202`, with results in saved
