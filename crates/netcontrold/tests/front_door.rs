@@ -456,6 +456,85 @@ async fn host_system_endpoints_authentication_permissions_and_simulated_catalog(
 }
 
 #[tokio::test]
+async fn firewall_bulk_clear_is_authenticated_and_returns_a_confirmable_transaction() {
+    use netcontrold::http::Credential;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".test-data")
+        .join(secret("").unwrap());
+    fs::create_dir_all(&path).unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(&path.join("state.json"), Box::new(Simulator::new())).unwrap(),
+    ));
+    let base = engine.lock().unwrap().committed_revision();
+    let fixture = Fixture {
+        path,
+        router: router(App::new(
+            engine.clone(),
+            Authentication::Scoped(
+                [
+                    ("reader", vec!["state.read"]),
+                    ("firewall-only", vec!["firewall.write"]),
+                    ("transactions-only", vec!["transactions.write"]),
+                    ("operator", vec!["transactions.write", "firewall.write"]),
+                ]
+                .into_iter()
+                .map(|(name, permissions)| Credential {
+                    name: name.into(),
+                    token_sha256: netcontrold::identity::digest(name),
+                    permissions: permissions.into_iter().map(str::to_string).collect(),
+                })
+                .collect(),
+            ),
+            false,
+        )),
+    };
+    let path = "/api/v1/firewall/hosts-and-rules";
+    let body =
+        json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":true}).to_string();
+    for (method, url, token, expected) in [
+        ("DELETE", path, "", 401),
+        ("DELETE", path, "reader", 403),
+        ("DELETE", path, "firewall-only", 403),
+        ("DELETE", path, "transactions-only", 403),
+        ("POST", path, "operator", 405),
+        ("GET", path, "operator", 405),
+        (
+            "DELETE",
+            "/api/v1/firewall/hosts-and-rules?extra=1",
+            "operator",
+            400,
+        ),
+    ] {
+        let response = fixture.request(method, url, &body, "", token, "").await;
+        assert_eq!(response.0, expected, "{}", response.2);
+        assert!(!engine.lock().unwrap().configuration_busy());
+    }
+    let pending = fixture
+        .request("DELETE", path, &body, "", "operator", "")
+        .await;
+    assert_eq!(pending.0, 202, "{}", pending.2);
+    assert_eq!(pending.1["cache-control"], "no-store");
+    let id = pending.2["id"].as_str().unwrap();
+    assert_eq!(pending.1["location"], format!("/api/v1/transactions/{id}"));
+    assert_eq!(pending.2["status"], "pending_confirmation");
+    assert_eq!(engine.lock().unwrap().committed_revision(), base);
+    let confirmed = fixture
+        .request(
+            "POST",
+            &format!("/api/v1/transactions/{id}/confirm"),
+            "",
+            "",
+            "operator",
+            "",
+        )
+        .await;
+    assert_eq!(confirmed.0, 200, "{}", confirmed.2);
+    assert_eq!(confirmed.2["status"], "committed");
+    assert_ne!(engine.lock().unwrap().committed_revision(), base);
+    drop(engine);
+}
+
+#[tokio::test]
 async fn sando_settings_and_import_reports_use_authenticated_confirmed_config_transactions() {
     use netcontrold::http::Credential;
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -492,11 +571,12 @@ async fn sando_settings_and_import_reports_use_authenticated_confirmed_config_tr
     assert_eq!(latest.0, 200);
     assert_eq!(
         latest.2["config"]["sando"],
-        json!({"api_url":"","hosts_import":null,"rules_import":null})
+        json!({"api_url":"","sync_enabled":false,"hosts_import":null,"rules_import":null})
     );
     let mut config = latest.2["config"].clone();
     config["sando"] = json!({
         "api_url":"http://sando.example.invalid:8044",
+        "sync_enabled":true,
         "hosts_import":{
             "source_url":"http://sando.example.invalid:8044",
             "import_count":1,"last_import_at":"2026-10-30T00:00:00Z",
@@ -562,6 +642,79 @@ async fn sando_settings_and_import_reports_use_authenticated_confirmed_config_tr
         "succeeded"
     );
     assert!(saved.2["config"]["sando"]["rules_import"].is_null());
+}
+
+#[tokio::test]
+async fn sando_sync_status_requires_read_permission_and_rejects_input() {
+    use netcontrold::http::Credential;
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(
+            &directory.path().join("state.json"),
+            Box::new(Simulator::new()),
+        )
+        .unwrap(),
+    ));
+    let mut app = App::new(
+        engine.clone(),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+            Credential {
+                name: "writer".into(),
+                token_sha256: netcontrold::identity::digest("writer"),
+                permissions: vec!["sando.write".into()],
+            },
+        ]),
+        false,
+    );
+    let manager =
+        netcontrold::sando::Manager::open(&directory.path().join("sando.json"), engine).unwrap();
+    App::attach_sando(&mut app, manager).unwrap();
+    let service = router(app);
+    for (method, path, body, token, expected) in [
+        ("GET", "/api/v1/sando", "", "invalid", 401),
+        ("GET", "/api/v1/sando", "", "writer", 403),
+        ("POST", "/api/v1/sando", "", "reader", 405),
+        ("GET", "/api/v1/sando?extra=1", "", "reader", 400),
+        ("GET", "/api/v1/sando", "{}", "reader", 400),
+        ("GET", "/api/v1/sando", "", "reader", 200),
+    ] {
+        let response = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected, "{method} {path}");
+        if expected == 200 {
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let value: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(value["enabled"], false);
+            assert_eq!(value["state"], "disabled");
+            assert_eq!(value["sync_interval_seconds"], 3600);
+            assert_eq!(value["hosts"], json!([]));
+            for field in [
+                "last_attempt_at",
+                "last_success_at",
+                "next_sync_at",
+                "error",
+            ] {
+                assert!(value[field].is_null(), "{field}");
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -91,6 +91,15 @@ struct RestoreRequest {
     #[serde(default)]
     description: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearFirewallRequest {
+    base_revision: Version,
+    confirm_timeout_seconds: i64,
+    confirm: bool,
+    #[serde(default)]
+    description: String,
+}
 pub struct Reply {
     pub status: u16,
     pub body: Value,
@@ -575,6 +584,53 @@ impl Engine {
                     }
                 })?;
             return Ok(Reply::value(200, value));
+        }
+        if path == "/api/v1/firewall/hosts-and-rules" {
+            if method != "DELETE" {
+                return Err(ApiError::new(405, "method not allowed"));
+            }
+            require(permissions, "transactions.write")?;
+            require(permissions, "firewall.write")?;
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "firewall bulk deletion does not accept query parameters",
+                ));
+            }
+            let request: ClearFirewallRequest = parse(body)?;
+            if !request.confirm {
+                return Err(ApiError::new(
+                    400,
+                    "deleting all firewall hosts and forwarding rules requires confirm: true",
+                ));
+            }
+            let mut config = self.state.desired.clone();
+            config.firewall.rules.clear();
+            if let Some(policies) = &mut config.firewall.policies {
+                policies.hosts.clear();
+                for interface in &mut policies.interfaces {
+                    interface.rules.clear();
+                }
+            }
+            let transaction = self.submit(
+                actor,
+                SubmitRequest {
+                    base_revision: request.base_revision,
+                    confirm_timeout_seconds: request.confirm_timeout_seconds,
+                    config,
+                    description: if request.description.trim().is_empty() {
+                        "Clear firewall hosts and forwarding rules".into()
+                    } else {
+                        request.description
+                    },
+                },
+                None,
+            )?;
+            return Ok(Reply {
+                status: 202,
+                location: Some(format!("/api/v1/transactions/{}", transaction.id)),
+                body: value(transaction)?,
+            });
         }
         if let Some(name) = path
             .strip_prefix("/api/v1/interfaces/")

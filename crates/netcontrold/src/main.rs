@@ -382,6 +382,9 @@ async fn run(options: Options) -> Result<()> {
     if release_config.is_some() {
         App::attach_release_checks(&mut app, release_checks)?;
     }
+    let sando =
+        netcontrold::sando::Manager::open(&appended(&options.state, ".sando"), engine.clone())?;
+    App::attach_sando(&mut app, sando.clone())?;
     let mqtt = netcontrold::mqtt::Manager::open(&mqtt_root, engine.clone(), mqtt_mode)?;
     App::attach_mqtt(&mut app, mqtt.clone())?;
     let dynamic_dns_mode = if mqtt_mode == netcontrold::mqtt::Mode::Simulated {
@@ -449,6 +452,8 @@ async fn run(options: Options) -> Result<()> {
     });
     let (mqtt_stop, mqtt_receiver) = tokio::sync::watch::channel(false);
     let (release_stop, release_receiver) = tokio::sync::watch::channel(false);
+    let (sando_stop, sando_receiver) = tokio::sync::watch::channel(false);
+    let sando_task = tokio::spawn(sando.run(sando_receiver));
     let release_task = tokio::spawn(netcontrold::updates::monitor_releases(
         engine.clone(),
         release_config,
@@ -495,6 +500,7 @@ async fn run(options: Options) -> Result<()> {
         ("dynamic_dns", dynamic_dns_task.abort_handle()),
         ("system", system_task.abort_handle()),
         ("release_check", release_task.abort_handle()),
+        ("sando_sync", sando_task.abort_handle()),
     ];
     let ticker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -613,6 +619,7 @@ async fn run(options: Options) -> Result<()> {
     let _ = dynamic_dns_stop.send(true);
     let _ = system_stop.send(true);
     let _ = release_stop.send(true);
+    let _ = sando_stop.send(true);
     signals.abort();
     mqtt_task.await.context("MQTT worker shutdown failed")??;
     system_task
@@ -624,6 +631,7 @@ async fn run(options: Options) -> Result<()> {
     release_task
         .await
         .context("release checker shutdown failed")??;
+    sando_task.await.context("Sando sync shutdown failed")??;
     let tick_result = ticker.await.context("deadline ticker task");
     let shutdown_result = engine
         .lock()

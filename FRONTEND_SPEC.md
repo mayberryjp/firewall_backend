@@ -337,7 +337,7 @@ routes, not backend endpoints.
 | `/transactions/:id` | Transaction details and lifecycle actions |
 | `/history` | Committed revision history |
 | `/history/:revision` | Historical configuration, comparison, restore |
-| `/settings/sando` | Sando base URL and one-time host/rule import suggestions |
+| `/settings/sando` | Sando base URL, hourly metadata sync and one-time host/rule imports |
 
 Deep links must work after browser refresh. Unknown browser routes show an
 application 404, not an empty page. Encode resource names/IDs in URLs.
@@ -3101,21 +3101,23 @@ isolated native tests.
 ### Sando One-Time Imports
 
 Provide **Settings > Sando** at browser route `/settings/sando` with an API
-base-URL form, **Import hosts** and **Import rules** buttons, and separate latest
-confirmed host/rule import statistics. This is a frontend integration: the
-backend stores settings and browser-reported state only. It never contacts
-Sando, proxies requests, validates reachability, schedules synchronization or
-copies complete Sando device objects into the firewall schema.
+base-URL form, **Sync enabled** toggle, hourly metadata status, **Import hosts**
+and **Import rules** buttons, and separate latest confirmed host/rule import
+statistics. One-time imports remain frontend-driven and explicitly reviewed.
+Optional hourly synchronization runs in the daemon, fetching only host metadata
+into a separate cache. It never automatically edits firewall hosts/rules or copies
+complete Sando device objects into the firewall schema.
 
 The always-serialized top-level `config.sando` defaults to:
 
 ```json
-{"api_url":"","hosts_import":null,"rules_import":null}
+{"api_url":"","sync_enabled":false,"hosts_import":null,"rules_import":null}
 ```
 
 ```ts
 interface SandoConfig {
   api_url: string;
+  sync_enabled: boolean;
   hosts_import: SandoImportState | null;
   rules_import: SandoImportState | null;
 }
@@ -3137,8 +3139,9 @@ discard a configured proxy prefix. Empty means unconfigured. Nonempty URLs and
 every record's required `source_url` must be absolute lowercase `http://` or
 `https://` URLs of at most 2048 UTF-8 bytes, with a host, no credentials,
 query/fragment, whitespace, control characters, backslashes or port zero.
-No DNS/HTTP/HTTPS connectivity test occurs on save. No Sando token/credential
-field is provided.
+No DNS/HTTP/HTTPS connectivity test occurs on save. `sync_enabled` defaults to
+`false`; `null`, strings and numbers are invalid. Enabling without a configured
+URL returns `422`. No Sando token/credential field is provided.
 
 Each nullable state records one import kind independently. Non-null records
 require every field. `import_count` is the frontend-reported number of
@@ -3172,7 +3175,8 @@ Imported hosts/rules additionally require `firewall.write`, and any other
 changed area retains its existing permission. Sando permission cannot authorize
 firewall changes.
 
-There are no new Sando/import/status/sync HTTP endpoints. Existing success
+`GET /api/v1/sando` supplies daemon sync status/cache as specified below; there
+is no one-time import or sync-write endpoint. Existing transaction success
 statuses remain submit `202`, confirm/rollback `200`; ordinary error envelope
 `{error,transaction}` applies: `401` API authentication, `403` permission,
 `400` invalid known JSON types/out-of-range unsigned integers/missing record fields/status enum/timestamp
@@ -3188,6 +3192,100 @@ appropriate. Import-only metadata is excluded from native operational
 configuration, so it does not restart workers or itself change firewall rules.
 The standard full-package safety checks remain. SSH generic `set`/`load candidate`
 and show/commit workflows carry the same typed settings and permissions.
+
+#### Hourly host-metadata synchronization
+
+Save `sync_enabled` through the same full confirmed transaction as `api_url`.
+Only committed settings drive the worker: drafts, provisional changes and rolled
+back settings do not start/stop it. Confirmed changes are observed within one
+second. When enabled, fetch immediately at daemon startup, enablement or source
+URL change, then 3600 seconds after each completed attempt, including failures.
+Requests are single-flight. Disabling or changing the source cancels any in-flight
+request within one second; obsolete results are discarded even before that poll.
+Shutdown cancels in-flight acquisition. No browser, cron or external process
+is needed. No independent manual-sync endpoint is added.
+
+The daemon makes an unauthenticated `GET <api_url>/api/localhosts`, preserving
+reverse-proxy path prefixes. It never calls Sando's mutating
+`POST /api/threatscore`; scores come from inventory. No ignore lists or rules
+are fetched. The daemon must reach Sando over the configured trusted network;
+browser CORS/mixed-content limits apply only to the separate browser imports.
+HTTP and HTTPS are supported, TLS certificates are verified, redirects and
+environment proxies are disabled, connect timeout is 5 seconds and request
+timeout is 30 seconds. Non-2xx, timeout, invalid JSON/types/metadata, duplicate
+IP addresses and size/count violations are explicit sync errors, not empty success.
+Responses are bounded to 4 MiB including chunked bodies, inventory to 4096 rows,
+and the serialized private cache to 1 MiB. Cache writes are atomic, owner-only
+and durable at `<--state path>.sando`; corrupt/unsafe existing caches fail startup
+explicitly. Sync results are runtime metadata, not revision history or client-
+writable fields in `config.sando`. Existing confirmed import counters do not
+change. Empty inventory only clears this cache, never firewall configuration;
+upstream may return empty arrays on database errors, so do not infer deletions.
+
+Read `GET /api/v1/sando` with an API key and `state.read`. No query/body is
+accepted. It returns `200`, `Cache-Control: no-store`; errors use the ordinary
+`{error,transaction}` envelope: `401` invalid key, `403` permission, `405` wrong
+method, `400` query/body and `503` unavailable manager/status. Reads never
+trigger HTTP acquisition. Synthetic successful response:
+
+```json
+{
+  "enabled": true,
+  "state": "succeeded",
+  "sync_interval_seconds": 3600,
+  "source_url": "http://192.0.2.10:8044",
+  "last_attempt_at": "2026-10-30T04:00:00Z",
+  "last_success_at": "2026-10-30T04:00:00Z",
+  "next_sync_at": "2026-10-30T05:00:00Z",
+  "error": null,
+  "skipped_hosts": 0,
+  "hosts": [{
+    "addresses": ["192.0.2.20", "2001:db8::20"],
+    "host_name": "camera.example.test",
+    "icon": "camera_icon",
+    "classification": "Camera",
+    "threat_score": 25
+  }]
+}
+```
+
+- `state`: `disabled | pending | syncing | succeeded | error`; describes
+  synchronization, **not firewall application**. Disabled takes precedence.
+- Timestamps are nullable RFC3339 UTC. `last_attempt_at` records the latest
+  completed attempt, `last_success_at` the latest persisted successful snapshot.
+  `next_sync_at` is null before scheduling, while fetching and when disabled.
+  `error` is nullable text. Failed refreshes retain prior hosts and success time;
+  persistence failure publishes an explicit error without publishing new hosts.
+  Cached metadata/status survive restart; enabled startup still refreshes
+  immediately. Disabled settings retain cached data without fetching. A
+  different configured URL never exposes another source's cache as its results.
+- `addresses`: one or two distinct unicast IP strings from `ip_address` and
+  `ip6_address`, normalized to canonical spelling. MAC-only/no-address entries
+  are omitted and counted in integer `skipped_hosts`. Invalid non-MAC IP strings
+  reject the snapshot. Match metadata by exact address, never by display name;
+  this does not create firewall identities or change their names/policies.
+- `host_name`: nullable string, first nonblank `dhcp_hostname`, `dns_hostname`,
+  then `lease_hostname`; maximum 255 UTF-8 bytes.
+- `icon`: nullable upstream icon identifier, maximum 128 UTF-8 bytes.
+- `classification`: nullable `local_description`, maximum 512 UTF-8 bytes.
+  This is Sando's free-text classification description, **not** a new category
+  enum inferred from icons, vendor names or tags.
+- All three strings reject control characters; empty/whitespace-only strings
+  become null. Treat names, descriptions and icons as untrusted display data:
+  escape text and map supported icon identifiers, never inject HTML or fetch
+  arbitrary icon URLs.
+- `threat_score`: nullable integer `-1..100`. Preserve `-1` as Sando's
+  **no traffic data** sentinel and `null` as unavailable; neither means zero
+  risk. `0..100` are dimensionless upstream scores, not firewall decisions.
+
+Frontend tasks: add the disabled-by-default toggle, require URL before enabling,
+explain daemon/network prerequisites, and save through normal confirmation.
+Poll the status endpoint while the page is visible (for example every 30
+seconds; polling does not initiate sync). Show actual last success/error and
+disabled/stale states independently of one-time import reports. Enrich matched
+host displays with these metadata fields without overwriting manual firewall
+names or policies. No automatic blocks/permits based on scores are implied.
+See [handoff 2026-10-29-07](docs/frontend-handoffs/2026-10-29.md#2026-10-29-07-hourly-sando-host-metadata-sync).
 
 #### Frontend acquisition and review
 
@@ -3209,11 +3307,13 @@ they are **Sando routes**, not Netcontrol endpoints:
   authoritative firewall allowlist. Do not equate `whitelisted` device flags
   with unrestricted firewall access.
 
-Fetch entirely from the browser, never sending the Netcontrol API key to Sando.
+For one-time imports, fetch entirely from the browser, never sending the
+Netcontrol API key to Sando.
 The browser must reach the configured source; CORS, HTTPS/mixed-content and
 local-network browser policies are operator/frontend prerequisites. Current
 Sando documents trusted-network use and missing authentication/TLS protections;
-do not expose it publicly or add a backend proxy to bypass browser restrictions.
+do not expose it publicly. The fixed hourly metadata worker is not an arbitrary
+backend proxy for browser import requests.
 Upstream database helpers can return empty arrays on errors; an empty fetch is
 not proof that existing firewall hosts/rules should be deleted.
 
@@ -3242,7 +3342,7 @@ not proof that existing firewall hosts/rules should be deleted.
    recovery; never blindly resubmit and double-count. Cancelled/failed browser
    fetches, discarded previews and rolled-back imports do not update saved
    reports. Show their error locally while retaining the last confirmed result.
-   No failed-attempt status API or scheduled sync is included.
+   The separate daemon metadata sync/status does not count as a confirmed import.
 
 ### 6.2 Managed interfaces and VLANs
 
@@ -3814,6 +3914,82 @@ Never sort rules before sending. Host inventory and port lists may be sorted.
 Require review acknowledgement for drop defaults and catch-all drops. Provide
 managed egress selection, but do not add arbitrary protocol choices, port ranges, logging, or configurable
 conntrack controls: these are not implemented.
+
+#### Bulk deletion of firewall hosts and forwarding rules
+
+Optional bulk-action UI: provide a clearly destructive **Delete all firewall
+hosts and forwarding rules** action with an explicit scope preview. This is not
+a factory reset, a complete firewall reset, or connection-state deletion.
+
+`DELETE /api/v1/firewall/hosts-and-rules` requires an API key with both
+`transactions.write` and `firewall.write`, even when already empty. It accepts
+no query parameters and requires this JSON body (synthetic revision; use the
+current revision from `GET /api/v1/revisions/latest`):
+
+```json
+{
+  "base_revision": "2026.10.30.1",
+  "confirm_timeout_seconds": 30,
+  "confirm": true,
+  "description": "Clear reviewed firewall hosts and forwarding rules"
+}
+```
+
+`base_revision` is a canonical calendar-version string; timeout is an integer
+10..300 seconds; `confirm` is the required literal boolean `true`. Optional
+`description` is trimmed, limited to 1024 UTF-8 bytes and defaults to
+`Clear firewall hosts and forwarding rules` if blank. Unknown request fields,
+including `config`, are rejected; the server builds a candidate from the current
+committed config without replacing unrelated settings.
+
+Exact effect:
+
+- Clear legacy `firewall.rules`.
+- Clear `firewall.policies.hosts`, including every host's attached rules/default.
+- Clear every `firewall.policies.interfaces[*].rules`. Preserve interface-policy
+  entries/metadata and whether `firewall.policies` is present.
+- Preserve `firewall.policy`, `firewall.allow_all_icmp`, all
+  `firewall.nat.masquerade`/`destination_rewrite`, and all `firewall.input`
+  rules/defaults. Preserve interfaces, routing, services, Sando settings/import
+  reports/cache and all other configuration.
+- Do not flush conntrack or remove other applications' nftables tables.
+  Automatically generated ICMP/established rules remain according to the
+  unchanged policy mode/settings. This is removal of configured forwarding
+  rules, not a promise that the kernel ruleset becomes literally empty.
+
+Success is `202` with the ordinary `Transaction` object and
+`Location: /api/v1/transactions/{id}`. The candidate is **already applied
+provisionally**, not merely queued. Committed config/revision remain unchanged
+until `POST /api/v1/transactions/{id}/confirm` (`200`, normal transaction and
+changed-resource permissions). Explicit `/rollback` or confirmation expiry
+restores the prior configuration; standard restart recovery, drift checks and
+durable intent apply. Confirmation allocates one normal current-day config
+revision. History/restore retains the original hosts/rules. Already-empty
+configuration still produces a normal pending transaction; it is not an
+immediate-success special case.
+
+Errors use `{error,transaction}`: `401` invalid/missing key, `403` either required
+permission missing, `405` method other than DELETE, `400` missing/invalid JSON,
+unknown fields, noncanonical revision/type, non-true confirmation or query;
+`422` invalid timeout/overlong description/candidate validation, `409` stale
+revision, active transaction, drift, upgrade/restart guard; ordinary backend/
+persistence failures are `500` with a transaction when one was created.
+Resolve uncertain writes through transaction/state reads; never blindly retry
+with a newer base revision. No automatic confirmation or privilege bypass.
+
+Frontend tasks if adopting this action: show the exact removed/preserved scope and warn that retaining
+a global Drop default can stop forwarding, while removing drops under Accept
+can broaden access. Keeping input rules does not guarantee remote connectivity.
+Require explicit destructive acknowledgement before DELETE, then use the normal
+confirmation countdown and rollback controls. Refresh hosts, forwarding rules,
+revision/history and pending-transaction views after confirmation/rollback.
+Keep Sando discovery metadata distinct from configured firewall hosts; clearing
+the firewall must not silently reimport discoveries. Do not label preserved NAT/
+input rules as deleted. See
+[handoff 2026-10-29-08](docs/frontend-handoffs/2026-10-29.md#2026-10-29-08-bulk-firewall-host-and-forward-rule-deletion).
+
+Per-rule packet/byte match counters remain unavailable. Existing connection
+accounting cannot be interpreted as cumulative hits on these rule definitions.
 
 ### 6.6.1 Host input filtering
 

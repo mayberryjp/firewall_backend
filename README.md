@@ -48,15 +48,40 @@ configuration must produce explicit errors rather than permissive defaults or
 successful no-op operations. Existing on-device data must never be deleted to
 force a new schema to load.
 
+## Bulk firewall clearing
+
+`DELETE /api/v1/firewall/hosts-and-rules` removes all configured firewall hosts,
+their attached rules, interface forwarding rules and legacy ordered rules.
+It preserves NAT, management-input rules, global policies, ICMP settings and
+unrelated configuration, and never flushes existing connection state.
+Require `transactions.write` plus `firewall.write`, current `base_revision`,
+`confirm: true` and a 10..300-second confirmation timeout. The response is a
+normal `202` pending transaction: changes are provisionally applied and must be
+explicitly confirmed, otherwise rollback restores the original state. This is
+not a factory reset or a literal empty kernel ruleset. Review the
+[complete scope and safeguards](FRONTEND_SPEC.md#bulk-deletion-of-firewall-hosts-and-forwarding-rules).
+Per-connection accounting is available; per-rule match counters are not yet exposed.
+
 ## Sando imports
 
 One-time Sando imports are frontend-driven. The backend saves `config.sando`
-with a browser-reachable base URL and separate latest confirmed host/rule import
+with an API base URL and separate latest confirmed host/rule import
 records, including source, operation/item counts, time and status. Save them
 with reviewed firewall changes through normal confirmed transactions
-(`sando.write`, plus `firewall.write` for host/rule edits). No backend Sando
-fetching, raw device storage, proxy or scheduled synchronization is added.
-The required **Settings > Sando** page and import preview workflow are specified
+(`sando.write`, plus `firewall.write` for host/rule edits).
+
+Optional `sando.sync_enabled` (default `false`, requires `api_url`) enables
+daemon-side host metadata acquisition immediately on startup/enablement and
+hourly after each completed attempt, even with no browser open. The daemon pulls
+host names, icons, classification descriptions and threat scores from Sando's
+`GET /api/localhosts`; it never recalculates scores or imports ignore lists.
+Read the durable, bounded metadata snapshot and last attempt/success/error using
+`GET /api/v1/sando` (`state.read`). Failed refreshes preserve the last successful
+snapshot; disabling cancels polling while retaining cached metadata. Sync does
+not modify firewall hosts, rules, configuration revisions or confirmed import
+reports. Server-to-Sando reachability is required; no credentials, arbitrary
+proxy or full device-object storage is added.
+The required **Settings > Sando** toggle, status panel and import workflow are specified
 in the [frontend contract](FRONTEND_SPEC.md#sando-one-time-imports).
 
 ## Build and validate

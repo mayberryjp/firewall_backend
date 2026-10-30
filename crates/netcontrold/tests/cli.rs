@@ -684,6 +684,7 @@ fn sando_settings_use_the_shared_candidate_and_require_sando_permission() {
         &mut cli,
         "set /sando/api_url \"http://sando.example.invalid:8044\"",
     );
+    f.ok(&mut cli, "set /sando/sync_enabled true");
     f.ok(&mut cli, "set /sando/hosts_import {\"source_url\":\"http://sando.example.invalid:8044\",\"import_count\":1,\"last_import_at\":\"2026-10-30T00:00:00Z\",\"status\":\"succeeded\",\"imported_count\":2,\"skipped_count\":0}");
     f.ok(&mut cli, "commit check");
     assert_eq!(
@@ -698,6 +699,7 @@ fn sando_settings_use_the_shared_candidate_and_require_sando_permission() {
         "http://sando.example.invalid:8044"
     );
     assert_eq!(saved["config"]["sando"]["hosts_import"]["import_count"], 1);
+    assert_eq!(saved["config"]["sando"]["sync_enabled"], true);
     assert!(saved["config"]["sando"]["rules_import"].is_null());
     let limited = Fixture::new(&["state.read", "transactions.write"]);
     let mut cli = CliSession::new();

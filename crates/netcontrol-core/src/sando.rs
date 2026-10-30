@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct SandoConfig {
     pub api_url: String,
+    pub sync_enabled: bool,
     pub hosts_import: Option<SandoImportState>,
     pub rules_import: Option<SandoImportState>,
 }
@@ -63,6 +64,10 @@ fn validate_url(value: &str) -> Result<()> {
 
 impl SandoConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.sync_enabled || !self.api_url.is_empty(),
+            "Sando sync requires a configured api_url"
+        );
         if !self.api_url.is_empty() {
             validate_url(&self.api_url)?;
         }
@@ -116,7 +121,7 @@ mod tests {
     fn defaults_and_confirmed_import_records_roundtrip_without_losing_source() {
         assert_eq!(
             serde_json::to_value(SandoConfig::default()).unwrap(),
-            json!({"api_url":"","hosts_import":null,"rules_import":null})
+            json!({"api_url":"","sync_enabled":false,"hosts_import":null,"rules_import":null})
         );
         let config = config();
         config.validate().unwrap();
@@ -144,6 +149,7 @@ mod tests {
         ] {
             validate_url(valid).unwrap();
         }
+
         for invalid in [
             "",
             "sando.example.test",
@@ -163,6 +169,22 @@ mod tests {
             assert!(validate_url(invalid).is_err(), "{invalid}");
         }
         assert!(validate_url(&format!("https://sando.example.test/{}", "x".repeat(2048))).is_err());
+    }
+
+    #[test]
+    fn sync_requires_a_url_and_a_boolean_flag() {
+        let mut config = SandoConfig {
+            sync_enabled: true,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config.api_url = "https://sando.example.test/proxy".into();
+        config.validate().unwrap();
+        for invalid in [json!(null), json!("true"), json!(1)] {
+            assert!(
+                serde_json::from_value::<SandoConfig>(json!({"sync_enabled":invalid})).is_err()
+            );
+        }
     }
 
     #[test]

@@ -67,6 +67,13 @@ pub(crate) fn read_private(path: &Path) -> Result<Vec<u8>> {
 
 pub(crate) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     ensure!(!path.try_exists()?, "private file already exists");
+    write_private(path, bytes)
+}
+
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path.try_exists()? {
+        private_file(path, false)?;
+    }
     let parent = path.parent().context("private file has no parent")?;
     let pending = parent.join(format!("{}.pending", identifier()));
     let result = (|| {

@@ -94,6 +94,7 @@ pub struct App {
     attempts: Mutex<(Instant, usize)>,
     updates: Option<crate::updates::Manager>,
     release_checks: Option<crate::updates::ReleaseCheckControl>,
+    sando: Option<Arc<crate::sando::Manager>>,
     mqtt: Option<Arc<crate::mqtt::Manager>>,
     dynamic_dns: Option<Arc<crate::dynamic_dns::Manager>>,
     system: Option<Arc<crate::host_system::Manager>>,
@@ -111,6 +112,7 @@ impl App {
             attempts: Mutex::new((Instant::now(), 0)),
             updates: None,
             release_checks: None,
+            sando: None,
             mqtt: None,
             dynamic_dns: None,
             system: None,
@@ -152,6 +154,12 @@ impl App {
         Arc::get_mut(app)
             .context("application is already shared")?
             .release_checks = Some(control);
+        Ok(())
+    }
+    pub fn attach_sando(app: &mut Arc<Self>, manager: Arc<crate::sando::Manager>) -> Result<()> {
+        Arc::get_mut(app)
+            .context("application is already shared")?
+            .sando = Some(manager);
         Ok(())
     }
     pub fn refresh_upgrade_gate(&self) -> Result<()> {
@@ -658,6 +666,27 @@ fn api(
             return fail(400, "platform status accepts no query or body", true);
         }
         return response(200, app.health.snapshot());
+    }
+    if path == "/api/v1/sando" {
+        if !credential.permissions.iter().any(|p| p == "state.read") {
+            return fail(403, "insufficient Sando read permission", true);
+        }
+        if method != "GET" {
+            return fail(405, "Sando status requires GET", true);
+        }
+        if !query.is_empty() || !body.is_empty() {
+            return fail(400, "Sando status accepts no query or body", true);
+        }
+        let Some(manager) = &app.sando else {
+            return fail(503, "Sando sync is not configured", true);
+        };
+        return match manager.status() {
+            Ok(status) => response(200, status),
+            Err(error) => {
+                tracing::error!(%error, "could not read Sando status");
+                fail(503, "Sando status unavailable", true)
+            }
+        };
     }
     if path == "/api/v1/system/upgrade/check" {
         if !credential.permissions.iter().any(|p| p == "system.upgrade") {

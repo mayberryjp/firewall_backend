@@ -71,6 +71,319 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
     )
 }
 
+fn firewall_clear_config(host_policies: bool) -> Config {
+    let mut candidate = config();
+    candidate.interfaces.push(
+        serde_json::from_value(json!({
+            "name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,
+            "addresses":["198.51.100.1/24"]
+        }))
+        .unwrap(),
+    );
+    candidate.firewall = serde_json::from_value(json!({
+        "policy":"drop","allow_all_icmp":false,
+        "nat":{
+            "masquerade":[{"family":"ipv4","out_interface":"wan0","source":"192.0.2.0/24"}],
+            "destination_rewrite":[{
+                "out_interface":"wan0","protocol":"udp","destination_port":53,
+                "target_interface":"lan0","target_address":"192.0.2.53"
+            }]
+        },
+        "input":{"policy":"drop","interfaces":[{
+            "interface":"lan0","rules":[{
+                "protocol":"tcp","destination_ports":[443],"action":"accept"
+            }]
+        }]}
+    }))
+    .unwrap();
+    if host_policies {
+        candidate.firewall.policies = Some(serde_json::from_value(json!({
+            "hosts":[{
+                "id":"camera","name":"Camera","addresses":["192.0.2.10"],"policy":"drop",
+                "rules":[{"protocol":"tcp","destination_ports":[443],"action":"accept"}]
+            }],
+            "interfaces":[{
+                "interface":"lan0",
+                "metadata":{"display_name":"LAN override","description":"Preserved interface metadata"},
+                "rules":[{"destination_host":"camera","action":"drop"}]
+            }]
+        })).unwrap());
+    } else {
+        candidate.firewall.rules = serde_json::from_value(json!([
+            {"source":"192.0.2.0/24","destination":"198.51.100.0/24","action":"accept"}
+        ]))
+        .unwrap();
+    }
+    candidate.sando.api_url = "http://sando.example.test".into();
+    candidate.sando.sync_enabled = true;
+    candidate.validate().unwrap();
+    candidate
+}
+
+#[test]
+fn firewall_bulk_clear_confirms_only_hosts_and_forward_rules_and_survives_restart() {
+    for host_policies in [false, true] {
+        let fixture = Fixture::new();
+        let mut engine = fixture.engine();
+        let original = firewall_clear_config(host_policies);
+        let initial = submit(&mut engine, original.clone());
+        assert_eq!(initial.status, 202, "{}", initial.body);
+        assert_eq!(
+            confirm(&mut engine, initial.body["id"].as_str().unwrap()).status,
+            200
+        );
+        let base = engine.committed_revision();
+        let response = engine.request(
+            "DELETE",
+            "/api/v1/firewall/hosts-and-rules",
+            "",
+            "operator",
+            &["transactions.write".into(), "firewall.write".into()],
+            &serde_json::to_vec(&json!({
+                "base_revision":base,"confirm_timeout_seconds":30,"confirm":true
+            }))
+            .unwrap(),
+        );
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(response.body["status"], "pending_confirmation");
+        assert_eq!(
+            response.body["description"],
+            "Clear firewall hosts and forwarding rules"
+        );
+        let id = response.body["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            response.location,
+            Some(format!("/api/v1/transactions/{id}"))
+        );
+        assert_eq!(engine.saved_configuration(), &original.normalized());
+        assert_eq!(engine.committed_revision(), base);
+        let mut expected = original.clone();
+        expected.firewall.rules = vec![];
+        if let Some(policies) = &mut expected.firewall.policies {
+            policies.hosts = vec![];
+            policies.interfaces[0].rules = vec![];
+        }
+        assert_eq!(response.body["candidate"], json!(expected.normalized()));
+        assert_eq!(engine.expected(), expected.normalized());
+        drop(engine);
+        let mut engine = fixture.engine();
+        assert_eq!(engine.active().unwrap().id, id);
+        assert_eq!(engine.saved_configuration(), &original.normalized());
+        assert_eq!(confirm(&mut engine, &id).status, 200);
+        assert_eq!(engine.saved_configuration(), &expected.normalized());
+        assert_ne!(engine.committed_revision(), base);
+        drop(engine);
+        let mut engine = fixture.engine();
+        assert_eq!(engine.saved_configuration(), &expected.normalized());
+        let old = request(
+            &mut engine,
+            "GET",
+            &format!("/api/v1/revisions/{base}"),
+            Value::Null,
+        );
+        assert_eq!(old.body["config"], json!(original.normalized()));
+    }
+}
+
+#[test]
+fn firewall_bulk_clear_requires_explicit_scoped_input_and_normal_transaction_guards() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let base = engine.committed_revision();
+    let valid = json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":true});
+    let path = "/api/v1/firewall/hosts-and-rules";
+    for missing in ["transactions.write", "firewall.write"] {
+        let permissions: Vec<_> = all().into_iter().filter(|p| p != missing).collect();
+        assert_eq!(
+            engine
+                .request(
+                    "DELETE",
+                    path,
+                    "",
+                    "operator",
+                    &permissions,
+                    &serde_json::to_vec(&valid).unwrap()
+                )
+                .status,
+            403
+        );
+    }
+    for method in ["GET", "POST", "PUT"] {
+        assert_eq!(
+            request(&mut engine, method, path, valid.clone()).status,
+            405
+        );
+    }
+    assert_eq!(
+        engine
+            .request(
+                "DELETE",
+                path,
+                "unexpected=1",
+                "operator",
+                &all(),
+                &serde_json::to_vec(&valid).unwrap()
+            )
+            .status,
+        400
+    );
+    assert_eq!(
+        engine
+            .request(
+                "DELETE",
+                path,
+                "",
+                "",
+                &all(),
+                &serde_json::to_vec(&valid).unwrap()
+            )
+            .status,
+        401
+    );
+    for body in [
+        json!({}),
+        json!({"base_revision":base,"confirm_timeout_seconds":30}),
+        json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":false}),
+        json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":"true"}),
+        json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":true,"config":{}}),
+        json!({"base_revision":1,"confirm_timeout_seconds":30,"confirm":true}),
+    ] {
+        let result = request(&mut engine, "DELETE", path, body);
+        assert_eq!(result.status, 400, "{}", result.body);
+        assert!(engine.active().is_none());
+    }
+    for timeout in [9, 301] {
+        assert_eq!(
+            request(
+                &mut engine,
+                "DELETE",
+                path,
+                json!({"base_revision":base,"confirm_timeout_seconds":timeout,"confirm":true})
+            )
+            .status,
+            422
+        );
+    }
+    assert_eq!(request(&mut engine, "DELETE", path,
+        json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":true,"description":"x".repeat(1025)})).status, 422);
+    assert_eq!(
+        request(
+            &mut engine,
+            "DELETE",
+            path,
+            json!({"base_revision":"2000.01.01.1","confirm_timeout_seconds":30,"confirm":true})
+        )
+        .status,
+        409
+    );
+    engine.set_upgrade_maintenance(true).unwrap();
+    assert_eq!(
+        request(&mut engine, "DELETE", path, valid.clone()).status,
+        409
+    );
+    engine.set_upgrade_maintenance(false).unwrap();
+    engine.begin_restart().unwrap();
+    assert_eq!(
+        request(&mut engine, "DELETE", path, valid.clone()).status,
+        409
+    );
+    engine.cancel_restart();
+    let active = submit(&mut engine, config());
+    assert_eq!(active.status, 202);
+    assert_eq!(request(&mut engine, "DELETE", path, valid).status, 409);
+}
+
+#[test]
+fn firewall_bulk_clear_rolls_back_explicitly_or_at_deadline_after_restart() {
+    for expire in [false, true] {
+        let fixture = Fixture::new();
+        let mut engine = fixture.engine();
+        let original = firewall_clear_config(true);
+        let initial = submit(&mut engine, original.clone());
+        assert_eq!(initial.status, 202);
+        assert_eq!(
+            confirm(&mut engine, initial.body["id"].as_str().unwrap()).status,
+            200
+        );
+        let base = engine.committed_revision();
+        let response = request(
+            &mut engine,
+            "DELETE",
+            "/api/v1/firewall/hosts-and-rules",
+            json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":true,"description":" Reviewed bulk clear "}),
+        );
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(response.body["description"], "Reviewed bulk clear");
+        let id = response.body["id"].as_str().unwrap().to_owned();
+        drop(engine);
+        let mut engine = fixture.engine();
+        if expire {
+            engine.now = Some(engine.active().unwrap().confirmation_deadline);
+            engine.tick().unwrap();
+        } else {
+            let rolled_back = request(
+                &mut engine,
+                "POST",
+                &format!("/api/v1/transactions/{id}/rollback"),
+                Value::Null,
+            );
+            assert_eq!(rolled_back.status, 200);
+        }
+        assert_eq!(engine.state.transactions[&id].status, "rolled_back");
+        assert!(engine.active().is_none());
+        assert_eq!(engine.saved_configuration(), &original.normalized());
+        assert_eq!(engine.expected(), original.normalized());
+        assert_eq!(engine.committed_revision(), base);
+    }
+}
+
+#[test]
+fn firewall_bulk_clear_rejects_drift_and_preserves_state_on_apply_or_persistence_failure() {
+    for failure in ["drift", "observation", "persistence", "apply"] {
+        let fixture = Fixture::new();
+        let (mut engine, faults) = faulty(&fixture);
+        let original = firewall_clear_config(true);
+        let initial = submit(&mut engine, original.clone());
+        assert_eq!(initial.status, 202, "{}", initial.body);
+        assert_eq!(
+            confirm(&mut engine, initial.body["id"].as_str().unwrap()).status,
+            200
+        );
+        let base = engine.committed_revision();
+        let applies = faults.lock().unwrap().apply_count;
+        match failure {
+            "drift" => faults.lock().unwrap().state.firewall.allow_all_icmp = true,
+            "observation" => faults.lock().unwrap().fail_observe = true,
+            "persistence" => engine.store.fail_after.set(Some(0)),
+            "apply" => faults.lock().unwrap().fail_applies = 1,
+            _ => unreachable!(),
+        }
+        let response = request(
+            &mut engine,
+            "DELETE",
+            "/api/v1/firewall/hosts-and-rules",
+            json!({"base_revision":base,"confirm_timeout_seconds":30,"confirm":true}),
+        );
+        assert_eq!(
+            response.status,
+            if failure == "drift" { 409 } else { 500 },
+            "{}",
+            response.body
+        );
+        assert_eq!(engine.saved_configuration(), &original.normalized());
+        assert_eq!(engine.committed_revision(), base);
+        assert!(engine.active().is_none());
+        let faults = faults.lock().unwrap();
+        assert_eq!(faults.connection_flushes, 0);
+        if failure == "apply" {
+            assert_eq!(response.body["transaction"]["status"], "rolled_back");
+            assert_eq!(faults.state, original.normalized());
+        } else {
+            assert_eq!(faults.apply_count, applies);
+        }
+    }
+}
+
 #[test]
 fn udp_relay_api_authorization_persistence_and_rollback() {
     let fixture = Fixture::new();
@@ -1925,6 +2238,7 @@ fn sando_import_state_and_firewall_changes_confirm_rollback_and_reopen_together(
     let mut candidate = config();
     candidate.sando = serde_json::from_value(json!({
         "api_url":"http://sando.example.invalid:8044",
+        "sync_enabled":true,
         "hosts_import":{
             "source_url":"http://sando.example.invalid:8044",
             "import_count":1,"last_import_at":"2026-10-30T00:00:00Z",
@@ -2062,6 +2376,8 @@ fn sando_api_validates_known_fields_instead_of_dropping_invalid_import_state() {
             422,
         ),
         (json!({"api_url":42}), 400),
+        (json!({"sync_enabled":true}), 422),
+        (json!({"sync_enabled":"true"}), 400),
         (json!({"hosts_import":{"status":"succeeded"}}), 400),
         (
             json!({"hosts_import":{"source_url":"http://sando.example.test","import_count":0,

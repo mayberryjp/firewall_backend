@@ -4,6 +4,24 @@
 
 ### Added
 
+- `DELETE /api/v1/firewall/hosts-and-rules` clears configured firewall hosts and
+  all forwarding rules through an explicitly acknowledged, revision-checked,
+  confirmable transaction. Preserves NAT, management input, global policies,
+  ICMP settings, unrelated configuration and conntrack; supports normal rollback/
+  restart recovery without new permissions. Additive endpoint, next automatic
+  calendar version. Optional frontend destructive-action/confirmation workflow:
+  [handoff 2026-10-29-08](docs/frontend-handoffs/2026-10-29.md#2026-10-29-08-bulk-firewall-host-and-forward-rule-deletion).
+
+- Optional `sando.sync_enabled` for daemon-side host metadata sync immediately
+  on startup/enablement/source change and hourly thereafter. Authenticated
+  `GET /api/v1/sando` exposes host names, icons, classification descriptions,
+  threat scores and durable last attempt/success/error state. Bounded requests,
+  cancellation and atomic private snapshots preserve prior results on failures;
+  sync never edits firewall policies, revisions or one-time import reports.
+  Additive feature; next automatic calendar version, no manual bump.
+  Required frontend toggle/status/enrichment:
+  [handoff 2026-10-29-07](docs/frontend-handoffs/2026-10-29.md#2026-10-29-07-hourly-sando-host-metadata-sync).
+
 - Automatic stable GitHub Releases and immutable version tags for each validated
   default-branch first-parent commit, including docs-only and multi-commit pushes.
   Publishes both Ubuntu update assets only after native/Rust/static-package

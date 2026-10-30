@@ -229,11 +229,12 @@ fn sando_state_is_saved_but_never_changes_native_operational_configuration() {
     let before = candidate();
     assert_eq!(
         serde_json::to_value(&before).unwrap()["sando"],
-        json!({"api_url":"","hosts_import":null,"rules_import":null})
+        json!({"api_url":"","sync_enabled":false,"hosts_import":null,"rules_import":null})
     );
     let mut after = before.clone();
     after.sando = serde_json::from_value(json!({
         "api_url":"http://192.0.2.10:8044",
+        "sync_enabled":true,
         "hosts_import":{
             "source_url":"http://192.0.2.10:8044",
             "import_count":1,
