@@ -59,6 +59,7 @@ mod netfilter;
 mod networking;
 mod sysctl;
 mod wireguard;
+mod wireguard_dns;
 
 pub use networking::Parent;
 
@@ -82,6 +83,7 @@ pub struct Native {
     services: Services,
     dhcp: dhcp_client::Manager,
     dhcp_monitors: dhcp_monitors::Manager,
+    wireguard_dns: wireguard_dns::Manager,
     state: PathBuf,
     _lock: File,
     host_namespace: Option<Arc<File>>,
@@ -332,6 +334,11 @@ impl Native {
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
         let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
+            wireguard_dns: wireguard_dns::Manager::new(
+                namespace.clone(),
+                options.keys.clone(),
+                state.join("wireguard-dns.json"),
+            )?,
             bgp: bgp::Manager::new(namespace.clone(), state.clone())?,
             link_monitor: link_monitor::Monitor::new(namespace.clone())?,
             deny_log: deny_log::Monitor::new(namespace.clone(), state.join("deny-log"))?,
@@ -401,17 +408,20 @@ impl Native {
     }
 
     fn stop_services(&mut self) -> Result<()> {
+        self.wireguard_dns.shutdown()?;
         self.bgp.shutdown()?;
         self.dhcp_monitors.shutdown()?;
         self.services.shutdown()
     }
 
     fn repair_services(&mut self, config: &Value) -> Result<()> {
+        self.wireguard_dns.shutdown()?;
         self.bgp.shutdown()?;
         self.dhcp_monitors.shutdown()?;
         self.services.repair(config)?;
         self.dhcp_monitors.configure(config)?;
-        self.bgp.configure(config)
+        self.bgp.configure(config)?;
+        self.wireguard_dns.configure(config)
     }
 
     fn gateway_statistics(&self, path: &str) -> Result<Value> {
@@ -518,7 +528,7 @@ impl Native {
         effective.namespace.extend(network.kernel.namespace.clone());
         effective.host.extend(network.kernel.host.clone());
         self.verify_kernel(&effective)?;
-        let keys = self.options.keys.clone();
+        let keys = self.wireguard_dns.control.clone();
         let lease_state = leases.clone();
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::check_ethernet(handle, &originals))?;
@@ -584,12 +594,12 @@ impl Native {
         let enabled = network.ipv6_enabled;
         session(self.namespace.clone(), move |_, _| ipv6::preflight(enabled))?;
         let parents = self.parents.clone();
-        let keys = self.options.keys.clone();
+        let keys = self.wireguard_dns.control.clone();
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::check_parents(handle, &parents))?;
             for link in &network.interfaces {
                 if let Some(wg) = &link.wireguard {
-                    wireguard::validate(&keys, wg)?;
+                    keys.validate(wg, network.ipv6_enabled)?;
                 }
             }
             Ok(())
@@ -614,7 +624,7 @@ impl Native {
         dhcp_client::effective(&mut before, &leases)?;
         dhcp_client::effective(&mut after, &leases)?;
         let parents = self.parents.clone();
-        let keys = self.options.keys.clone();
+        let keys = self.wireguard_dns.control.clone();
         let namespace_values = kernel.namespace.clone();
         let originals = ownership.ethernet_originals.clone();
         let lease_state = leases.clone();
@@ -817,7 +827,7 @@ impl Native {
                 .context("missing reboot configuration")?,
         )?;
         let originals = ownership.ethernet_originals.clone();
-        let keys = self.options.keys.clone();
+        let keys = self.wireguard_dns.control.clone();
         let (mut before, fingerprint) = session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::check_ethernet(handle, &originals))?;
             Ok((
@@ -1262,6 +1272,7 @@ impl Backend for Native {
             self.services.apply(&before, &after)?;
             self.dhcp_monitors.configure(&after)?;
             self.bgp.configure(&after)?;
+            self.wireguard_dns.configure(&after)?;
             self.log("native networking and services converged")?;
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))
@@ -1342,6 +1353,7 @@ impl Backend for Native {
         value["parents"] = parent_status;
         value["dhcp_clients"] = self.dhcp.status()?;
         value["scope"] = json!(self.identity);
+        value["wireguard_dns"] = self.wireguard_dns.snapshot()?;
         let enabled = config.ipv6_enabled;
         value["ipv6"] = session(self.namespace.clone(), move |_, _| ipv6::status(enabled))?;
         let desired = Network::parse(&config.operational_value()?)?.kernel;
@@ -1576,6 +1588,9 @@ impl Backend for Native {
 
 impl Drop for Native {
     fn drop(&mut self) {
+        if let Err(error) = self.wireguard_dns.shutdown() {
+            eprintln!("WireGuard DNS shutdown failed: {error:#}");
+        }
         if let Err(error) = self.deny_log.shutdown() {
             eprintln!("deny-log shutdown failed: {error:#}");
         }

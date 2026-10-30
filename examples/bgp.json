@@ -1,7 +1,7 @@
 {
   "base_revision": "2026.10.29.1",
   "confirm_timeout_seconds": 30,
-  "description": "Synthetic IPv4 BGP over WireGuard example; provision the private key and underlay first",
+  "description": "Synthetic IPv4 BGP over WireGuard example; replace the DNS peer name and provision the private key, underlay and DNS first",
   "config": {
     "interfaces": [
       {
@@ -17,7 +17,7 @@
           "peers": [
             {
               "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
-              "endpoint": "192.0.2.2:51820",
+              "endpoint": "vpn.example.test:51820",
               "allowed_ips": ["10.10.0.2/32"],
               "persistent_keepalive_seconds": 25
             }

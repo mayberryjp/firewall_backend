@@ -112,7 +112,7 @@ pub(crate) fn parse(data: &[u8], id: u16, question: &[u8]) -> Result<Vec<IpAddr>
     }
     bail!("DNS alias cycle/depth limit")
 }
-pub(crate) fn resolve(host: &str, port: u16, ipv6_enabled: bool) -> Result<Vec<SocketAddr>> {
+pub fn resolve(host: &str, port: u16, ipv6_enabled: bool) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         ensure!(
             ipv6_enabled || ip.is_ipv4(),

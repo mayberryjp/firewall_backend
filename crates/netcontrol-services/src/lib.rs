@@ -14,6 +14,7 @@ mod linux;
 mod mdns;
 mod ntp;
 mod resolve;
+pub use resolve::resolve as resolve_addresses;
 mod syslog;
 mod udp_broadcast_relay;
 mod worker;

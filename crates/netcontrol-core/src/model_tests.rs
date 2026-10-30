@@ -1106,8 +1106,62 @@ fn wireguard_keys_endpoints_and_allowed_ips() {
     assert!(bad.validate().is_err());
     let mut bad = c;
     bad.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint = "host.invalid:1".into();
-    assert!(bad.validate().is_err());
+    bad.validate().unwrap();
 }
+#[test]
+fn wireguard_dns_endpoint_syntax_and_ipv6_policy() {
+    for endpoint in [
+        "",
+        "vpn.example.test:51820",
+        "localhost:1",
+        "wg-peer:65535",
+        "192.0.2.1:51820",
+        "[2001:db8::1]:51820",
+    ] {
+        WireGuardEndpoint::parse(endpoint).unwrap();
+    }
+    for endpoint in [
+        "vpn.example.test",
+        "vpn.example.test:0",
+        "vpn.example.test:65536",
+        "vpn.example.test:051820",
+        "VPN.example.test:51820",
+        "vpn.example.test.:51820",
+        "https://vpn.example.test:51820",
+        "bad_name:51820",
+        "-bad.test:51820",
+        "bad-.test:51820",
+        "bad..test:51820",
+        "999.1.1.1:51820",
+        "192.0.2.1:051820",
+        "[::ffff:192.0.2.1]:51820",
+        "[fe80::1%eth0]:51820",
+        "0.0.0.0:51820",
+        "224.0.0.1:51820",
+    ] {
+        assert!(WireGuardEndpoint::parse(endpoint).is_err(), "{endpoint}");
+    }
+    assert!(WireGuardEndpoint::parse(&format!("{}.test:51820", "a".repeat(64))).is_err());
+    use base64::Engine as _;
+    let mut c = candidate();
+    c.interfaces[0].kind = "wireguard".into();
+    c.interfaces[0].wireguard = Some(
+        serde_json::from_value(json!({
+            "key_ref":"wg","listen_port":51820,"peers":[{
+                "public_key":base64::engine::general_purpose::STANDARD.encode([1;32]),
+                "endpoint":"vpn.example.test:51820","allowed_ips":["192.0.2.2/32"]
+            }]
+        }))
+        .unwrap(),
+    );
+    c.ipv6_enabled = false;
+    c.validate().unwrap();
+    c.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint = "[2001:db8::1]:51820".into();
+    assert!(c.validate().is_err());
+    c.ipv6_enabled = true;
+    c.validate().unwrap();
+}
+
 #[test]
 fn wireguard_peer_enabled_defaults_true_and_disabled_peers_are_saved_but_not_installed() {
     use base64::Engine as _;

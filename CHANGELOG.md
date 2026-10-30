@@ -4,6 +4,17 @@
 
 ### Added
 
+- WireGuard DNS peer endpoints with immediate/60-second automatic refresh,
+  IPv4-only resolution when IPv6 is disabled, persisted last-good selections,
+  explicit refresh diagnostics in native state and joined worker shutdown.
+  Endpoint-only updates preserve keys, AllowedIPs/BGP routes and keepalives;
+  numeric endpoint drift checks remain strict. Initial uncached resolution must
+  succeed; later DNS failures retain working selections and report errors.
+  Recommended bump: minor (additive endpoint/runtime contract), baseline unknown,
+  Unreleased; next automatic calendar version, no manual bump.
+  Required frontend work:
+  [handoff 2026-10-30-07](docs/frontend-handoffs/2026-10-30.md#2026-10-30-07-wireguard-dns-peer-endpoints).
+
 - ICMP and ICMPv6 protocol choices for host, interface, management-input and
   legacy ordered firewall filters, with strict family/port validation and
   extension-header-aware ICMPv6 matching. Legacy rules now also support the

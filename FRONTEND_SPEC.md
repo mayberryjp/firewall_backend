@@ -3071,7 +3071,9 @@ For WireGuard it must identify an enabled peer on the selected interface;
 one BGP neighbor per WireGuard peer is supported. That peer's **static**
 AllowedIPs must already cover the neighbor address to bootstrap BGP. Operators
 also need a connected/static route to the neighbor through the tunnel and a
-working underlay route to its WireGuard endpoint. BGP cannot learn the route
+working underlay route to its WireGuard endpoint. DNS endpoints also require
+working underlay DNS; endpoint refresh preserves BGP-owned AllowedIPs.
+BGP cannot learn the route
 needed to establish its own initial connection.
 
 `accept_default` defaults false per neighbor. True permits receiving `0.0.0.0/0`;
@@ -4653,9 +4655,64 @@ Simulator results do not prove packet forwarding.
 ### 6.8 WireGuard
 
 Show WireGuard interfaces and peers using the same underlying draft as Interfaces.
-Fields: key reference, stable listen port, peer public key, optional numeric
+Fields: key reference, stable listen port, peer public key, optional numeric or DNS
 endpoint, allowed network list, persistent keepalive seconds, and a per-peer
 `enabled` toggle.
+
+#### DNS peer endpoints
+
+`endpoint` remains an optional nonnullable string: omit/empty for no configured
+endpoint, canonical numeric `IPv4:port` / `[IPv6]:port`, or lowercase ASCII
+`hostname:port` such as `vpn.example.test:51820`. DNS names use nonempty labels
+of 1..63 letters/digits/hyphens, no leading/trailing hyphen, at most 253 bytes,
+no trailing dot, whitespace, underscore, URL scheme/path or service-name port.
+Single-label host aliases are accepted; use a fully qualified name for DNS
+rather than relying on search suffixes. Ports are canonical decimal 1..65535.
+Wrong field types/null return `400`; invalid syntax returns `422`.
+
+The backend, not the browser, resolves enabled DNS peers using its existing
+bounded native `/etc/hosts` and `/etc/resolv.conf` UDP A/AAAA resolver in the
+managed namespace. It supports untruncated replies/CNAMEs, not TCP fallback,
+DNS-over-HTTPS or browser DNS. Resolver reachability must not depend on the
+tunnel being bootstrapped. First use needs a usable answer; a cold lookup or
+cache-persistence failure fails the normal transaction (`500`, with its
+transaction/rollback outcome), not a silently empty endpoint.
+
+Automatic refresh runs immediately and then waits 60 seconds between cycles,
+plus lookup/processing time; DNS TTL does not change this interval. Retain the
+selected address while it is still returned; otherwise select deterministically,
+preferring IPv4. Disabled global IPv6 permits only A/IPv4 results and IPv4 DNS
+servers. No compatible answers or later lookup/update failures retain the last
+successful selection and report an error. Cached successful selections persist
+in private native state for restart/rollback, so a resolver outage does not erase
+working peer configuration. Disabled peers are neither resolved nor refreshed.
+
+Refresh updates only the endpoint of the existing device/peer identity, not keys,
+AllowedIPs (including BGP-owned prefixes), keepalives, revisions or transaction
+history. Workers stop/join before link/peer reconfiguration, rollback or removal.
+DNS-selected endpoints and authenticated roaming are runtime transport state,
+not numeric endpoint drift; explicitly numeric endpoints retain strict drift
+checks. Preserve the configured hostname in drafts/desired/observed config;
+do not replace it with a runtime IP or resolve it in the frontend.
+
+`GET /api/v1/state` (`state.read`) adds native `runtime.wireguard_dns`:
+
+- `running: boolean`, `refresh_interval_seconds: 60`, `error: string | null`.
+  False with no DNS peers is normal; a worker-level error is not successful DNS.
+- `peers: []` for no enabled DNS peers; otherwise one row per interface/public-key
+  identity with `interface`, `public_key`, configured `endpoint`,
+  `ipv6_enabled`, `resolved_endpoint` (numeric socket string),
+  `last_attempt_unix_ms`, `last_success_unix_ms` (nonnullable Unix ms numbers),
+  and nullable `error`. Selected cache state is not a connectivity guarantee;
+  actual roaming endpoints remain under `runtime.wireguard[].peers[].endpoint`.
+- Show refresh failures and last success separately from handshake/traffic.
+  Keep the configured name visible alongside selected/actual addresses.
+  Simulators need not report this native-only measurement; do not fabricate it.
+
+There is no new config flag, interval form, endpoint or permission. Changing the
+existing endpoint uses `POST /api/v1/transactions`, normal confirmation/rollback,
+`transactions.write` and `wireguard.write` (plus other changed-component
+permissions). Deploy the updated backend before enabling hostname entry.
 
 Peers accept `enabled: boolean`; omission defaults to `true` in requests and saved
 configurations (including revision records), and canonical responses always include
@@ -4684,8 +4741,8 @@ Do not label a configured peer connected. Native runtime diagnostics can include
 measured public peer handshake/transfer information; these are optional
 observations, not a dedicated peer-statistics API or proof of reachability.
 Do not fabricate telemetry when absent or simulated.
-Endpoint roaming can create modeled drift; surface it without overwriting the
-draft automatically.
+Numeric endpoint roaming can create modeled drift; surface it without overwriting
+the draft automatically. DNS/omitted endpoints have the dynamic behavior above.
 
 ### 6.9 softflowd
 
@@ -4956,7 +5013,7 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Key reference | `^[a-zA-Z0-9_-]{1,64}$`; no path; availability/private file checks are server-side |
 | Listen port | 1..65535; stable nonzero port required |
 | Peer public key | Base64 decodes to a nonzero 32-byte WireGuard key; unique within interface |
-| Endpoint | Optional numeric IP:port, nonzero port, IPv6 bracketed; no DNS, zone, or mapped IPv6 |
+| Endpoint | Optional canonical IP:port (IPv6 bracketed) or lowercase DNS hostname:port; canonical decimal port 1..65535; no URL, zone, mapped IPv6, trailing dot or non-DNS label characters |
 | Allowed IPs | Canonical networks; exact duplicates prohibited within a peer and across all **enabled** peers on that WireGuard interface (a disabled peer may reuse one); overlaps are not generically forbidden |
 | Keepalive | 0..65535 seconds; 0 means disabled |
 | Route destination | Canonical network |

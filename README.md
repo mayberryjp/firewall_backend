@@ -50,6 +50,25 @@ configuration must produce explicit errors rather than permissive defaults or
 successful no-op operations. Existing on-device data must never be deleted to
 force a new schema to load.
 
+## WireGuard DNS peers
+
+WireGuard peers accept DNS endpoints such as `vpn.example.test:51820`, as well
+as canonical numeric IP endpoints. Use lowercase ASCII hostnames and an explicit
+port 1..65535. The backend resolves enabled peers immediately and refreshes DNS
+every 60 seconds, retaining a still-advertised address to avoid unnecessary churn.
+Global IPv6 disablement restricts resolution to IPv4.
+
+Successful selections persist in private native state for restart/rollback.
+Later DNS failures retain the last address and appear in
+`GET /api/v1/state` under `runtime.wireguard_dns`. First use requires working
+underlay DNS independent of the tunnel. Disabled peers are not resolved.
+Updates change only peer endpoints, preserving keys, AllowedIPs/BGP prefixes
+and keepalives. Numeric endpoints retain strict drift checks; DNS-selected
+addresses and authenticated roaming are dynamic runtime state.
+See the [contract](FRONTEND_SPEC.md#dns-peer-endpoints) and synthetic
+[BGP-over-WireGuard example](examples/bgp.json); replace its name, addresses
+and public key, and provision the private key/underlay before applying.
+
 ## Bulk firewall clearing
 
 `DELETE /api/v1/firewall/hosts-and-rules` removes all configured firewall hosts,

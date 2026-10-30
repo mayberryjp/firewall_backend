@@ -1301,7 +1301,7 @@ fn native_blackhole_routes_drop_traffic_change_action_rename_rollback_and_restar
     };
     let installed = |native: &Native, desired: &Config| -> Result<usize> {
         let network = Network::parse(&desired.operational_value()?)?;
-        let keys = options.keys.clone();
+        let keys = native.wireguard_dns.control.clone();
         session(native.namespace.clone(), move |rt, handle| {
             let snapshot = rt.block_on(networking::boot_snapshot(handle, &network, &keys))?;
             Ok(snapshot["routes"].as_array().unwrap().len())
@@ -1386,7 +1386,7 @@ fn native_static_route_enabled_toggle_restart_and_rollback() -> Result<()> {
     active.validate()?;
     let installed = |native: &Native, desired: &Config| -> Result<usize> {
         let network = Network::parse(&desired.operational_value()?)?;
-        let keys = options.keys.clone();
+        let keys = native.wireguard_dns.control.clone();
         session(native.namespace.clone(), move |rt, handle| {
             let snapshot = rt.block_on(networking::boot_snapshot(handle, &network, &keys))?;
             Ok(snapshot["routes"].as_array().unwrap().len())
@@ -2546,7 +2546,10 @@ fn native_dhcp_static_routes_survive_renewal_address_change_expiry_and_rollback(
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
 fn native_static_routes_rechecked_after_configured_address_replacement() -> Result<()> {
     let fixture = Fixture::new()?;
-    let keys = fixture.root.join("keys");
+    let keys = wireguard::Control {
+        keys: fixture.root.join("keys"),
+        dns: wireguard_dns::Cache::new(fixture.root.join("wireguard-dns.json"))?,
+    };
     session(
         Arc::new(File::open(&fixture.namespace)?),
         move |rt, handle| {
@@ -2690,6 +2693,199 @@ fn native_network_only_change_restarts_the_services_it_stopped() -> Result<()> {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/WireGuard modules"]
+fn native_wireguard_dns_refresh_failure_restart_rollback_and_disabled_peer() -> Result<()> {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
+    use wireguard_control::{Backend as WgBackend, Device, DeviceUpdate, Key, PeerConfigBuilder};
+    let fixture = Fixture::new()?;
+    let options = fixture.options();
+    wireguard::create_key(&options.keys, "wg")?;
+    let public = Key([9; 32]).get_public().to_base64();
+    let mut desired = config(json!({"ipv6_enabled":false,"interfaces":[{
+        "name":"wg0","kind":"wireguard","role":"lan","up":true,"mtu":1420,
+        "addresses":["10.44.0.1/24"],"wireguard":{"key_ref":"wg","listen_port":51820,
+            "peers":[{"public_key":public,"endpoint":"localhost:51820",
+                "allowed_ips":["10.44.0.2/32"],"persistent_keepalive_seconds":25}]}
+    }]}))?;
+    desired.validate()?;
+    let empty = Config::empty();
+    let mut native = Native::open(options.clone())?;
+    native.repair(&empty)?;
+    native.apply(&empty, &desired)?;
+    let endpoint = |native: &Native| -> Result<Option<std::net::SocketAddr>> {
+        session(native.namespace.clone(), |_, _| {
+            let device = Device::get(&"wg0".parse()?, WgBackend::Kernel)?;
+            Ok(device.peers.first().and_then(|peer| peer.config.endpoint))
+        })
+    };
+    assert_eq!(endpoint(&native)?, Some("127.0.0.1:51820".parse()?));
+    native.wireguard_dns.shutdown()?;
+    let phase = Arc::new(AtomicUsize::new(0));
+    let answers = phase.clone();
+    native
+        .wireguard_dns
+        .control
+        .dns
+        .set_resolver(Arc::new(move |_, port, _| {
+            let address = match answers.load(Ordering::Acquire) {
+                0 => "127.0.0.1",
+                1 => "192.0.2.20",
+                2 => anyhow::bail!("synthetic DNS failure"),
+                3 => "2001:db8::20",
+                _ => "192.0.2.30",
+            };
+            Ok(vec![std::net::SocketAddr::new(address.parse()?, port)])
+        }));
+    native
+        .wireguard_dns
+        .configure_for_test(&desired.operational_value()?, Duration::from_millis(20))?;
+    let ownership = fs::read(native.state.join("ownership.json"))?;
+    let wait = |native: &Native, expected: &str, has_error: bool| -> Result<()> {
+        let expected = Some(expected.parse()?);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = native.wireguard_dns.snapshot()?;
+            if endpoint(native)? == expected && status["peers"][0]["error"].is_string() == has_error
+            {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "WireGuard DNS convergence failed: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    phase.store(1, Ordering::Release);
+    wait(&native, "192.0.2.20:51820", false)?;
+    assert_eq!(native.observe(&desired)?, desired);
+    assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
+    session(native.namespace.clone(), |_, _| {
+        let device = Device::get(&"wg0".parse()?, WgBackend::Kernel)?;
+        assert_eq!(device.listen_port, Some(51820));
+        assert_eq!(device.peers.len(), 1);
+        assert_eq!(
+            device.peers[0].config.persistent_keepalive_interval,
+            Some(25)
+        );
+        assert_eq!(device.peers[0].config.allowed_ips.len(), 1);
+        assert_eq!(
+            device.peers[0].config.allowed_ips[0].address,
+            "10.44.0.2".parse::<std::net::IpAddr>()?
+        );
+        Ok(())
+    })?;
+    phase.store(2, Ordering::Release);
+    wait(&native, "192.0.2.20:51820", true)?;
+    assert!(
+        native.runtime(&desired)?["wireguard_dns"]["peers"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("DNS failure")
+    );
+    assert_eq!(native.observe(&desired)?, desired);
+    phase.store(3, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = native.wireguard_dns.snapshot()?;
+        if status["peers"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("enabled IP families"))
+        {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "IPv4-only DNS resolution did not reject AAAA-only answers"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(endpoint(&native)?, Some("192.0.2.20:51820".parse()?));
+    let bgp_peer = public.clone();
+    session(native.namespace.clone(), move |_, _| {
+        DeviceUpdate::new()
+            .add_peer(
+                PeerConfigBuilder::new(&Key::from_base64(&bgp_peer)?)
+                    .add_allowed_ip("198.51.100.0".parse()?, 24),
+            )
+            .apply(&"wg0".parse()?, WgBackend::Kernel)?;
+        Ok(())
+    })?;
+    phase.store(4, Ordering::Release);
+    wait(&native, "192.0.2.30:51820", false)?;
+    let bgp_peer = public.clone();
+    session(native.namespace.clone(), move |_, _| {
+        let device = Device::get(&"wg0".parse()?, WgBackend::Kernel)?;
+        assert_eq!(device.peers[0].config.allowed_ips.len(), 2);
+        DeviceUpdate::new()
+            .add_peer(
+                PeerConfigBuilder::new(&Key::from_base64(&bgp_peer)?)
+                    .replace_allowed_ips()
+                    .add_allowed_ip("10.44.0.2".parse()?, 32),
+            )
+            .apply(&"wg0".parse()?, WgBackend::Kernel)?;
+        Ok(())
+    })?;
+    let mut changed = desired.clone();
+    changed.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint =
+        "other.example.test:51820".into();
+    native.apply(&desired, &changed)?;
+    phase.store(2, Ordering::Release);
+    native.apply(&changed, &desired)?;
+    assert_eq!(native.observe(&desired)?, desired);
+    assert_eq!(endpoint(&native)?, Some("192.0.2.30:51820".parse()?));
+    let mut unresolved = desired.clone();
+    unresolved.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint =
+        "missing.example.test:51820".into();
+    assert!(native.apply(&desired, &unresolved).is_err());
+    assert_eq!(native.observe(&desired)?, desired);
+    drop(native);
+    let mut native = Native::open(options)?;
+    native
+        .wireguard_dns
+        .control
+        .dns
+        .set_resolver(Arc::new(|_, _, _| {
+            anyhow::bail!("synthetic offline startup")
+        }));
+    native.repair(&desired)?;
+    assert_eq!(endpoint(&native)?, Some("192.0.2.30:51820".parse()?));
+    let mut disabled = unresolved;
+    disabled.interfaces[0].wireguard.as_mut().unwrap().peers[0].enabled = false;
+    native.apply(&desired, &disabled)?;
+    assert!(
+        !native.wireguard_dns.snapshot()?["running"]
+            .as_bool()
+            .unwrap()
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(endpoint(&native)?, None);
+    desired.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint = "192.0.2.40:51820".into();
+    native.apply(&disabled, &desired)?;
+    let peer = public.clone();
+    session(native.namespace.clone(), move |_, _| {
+        DeviceUpdate::new()
+            .add_peer(
+                PeerConfigBuilder::new(&Key::from_base64(&peer)?)
+                    .set_endpoint("192.0.2.50:51820".parse()?),
+            )
+            .apply(&"wg0".parse()?, WgBackend::Kernel)?;
+        Ok(())
+    })?;
+    assert!(
+        native
+            .observe(&desired)
+            .unwrap_err()
+            .downcast_ref::<netcontrol_core::BackendDrift>()
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/WireGuard modules"]
 fn native_wireguard_peer_enabled_toggle_restart_and_rollback() -> Result<()> {
     let fixture = Fixture::new()?;
     let options = fixture.options();
@@ -2806,7 +3002,7 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
         serde_json::to_value(&after)?
     );
     let plan = after.operational_value()?;
-    let keys = options.keys.clone();
+    let keys = native.wireguard_dns.control.clone();
     let snapshot = session(native.namespace.clone(), move |rt, handle| {
         rt.block_on(networking::boot_snapshot(
             handle,

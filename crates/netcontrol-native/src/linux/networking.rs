@@ -18,7 +18,6 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
-    path::Path,
 };
 
 #[cfg(test)]
@@ -887,7 +886,11 @@ pub async fn preflight(handle: &Handle, before: &Network, after: &Network) -> Re
     }
     Ok(())
 }
-pub async fn boot_snapshot(handle: &Handle, expected: &Network, keys: &Path) -> Result<Value> {
+pub async fn boot_snapshot(
+    handle: &Handle,
+    expected: &Network,
+    keys: &super::wireguard::Control,
+) -> Result<Value> {
     let available = links(handle).await?;
     let names = available
         .iter()
@@ -919,7 +922,7 @@ pub async fn boot_snapshot(handle: &Handle, expected: &Network, keys: &Path) -> 
             );
         }
         if let Some(wg) = &desired.wireguard {
-            super::wireguard::verify(keys, &desired.name, wg)
+            keys.verify(&desired.name, wg)
                 .context("existing WireGuard state cannot be safely snapshotted after reboot")?;
         }
         let mut observed = desired.clone();
@@ -1025,7 +1028,7 @@ pub async fn verify(
     handle: &Handle,
     network: &Network,
     parents: &BTreeMap<String, Parent>,
-    keys: &Path,
+    keys: &super::wireguard::Control,
 ) -> Result<()> {
     check_parents(handle, parents).await?;
     let available = links(handle).await?;
@@ -1069,7 +1072,7 @@ pub async fn verify(
             format!("interface {} address drift", desired.name),
         )?;
         if let Some(wg) = &desired.wireguard {
-            super::wireguard::verify(keys, &desired.name, wg)?;
+            keys.verify(&desired.name, wg)?;
         }
     }
     let mut routes = owned_routes(handle)
@@ -1094,7 +1097,7 @@ pub async fn reconcile(
     before: &Network,
     after: &Network,
     parents: &BTreeMap<String, Parent>,
-    keys: &Path,
+    keys: &super::wireguard::Control,
     originals: &BTreeMap<String, EthernetSnapshot>,
 ) -> Result<()> {
     check_parents(handle, parents).await?;
@@ -1302,8 +1305,14 @@ pub async fn reconcile(
             request.execute().await?;
         }
         if let Some(wg) = &desired.wireguard {
-            if super::wireguard::verify(keys, &desired.name, wg).is_err() {
-                super::wireguard::apply(keys, &desired.name, wg)?;
+            let changed = before
+                .interfaces
+                .iter()
+                .find(|link| link.name == desired.name)
+                .and_then(|link| link.wireguard.as_ref())
+                != Some(wg);
+            if changed || keys.verify(&desired.name, wg).is_err() {
+                keys.apply(&desired.name, wg, after.ipv6_enabled)?;
             }
         }
     }

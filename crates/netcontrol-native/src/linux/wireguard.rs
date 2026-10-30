@@ -140,7 +140,19 @@ fn private_key(root: &Path, reference: &str) -> Result<Key> {
     Ok(key)
 }
 
-fn settings(root: &Path, value: &Value) -> Result<(Key, u16, Vec<PeerConfigBuilder>)> {
+#[derive(Clone)]
+pub(super) struct Control {
+    pub keys: std::path::PathBuf,
+    pub dns: super::wireguard_dns::Cache,
+}
+
+fn settings(
+    root: &Path,
+    value: &Value,
+    dns: &super::wireguard_dns::Cache,
+    ipv6: bool,
+    resolve_dns: bool,
+) -> Result<(Key, u16, Vec<PeerConfigBuilder>)> {
     let reference = value["key_ref"]
         .as_str()
         .context("missing WireGuard key_ref")?;
@@ -185,16 +197,19 @@ fn settings(root: &Path, value: &Value) -> Result<(Key, u16, Vec<PeerConfigBuild
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty())
         {
-            let address: std::net::SocketAddr = endpoint
-                .parse()
-                .context("peer endpoint must be a numeric socket address")?;
-            ensure!(
-                address.port() != 0
-                    && !address.ip().is_unspecified()
-                    && !address.ip().is_multicast(),
-                "invalid peer endpoint"
-            );
-            builder = builder.set_endpoint(address);
+            match netcontrol_core::WireGuardEndpoint::parse(endpoint)? {
+                Some(netcontrol_core::WireGuardEndpoint::Numeric(address)) => {
+                    ensure!(
+                        ipv6 || address.is_ipv4(),
+                        "IPv6 WireGuard endpoint requires ipv6_enabled"
+                    );
+                    builder = builder.set_endpoint(address);
+                }
+                Some(netcontrol_core::WireGuardEndpoint::Dns { .. }) if resolve_dns => {
+                    builder = builder.set_endpoint(dns.resolve(endpoint, ipv6)?);
+                }
+                _ => {}
+            }
         }
         for prefix in peer["allowed_ips"]
             .as_array()
@@ -213,85 +228,86 @@ fn settings(root: &Path, value: &Value) -> Result<(Key, u16, Vec<PeerConfigBuild
     Ok((key, port, peers))
 }
 
-pub fn validate(root: &Path, value: &Value) -> Result<()> {
-    settings(root, value)?;
-    Ok(())
-}
-
-pub fn apply(root: &Path, name: &str, value: &Value) -> Result<()> {
-    let (key, port, peers) = settings(root, value)?;
-    let name: InterfaceName = name.parse()?;
-    DeviceUpdate::new()
-        .set_private_key(key)
-        .set_listen_port(port)
-        .unset_fwmark()
-        .replace_peers()
-        .add_peers(&peers)
-        .apply(&name, Backend::Kernel)?;
-    Ok(())
-}
-
-pub fn verify(root: &Path, name: &str, value: &Value) -> Result<()> {
-    let (key, port, peers) = settings(root, value)?;
-    let device = Device::get(&name.parse()?, Backend::Kernel)?;
-    crate::ensure_unchanged(
-        device.public_key == Some(key.get_public())
-            && device.listen_port == Some(port)
-            && device.fwmark.unwrap_or_default() == 0,
-        "WireGuard device configuration drift",
-    )?;
-    let expected: BTreeMap<_, _> = peers
-        .into_iter()
-        .map(|v| {
-            let config = v.into_peer_config();
-            (config.public_key.to_base64(), config)
-        })
-        .collect();
-    crate::ensure_unchanged(
-        device.peers.len() == expected.len(),
-        "WireGuard peer count drift",
-    )?;
-    for peer in device.peers {
-        let expected = expected
-            .get(&peer.config.public_key.to_base64())
-            .ok_or_else(|| netcontrol_core::BackendDrift("unexpected WireGuard peer".into()))?;
-        let mut actual_ips: Vec<_> = peer
-            .config
-            .allowed_ips
-            .iter()
-            .map(|p| format!("{}/{}", p.address, p.cidr))
-            .collect();
-        let mut expected_ips: Vec<_> = expected
-            .allowed_ips
-            .iter()
-            .map(|p| format!("{}/{}", p.address, p.cidr))
-            .collect();
-        actual_ips.sort();
-        expected_ips.sort();
-        crate::ensure_unchanged(
-            actual_ips == expected_ips
-                && peer
-                    .config
-                    .preshared_key
-                    .as_ref()
-                    .is_none_or(|v| v == &Key::zero())
-                && peer
-                    .config
-                    .persistent_keepalive_interval
-                    .unwrap_or_default()
-                    == expected.persistent_keepalive_interval.unwrap_or_default(),
-            "WireGuard peer allowed IP/keepalive/PSK drift",
-        )?;
-        // Endpoint roaming is kernel runtime state. Explicit configured endpoints are checked;
-        // omitted endpoints deliberately permit authenticated peer roaming.
-        if expected.endpoint.is_some() {
-            crate::ensure_unchanged(
-                peer.config.endpoint == expected.endpoint,
-                "WireGuard endpoint drift",
-            )?;
-        }
+impl Control {
+    pub fn validate(&self, value: &Value, ipv6: bool) -> Result<()> {
+        settings(&self.keys, value, &self.dns, ipv6, true)?;
+        Ok(())
     }
-    Ok(())
+
+    pub fn apply(&self, name: &str, value: &Value, ipv6: bool) -> Result<()> {
+        let (key, port, peers) = settings(&self.keys, value, &self.dns, ipv6, true)?;
+        let name: InterfaceName = name.parse()?;
+        DeviceUpdate::new()
+            .set_private_key(key)
+            .set_listen_port(port)
+            .unset_fwmark()
+            .replace_peers()
+            .add_peers(&peers)
+            .apply(&name, Backend::Kernel)?;
+        Ok(())
+    }
+
+    pub fn verify(&self, name: &str, value: &Value) -> Result<()> {
+        let (key, port, peers) = settings(&self.keys, value, &self.dns, true, false)?;
+        let device = Device::get(&name.parse()?, Backend::Kernel)?;
+        crate::ensure_unchanged(
+            device.public_key == Some(key.get_public())
+                && device.listen_port == Some(port)
+                && device.fwmark.unwrap_or_default() == 0,
+            "WireGuard device configuration drift",
+        )?;
+        let expected: BTreeMap<_, _> = peers
+            .into_iter()
+            .map(|v| {
+                let config = v.into_peer_config();
+                (config.public_key.to_base64(), config)
+            })
+            .collect();
+        crate::ensure_unchanged(
+            device.peers.len() == expected.len(),
+            "WireGuard peer count drift",
+        )?;
+        for peer in device.peers {
+            let expected = expected
+                .get(&peer.config.public_key.to_base64())
+                .ok_or_else(|| netcontrol_core::BackendDrift("unexpected WireGuard peer".into()))?;
+            let mut actual_ips: Vec<_> = peer
+                .config
+                .allowed_ips
+                .iter()
+                .map(|p| format!("{}/{}", p.address, p.cidr))
+                .collect();
+            let mut expected_ips: Vec<_> = expected
+                .allowed_ips
+                .iter()
+                .map(|p| format!("{}/{}", p.address, p.cidr))
+                .collect();
+            actual_ips.sort();
+            expected_ips.sort();
+            crate::ensure_unchanged(
+                actual_ips == expected_ips
+                    && peer
+                        .config
+                        .preshared_key
+                        .as_ref()
+                        .is_none_or(|v| v == &Key::zero())
+                    && peer
+                        .config
+                        .persistent_keepalive_interval
+                        .unwrap_or_default()
+                        == expected.persistent_keepalive_interval.unwrap_or_default(),
+                "WireGuard peer allowed IP/keepalive/PSK drift",
+            )?;
+            // DNS-selected and omitted endpoints are dynamic kernel state; numeric endpoints are owned.
+            if expected.endpoint.is_some() {
+                crate::ensure_unchanged(
+                    peer.config.endpoint == expected.endpoint,
+                    "WireGuard endpoint drift",
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn runtime(name: &str) -> Result<Value> {

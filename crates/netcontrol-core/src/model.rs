@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -820,6 +820,42 @@ fn socket(s: &str) -> Result<SocketAddr> {
     );
     Ok(addr)
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WireGuardEndpoint {
+    Numeric(SocketAddr),
+    Dns { host: String, port: u16 },
+}
+
+impl WireGuardEndpoint {
+    pub fn parse(value: &str) -> Result<Option<Self>> {
+        if value.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(address) = socket(value) {
+            ensure!(
+                !address.ip().is_unspecified() && !address.ip().is_multicast(),
+                "invalid WireGuard endpoint address"
+            );
+            return Ok(Some(Self::Numeric(address)));
+        }
+        let (host, port) = value
+            .rsplit_once(':')
+            .context("WireGuard endpoint requires host:port")?;
+        let number: u16 = port.parse().context("invalid WireGuard endpoint port")?;
+        ensure!(
+            valid_host(host)
+                && host.parse::<IpAddr>().is_err()
+                && number != 0
+                && number.to_string() == port,
+            "WireGuard endpoint requires a canonical IP:port or lowercase DNS name:port"
+        );
+        Ok(Some(Self::Dns {
+            host: host.into(),
+            port: number,
+        }))
+    }
+}
 fn action(s: &str) -> bool {
     matches!(s, "accept" | "drop")
 }
@@ -1147,9 +1183,7 @@ impl Config {
                                 && keys.insert(&p.public_key),
                             "invalid or duplicate WireGuard public key"
                         );
-                        if !p.endpoint.is_empty() {
-                            socket(&p.endpoint)?;
-                        }
+                        WireGuardEndpoint::parse(&p.endpoint)?;
                         ensure!(
                             (0..=65535).contains(&p.persistent_keepalive_seconds),
                             "invalid keepalive"
@@ -1518,12 +1552,11 @@ impl Config {
             if let Some(wg) = &link.wireguard {
                 for peer in &wg.peers {
                     prefixes.extend(peer.allowed_ips.iter().map(String::as_str));
-                    if !peer.endpoint.is_empty() {
-                        ensure!(
-                            socket(&peer.endpoint)?.is_ipv4(),
-                            "IPv6 WireGuard endpoint requires ipv6_enabled"
-                        );
-                    }
+                    ensure!(
+                        !matches!(WireGuardEndpoint::parse(&peer.endpoint)?,
+                        Some(WireGuardEndpoint::Numeric(address)) if address.is_ipv6()),
+                        "IPv6 WireGuard endpoint requires ipv6_enabled"
+                    );
                 }
             }
         }

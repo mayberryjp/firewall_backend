@@ -217,6 +217,80 @@ fn firewall_clear_config(host_policies: bool) -> Config {
 }
 
 #[test]
+fn wireguard_dns_names_persist_and_rollback_through_authorized_transactions() {
+    use base64::Engine as _;
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut candidate = config();
+    candidate.interfaces[0].kind = "wireguard".into();
+    candidate.interfaces[0].wireguard = Some(
+        serde_json::from_value(json!({
+            "key_ref":"wg","listen_port":51820,"peers":[{
+                "public_key":base64::engine::general_purpose::STANDARD.encode([1;32]),
+                "endpoint":"vpn.example.test:51820","allowed_ips":["192.0.2.2/32"]
+            }]
+        }))
+        .unwrap(),
+    );
+    let revision = engine.committed_revision();
+    let permissions: Vec<_> = all()
+        .into_iter()
+        .filter(|permission| permission != "wireguard.write")
+        .collect();
+    let denied = engine.request(
+        "POST",
+        "/api/v1/transactions",
+        "",
+        "operator",
+        &permissions,
+        &serde_json::to_vec(
+            &json!({"base_revision":revision,"confirm_timeout_seconds":30,"config":candidate}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(denied.status, 403);
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let endpoint = |config: &Config| {
+        config.interfaces[0].wireguard.as_ref().unwrap().peers[0]
+            .endpoint
+            .clone()
+    };
+    assert_eq!(
+        endpoint(engine.saved_configuration()),
+        "vpn.example.test:51820"
+    );
+    candidate.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint =
+        "other.example.test:51820".into();
+    let changed = submit(&mut engine, candidate.clone());
+    assert_eq!(changed.status, 202, "{}", changed.body);
+    let id = changed.body["id"].as_str().unwrap().to_string();
+    drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        endpoint(engine.saved_configuration()),
+        "vpn.example.test:51820"
+    );
+    candidate.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint =
+        "https://vpn.example.test:51820".into();
+    assert_eq!(submit(&mut engine, candidate).status, 422);
+}
+
+#[test]
 fn filter_protocol_api_validation_persistence_and_restart_rollback() {
     for host_policies in [false, true] {
         let fixture = Fixture::new();
