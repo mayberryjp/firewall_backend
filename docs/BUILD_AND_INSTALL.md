@@ -380,7 +380,7 @@ Neither script enables unprivileged BPF, installs BCC/bpftrace/ss/tc collectors,
 mounts tracefs/bpffs, or weakens AppArmor/lockdown. No reboot is normally required.
 No API or collector-side host sysctl/module mutation is added.
 
-Other deployment paths (signed package/self-update/OpenRC/manual binaries)
+Other deployment paths (signed packages, HTTPS self-updates, OpenRC/manual binaries)
 require operator-provided kernel support/modules. Missing support produces an
 explicit unavailable diagnostic sample with retries, not a healthy zero, service
 crash or configuration-write lock. Verify with authenticated
@@ -440,7 +440,7 @@ namespaces require explicit operator setup in the appropriate namespace; the
 read-only connections API never changes these settings itself. No package,
 daemon-startup, factory-reset or browser hook is added by this shell setup.
 
-## Signed Ubuntu Self-Upgrade
+## Ubuntu Self-Upgrade
 
 Optional self-upgrade supports Ubuntu amd64, root-run `netcontrold.service`,
 and the Linux host appliance backend only. It downloads a specific GitHub release
@@ -453,17 +453,24 @@ release baseline or published update channel established by this change.
 
 ### Trust and Bootstrap
 
-First deploy a reviewed daemon containing this feature using the ordinary
-upgrade path. Obtain the release-signing **public** key through a separately
-trusted channel. Keep the private signing key off appliances. Public keys contain
-exactly 32 binary Ed25519 bytes. Install the public key root-owned, not writable
-by other users, at `/etc/netcontrol/update.pub`. Create root-owned mode `0600`
-`/etc/netcontrol/updates.json` with this configuration (synthetic example):
+Ubuntu self-updates use the fixed GitHub repository over verified HTTPS, **without
+publisher signatures**. SHA-256 checks consistency with the same-source manifest,
+not independent authenticity. Compromise of the trusted GitHub repository/account
+can supply an accepted executable. This user-selected trust model does not change
+the separate signed `.ncpkg` package format.
+
+Fresh `install.sh` and source `upgrade.sh` runs automatically create or validate
+root-owned mode `0600` `/etc/netcontrol/updates.json` and enable
+`NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json` in the managed service
+drop-in. Source upgrades run the staged new daemon's bootstrap **before stopping
+the previous service**; bootstrap failure aborts replacement. The helper is:
+`netcontrold --configure-updates /etc/netcontrol/updates.json`. It exits without
+starting a daemon, fetching releases or changing saved networking. It creates
+the following defaults only when the file is absent:
 
 ```json
 {
   "repository": "mayberryjp/firewall_backend",
-  "public_key": "/etc/netcontrol/update.pub",
   "token_file": null
 }
 ```
@@ -471,24 +478,25 @@ by other users, at `/etc/netcontrol/update.pub`. Create root-owned mode `0600`
 For private repositories, `token_file` is an absolute path to a root-owned mode
 `0600` file containing a GitHub token with read-only repository release access.
 Never include its value in API requests, URLs, documentation or logs. Public
-releases need no token. Configuration/key/token ancestors must be root-owned,
+releases need no token. Configuration/token ancestors must be root-owned,
 not writable by other users and not symlinks. Do not put them in temporary or
 user-writable directories. Unknown configuration fields are rejected.
 
-Add `--upgrade-config /etc/netcontrol/updates.json` to the service's effective
-`ExecStart` using a reviewed systemd drop-in, retaining its complete existing
-arguments, state paths and environment. For the unmodified Ubuntu appliance unit,
-the replacement `[Service]` section is:
+Existing valid configuration is preserved byte-for-byte, including custom
+repository/token paths. Existing invalid, unsafe, symlink or hard-linked files
+are rejected, not reset. The current schema contains only `repository` and
+optional `token_file`: remove a former `public_key` field explicitly before
+deployment; do not delete unrelated key files or change a pending worker's
+configuration. Finish/recover active upgrades using their matching binary first.
+No signing key, signature asset or key-generation setup is needed.
 
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/local/sbin/netcontrold --backend linux --appliance --listen ${NETCONTROL_LISTEN} --state /var/lib/netcontrol/native-state.json --credential-db /var/lib/netcontrol/credentials.json --keys /etc/netcontrol/keys --services-state-dir /var/lib/netcontrol/services --upgrade-config /etc/netcontrol/updates.json
-```
-
-Reload systemd and restart from an independent OS SSH session/local console.
-Invalid/unsafe upgrade configuration fails startup explicitly. Without the flag,
-upgrades are disabled; a simulator/lab namespace cannot enable them. Keep `kmod`
+Manual/custom deployments can set `--upgrade-config PATH` explicitly; a command
+line value takes precedence over the service environment. The managed drop-in
+does not replace existing unit arguments/state paths. Restart from an independent
+OS SSH session/local console. Invalid/unsafe configuration fails startup
+explicitly. Without the option/environment, installation stays disabled (but
+release discovery works independently). A simulator/lab namespace cannot enable
+installation. `--build-only` makes no service/configuration changes. Keep `kmod`
 and `procps` installed. Successful API upgrades apply/persist the same conntrack
 accounting/checksum prerequisites as the shell paths before binary replacement;
 those host prerequisite changes are not rolled back on later failure.
@@ -502,18 +510,20 @@ The embedded source version is `RELEASE_VERSION` in
 label is `2026.10.29.1`, not a claim that a release has been published.
 Substantive code changes advance that build label once per task. Cargo's
 three-part package version is internal, not software identity.
-Publication still needs explicit approval. The illustrative future version below
-must match the daemon being signed. No prerelease/build suffix or `v` prefix is
-accepted in manifests/API bodies; the GitHub tag is `v2026.10.29.2`.
+Publication still needs explicit approval. Use the embedded version from the
+daemon being published. No prerelease/build suffix or `v` prefix is accepted in
+manifests/API bodies; the GitHub tag adds `v` to that exact version.
 
 Build the daemon as a static amd64 Linux musl executable and use the package
 tool's offline asset builder on the publishing machine:
 
 ```sh
+daemon=target/x86_64-unknown-linux-musl/release/netcontrold
+version="$("$daemon" --version)"
+version="${version#netcontrold }"
 netcontrol-package build-update \
-  --daemon target/x86_64-unknown-linux-musl/release/netcontrold \
-  --version 2026.10.29.2 \
-  --signing-key signing.key \
+  --daemon "$daemon" \
+  --version "$version" \
   --output-dir ubuntu-update-assets
 ```
 
@@ -524,15 +534,17 @@ ELF and creates exactly these assets; it does not upload, tag or release:
 - `netcontrol-ubuntu-amd64.json`: strict manifest, maximum 4096 bytes, containing
   `schema: 1`, `version`, `target: "ubuntu-amd64-systemd"`, numeric `size` in bytes
   and lowercase hexadecimal `sha256`.
-- `netcontrol-ubuntu-amd64.sig`: 64-byte detached Ed25519 signature covering the
-  exact manifest bytes. Do not reformat the manifest after signing it.
 
-Upload those three files to the approved, non-draft release in the configured
+No `.sig` is produced or required. `build-update` has no signing-key argument.
+The existing manually gated build workflow prepares these same two assets in
+`netcontrol-ubuntu-updates-<commit>`; it does not create a release or publish them.
+
+Upload those two files to the approved, non-draft release in the configured
 repository using a separate authorized publication workflow. The daemon uses
 GitHub's HTTPS release/asset API, including private-release authentication when
-configured. It checks the tag, exact asset names/sizes, signature, signed version
-and target, binary size/digest/ELF, and the replacement's `--help` support for
-`--upgrade-config`. HTTPS certificate verification stays enabled; credentials
+configured. It checks the tag, unique asset names/sizes, manifest version/target,
+binary size/digest/ELF, replacement `--help` support for `--upgrade-config` and
+exact embedded `--version` match before installation. HTTPS certificate verification stays enabled; credentials
 are sensitive headers, not URLs, and are not forwarded to a different redirect
 host. Requests have 15-second connect and 300-second per-request total timeouts,
 at most five HTTPS redirects and bounded response bodies. No release is
@@ -564,9 +576,12 @@ Asynchronous errors appear in job status, not a later HTTP error from the POST.
 
 ### Daily Release Discovery and Configuration Versions
 
-The configured daemon checks GitHub's latest published stable release at startup
-and every 24 hours, asynchronously and without installing it. It reuses the fixed
-repository and optional private token in `--upgrade-config`; no browser-supplied
+The daemon checks GitHub's latest published stable release at startup and every
+24 hours by default, asynchronously and without installing it. Without installation
+configuration it uses `mayberryjp/firewall_backend` anonymously; configured
+self-upgrades supply their fixed repository and optional private token.
+`--disable-release-checks` explicitly disables scheduled/manual discovery,
+not a configured installation manager. No browser-supplied
 repository/token/URL is accepted. HTTPS requests refuse redirects, use a 10-second
 connect/30-second total timeout and limit JSON to 1 MiB. Tags must be canonical
 `vyyyy.mm.dd.iteration`; errors (including no published release or rate limiting)
@@ -577,17 +592,17 @@ To check immediately without restarting or installing anything, use authenticate
 body. `202 {"status":"check_requested"}` queues work on the same single-flight
 worker; `Location: /api/v1/revisions/latest` identifies where to read
 `config.software` with `state.read`. The previous result remains until completion.
-An already queued/running manual or scheduled check returns `409`; unconfigured
+An already queued/running manual or scheduled check returns `409`; explicitly disabled
 or unavailable checking returns `503`. No repository/token/version override is
 accepted. The daily timer is unchanged; shutdown cancels outstanding checks.
-This action neither downloads assets nor invokes the signed installation path.
+This action neither downloads assets nor invokes the installation path.
 
 The master configuration's daemon-managed `software` object saves running
 `version`, nullable `repository`, `latest_version`, `update_available`,
 `last_checked_at` and `error`. Null availability means disabled, pending or failed,
 distinguished by repository/time/error; it never means up to date. Metadata is
 reset to the running build at startup and atomically refreshed without a
-configuration revision or network apply. Upgrades still verify all signed assets
+configuration revision or network apply. Upgrades validate binary/manifest integrity
 separately. No real release publication/discovery or appliance upgrade is implied
 by tests. See [field/UI details](../FRONTEND_SPEC.md#46-software-version-and-daily-release-checks).
 
@@ -653,7 +668,8 @@ state/deployment contract and test recovery before approving deployment. Never
 delete state or flush connections to force an update. Automated systemd restart,
 boot/power-loss, authenticated release-download and frontend acceptance still
 require a disposable Ubuntu VM; container build/unit/filesystem tests do not
-prove these behaviors. See the [current journal](journal/2026-10-24.md#signed-ubuntu-self-upgrade).
+prove these behaviors. See the [current journal](journal/2026-10-29.md#automatic-github-https-updates)
+and [original recovery design](journal/2026-10-24.md#signed-ubuntu-self-upgrade).
 
 ## Ubuntu prebuilt installation (amd64)
 
@@ -1192,7 +1208,7 @@ The scripts atomically publish these root-owned mode `0644` managed files:
   `PartOf=netcontrold.service`. Systemd creates and passes the receiver.
 - The appliance service drop-in shown above requires/receives that socket.
   `PartOf` propagates service stop/restart to the socket in the same systemd
-  transaction, including source upgrades, signed API upgrades and factory reset.
+  transaction, including source upgrades, API upgrades and factory reset.
   It prevents forwarding traffic from reactivating the daemon during maintenance.
   The socket is not independently enabled or started before initial provisioning.
 

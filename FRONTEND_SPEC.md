@@ -864,18 +864,25 @@ and explicit disable are documented in the
 [deployment guide](docs/BUILD_AND_INSTALL.md#optional-configuration-ssh-server).
 Host-key or bind failures remain startup errors, not silent SSH disablement.
 
-### 4.5 Signed Ubuntu Self-Upgrade
+### 4.5 Ubuntu Self-Upgrade
 
-Self-upgrade is optional and disabled unless a root-owned trusted GitHub
-repository/public-key configuration is supplied through `--upgrade-config`.
+Ubuntu self-upgrades trust a fixed GitHub repository over verified HTTPS,
+without publisher signatures or signing-key setup. A root-owned repository/
+optional-token configuration enables installation through `--upgrade-config`
+or `NETCONTROL_UPGRADE_CONFIG`; standard install/upgrade scripts now bootstrap
+that configuration and service environment automatically, preserving valid
+operator settings and existing startup arguments.
 It supports only Ubuntu amd64/systemd, Linux host appliance mode. It is not an
 OS update, `.ncpkg` installation, factory reset or source build. Release assets
-must be separately signed and explicitly published; no approved release/version
-baseline or channel is implied. See [operator setup and artifact contract](docs/BUILD_AND_INSTALL.md#signed-ubuntu-self-upgrade).
+must be explicitly published; no approved release/version baseline or channel
+is implied. SHA-256 detects corruption against the same-source manifest, not
+publisher authenticity: compromise of the trusted GitHub repository/account can
+provide an accepted replacement. Separate signed `.ncpkg` packages are unchanged.
+See [operator setup and artifact contract](docs/BUILD_AND_INSTALL.md#ubuntu-self-upgrade).
 
 | Method/path | Permission | Behavior |
 | --- | --- | --- |
-| `POST /api/v1/system/upgrade` | `system.upgrade` | Submit a specific signed release version; returns `202` job and `Location: /api/v1/system/upgrade` |
+| `POST /api/v1/system/upgrade` | `system.upgrade` | Submit a specific GitHub HTTPS release version; returns `202` job and `Location: /api/v1/system/upgrade` |
 | `GET /api/v1/system/upgrade` | `state.read` | Read configuration-enabled flag and latest durable job; `200` even when disabled |
 | `POST /api/v1/system/upgrade/check` | `system.upgrade` | Request release discovery now, no body/query; `202` with `Location: /api/v1/revisions/latest`; does not install |
 
@@ -909,7 +916,7 @@ Statuses: `queued`, `downloading`, `installing`, `checking`, `succeeded`,
 `failed`, `rolled_back`, `recovery_required`. Only `succeeded`, `failed` and
 `rolled_back` are terminal; recovery-required needs local-console intervention
 and remains write-blocking. `202` does not promise that the release was found,
-signature passed or installation succeeded. A new API upgrade must be newer
+integrity checks passed or installation succeeded. A new API upgrade must be newer
 than both the running version and last successful API-upgrade version when known;
 there is no downgrade override. The running baseline is the embedded public
 software version, independently of upgrade receipts and Cargo package versions.
@@ -924,8 +931,11 @@ Reads remain available until restart, but new configuration/SSH writes and DHCP
 retry return `409` while active; disable those actions and preserve unsaved drafts.
 After reconnect, refetch state/revision before allowing draft submission.
 
-The independent helper verifies the configured signing key, version, target,
-digest and bounded HTTPS downloads, preserves the main service arguments and
+The independent helper validates the fixed release/tag, version, target, exact
+two required assets, size/digest/ELF and bounded HTTPS downloads. It requires
+`netcontrold-ubuntu-amd64` and `netcontrol-ubuntu-amd64.json`, with no signature
+asset. The staged executable's `--version` must match the manifest/request.
+It preserves the main service arguments and
 saved configuration, and attempts previous-binary restoration on install/startup
 failure. A required boot recovery unit handles interrupted install/check phases.
 It also applies existing conntrack accounting/checksum prerequisites. Browser
@@ -936,6 +946,9 @@ migration is added. Actual systemd/power-loss/release/browser acceptance remains
 pending; [handoff 2026-10-24-07](docs/frontend-handoffs/2026-10-24.md#2026-10-24-07-signed-ubuntu-self-upgrade)
 is Pending frontend review and its version rules are superseded by the
 [date-version handoff](docs/frontend-handoffs/2026-10-29.md#2026-10-29-01-date-versions-and-daily-release-checks).
+Signing/bootstrap and checking enablement requirements are superseded by
+[handoff 2026-10-29-05](docs/frontend-handoffs/2026-10-29.md#2026-10-29-05-automatic-github-https-upgrades),
+also Pending frontend review.
 
 ### 4.6 Software Version and Daily Release Checks
 
@@ -962,15 +975,20 @@ means `update_available:false`, not an available downgrade. A failed check
 sets `last_checked_at` and explicit `error`, clearing latest/availability to
 null; never render it as "up to date" or keep a stale success badge.
 
-When `--upgrade-config` is configured, an in-process async worker queries that
-trusted repository's GitHub `/releases/latest` at startup and every 24 hours.
+An in-process worker queries GitHub `/releases/latest` at startup and every
+24 hours by default, using `mayberryjp/firewall_backend` without any signing
+or installation configuration. Configured self-upgrades supply the same trusted
+repository and optional server-managed token for discovery. Explicit
+`--disable-release-checks` disables automatic/manual checks and produces
+`repository:null`; an absent upgrade configuration no longer disables checking.
+Discovery is portable and independent of installation's Ubuntu/native constraints.
 Only published stable releases with canonical `v<version>` tags qualify.
 HTTPS verification is mandatory; redirects are refused, connect timeout is
 10 seconds, total request timeout 30 seconds, response limit 1 MiB. No release,
 rate limiting, malformed tags and transport/API errors are explicit failed
 checks; retry with the manual action below, the next daily check or daemon restart. No automatic
 download/install or publication occurs. Availability is discovery metadata,
-not proof that signed assets exist or that installation will succeed.
+not proof that the required binary/manifest assets exist or that installation will succeed.
 
 Results are atomically saved in the master journal without applying networking,
 allocating a configuration revision or changing a pending transaction.
@@ -992,7 +1010,7 @@ repository, URL, token or force flag.
 
 Accepted response: HTTP `202`, `Location: /api/v1/revisions/latest`,
 `{"status":"check_requested"}`. This acknowledges queuing, not completion,
-availability, signature verification or installation. Read
+availability, integrity validation or installation. Read
 `GET /api/v1/revisions/latest` (`config.software`) or normal state polling
 (`desired.software`) with `state.read` for the resulting metadata.
 The old saved result remains visible while checking; no persisted `checking`
@@ -1003,15 +1021,17 @@ null latest/availability, not a later HTTP error from the accepted POST.
 The standard error envelope is unchanged: `401` invalid/missing authentication,
 `403` missing `system.upgrade`, `405` methods other than POST, `400` any nonempty
 body/query, `409` a manual or scheduled check already queued/running, `503`
-checking unconfigured or its worker unavailable. `409` does not queue another
+checking explicitly disabled or its worker unavailable. `409` does not queue another
 check; show an already-checking message and observe the existing result.
 Manual and scheduled requests share one worker and cannot overlap. Requests do
 not reset the daily timer, allocate configuration revisions, alter pending
 transactions or start an upgrade. Shutdown cancels queued/in-flight checks
 without publishing a fabricated result; the next startup checks normally.
 
-Add **Check now** beside software availability, enabled only for configured
-checking and an authorized user. Disable repeated clicks during a local request/
+Add **Check now** beside software availability, enabled when
+`software.repository !== null` and the user has permission. Do not gate it on
+`GET /api/v1/system/upgrade.enabled`: that field controls installation only.
+Disable repeated clicks during a local request/
 poll cycle, show the prior result as stale/checking, and keep fetch/authorization/
 worker errors distinct from a successful no-update result. Capture the previous
 `last_checked_at`, then poll for a changed result with a bounded local wait.
@@ -1904,7 +1924,7 @@ arbitrary commands, OpenRC service management, or host-network edits are exposed
 Ubuntu install/full source-upgrade scripts configure `ForwardToSyslog=yes`,
 `MaxLevelSyslog=debug`, `ReadKMsg=yes` and `netcontrol-syslog.socket`, and stop/mask
 common competing syslog receivers. They preserve journald and its `/dev/log` input.
-Build-only and signed API/package upgrades do not provision this setup. Saved
+Build-only and API/package upgrades do not provision this setup. Saved
 syslog settings remain unchanged: disabling native syslog stops forwarding, not
 local journald capture. The bounded receiver queue may retain messages while
 disabled and forward them on enable; overflow/daemon restart may lose them.

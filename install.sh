@@ -73,7 +73,7 @@ configure_appliance_services() (
     install -d -o root -g root -m 0755 "$directory" || exit 1
     staged=$(mktemp "$directory/.appliance-services.XXXXXX") || exit 1
     trap '[[ -z $staged ]] || rm -f -- "$staged"' EXIT
-    printf '[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222\n' > "$staged" || exit 1
+    printf '[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222\nEnvironment=NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json\n' > "$staged" || exit 1
     chmod 0644 "$staged" || exit 1
     mv -fT -- "$staged" "$destination" || exit 1
     printf 'Appliance host services, gateway monitoring and embedded configuration SSH (TCP 2222) enabled for the next daemon start; configured protocol services remain controlled by saved configuration. Restrict management access with the host-input firewall.\n'
@@ -175,10 +175,15 @@ check_systemd_unit() {
     fi
 }
 
+configure_upgrade_settings() {
+    "${1:-/usr/local/sbin/netcontrold}" --configure-updates /etc/netcontrol/updates.json
+}
+
 install_systemd_service() {
     check_systemd_unit || return 1
     install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys || return 1
     install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service || return 1
+    configure_upgrade_settings || return 1
     configure_appliance_services || return 1
     configure_logging_units || return 1
     systemctl daemon-reload || return 1
@@ -323,7 +328,9 @@ main() {
     if ! grep -q -- --provision-wan <<< "$help" ||
        ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
        ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help" ||
-       ! grep -q NETCONTROL_SSH_LISTEN <<< "$help"; then
+       ! grep -q NETCONTROL_SSH_LISTEN <<< "$help" ||
+       ! grep -q NETCONTROL_UPGRADE_CONFIG <<< "$help" ||
+       ! grep -q -- --configure-updates <<< "$help"; then
         printf 'Artifact lacks current appliance provisioning/service/SSH environment support. Build the reviewed current source; no older-contract fallback is provided.\n' >&2
         return 1
     fi

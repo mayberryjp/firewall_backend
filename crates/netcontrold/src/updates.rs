@@ -21,8 +21,16 @@ const DEPENDENCY: &str = "[Unit]\nRequires=netcontrol-upgrade-recovery.service\n
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub repository: String,
-    pub public_key: PathBuf,
     pub token_file: Option<PathBuf>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            repository: "mayberryjp/firewall_backend".into(),
+            token_file: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -57,7 +65,9 @@ fn now() -> Result<String> {
     Ok(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
 }
 
-fn regular(path: &Path, private: bool) -> Result<()> {
+fn safe_parents(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     for parent in path.ancestors().skip(1) {
         use std::os::unix::fs::MetadataExt;
@@ -70,6 +80,11 @@ fn regular(path: &Path, private: bool) -> Result<()> {
             "update path parents must be root-owned and not writable by other users"
         );
     }
+    Ok(())
+}
+
+fn regular(path: &Path, private: bool) -> Result<()> {
+    safe_parents(path)?;
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink(),
@@ -268,16 +283,62 @@ fn validate_config(config: &Config) -> Result<()> {
         "repository must be a GitHub owner/repository name"
     );
     ensure!(
-        config.public_key.is_absolute()
-            && config
-                .token_file
-                .as_ref()
-                .is_none_or(|path| path.is_absolute()),
-        "update key/token paths must be absolute"
+        config
+            .token_file
+            .as_ref()
+            .is_none_or(|path| path.is_absolute()),
+        "update token path must be absolute"
+    );
+    Ok(())
+}
+
+fn parse_config(bytes: &[u8]) -> Result<Config> {
+    let config: Config = serde_json::from_slice(bytes)
+        .context("upgrade configuration must contain only repository and optional token_file; no signing key")?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+pub fn configure(path: &Path) -> Result<()> {
+    ensure!(
+        cfg!(target_os = "linux"),
+        "upgrade bootstrap requires Linux"
+    );
+    #[cfg(unix)]
+    ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "upgrade bootstrap requires root"
     );
     ensure!(
-        read(&config.public_key, 32, false)?.len() == 32,
-        "update public key must contain 32 binary bytes"
+        path.is_absolute(),
+        "upgrade configuration path must be absolute"
+    );
+    let parent = path
+        .parent()
+        .context("upgrade configuration needs a parent")?;
+    safe_parents(parent)?;
+    if !parent.try_exists()? {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
+    }
+    safe_parents(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            parse_config(&read(path, 4096, true)?)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic(path, &serde_json::to_vec_pretty(&Config::default())?, false)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    println!(
+        "GitHub HTTPS upgrade configuration ready: {}",
+        path.display()
     );
     Ok(())
 }
@@ -309,8 +370,7 @@ impl Manager {
             Path::new("/run/systemd/system").is_dir(),
             "self-upgrade requires systemd"
         );
-        let config: Config = serde_json::from_slice(&read(path, 4096, true)?)?;
-        validate_config(&config)?;
+        let config = parse_config(&read(path, 4096, true)?)?;
         directory(Path::new(ROOT))?;
         Ok(Self {
             config,
@@ -697,6 +757,16 @@ struct Asset {
     size: u64,
 }
 
+fn release_asset<'a>(release: &'a Release, name: &str, limit: u64) -> Result<&'a Asset> {
+    let mut matches = release.assets.iter().filter(|asset| asset.name == name);
+    let asset = matches.next().context("missing release asset")?;
+    ensure!(
+        matches.next().is_none() && asset.id > 0 && asset.size > 0 && asset.size <= limit,
+        "duplicate or invalid release asset"
+    );
+    Ok(asset)
+}
+
 impl Manager {
     fn download(&self, job: &Job) -> Result<(Manifest, Vec<u8>)> {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -748,27 +818,20 @@ impl Manager {
             "release tag does not match requested version"
         );
         let asset = |name: &str, limit: usize| -> Result<Vec<u8>> {
-            let matches: Vec<_> = release
-                .assets
-                .iter()
-                .filter(|asset| asset.name == name)
-                .collect();
-            ensure!(
-                matches.len() == 1 && matches[0].size <= limit as u64,
-                "missing, duplicate or oversized release asset"
-            );
+            let metadata = release_asset(&release, name, limit as u64)?;
             fetch(
-                &format!("{base}/releases/assets/{}", matches[0].id),
+                &format!("{base}/releases/assets/{}", metadata.id),
                 limit,
                 "application/octet-stream",
             )
         };
         let bytes = asset("netcontrol-ubuntu-amd64.json", update::MANIFEST_LIMIT)?;
-        let signature = asset("netcontrol-ubuntu-amd64.sig", 64)?;
-        let key: [u8; 32] = read(&self.config.public_key, 32, false)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid update key"))?;
-        let manifest = update::verify_manifest(&bytes, &signature, &key, &job.version)?;
+        let manifest = update::parse_manifest(&bytes, &job.version)?;
+        ensure!(
+            release_asset(&release, "netcontrold-ubuntu-amd64", manifest.size)?.size
+                == manifest.size,
+            "release binary metadata size does not match manifest"
+        );
         let binary = asset("netcontrold-ubuntu-amd64", manifest.size as usize)?;
         update::verify_binary(&binary, &manifest)?;
         Ok((manifest, binary))
@@ -810,6 +873,11 @@ impl Manager {
             command("/var/lib/netcontrol-updates/candidate", &["--help"])?
                 .contains("--upgrade-config"),
             "replacement does not support self-upgrade configuration"
+        );
+        ensure!(
+            command("/var/lib/netcontrol-updates/candidate", &["--version"])?.trim()
+                == format!("netcontrold {}", manifest.version),
+            "replacement embedded version does not match manifest"
         );
         let previous = read(&job.destination, update::BINARY_LIMIT as usize, false)?;
         ensure!(
@@ -869,7 +937,7 @@ pub fn helper(recover: bool) -> Result<()> {
     );
     directory(Path::new(ROOT))?;
     let manager = Manager {
-        config: serde_json::from_slice(&read(&Path::new(ROOT).join("config.json"), 4096, true)?)?,
+        config: parse_config(&read(&Path::new(ROOT).join("config.json"), 4096, true)?)?,
         root: PathBuf::from(ROOT),
     };
     let lock_path = manager.root.join("worker.lock");
@@ -977,6 +1045,91 @@ mod tests {
         assert!(release_metadata("example/netcontrol", &invalid).is_err());
     }
 
+    #[test]
+    fn upgrade_configuration_defaults_need_no_signing_key_and_reject_invalid_sources() {
+        let config = Config::default();
+        validate_config(&config).unwrap();
+        assert_eq!(config.repository, "mayberryjp/firewall_backend");
+        assert!(config.token_file.is_none());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({"repository":"mayberryjp/firewall_backend","token_file":null})
+        );
+        parse_config(br#"{"repository":"example/netcontrol"}"#).unwrap();
+        for bytes in [
+            br#"{"repository":"https://example.test/a"}"#.as_slice(),
+            br#"{"repository":"../a"}"#,
+            br#"{"repository":"example/netcontrol","token_file":"relative"}"#,
+            br#"{"repository":"example/netcontrol","public_key":"/etc/old.pub"}"#,
+            br#"{"repository":"example/netcontrol","unknown":true}"#,
+        ] {
+            assert!(parse_config(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn release_assets_reject_missing_duplicate_empty_and_oversized_downloads() {
+        let mut release = Release {
+            tag_name: "v9999.12.31.1".into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![],
+        };
+        assert!(release_asset(&release, "binary", 64).is_err());
+        release.assets.push(Asset {
+            id: 1,
+            name: "binary".into(),
+            size: 64,
+        });
+        assert_eq!(release_asset(&release, "binary", 64).unwrap().size, 64);
+        assert!(release_asset(&release, "binary", 63).is_err());
+        release.assets[0].size = 0;
+        assert!(release_asset(&release, "binary", 64).is_err());
+        release.assets[0].size = 64;
+        release.assets.push(Asset {
+            id: 2,
+            name: "binary".into(),
+            size: 64,
+        });
+        assert!(release_asset(&release, "binary", 64).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root and a private fixture under /var/lib; no systemd or networking"]
+    fn upgrade_bootstrap_creates_private_settings_and_preserves_or_rejects_existing_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::Builder::new()
+            .prefix("netcontrol-bootstrap-")
+            .tempdir_in("/var/lib")
+            .unwrap();
+        let path = root.path().join("settings").join("updates.json");
+        configure(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let defaults = read(&path, 4096, true).unwrap();
+        configure(&path).unwrap();
+        assert_eq!(read(&path, 4096, true).unwrap(), defaults);
+        let custom =
+            br#"{"repository":"example/private","token_file":"/etc/netcontrol/github.token"}"#;
+        atomic(&path, custom, false).unwrap();
+        configure(&path).unwrap();
+        assert_eq!(read(&path, 4096, true).unwrap(), custom);
+        let invalid = br#"{"repository":"example/private","public_key":"/etc/old.pub"}"#;
+        atomic(&path, invalid, false).unwrap();
+        assert!(configure(&path).is_err());
+        assert_eq!(read(&path, 4096, true).unwrap(), invalid);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(configure(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        let target = root.path().join("operator-settings");
+        atomic(&target, custom, false).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(configure(&path).is_err());
+        assert_eq!(read(&target, 4096, true).unwrap(), custom);
+    }
     #[tokio::test(start_paused = true)]
     async fn release_checks_run_at_startup_daily_persist_errors_and_stop() {
         use std::sync::{
@@ -1296,7 +1449,6 @@ mod tests {
         let manager = Manager {
             config: Config {
                 repository: "example/netcontrol".into(),
-                public_key: root.path().join("unused-key"),
                 token_file: None,
             },
             root: root.path().to_owned(),

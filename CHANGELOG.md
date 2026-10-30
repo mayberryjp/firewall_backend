@@ -4,6 +4,14 @@
 
 ### Added
 
+- Automatic private GitHub update configuration on standard Ubuntu installation
+  and source upgrades, preserving valid operator settings and existing service
+  arguments. Release checks now run by default independently of installation;
+  `--disable-release-checks` is the explicit offline opt-out. No automatic
+  installation or publication. Unreleased build `2026.10.30.4`; required frontend
+  wording/gating and deployment work:
+  [handoff 2026-10-29-05](docs/frontend-handoffs/2026-10-29.md#2026-10-29-05-automatic-github-https-upgrades).
+
 - Explicit offline `netcontrol-state-convert --date-revisions` recovery for
   numeric-v1 journals, preserving configuration/history and native metadata
   with private originals, mapping manifest, source validation and locking.
@@ -120,6 +128,16 @@
   [handoff 2026-10-27-04](docs/frontend-handoffs/2026-10-27.md#2026-10-27-04-native-link-diagnostics).
 
 ### Changed
+
+- Ubuntu API self-upgrades now trust the operator-configured GitHub repository
+  over HTTPS without publisher signatures, as explicitly approved. The current
+  config accepts only `repository` and optional `token_file`; former `public_key`
+  fields are rejected. `build-update` emits binary/JSON assets without a signing
+  argument or `.sig`; the staged binary must match its declared version.
+  SHA-256 is integrity checking, not independent publisher authentication.
+  Separate signed `.ncpkg` packaging is unchanged. Breaking config/asset/builder
+  contract (major-equivalent impact under the approved calendar-version policy);
+  unreleased build `2026.10.30.4`, no release baseline established.
 
 - Software releases, signed-update versions and independent firewall
   configuration revisions now use UTC `yyyy.mm.dd.iteration`, replacing public

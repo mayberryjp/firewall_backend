@@ -100,6 +100,8 @@ upgrade_binary() (
     fi
     staged=$(root_command mktemp "${destination}.upgrade.XXXXXX")
     root_command install -o root -g root -m 0755 -- "$binary" "$staged"
+    phase='configure GitHub HTTPS upgrades'
+    root_command "$staged" --configure-updates /etc/netcontrol/updates.json
     if [[ -f $destination ]]; then
         root_command cp -p -- "$destination" "$backup"
         had_binary=true

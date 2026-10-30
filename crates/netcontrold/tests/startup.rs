@@ -63,6 +63,8 @@ fn actual_daemon_notifies_readiness_progress_and_stopping() {
     let http = available();
     let mut child = Daemon(
         Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+            .arg("--disable-release-checks")
+            .env_remove("NETCONTROL_UPGRADE_CONFIG")
             .env("NOTIFY_SOCKET", &path)
             .env("WATCHDOG_USEC", "1000000")
             .env_remove("WATCHDOG_PID")
@@ -118,6 +120,8 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
         };
         let mut command = Command::new(env!("CARGO_BIN_EXE_netcontrold"));
         command
+            .arg("--disable-release-checks")
+            .env_remove("NETCONTROL_UPGRADE_CONFIG")
             .env("NETCONTROL_ALLOW_HOST_SERVICES", "true")
             .env("NETCONTROL_GATEWAY_MONITORING", "true")
             .env(
@@ -297,6 +301,7 @@ fn http_bind_failure_stops_custom_ssh_and_exits_without_hanging() {
     let mut child = Daemon(
         Command::new(env!("CARGO_BIN_EXE_netcontrold"))
             .args([
+                "--disable-release-checks",
                 "--listen",
                 &http.to_string(),
                 "--ssh-listen",
@@ -330,10 +335,133 @@ fn http_bind_failure_stops_custom_ssh_and_exits_without_hanging() {
             );
             break;
         }
+
         assert!(
             start.elapsed() < Duration::from_secs(15),
             "failed HTTP startup did not stop SSH"
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn default_release_discovery_and_manual_check_work_without_installation_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let auth = directory.path().join("auth.json");
+    let token = "synthetic-release-operator";
+    std::fs::write(
+        &auth,
+        serde_json::to_vec(&serde_json::json!({
+            "schema":1,"credentials":[{
+                "name":"release-operator","token_sha256":netcontrold::identity::digest(token),
+                "permissions":["state.read","system.upgrade"]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let http = available();
+    let mut child = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+            .env_remove("NETCONTROL_UPGRADE_CONFIG")
+            .env_remove("NETCONTROL_SSH_LISTEN")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .args(["--listen", &http.to_string()])
+            .arg("--state")
+            .arg(directory.path().join("state.json"))
+            .arg("--auth-file")
+            .arg(&auth)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let request = |child: &mut Daemon, method: &str, path: &str| {
+        let mut stream = connect(child, http);
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        let status: u16 = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (
+            status,
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+        )
+    };
+    let accept = || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match proxy.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                        assert!(request.len() < 8192);
+                    }
+                    assert!(request.starts_with(b"CONNECT api.github.com:443 HTTP/1.1\r\n"));
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "default release checker did not contact the local proxy"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("proxy accept failed: {error}"),
+            }
+        }
+    };
+    let mut first = accept();
+    let (status, upgrade) = request(&mut child, "GET", "/api/v1/system/upgrade");
+    assert_eq!(status, 200);
+    assert_eq!(upgrade["enabled"], false);
+    assert_eq!(
+        request(&mut child, "POST", "/api/v1/system/upgrade/check").0,
+        409
+    );
+    first
+        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    drop(first);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, latest) = request(&mut child, "GET", "/api/v1/revisions/latest");
+        assert_eq!(status, 200);
+        let software = &latest["config"]["software"];
+        assert_eq!(software["repository"], "mayberryjp/firewall_backend");
+        if software["error"].is_string() {
+            assert!(software["last_checked_at"].is_string());
+            assert!(software["update_available"].is_null());
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        request(&mut child, "POST", "/api/v1/system/upgrade/check").0,
+        202
+    );
+    let mut second = accept();
+    second
+        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .unwrap();
 }

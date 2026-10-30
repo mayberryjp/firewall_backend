@@ -143,16 +143,22 @@ before applying it.
 
 Optional Ubuntu amd64 self-upgrade uses `POST /api/v1/system/upgrade` with a
 specific `yyyy.mm.dd.iteration` version and `GET` on the same path for durable job status.
-It is disabled until a trusted release-signing public key and fixed GitHub
-repository are configured. See [signed self-upgrades](docs/BUILD_AND_INSTALL.md#signed-ubuntu-self-upgrade)
+Installation and source upgrades automatically create/validate private update
+settings and enable the fixed GitHub HTTPS repository; no signing key is needed.
+Ubuntu self-updates are unsigned: HTTPS/GitHub are trusted, with bounded manifest,
+version, ELF, size and SHA-256 checks, not independent publisher authentication.
+The separate signed `.ncpkg` format is unchanged.
+See [Ubuntu self-upgrades](docs/BUILD_AND_INSTALL.md#ubuntu-self-upgrade)
 for bootstrap, artifact publishing, recovery and validation limitations.
 
 Software identity comes from `RELEASE_VERSION` in
 [version.rs](crates/netcontrol-core/src/version.rs), not Cargo's internal package
 version. The daemon saves read-only `software` metadata in the master configuration:
 running version, configured release repository, latest release, nullable update
-availability, last check time and explicit error. When self-upgrade is configured,
-it checks GitHub's latest published stable release at startup and every 24 hours;
+availability, last check time and explicit error. It checks the fixed default
+`mayberryjp/firewall_backend` repository at startup and every 24 hours even without
+installation configuration; configured self-upgrades supply their repository/token.
+`--disable-release-checks` explicitly disables discovery and Check now;
 no automatic installation occurs. Disabled, pending and failed checks never mean
 "up to date". `POST /api/v1/system/upgrade/check`, with `system.upgrade` and an
 empty body, requests a check now (`202`); read saved `software` metadata for the

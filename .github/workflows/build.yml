@@ -116,6 +116,22 @@ jobs:
           cp "target/$TARGET/release/netcontrold" ubuntu-dist/netcontrold
           cp packaging/native/netcontrold.service ubuntu-dist/netcontrold.service
           (cd ubuntu-dist && sha256sum --binary netcontrold netcontrold.service > SHA256SUMS)
+      - name: Prepare unsigned Ubuntu HTTPS update assets
+        run: |
+          set -eu
+          version="$(target/$TARGET/release/netcontrold --version)"
+          version="${version#netcontrold }"
+          "target/$TARGET/release/netcontrol-package" build-update \
+            --daemon "target/$TARGET/release/netcontrold" \
+            --version "$version" --output-dir ubuntu-update-assets
+      - name: Upload Ubuntu HTTPS update assets
+        if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: netcontrol-ubuntu-updates-${{ github.sha }}
+          path: ubuntu-update-assets/
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload prebuilt Ubuntu daemon and systemd unit
         if: github.event_name == 'workflow_dispatch' && inputs.upload_packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

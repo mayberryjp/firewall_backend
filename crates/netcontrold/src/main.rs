@@ -87,9 +87,14 @@ struct Options {
     ssh_host_key: Option<PathBuf>,
     #[arg(
         long,
-        help = "Root-owned private JSON configuration enabling signed Ubuntu self-upgrades"
+        env = "NETCONTROL_UPGRADE_CONFIG",
+        help = "Root-owned private JSON configuration enabling GitHub HTTPS Ubuntu self-upgrades"
     )]
     upgrade_config: Option<PathBuf>,
+    #[arg(long, help = "Disable startup, daily and manual release discovery")]
+    disable_release_checks: bool,
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["upgrade_worker", "upgrade_recover", "create_wireguard_key", "wireguard_public_key"], help = "Create or validate root-owned upgrade settings and exit; does not start services")]
+    configure_updates: Option<PathBuf>,
     #[arg(long, hide = true, conflicts_with = "upgrade_recover")]
     upgrade_worker: bool,
     #[arg(long, hide = true)]
@@ -162,6 +167,9 @@ async fn run(options: Options) -> Result<()> {
         return Ok(());
     }
     configure_logging(&options)?;
+    if let Some(path) = &options.configure_updates {
+        return netcontrold::updates::configure(path);
+    }
     if options.upgrade_worker || options.upgrade_recover {
         return tokio::task::spawn_blocking(move || {
             netcontrold::updates::helper(options.upgrade_recover)
@@ -356,9 +364,12 @@ async fn run(options: Options) -> Result<()> {
     if options.appliance {
         provision::enable_forwarding(&mut engine)?;
     }
-    let release_config = updates
-        .as_ref()
-        .map(netcontrold::updates::Manager::release_config);
+    let release_config = (!options.disable_release_checks).then(|| {
+        updates
+            .as_ref()
+            .map(netcontrold::updates::Manager::release_config)
+            .unwrap_or_default()
+    });
     netcontrold::updates::initialize_release_check(&mut engine, release_config.as_ref())?;
     let engine = Arc::new(Mutex::new(engine));
     let mut app = if let Some(updates) = updates {
@@ -642,6 +653,34 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_checks_default_on_and_upgrade_bootstrap_is_an_explicit_operation() {
+        let defaults = Options::try_parse_from(["netcontrold"]).unwrap();
+        assert!(!defaults.disable_release_checks);
+        assert!(defaults.configure_updates.is_none());
+        let offline = Options::try_parse_from(["netcontrold", "--disable-release-checks"]).unwrap();
+        assert!(offline.disable_release_checks);
+        let bootstrap = Options::try_parse_from([
+            "netcontrold",
+            "--configure-updates",
+            "/etc/netcontrol/updates.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            bootstrap.configure_updates,
+            Some(PathBuf::from("/etc/netcontrol/updates.json"))
+        );
+        assert!(
+            Options::try_parse_from([
+                "netcontrold",
+                "--configure-updates",
+                "/etc/netcontrol/updates.json",
+                "--upgrade-worker"
+            ])
+            .is_err()
+        );
+    }
     #[test]
     fn cli_current_contract_and_rejected_legacy_flags() {
         let options = Options::try_parse_from(["netcontrold"]).unwrap();

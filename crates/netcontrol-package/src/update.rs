@@ -1,5 +1,4 @@
 use anyhow::{Result, ensure};
-use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -44,19 +43,13 @@ impl Manifest {
     }
 }
 
-pub fn verify_manifest(
-    bytes: &[u8],
-    signature: &[u8],
-    key: &[u8; 32],
-    expected_version: &str,
-) -> Result<Manifest> {
+pub fn parse_manifest(bytes: &[u8], expected_version: &str) -> Result<Manifest> {
     ensure!(bytes.len() <= MANIFEST_LIMIT, "update manifest too large");
-    VerifyingKey::from_bytes(key)?.verify_strict(bytes, &Signature::from_slice(signature)?)?;
     let manifest: Manifest = serde_json::from_slice(bytes)?;
     manifest.validate()?;
     ensure!(
         manifest.version == expected_version,
-        "signed update version does not match requested version"
+        "update manifest version does not match requested version"
     );
     Ok(manifest)
 }
@@ -82,7 +75,6 @@ pub fn verify_binary(bytes: &[u8], manifest: &Manifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn update_versions_are_canonical_not_paths_or_urls() {
@@ -104,8 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn signatures_bind_version_target_size_and_digest() {
-        let key = SigningKey::from_bytes(&[7; 32]);
+    fn manifests_validate_version_target_size_and_digest_without_signatures() {
         let mut binary = vec![0; 64];
         binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
         binary[18] = 62;
@@ -117,33 +108,15 @@ mod tests {
             sha256: hex::encode(Sha256::digest(&binary)),
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let signature = key.sign(&bytes).to_bytes();
-        let verified = verify_manifest(
-            &bytes,
-            &signature,
-            &key.verifying_key().to_bytes(),
-            "2026.10.29.1",
-        )
-        .unwrap();
+        let verified = parse_manifest(&bytes, "2026.10.29.1").unwrap();
+        let mut maximum = bytes.clone();
+        maximum.resize(MANIFEST_LIMIT, b' ');
+        assert!(parse_manifest(&maximum, "2026.10.29.1").is_ok());
+        maximum.push(b' ');
+        assert!(parse_manifest(&maximum, "2026.10.29.1").is_err());
         verify_binary(&binary, &verified).unwrap();
-        assert!(
-            verify_manifest(
-                &bytes,
-                &signature,
-                &key.verifying_key().to_bytes(),
-                "2026.10.29.2"
-            )
-            .is_err()
-        );
-        assert!(
-            verify_manifest(
-                &bytes,
-                &signature,
-                &SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes(),
-                "2026.10.29.1"
-            )
-            .is_err()
-        );
+        assert!(parse_manifest(&bytes, "2026.10.29.2").is_err());
+        assert!(parse_manifest(&vec![b' '; MANIFEST_LIMIT + 1], "2026.10.29.1").is_err());
         binary[63] ^= 1;
         assert!(verify_binary(&binary, &verified).is_err());
         manifest.target = "other".into();

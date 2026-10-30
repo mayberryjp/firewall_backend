@@ -24,7 +24,7 @@ const PATHS: [(&str, u32); 4] = [
 ];
 
 #[derive(Parser)]
-#[command(about = "Build, verify and install signed native Netcontrol packages")]
+#[command(about = "Build native Netcontrol packages and Ubuntu update assets")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -71,8 +71,6 @@ enum Command {
         daemon: PathBuf,
         #[arg(long)]
         version: String,
-        #[arg(long)]
-        signing_key: PathBuf,
         #[arg(long)]
         output_dir: PathBuf,
     },
@@ -136,7 +134,6 @@ fn execute(command: Command) -> Result<()> {
         Command::BuildUpdate {
             daemon,
             version,
-            signing_key,
             output_dir,
         } => {
             use netcontrol_package::update::{self, Manifest};
@@ -152,7 +149,6 @@ fn execute(command: Command) -> Result<()> {
             };
             update::verify_binary(&binary, &manifest)?;
             let bytes = serde_json::to_vec(&manifest)?;
-            let key = SigningKey::from_bytes(&read_key(&signing_key)?);
             fs::create_dir(&output_dir).context("output directory must not already exist")?;
             create_file(&output_dir.join("netcontrold-ubuntu-amd64"), &binary, 0o755)?;
             create_file(
@@ -160,12 +156,9 @@ fn execute(command: Command) -> Result<()> {
                 &bytes,
                 0o644,
             )?;
-            create_file(
-                &output_dir.join("netcontrol-ubuntu-amd64.sig"),
-                &key.sign(&bytes).to_bytes(),
-                0o644,
-            )?;
-            println!("Created signed Ubuntu update assets; nothing was uploaded or released.");
+            println!(
+                "Created unsigned Ubuntu HTTPS update assets; nothing was uploaded or released."
+            );
         }
         Command::Keygen {
             private_key,
@@ -738,29 +731,24 @@ mod tests {
     }
 
     #[test]
-    fn build_update_emits_version_bound_signed_assets_without_overwriting() {
+    fn build_update_emits_two_version_bound_unsigned_assets_without_overwriting() {
         let root = tempfile::tempdir().unwrap();
-        let key = SigningKey::generate(&mut OsRng);
         let daemon = root.path().join("daemon");
-        let signing_key = root.path().join("key");
         let output_dir = root.path().join("release");
         fs::write(&daemon, elf()).unwrap();
-        fs::write(&signing_key, key.to_bytes()).unwrap();
         let command = || Command::BuildUpdate {
             daemon: daemon.clone(),
             version: "2026.10.29.1".into(),
-            signing_key: signing_key.clone(),
             output_dir: output_dir.clone(),
         };
         execute(command()).unwrap();
-        assert_eq!(fs::read_dir(&output_dir).unwrap().count(), 3);
-        let manifest = netcontrol_package::update::verify_manifest(
+        assert_eq!(fs::read_dir(&output_dir).unwrap().count(), 2);
+        let manifest = netcontrol_package::update::parse_manifest(
             &fs::read(output_dir.join("netcontrol-ubuntu-amd64.json")).unwrap(),
-            &fs::read(output_dir.join("netcontrol-ubuntu-amd64.sig")).unwrap(),
-            &key.verifying_key().to_bytes(),
             "2026.10.29.1",
         )
         .unwrap();
+        assert!(!output_dir.join("netcontrol-ubuntu-amd64.sig").exists());
         netcontrol_package::update::verify_binary(
             &fs::read(output_dir.join("netcontrold-ubuntu-amd64")).unwrap(),
             &manifest,

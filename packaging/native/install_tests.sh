@@ -162,7 +162,7 @@ for service_scenario in success repeat directory_failure chmod_failure publish_f
         fi
     ); then
         [[ $service_scenario == success || $service_scenario == repeat ]] || exit 1
-        [[ $(< "$service_target") == $'[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222' ]]
+        [[ $(< "$service_target") == $'[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222\nEnvironment=NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json' ]]
     else
         [[ $service_scenario != success && $service_scenario != repeat ]] || exit 1
         if [[ $service_scenario == *_failure ]]; then
@@ -342,6 +342,7 @@ systemctl() { trace="$trace systemctl $*;"; }
 configure_appliance_services() { trace+=' appliance-services;'; }
 configure_logging_units() { trace+=' logging-units;'; }
 configure_host_logging() { trace+=' host-logging;'; }
+configure_upgrade_settings() { trace+=' upgrade-settings;'; }
 install_systemd_service
 [[ $trace == *'install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys;'* ]]
 [[ $trace == *'install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service;'* ]]
@@ -353,14 +354,19 @@ trace=''
 check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
-for failure_stage in service_setup logging_units reload logging; do
+for failure_stage in upgrade_settings service_setup logging_units reload logging; do
     trace=''
     check_systemd_unit() { return 0; }
+    configure_upgrade_settings() { trace+=' upgrade-settings;'; [[ $failure_stage != upgrade_settings ]]; }
     configure_appliance_services() { trace+=' appliance-services;'; [[ $failure_stage != service_setup ]]; }
     configure_logging_units() { trace+=' logging-units;'; [[ $failure_stage != logging_units ]]; }
     systemctl() { trace+=" systemctl $*;"; [[ $failure_stage != reload ]]; }
     configure_host_logging() { trace+=' host-logging;'; return 1; }
     if install_systemd_service; then exit 1; fi
+    if [[ $failure_stage == upgrade_settings ]]; then
+        [[ $trace != *'appliance-services;'* ]]
+        continue
+    fi
     [[ $trace == *'appliance-services;'* ]]
     if [[ $failure_stage == service_setup || $failure_stage == logging_units ]]; then
         [[ $trace != *'systemctl daemon-reload;'* ]]
@@ -544,7 +550,7 @@ for scenario in missing loaded unmanaged conflicting masked install_failure relo
 done
 printf 'Upgrade refuses missing services without provisioning or interface changes (mocked privileged commands).\n'
 
-for scenario in success fail_stage fail_logging fail_restart fail_health first_install fail_first_start inactive_existing fail_inactive_start; do
+for scenario in success fail_stage fail_bootstrap fail_logging fail_restart fail_health first_install fail_first_start inactive_existing fail_inactive_start; do
     destination="$temporary/upgrade-$scenario"
     mkdir "$destination"
     printf 'old binary\n' > "$destination/netcontrold"
@@ -557,6 +563,10 @@ for scenario in success fail_stage fail_logging fail_restart fail_health first_i
         root_command() {
             printf "%s\n" "$*" >> "$UPGRADE_TEST_DIRECTORY/commands"
             case $1 in
+                "$UPGRADE_TEST_DIRECTORY/"*.upgrade.*)
+                    [[ $2 == --configure-updates && $3 == /etc/netcontrol/updates.json &&
+                       $UPGRADE_TEST_SCENARIO != fail_bootstrap ]]
+                    ;;
                 bash)
                     if [[ $3 == '\''source "$1"; configure_host_logging'\'' ]]; then
                         grep -q "^systemctl stop netcontrold.service$" "$UPGRADE_TEST_DIRECTORY/commands" || return 1
@@ -602,7 +612,7 @@ for scenario in success fail_stage fail_logging fail_restart fail_health first_i
         else
             [[ $(< "$destination/netcontrold") == 'old binary' ]]
         fi
-        if [[ $scenario == fail_stage ]]; then
+        if [[ $scenario == fail_stage || $scenario == fail_bootstrap ]]; then
             ! grep -q 'systemctl stop' "$destination/commands"
         else
             [[ $(grep -c 'systemctl stop' "$destination/commands") -eq 2 ]]
@@ -613,7 +623,7 @@ for scenario in success fail_stage fail_logging fail_restart fail_health first_i
             fi
         fi
     fi
-    if [[ $scenario != fail_stage && $scenario != first_install && $scenario != fail_first_start ]]; then
+    if [[ $scenario != fail_stage && $scenario != fail_bootstrap && $scenario != first_install && $scenario != fail_first_start ]]; then
         [[ $(< "$destination/netcontrold.previous") == 'old binary' ]]
     fi
     [[ -z $(find "$destination" -name 'netcontrold.upgrade.*' -print) ]]
