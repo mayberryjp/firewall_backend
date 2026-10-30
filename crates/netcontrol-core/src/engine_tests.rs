@@ -975,10 +975,12 @@ fn startup_recovers_applying_rolling_back_and_recovery_failed() {
 fn startup_recovers_expired_pending_confirmation() {
     let f = Fixture::new();
     let mut e = f.engine();
-    // Preserve a valid initial/submission time while placing the whole transaction in the past.
-    e.state.initialized_at = Utc::now() - Duration::hours(2);
+    // Keep the empty archive consistent when backdating across a UTC day boundary.
+    e.state.initialized_at = Utc::now() - Duration::hours(26);
+    e.state.initial_revision = Version::first(e.state.initialized_at.date_naive()).unwrap();
+    e.state.revision = e.state.initial_revision;
     e.store.save(&e.state).unwrap();
-    e.now = Some(Utc::now() - Duration::hours(1));
+    e.now = Some(e.state.initialized_at + Duration::hours(1));
     let r = submit(&mut e, config());
     let id = r.body["id"].as_str().unwrap().to_string();
     drop(e);
@@ -1916,6 +1918,174 @@ fn fine_grained_permissions_cover_confirmation_and_restore() {
     );
 }
 #[test]
+fn sando_import_state_and_firewall_changes_confirm_rollback_and_reopen_together() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let initial = engine.committed_revision();
+    let mut candidate = config();
+    candidate.sando = serde_json::from_value(json!({
+        "api_url":"http://sando.example.invalid:8044",
+        "hosts_import":{
+            "source_url":"http://sando.example.invalid:8044",
+            "import_count":1,"last_import_at":"2026-10-30T00:00:00Z",
+            "status":"succeeded","imported_count":1,"skipped_count":0
+        },
+        "rules_import":{
+            "source_url":"http://sando.example.invalid:8044",
+            "import_count":2,"last_import_at":"2026-10-30T00:01:00Z",
+            "status":"partial","imported_count":1,"skipped_count":2
+        }
+    }))
+    .unwrap();
+    candidate.firewall.policies = Some(serde_json::from_value(json!({
+        "hosts":[{
+            "id":"sando-device-1","name":"Camera","addresses":["192.0.2.20"],
+            "policy":"drop","rules":[{
+                "destination":"203.0.113.53/32","protocol":"udp","destination_ports":[53],"action":"accept"
+            }]
+        }]
+    })).unwrap());
+    for denied in ["sando.write", "firewall.write"] {
+        let permissions: Vec<_> = all()
+            .into_iter()
+            .filter(|permission| permission != denied)
+            .collect();
+        let response = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "operator",
+            &permissions,
+            &serde_json::to_vec(
+                &json!({"base_revision":initial,"confirm_timeout_seconds":30,"config":candidate}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(response.status, 403, "{}", response.body);
+        assert!(response.body["error"].as_str().unwrap().contains(denied));
+    }
+    let pending = submit(&mut engine, candidate.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    let id = pending.body["id"].as_str().unwrap();
+    assert_eq!(
+        engine.saved_configuration().sando,
+        crate::SandoConfig::default()
+    );
+    assert_eq!(engine.committed_revision(), initial);
+    let reader = request(&mut engine, "GET", "/api/v1/revisions/latest", Value::Null);
+    assert!(reader.body["config"]["sando"]["hosts_import"].is_null());
+    let without_sando: Vec<_> = all()
+        .into_iter()
+        .filter(|permission| permission != "sando.write")
+        .collect();
+    for action in ["confirm", "rollback"] {
+        assert_eq!(
+            engine
+                .request(
+                    "POST",
+                    &format!("/api/v1/transactions/{id}/{action}"),
+                    "",
+                    "operator",
+                    &without_sando,
+                    &[]
+                )
+                .status,
+            403
+        );
+    }
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    assert_eq!(engine.saved_configuration().sando, candidate.sando);
+    assert_eq!(
+        engine.saved_configuration().firewall.policies,
+        candidate.firewall.policies
+    );
+    let mut changed = candidate.clone();
+    changed.sando.rules_import.as_mut().unwrap().import_count = 3;
+    changed.firewall.policies.as_mut().unwrap().hosts[0].rules[0].action = "drop".into();
+    let pending = submit(&mut engine, changed);
+    assert_eq!(pending.status, 202);
+    let pending_id = pending.body["id"].as_str().unwrap().to_owned();
+    drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(engine.saved_configuration().sando, candidate.sando);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{pending_id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.saved_configuration().sando, candidate.sando);
+    assert_eq!(
+        engine.saved_configuration().firewall.policies,
+        candidate.firewall.policies
+    );
+    let base = engine.committed_revision();
+    let restored = request(
+        &mut engine,
+        "POST",
+        &format!("/api/v1/revisions/{initial}/restore"),
+        json!({"base_revision":base,"confirm_timeout_seconds":30}),
+    );
+    assert_eq!(restored.status, 202, "{}", restored.body);
+    assert_eq!(
+        confirm(&mut engine, restored.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert_eq!(
+        engine.saved_configuration().sando,
+        crate::SandoConfig::default()
+    );
+    assert!(engine.saved_configuration().firewall.policies.is_none());
+    drop(engine);
+    let mut engine = fixture.engine();
+    let historical = request(
+        &mut engine,
+        "GET",
+        &format!("/api/v1/revisions/{base}"),
+        Value::Null,
+    );
+    assert_eq!(historical.body["config"]["sando"], json!(candidate.sando));
+}
+
+#[test]
+fn sando_api_validates_known_fields_instead_of_dropping_invalid_import_state() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    for (sando, status) in [
+        (json!({"api_url":"javascript:alert(1)"}), 422),
+        (
+            json!({"api_url":"http://sando.example.test?token=synthetic"}),
+            422,
+        ),
+        (json!({"api_url":42}), 400),
+        (json!({"hosts_import":{"status":"succeeded"}}), 400),
+        (
+            json!({"hosts_import":{"source_url":"http://sando.example.test","import_count":0,
+            "last_import_at":"2026-10-30T00:00:00Z","status":"succeeded","imported_count":0,"skipped_count":0}}),
+            422,
+        ),
+    ] {
+        let base = engine.committed_revision();
+        let response = request(
+            &mut engine,
+            "POST",
+            "/api/v1/transactions",
+            json!({"base_revision":base,"confirm_timeout_seconds":30,"config":{"sando":sando}}),
+        );
+        assert_eq!(response.status, status, "{}", response.body);
+        assert!(response.body["error"].is_string());
+        assert_eq!(
+            engine.saved_configuration().sando,
+            crate::SandoConfig::default()
+        );
+    }
+}
+
+#[test]
 fn host_system_settings_need_backend_support_and_only_changed_values_are_checked() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
@@ -1982,6 +2152,10 @@ fn all_domain_permissions_are_independently_required() {
         ("mqtt.write", json!({"mqtt":{"interval_seconds":120}})),
         ("system.write", json!({"system":{"hostname":"fw-1"}})),
         ("system.write", json!({"system":{"timezone":"UTC"}})),
+        (
+            "sando.write",
+            json!({"sando":{"api_url":"http://192.0.2.10:8044"}}),
+        ),
         (
             "system.write",
             json!({"system":{"domain":"home.example.test"}}),

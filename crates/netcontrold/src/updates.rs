@@ -579,13 +579,50 @@ async fn discover_release(config: &Config) -> Result<netcontrol_core::SoftwareMe
     release_metadata(&config.repository, &release)
 }
 
+#[derive(Clone)]
+pub struct ReleaseCheckControl {
+    sender: tokio::sync::mpsc::Sender<tokio::sync::OwnedSemaphorePermit>,
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+pub struct ReleaseCheckRequests {
+    receiver: tokio::sync::mpsc::Receiver<tokio::sync::OwnedSemaphorePermit>,
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+pub fn release_check_channel() -> (ReleaseCheckControl, ReleaseCheckRequests) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    (
+        ReleaseCheckControl {
+            sender,
+            slot: slot.clone(),
+        },
+        ReleaseCheckRequests { receiver, slot },
+    )
+}
+
+impl ReleaseCheckControl {
+    pub fn request(&self) -> Result<bool> {
+        ensure!(!self.sender.is_closed(), "release check worker unavailable");
+        let Ok(permit) = self.slot.clone().try_acquire_owned() else {
+            return Ok(false);
+        };
+        self.sender
+            .try_send(permit)
+            .map_err(|_| anyhow::anyhow!("release check worker unavailable"))?;
+        Ok(true)
+    }
+}
+
 pub async fn monitor_releases(
     engine: std::sync::Arc<std::sync::Mutex<netcontrol_core::Engine>>,
     config: Option<Config>,
     stop: tokio::sync::watch::Receiver<bool>,
+    requests: ReleaseCheckRequests,
 ) -> Result<()> {
     let repository = config.as_ref().map(|config| config.repository.clone());
-    run_release_checks(engine, repository, stop, || async {
+    run_release_checks(engine, repository, stop, requests, || async {
         discover_release(
             config
                 .as_ref()
@@ -600,6 +637,7 @@ async fn run_release_checks<F, Fut>(
     engine: std::sync::Arc<std::sync::Mutex<netcontrol_core::Engine>>,
     repository: Option<String>,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    mut requests: ReleaseCheckRequests,
     mut check: F,
 ) -> Result<()>
 where
@@ -612,36 +650,44 @@ where
     let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
+        let _permit = tokio::select! {
             biased;
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() { return Ok(()); }
+                continue;
             }
+            Some(permit) = requests.receiver.recv(), if repository.is_some() => permit,
             _ = interval.tick(), if repository.is_some() => {
-                let checked = tokio::select! {
-                    biased;
-                    changed = stop.changed() => {
-                        if changed.is_err() || *stop.borrow() { return Ok(()); }
-                        continue;
-                    }
-                    result = check() => result
+                let Ok(permit) = requests.slot.clone().try_acquire_owned() else {
+                    continue;
                 };
-                let metadata = match checked {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        tracing::warn!(%error, "daily release check failed");
-                        netcontrol_core::SoftwareMetadata {
-                            repository: repository.clone(),
-                            last_checked_at: Some(now()?.parse()?),
-                            error: Some(format!("Release check failed: {error}")),
-                            ..Default::default()
-                        }
-                    }
-                };
-                engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?
-                    .update_software_metadata(metadata)?;
+                permit
             }
-        }
+        };
+        let checked = tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() { return Ok(()); }
+                continue;
+            }
+            result = check() => result
+        };
+        let metadata = match checked {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(%error, "release check failed");
+                netcontrol_core::SoftwareMetadata {
+                    repository: repository.clone(),
+                    last_checked_at: Some(now()?.parse()?),
+                    error: Some(format!("Release check failed: {error}")),
+                    ..Default::default()
+                }
+            }
+        };
+        engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?
+            .update_software_metadata(metadata)?;
     }
 }
 #[derive(Deserialize)]
@@ -947,10 +993,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let attempts = calls.clone();
         let (stop, receiver) = tokio::sync::watch::channel(false);
+        let (_control, requests) = release_check_channel();
         let worker = tokio::spawn(run_release_checks(
             engine.clone(),
             Some("example/netcontrol".into()),
             receiver,
+            requests,
             move || {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -1031,10 +1079,12 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let attempts = calls.clone();
             let (stop, receiver) = tokio::sync::watch::channel(false);
+            let (_control, requests) = release_check_channel();
             let worker = tokio::spawn(run_release_checks(
                 engine.clone(),
                 enabled.then(|| "example/netcontrol".into()),
                 receiver,
+                requests,
                 move || {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     std::future::pending::<Result<netcontrol_core::SoftwareMetadata>>()
@@ -1053,6 +1103,161 @@ mod tests {
                 netcontrol_core::SoftwareMetadata::default()
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_release_checks_share_daily_worker_persist_results_and_cancel_on_shutdown() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let engine = Arc::new(Mutex::new(
+            netcontrol_core::Engine::open(&path, Box::new(netcontrol_core::Simulator::new()))
+                .unwrap(),
+        ));
+        let revision = engine.lock().unwrap().committed_revision();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let check_gate = gate.clone();
+        let (control, requests) = release_check_channel();
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run_release_checks(
+            engine.clone(),
+            Some("example/netcontrol".into()),
+            receiver,
+            requests,
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let gate = check_gate.clone();
+                async move {
+                    gate.notified().await;
+                    if attempt == 2 {
+                        bail!("synthetic manual release failure");
+                    }
+                    release_metadata(
+                        "example/netcontrol",
+                        &Release {
+                            tag_name: format!("v9999.12.31.{}", attempt + 10),
+                            draft: false,
+                            prerelease: false,
+                            assets: vec![],
+                        },
+                    )
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!control.request().unwrap());
+        gate.notify_one();
+        tokio::task::yield_now().await;
+        let previous = engine
+            .lock()
+            .unwrap()
+            .saved_configuration()
+            .software
+            .clone();
+        assert_eq!(
+            previous.latest_version.unwrap().to_string(),
+            "9999.12.31.10"
+        );
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(control.request().unwrap());
+        assert!(!control.request().unwrap());
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!control.request().unwrap());
+        assert_eq!(
+            engine.lock().unwrap().saved_configuration().software,
+            previous
+        );
+        gate.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .saved_configuration()
+                .software
+                .latest_version
+                .unwrap()
+                .to_string(),
+            "9999.12.31.11"
+        );
+
+        assert!(control.request().unwrap());
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        tokio::time::advance(Duration::from_secs(82_800)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        gate.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(!control.request().unwrap());
+        let failed = engine
+            .lock()
+            .unwrap()
+            .saved_configuration()
+            .software
+            .clone();
+        assert!(failed.latest_version.is_none());
+        assert!(failed.update_available.is_none());
+        assert!(failed.last_checked_at.is_some());
+        assert!(
+            failed
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("synthetic manual release failure")
+        );
+        assert_eq!(engine.lock().unwrap().committed_revision(), revision);
+
+        stop.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+        assert!(control.request().is_err());
+        assert_eq!(
+            engine.lock().unwrap().saved_configuration().software,
+            failed
+        );
+        drop(engine);
+        let reopened =
+            netcontrol_core::Engine::open(&path, Box::new(netcontrol_core::Simulator::new()))
+                .unwrap();
+        assert_eq!(reopened.saved_configuration().software, failed);
+    }
+
+    #[tokio::test]
+    async fn release_checker_shutdown_discards_queued_manual_requests() {
+        use std::sync::{Arc, Mutex};
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(
+            netcontrol_core::Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(netcontrol_core::Simulator::new()),
+            )
+            .unwrap(),
+        ));
+        let (control, requests) = release_check_channel();
+        assert!(control.request().unwrap());
+        let (_stop, receiver) = tokio::sync::watch::channel(true);
+        run_release_checks(
+            engine.clone(),
+            Some("example/netcontrol".into()),
+            receiver,
+            requests,
+            || std::future::ready(Err(anyhow::anyhow!("source must not run"))),
+        )
+        .await
+        .unwrap();
+        assert!(control.request().is_err());
+        assert_eq!(
+            engine.lock().unwrap().saved_configuration().software,
+            netcontrol_core::SoftwareMetadata::default(),
+        );
     }
 
     #[test]

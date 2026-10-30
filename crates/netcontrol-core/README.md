@@ -54,6 +54,16 @@ decimal-string counters and no claimed packets/membership.
 
 ## Persistent state and recovery
 
+`sando` is always-serialized frontend integration configuration, defaulting to
+an empty `api_url` and null `hosts_import`/`rules_import`. Typed confirmed-import
+records retain browser-reported source URL, operation/item counts, RFC3339 time
+and succeeded/partial outcome. They are saved atomically with full reviewed
+configuration transactions under `sando.write`; firewall edits still need
+`firewall.write`. They survive restart/history and follow normal rollback/
+restore semantics, but are excluded from `operational_value`: the backend never
+contacts Sando or derives/enables firewall rules from this metadata. See the
+[complete contract](../../FRONTEND_SPEC.md#sando-one-time-imports).
+
 The state file is a JSON envelope with exactly these fields:
 
 ```json

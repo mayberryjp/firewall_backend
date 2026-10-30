@@ -456,6 +456,115 @@ async fn host_system_endpoints_authentication_permissions_and_simulated_catalog(
 }
 
 #[tokio::test]
+async fn sando_settings_and_import_reports_use_authenticated_confirmed_config_transactions() {
+    use netcontrold::http::Credential;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".test-data")
+        .join(secret("").unwrap());
+    fs::create_dir_all(&path).unwrap();
+    let engine = Engine::open(&path.join("state.json"), Box::new(Simulator::new())).unwrap();
+    let fixture = Fixture {
+        path,
+        router: router(App::new(
+            Arc::new(Mutex::new(engine)),
+            Authentication::Scoped(vec![
+                Credential {
+                    name: "sando-operator".into(),
+                    token_sha256: netcontrold::identity::digest("sando-operator"),
+                    permissions: vec![
+                        "state.read".into(),
+                        "transactions.write".into(),
+                        "sando.write".into(),
+                    ],
+                },
+                Credential {
+                    name: "reader".into(),
+                    token_sha256: netcontrold::identity::digest("reader"),
+                    permissions: vec!["state.read".into()],
+                },
+            ]),
+            false,
+        )),
+    };
+    let latest = fixture
+        .request("GET", "/api/v1/revisions/latest", "", "", "reader", "")
+        .await;
+    assert_eq!(latest.0, 200);
+    assert_eq!(
+        latest.2["config"]["sando"],
+        json!({"api_url":"","hosts_import":null,"rules_import":null})
+    );
+    let mut config = latest.2["config"].clone();
+    config["sando"] = json!({
+        "api_url":"http://sando.example.invalid:8044",
+        "hosts_import":{
+            "source_url":"http://sando.example.invalid:8044",
+            "import_count":1,"last_import_at":"2026-10-30T00:00:00Z",
+            "status":"succeeded","imported_count":2,"skipped_count":0
+        }
+    });
+    let body =
+        json!({"base_revision":latest.2["revision"],"confirm_timeout_seconds":30,"config":config})
+            .to_string();
+    assert_eq!(
+        fixture
+            .request("POST", "/api/v1/transactions", &body, "", "", "")
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        fixture
+            .request("POST", "/api/v1/transactions", &body, "", "reader", "")
+            .await
+            .0,
+        403
+    );
+    let pending = fixture
+        .request(
+            "POST",
+            "/api/v1/transactions",
+            &body,
+            "",
+            "sando-operator",
+            "",
+        )
+        .await;
+    assert_eq!(pending.0, 202, "{}", pending.2);
+    let before = fixture
+        .request("GET", "/api/v1/revisions/latest", "", "", "reader", "")
+        .await;
+    assert!(before.2["config"]["sando"]["hosts_import"].is_null());
+    let confirmed = fixture
+        .request(
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/confirm",
+                pending.2["id"].as_str().unwrap()
+            ),
+            "",
+            "",
+            "sando-operator",
+            "",
+        )
+        .await;
+    assert_eq!(confirmed.0, 200, "{}", confirmed.2);
+    let saved = fixture
+        .request("GET", "/api/v1/revisions/latest", "", "", "reader", "")
+        .await;
+    assert_eq!(saved.0, 200);
+    assert_eq!(
+        saved.2["config"]["sando"]["hosts_import"]["import_count"],
+        1
+    );
+    assert_eq!(
+        saved.2["config"]["sando"]["hosts_import"]["status"],
+        "succeeded"
+    );
+    assert!(saved.2["config"]["sando"]["rules_import"].is_null());
+}
+
+#[tokio::test]
 async fn software_upgrade_requires_permission_and_validates_versions_when_disabled() {
     use netcontrold::http::Credential;
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -579,6 +688,116 @@ async fn software_upgrade_requires_permission_and_validates_versions_when_disabl
             .0,
         400
     );
+}
+
+#[tokio::test]
+async fn software_release_check_requires_permission_and_rejects_duplicate_or_unavailable_workers() {
+    use netcontrold::{http::Credential, updates::release_check_channel};
+    for enabled in [false, true] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".test-data")
+            .join(secret("").unwrap());
+        fs::create_dir_all(&path).unwrap();
+        let engine = Engine::open(&path.join("state.json"), Box::new(Simulator::new())).unwrap();
+        let mut app = App::new(
+            Arc::new(Mutex::new(engine)),
+            Authentication::Scoped(vec![
+                Credential {
+                    name: "reader".into(),
+                    token_sha256: netcontrold::identity::digest("reader"),
+                    permissions: vec!["state.read".into()],
+                },
+                Credential {
+                    name: "upgrader".into(),
+                    token_sha256: netcontrold::identity::digest("upgrader"),
+                    permissions: vec!["system.upgrade".into()],
+                },
+            ]),
+            false,
+        );
+        let (control, requests) = release_check_channel();
+        if enabled {
+            App::attach_release_checks(&mut app, control).unwrap();
+        }
+        let fixture = Fixture {
+            path,
+            router: router(app),
+        };
+        let endpoint = "/api/v1/system/upgrade/check";
+        assert_eq!(
+            fixture.request("POST", endpoint, "", "", "", "").await.0,
+            401
+        );
+        assert_eq!(
+            fixture
+                .request("POST", endpoint, "", "", "reader", "")
+                .await
+                .0,
+            403
+        );
+        assert_eq!(
+            fixture
+                .request("GET", endpoint, "", "", "upgrader", "")
+                .await
+                .0,
+            405
+        );
+        assert_eq!(
+            fixture
+                .request(
+                    "POST",
+                    &format!("{endpoint}?force=true"),
+                    "",
+                    "",
+                    "upgrader",
+                    ""
+                )
+                .await
+                .0,
+            400
+        );
+        for body in ["{}", "null", r#"{"repository":"example/other"}"#] {
+            assert_eq!(
+                fixture
+                    .request("POST", endpoint, body, "", "upgrader", "")
+                    .await
+                    .0,
+                400
+            );
+        }
+        let before = fixture
+            .request("GET", "/api/v1/revisions/latest", "", "", "reader", "")
+            .await;
+        let reply = fixture
+            .request("POST", endpoint, "", "", "upgrader", "")
+            .await;
+        if enabled {
+            assert_eq!(reply.0, 202, "{}", reply.2);
+            assert_eq!(reply.2, json!({"status":"check_requested"}));
+            assert_eq!(reply.1["location"], "/api/v1/revisions/latest");
+            assert_eq!(
+                fixture
+                    .request("POST", endpoint, "", "", "upgrader", "")
+                    .await
+                    .0,
+                409
+            );
+        } else {
+            assert_eq!(reply.0, 503);
+        }
+        let after = fixture
+            .request("GET", "/api/v1/revisions/latest", "", "", "reader", "")
+            .await;
+        assert_eq!(after.2, before.2);
+        drop(requests);
+        assert_eq!(
+            fixture
+                .request("POST", endpoint, "", "", "upgrader", "")
+                .await
+                .0,
+            503
+        );
+    }
 }
 
 #[tokio::test]

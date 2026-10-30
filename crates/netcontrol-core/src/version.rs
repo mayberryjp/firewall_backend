@@ -3,7 +3,7 @@ use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
-pub const RELEASE_VERSION: &str = "2026.10.29.1";
+pub const RELEASE_VERSION: &str = "2026.10.30.2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

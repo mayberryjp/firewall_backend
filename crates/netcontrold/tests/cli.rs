@@ -676,6 +676,40 @@ fn ergonomic_interfaces_routes_policies_and_services_preserve_complete_config() 
 }
 
 #[test]
+fn sando_settings_use_the_shared_candidate_and_require_sando_permission() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(
+        &mut cli,
+        "set /sando/api_url \"http://sando.example.invalid:8044\"",
+    );
+    f.ok(&mut cli, "set /sando/hosts_import {\"source_url\":\"http://sando.example.invalid:8044\",\"import_count\":1,\"last_import_at\":\"2026-10-30T00:00:00Z\",\"status\":\"succeeded\",\"imported_count\":2,\"skipped_count\":0}");
+    f.ok(&mut cli, "commit check");
+    assert_eq!(
+        f.request("/api/v1/revisions/latest")["config"]["sando"]["api_url"],
+        ""
+    );
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    let saved = f.request("/api/v1/revisions/latest");
+    assert_eq!(
+        saved["config"]["sando"]["api_url"],
+        "http://sando.example.invalid:8044"
+    );
+    assert_eq!(saved["config"]["sando"]["hosts_import"]["import_count"], 1);
+    assert!(saved["config"]["sando"]["rules_import"].is_null());
+    let limited = Fixture::new(&["state.read", "transactions.write"]);
+    let mut cli = CliSession::new();
+    limited.configure(&mut cli);
+    limited.ok(
+        &mut cli,
+        "set /sando/api_url \"http://sando.example.invalid:8044\"",
+    );
+    limited.fail(&mut cli, "commit confirmed 30", "sando.write");
+}
+
+#[test]
 fn software_metadata_is_readonly_and_daily_changes_do_not_invalidate_candidates() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

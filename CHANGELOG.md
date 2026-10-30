@@ -4,6 +4,23 @@
 
 ### Added
 
+- Authenticated `POST /api/v1/system/upgrade/check` to request immediate release
+  discovery without restarting or installing. Reuses `system.upgrade` and the
+  single-flight startup/daily worker; returns `202`, with results in saved
+  `software` metadata, `409` while busy and `503` when disabled/unavailable.
+  Additive contract; unreleased build `2026.10.30.2`. Required frontend action:
+  [handoff 2026-10-29-03](docs/frontend-handoffs/2026-10-29.md#2026-10-29-03-software-check-now).
+
+- Frontend-only Sando integration settings in saved `config.sando`: API base URL
+  and independent confirmed host/rule import reports with source URL, operation/
+  item counts, latest timestamp and succeeded/partial status. `sando.write`
+  protects configuration and report edits; imported firewall changes still need
+  `firewall.write` and normal confirmed transactions. No backend acquisition,
+  raw device persistence, import proxy or periodic sync is included. Additive
+  contract, unreleased build `2026.10.30.1` (UTC date; local journal 2026-10-29).
+  Required frontend page/import review:
+  [handoff 2026-10-29-02](docs/frontend-handoffs/2026-10-29.md#2026-10-29-02-sando-one-time-import-settings-and-state).
+
 - Embedded public software identity and saved daemon-managed master-config
   `software` metadata, including running/latest versions, nullable update
   availability, last check time and errors. Configured GitHub release discovery

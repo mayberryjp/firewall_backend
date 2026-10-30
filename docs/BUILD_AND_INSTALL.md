@@ -506,6 +506,16 @@ connect/30-second total timeout and limit JSON to 1 MiB. Tags must be canonical
 `vyyyy.mm.dd.iteration`; errors (including no published release or rate limiting)
 are logged and saved, not turned into "no update".
 
+To check immediately without restarting or installing anything, use authenticated
+`POST /api/v1/system/upgrade/check` with `system.upgrade`, no query and an empty
+body. `202 {"status":"check_requested"}` queues work on the same single-flight
+worker; `Location: /api/v1/revisions/latest` identifies where to read
+`config.software` with `state.read`. The previous result remains until completion.
+An already queued/running manual or scheduled check returns `409`; unconfigured
+or unavailable checking returns `503`. No repository/token/version override is
+accepted. The daily timer is unchanged; shutdown cancels outstanding checks.
+This action neither downloads assets nor invokes the signed installation path.
+
 The master configuration's daemon-managed `software` object saves running
 `version`, nullable `repository`, `latest_version`, `update_available`,
 `last_checked_at` and `error`. Null availability means disabled, pending or failed,

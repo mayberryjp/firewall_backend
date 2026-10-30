@@ -27,6 +27,7 @@ pub struct Config {
     pub bgp: crate::BGPConfig,
     pub mqtt: MQTTConfig,
     pub system: SystemConfig,
+    pub sando: crate::SandoConfig,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dynamic_dns: Vec<crate::DynamicDNSConfig>,
     pub gateway_monitors: Vec<GatewayMonitor>,
@@ -56,6 +57,7 @@ impl Default for Config {
             bgp: Default::default(),
             mqtt: Default::default(),
             system: Default::default(),
+            sando: Default::default(),
             dynamic_dns: Vec::new(),
             gateway_monitors: Vec::new(),
             interfaces: Vec::new(),
@@ -817,6 +819,7 @@ impl Config {
         value.as_object_mut().unwrap().remove("mqtt");
         value.as_object_mut().unwrap().remove("system");
         value.as_object_mut().unwrap().remove("dynamic_dns");
+        value.as_object_mut().unwrap().remove("sando");
         strip(&mut value);
         if let Some(routes) = value["routes"].as_array_mut() {
             routes.retain(|route| route["enabled"] == true);
@@ -909,6 +912,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         self.software.validate()?;
+        self.sando.validate()?;
         self.bgp.validate(self)?;
         self.mdns.validate(self)?;
         self.udp_broadcast_relay.validate(self)?;

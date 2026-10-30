@@ -48,6 +48,17 @@ configuration must produce explicit errors rather than permissive defaults or
 successful no-op operations. Existing on-device data must never be deleted to
 force a new schema to load.
 
+## Sando imports
+
+One-time Sando imports are frontend-driven. The backend saves `config.sando`
+with a browser-reachable base URL and separate latest confirmed host/rule import
+records, including source, operation/item counts, time and status. Save them
+with reviewed firewall changes through normal confirmed transactions
+(`sando.write`, plus `firewall.write` for host/rule edits). No backend Sando
+fetching, raw device storage, proxy or scheduled synchronization is added.
+The required **Settings > Sando** page and import preview workflow are specified
+in the [frontend contract](FRONTEND_SPEC.md#sando-one-time-imports).
+
 ## Build and validate
 
 Use stable Rust. The workspace toolchain file selects rustfmt and clippy;
@@ -143,7 +154,10 @@ running version, configured release repository, latest release, nullable update
 availability, last check time and explicit error. When self-upgrade is configured,
 it checks GitHub's latest published stable release at startup and every 24 hours;
 no automatic installation occurs. Disabled, pending and failed checks never mean
-"up to date". See the [frontend contract](FRONTEND_SPEC.md#46-software-version-and-daily-release-checks).
+"up to date". `POST /api/v1/system/upgrade/check`, with `system.upgrade` and an
+empty body, requests a check now (`202`); read saved `software` metadata for the
+result. An existing queued/running check returns `409`, disabled/unavailable
+checking `503`. See the [frontend contract](FRONTEND_SPEC.md#check-now).
 
 Configuration revisions independently use the same UTC date format as JSON strings.
 Initialization and each UTC day's first confirmed commit start at iteration 1;

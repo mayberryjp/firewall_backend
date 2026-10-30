@@ -93,6 +93,7 @@ pub struct App {
     tls: bool,
     attempts: Mutex<(Instant, usize)>,
     updates: Option<crate::updates::Manager>,
+    release_checks: Option<crate::updates::ReleaseCheckControl>,
     mqtt: Option<Arc<crate::mqtt::Manager>>,
     dynamic_dns: Option<Arc<crate::dynamic_dns::Manager>>,
     system: Option<Arc<crate::host_system::Manager>>,
@@ -109,6 +110,7 @@ impl App {
             tls,
             attempts: Mutex::new((Instant::now(), 0)),
             updates: None,
+            release_checks: None,
             mqtt: None,
             dynamic_dns: None,
             system: None,
@@ -142,6 +144,15 @@ impl App {
             .context("new application is shared")?
             .updates = Some(updates);
         Ok(app)
+    }
+    pub fn attach_release_checks(
+        app: &mut Arc<Self>,
+        control: crate::updates::ReleaseCheckControl,
+    ) -> Result<()> {
+        Arc::get_mut(app)
+            .context("application is already shared")?
+            .release_checks = Some(control);
+        Ok(())
     }
     pub fn refresh_upgrade_gate(&self) -> Result<()> {
         if let Some(updates) = &self.updates {
@@ -647,6 +658,33 @@ fn api(
             return fail(400, "platform status accepts no query or body", true);
         }
         return response(200, app.health.snapshot());
+    }
+    if path == "/api/v1/system/upgrade/check" {
+        if !credential.permissions.iter().any(|p| p == "system.upgrade") {
+            return fail(403, "insufficient upgrade permission", true);
+        }
+        if method != "POST" {
+            return fail(405, "release check requires POST", true);
+        }
+        if !query.is_empty() || !body.is_empty() {
+            return fail(400, "release check accepts no query or body", true);
+        }
+        let Some(control) = &app.release_checks else {
+            return fail(503, "release checking is not configured", true);
+        };
+        return match control.request() {
+            Ok(true) => {
+                tracing::info!(actor=%credential.name, "software release check requested");
+                let mut reply = response(202, json!({"status":"check_requested"}));
+                set(&mut reply, "location", "/api/v1/revisions/latest");
+                reply
+            }
+            Ok(false) => fail(409, "release check already queued or running", true),
+            Err(error) => {
+                tracing::warn!(%error, "could not request software release check");
+                fail(503, "release check worker unavailable", true)
+            }
+        };
     }
     if matches!(
         path,

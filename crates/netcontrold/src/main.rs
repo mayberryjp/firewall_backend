@@ -367,6 +367,10 @@ async fn run(options: Options) -> Result<()> {
     } else {
         App::new(engine.clone(), auth, tls.is_some())
     };
+    let (release_checks, release_requests) = netcontrold::updates::release_check_channel();
+    if release_config.is_some() {
+        App::attach_release_checks(&mut app, release_checks)?;
+    }
     let mqtt = netcontrold::mqtt::Manager::open(&mqtt_root, engine.clone(), mqtt_mode)?;
     App::attach_mqtt(&mut app, mqtt.clone())?;
     let dynamic_dns_mode = if mqtt_mode == netcontrold::mqtt::Mode::Simulated {
@@ -438,6 +442,7 @@ async fn run(options: Options) -> Result<()> {
         engine.clone(),
         release_config,
         release_receiver,
+        release_requests,
     ));
     let mqtt_control = controls["mqtt"].clone();
     let mqtt_task = tokio::spawn(async move {

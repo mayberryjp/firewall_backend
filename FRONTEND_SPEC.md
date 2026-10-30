@@ -332,6 +332,7 @@ routes, not backend endpoints.
 | `/transactions/:id` | Transaction details and lifecycle actions |
 | `/history` | Committed revision history |
 | `/history/:revision` | Historical configuration, comparison, restore |
+| `/settings/sando` | Sando base URL and one-time host/rule import suggestions |
 
 Deep links must work after browser refresh. Unknown browser routes show an
 application 404, not an empty page. Encode resource names/IDs in URLs.
@@ -620,6 +621,7 @@ Configuration changes additionally require permissions for every changed area:
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
 | MQTT streaming configuration | `mqtt.write` |
 | Host name and time zone (`system`) | `system.write` |
+| Sando URL and frontend-reported import state (`sando`) | `sando.write` |
 | Azure Dynamic DNS configuration and secret upload | `dynamic_dns.write` |
 
 Creating/removing a WireGuard interface typically needs both interface and
@@ -870,6 +872,7 @@ baseline or channel is implied. See [operator setup and artifact contract](docs/
 | --- | --- | --- |
 | `POST /api/v1/system/upgrade` | `system.upgrade` | Submit a specific signed release version; returns `202` job and `Location: /api/v1/system/upgrade` |
 | `GET /api/v1/system/upgrade` | `state.read` | Read configuration-enabled flag and latest durable job; `200` even when disabled |
+| `POST /api/v1/system/upgrade/check` | `system.upgrade` | Request release discovery now, no body/query; `202` with `Location: /api/v1/revisions/latest`; does not install |
 
 POST body is exactly `{"version":"2026.10.29.2"}` (synthetic version). Version is
 canonical `yyyy.mm.dd.iteration`, maximum 21 bytes, a real UTC calendar date,
@@ -935,7 +938,7 @@ The saved master configuration contains a daemon-managed `software` object.
 Read it from `GET /api/v1/state` at `desired.software`, or
 `GET /api/v1/revisions/latest` at `config.software` without requiring healthy
 network observation. Existing API-key authentication and `state.read` apply.
-No new HTTP route, permission or manual refresh action is introduced.
+The manual check action below reuses `system.upgrade`; no new permission is added.
 
 Synthetic successful check:
 
@@ -960,7 +963,7 @@ Only published stable releases with canonical `v<version>` tags qualify.
 HTTPS verification is mandatory; redirects are refused, connect timeout is
 10 seconds, total request timeout 30 seconds, response limit 1 MiB. No release,
 rate limiting, malformed tags and transport/API errors are explicit failed
-checks; retry is the next scheduled daily check or daemon restart. No automatic
+checks; retry with the manual action below, the next daily check or daemon restart. No automatic
 download/install or publication occurs. Availability is discovery metadata,
 not proof that signed assets exist or that installation will succeed.
 
@@ -973,6 +976,44 @@ It is not an editable setting or an authorization bypass. Confirmation and
 historical restore retain current software metadata rather than restoring old
 binary identity/check results. Historical snapshots may contain historical
 metadata; the current revision detail always returns current saved metadata.
+
+#### Check now
+
+`POST /api/v1/system/upgrade/check` requests an immediate asynchronous check of
+the same operator-configured repository. Existing API-key authentication and
+`system.upgrade` are required; `state.read` alone cannot trigger network work.
+Send an **empty body**, with no query parameters. Do not send `{}`, a version,
+repository, URL, token or force flag.
+
+Accepted response: HTTP `202`, `Location: /api/v1/revisions/latest`,
+`{"status":"check_requested"}`. This acknowledges queuing, not completion,
+availability, signature verification or installation. Read
+`GET /api/v1/revisions/latest` (`config.software`) or normal state polling
+(`desired.software`) with `state.read` for the resulting metadata.
+The old saved result remains visible while checking; no persisted `checking`
+flag or job ID is added. A new success/failure updates `last_checked_at` and
+the usual fields above. Discovery failures appear in `software.error` with
+null latest/availability, not a later HTTP error from the accepted POST.
+
+The standard error envelope is unchanged: `401` invalid/missing authentication,
+`403` missing `system.upgrade`, `405` methods other than POST, `400` any nonempty
+body/query, `409` a manual or scheduled check already queued/running, `503`
+checking unconfigured or its worker unavailable. `409` does not queue another
+check; show an already-checking message and observe the existing result.
+Manual and scheduled requests share one worker and cannot overlap. Requests do
+not reset the daily timer, allocate configuration revisions, alter pending
+transactions or start an upgrade. Shutdown cancels queued/in-flight checks
+without publishing a fabricated result; the next startup checks normally.
+
+Add **Check now** beside software availability, enabled only for configured
+checking and an authorized user. Disable repeated clicks during a local request/
+poll cycle, show the prior result as stale/checking, and keep fetch/authorization/
+worker errors distinct from a successful no-update result. Capture the previous
+`last_checked_at`, then poll for a changed result with a bounded local wait.
+An unchanged timestamp after a timeout/restart is an uncertain outcome, not
+proof that the current version is up to date; allow an explicit retry. The
+network timeout is 30 seconds; account for scheduling/persistence overhead.
+No install confirmation or update job should appear merely from this action.
 
 Frontend tasks: show running version and separate update availability/error/
 pending/disabled states; keep these fields out of editable drafts and omit
@@ -3022,6 +3063,152 @@ authentication beyond configured address admission; prefer WireGuard/trusted
 links. Real-appliance and interoperability acceptance remain separate from
 isolated native tests.
 
+### Sando One-Time Imports
+
+Provide **Settings > Sando** at browser route `/settings/sando` with an API
+base-URL form, **Import hosts** and **Import rules** buttons, and separate latest
+confirmed host/rule import statistics. This is a frontend integration: the
+backend stores settings and browser-reported state only. It never contacts
+Sando, proxies requests, validates reachability, schedules synchronization or
+copies complete Sando device objects into the firewall schema.
+
+The always-serialized top-level `config.sando` defaults to:
+
+```json
+{"api_url":"","hosts_import":null,"rules_import":null}
+```
+
+```ts
+interface SandoConfig {
+  api_url: string;
+  hosts_import: SandoImportState | null;
+  rules_import: SandoImportState | null;
+}
+interface SandoImportState {
+  source_url: string;
+  import_count: number;
+  last_import_at: Timestamp;
+  status: "succeeded" | "partial";
+  imported_count: number;
+  skipped_count: number;
+}
+```
+
+`api_url` is the Sando server base **before** `/api`, e.g.
+`http://192.0.2.10:8044`; a reverse-proxy prefix is allowed, e.g.
+`https://inventory.example.test/sando`. Append `/api/localhosts` or
+`/api/ignorelist/ip/<encoded-IP>` after removing trailing base slashes; do not
+discard a configured proxy prefix. Empty means unconfigured. Nonempty URLs and
+every record's required `source_url` must be absolute lowercase `http://` or
+`https://` URLs of at most 2048 UTF-8 bytes, with a host, no credentials,
+query/fragment, whitespace, control characters, backslashes or port zero.
+No DNS/HTTP/HTTPS connectivity test occurs on save. No Sando token/credential
+field is provided.
+
+Each nullable state records one import kind independently. Non-null records
+require every field. `import_count` is the frontend-reported number of
+confirmed logical import operations represented by the saved configuration:
+integer 1..4294967295. `imported_count` and `skipped_count` are item counts for
+the latest import, integers 0..4294967295. Status `succeeded` requires zero
+skipped items; an empty successfully reviewed import can have zero imported.
+`partial` requires both positive imported and skipped counts. Counts are ordinary
+JSON numbers, not quoted counters. `last_import_at` is client-reported RFC3339
+time, years 1970..9999; offsets are accepted and serialized in UTC. It is not a
+server measurement or an independently verified sync time.
+
+`source_url` records the base used for that latest import. It may differ from
+the current `api_url`, so changing/clearing settings does not silently erase or
+misattribute prior results. Show the recorded source alongside statistics.
+These are versioned configuration snapshots, not an immutable audit log:
+the backend validates but does not calculate/verify import counters, timestamps
+or source data. Normal historical restoration can restore prior statistics.
+
+#### Persistence, authorization and errors
+
+Read committed settings using `GET /api/v1/revisions/latest` at `config.sando`
+without live network observation, or `GET /api/v1/state` at `desired.sando`.
+Existing API-key authentication and `state.read` apply. Save URL changes or
+import records through the existing complete `POST /api/v1/transactions`
+package, followed by `/api/v1/transactions/{id}/confirm`. Preserve the entire
+configuration and current string `base_revision`; a partial config is not a
+settings PATCH. `transactions.write` plus `sando.write` are required for every
+Sando change, including records, clearing, confirmation, rollback and restores.
+Imported hosts/rules additionally require `firewall.write`, and any other
+changed area retains its existing permission. Sando permission cannot authorize
+firewall changes.
+
+There are no new Sando/import/status/sync HTTP endpoints. Existing success
+statuses remain submit `202`, confirm/rollback `200`; ordinary error envelope
+`{error,transaction}` applies: `401` API authentication, `403` permission,
+`400` invalid known JSON types/out-of-range unsigned integers/missing record fields/status enum/timestamp
+encoding, `422` invalid URL/count/timestamp range or inconsistent outcome,
+`409` stale revision/active transaction/drift, and existing persistence/backend
+failures. The ordinary unknown-configuration-field reporting policy still
+applies; do not rely on unknown import fields being saved.
+
+Statistics become committed only on confirmation and are atomically saved with
+the reviewed host/rule edits. Provisional application, failed confirmation,
+rollback and restart recovery retain the previous committed report as
+appropriate. Import-only metadata is excluded from native operational
+configuration, so it does not restart workers or itself change firewall rules.
+The standard full-package safety checks remain. SSH generic `set`/`load candidate`
+and show/commit workflows carry the same typed settings and permissions.
+
+#### Frontend acquisition and review
+
+The following upstream routes were verified against
+[Sando source revision be3df805](https://github.com/mayberryjp/sando/tree/be3df805adb82606ae7285f885d21b6cf597698e);
+they are **Sando routes**, not Netcontrol endpoints:
+
+- `GET /api/localhosts`: array of inventory objects. Known fields include
+  `ip_address`, `ip6_address`, `mac_address`, `mac_vendor`, `dhcp_hostname`,
+  `dns_hostname`, `lease_hostname`, `local_description`, `icon`, `tags`,
+  `os_fingerprint`, `domain_name`, lease/detection flags, timestamps and traffic
+  totals. `/api/devices` supplies category names, not the host inventory.
+  Keep the complete upstream device object in the browser for display if useful;
+  runtime-validate fields before mapping to the existing `FirewallHost`.
+  The backend adds no vendor/device-type/raw-device fields in this iteration.
+- `GET /api/ignorelist/ip/<encoded-IP>`: active detection-ignore entries matching
+  the IP as **either source or destination**, with `id`, `src_ip`, `dst_ip`,
+  `dst_port`, `protocol`, `times_seen`, `first_seen`, `last_seen`. This is not an
+  authoritative firewall allowlist. Do not equate `whitelisted` device flags
+  with unrestricted firewall access.
+
+Fetch entirely from the browser, never sending the Netcontrol API key to Sando.
+The browser must reach the configured source; CORS, HTTPS/mixed-content and
+local-network browser policies are operator/frontend prerequisites. Current
+Sando documents trusted-network use and missing authentication/TLS protections;
+do not expose it publicly or add a backend proxy to bypass browser restrictions.
+Upstream database helpers can return empty arrays on errors; an empty fetch is
+not proof that existing firewall hosts/rules should be deleted.
+
+1. Save/review the configured URL through the normal full transaction. Disable
+   import actions while unconfigured or an operation is in flight.
+2. **Import hosts** fetches inventory and stages selected additions/updates:
+   validate canonical unicast IPv4/IPv6 addresses, unique stable IDs/names and
+   existing host limits. Resolve collisions with an explicit review. Preserve
+   unrelated hosts, policies and manual rules. Do not activate discovered devices
+   or choose a more permissive default policy merely because they exist in Sando.
+3. **Import rules** fetches candidate ignorelist entries for selected hosts.
+   Only entries whose source matches the selected host can suggest that host's
+   outbound rules. Do not reverse inbound entries into outbound permits. Map
+   only explicitly supported TCP/UDP protocol, literal destination and port
+   values into existing host-policy fields; skip/report ambiguous, wildcard or
+   unsupported entries rather than broadening them. Do not import universal
+   allow rules from suppression settings. Review and deduplicate suggested
+   accept rules; preserve manual rules and require explicit policy choices.
+4. Stage the appropriate record with the selected source, latest item counts,
+   UTC browser time, result status and saved `import_count + 1` (or 1 initially).
+   One confirmed logical import increments once, not once per fetch/retry.
+   Show local **Fetched/staged; not applied** until successful confirmation;
+   committed report panels continue reading committed desired state.
+5. Apply the full reviewed draft and explicitly confirm. Handle stale revisions,
+   interrupted requests and uncertain writes through existing transaction
+   recovery; never blindly resubmit and double-count. Cancelled/failed browser
+   fetches, discarded previews and rolled-back imports do not update saved
+   reports. Show their error locally while retaining the last confirmed result.
+   No failed-attempt status API or scheduled sync is included.
+
 ### 6.2 Managed interfaces and VLANs
 
 Table columns: name, kind, WAN/LAN role, administrative up/down, MTU, addresses, VLAN parent/ID
@@ -4255,6 +4442,7 @@ type Timestamp = string; // RFC 3339.
 
 interface Config {
   software: SoftwareMetadata; // Daemon-managed; omit from write requests.
+  sando: SandoConfig; // Settings and frontend-reported confirmed import state.
   ipv6_enabled: boolean;
   ntp: NTPConfig;
   syslog: SyslogConfig;

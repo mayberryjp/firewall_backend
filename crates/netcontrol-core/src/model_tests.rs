@@ -225,6 +225,39 @@ fn mqtt_settings_do_not_change_native_operational_configuration() {
 }
 
 #[test]
+fn sando_state_is_saved_but_never_changes_native_operational_configuration() {
+    let before = candidate();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap()["sando"],
+        json!({"api_url":"","hosts_import":null,"rules_import":null})
+    );
+    let mut after = before.clone();
+    after.sando = serde_json::from_value(json!({
+        "api_url":"http://192.0.2.10:8044",
+        "hosts_import":{
+            "source_url":"http://192.0.2.10:8044",
+            "import_count":1,
+            "last_import_at":"2026-10-30T00:00:00Z",
+            "status":"succeeded",
+            "imported_count":2,
+            "skipped_count":0
+        }
+    }))
+    .unwrap();
+    after.validate().unwrap();
+    assert_ne!(before, after);
+    assert_eq!(
+        before.operational_value().unwrap(),
+        after.operational_value().unwrap()
+    );
+    assert!(after.operational_value().unwrap().get("sando").is_none());
+    assert_eq!(
+        serde_json::from_value::<Config>(serde_json::to_value(&after).unwrap()).unwrap(),
+        after
+    );
+}
+
+#[test]
 fn system_settings_default_unmanaged_validate_and_stay_out_of_native_configuration() {
     let before = candidate();
     assert_eq!(before.system, SystemConfig::default());

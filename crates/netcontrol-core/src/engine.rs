@@ -31,6 +31,7 @@ pub const PERMISSIONS: &[&str] = &[
     "vnstat.write",
     "mqtt.write",
     "system.write",
+    "sando.write",
     "dynamic_dns.write",
     "kernel.namespace.write",
     "kernel.host.write",
@@ -239,6 +240,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ("vnstat.write", a.vnstat != b.vnstat),
         ("mqtt.write", a.mqtt != b.mqtt),
         ("system.write", a.system != b.system),
+        ("sando.write", a.sando != b.sando),
         ("dynamic_dns.write", a.dynamic_dns != b.dynamic_dns),
         ("kernel.namespace.write", a.ipv6_enabled != b.ipv6_enabled),
         (
