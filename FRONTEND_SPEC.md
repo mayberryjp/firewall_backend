@@ -3198,6 +3198,48 @@ configuration, so it does not restart workers or itself change firewall rules.
 The standard full-package safety checks remain. SSH generic `set`/`load candidate`
 and show/commit workflows carry the same typed settings and permissions.
 
+#### Rule-source labels and Sando replacement
+
+Rule acquisition, mapping, review, replacement and ordering remain **frontend
+responsibilities**. There is no backend rule-import/merge endpoint, automatic
+rule fetch, special preservation guard or background firewall synchronization.
+Submit the complete reviewed candidate through ordinary confirmed transactions.
+See [rule origins](#firewall-rule-origins) for persisted labels.
+
+Tag each newly imported Sando rule with `origin:"import"` and
+`import_source:"sando"` (the provider ID, not an upstream URL). On **Import rules**:
+
+1. Fetch/validate the source and build a reviewable replacement before changing
+   the draft. A failed/incomplete acquisition must not be interpreted as an empty
+   successful import. Show skipped/invalid items and require explicit review of
+   any intentionally partial replacement.
+2. Read the current committed configuration/revision. Across rule lists managed
+   by this import (including previous target lists with no replacement entries),
+   remove **only** rules whose origin is `import` and
+   import_source is exactly `sando`. This replaces prior Sando rules even if the
+   configured Sando base URL changed. Record the actual URL in `rules_import`.
+3. Keep every manual rule and every other provider's imported rules unchanged,
+   including their matching fields, action, metadata and source labels. Never
+   infer Sando ownership from names, addresses, matching content or host metadata.
+   Preserve non-Sando `system`/`inherited` labels too. Do not delete/recreate
+   host inventory, defaults, input policy or NAT as a side effect of a forwarding
+   rule import.
+4. Within each affected existing rule list, keep manual rules first in their
+   existing relative order; preserve other retained rules' relative order, then
+   append new Sando rules in source order. Do not change the compiler's ingress-
+   interface-before-host precedence or move rules between scopes. Show ordering
+   and removed/new-rule effects in the review.
+5. Commit the complete candidate and updated report together; normal confirmation/
+   rollback applies. On revision conflict, rebase/rebuild the review against the
+   latest state, never blind-resubmit a stale full package. A reviewed genuinely
+   empty source removes only old Sando-owned rules; cancel/failure leaves the
+   prior configuration intact.
+
+These are frontend requirements, not backend enforcement: an authorized full
+configuration write can still edit/delete any rule. Changing a rule's ownership
+label is an explicit reviewed edit, not an automatic consequence of opening an
+editor. Hourly Sando metadata refresh still never changes labels or rules.
+
 #### Hourly host-metadata synchronization
 
 Save `sync_enabled` through the same full confirmed transaction as `api_url`.
@@ -3589,7 +3631,10 @@ Linux compilation and runtime acceptance; it is not proof of production safety.
 Installed Ubuntu appliance mode enables host IPv4 forwarding after native
 policy reconciliation on each startup. The installer explicitly commits the
 initial LAN/WAN roles, static LAN address, DHCPv4 WAN, forward/input drop defaults,
-LAN allow-all rules and LAN-subnet WAN masquerade. Role edits alone do not regenerate policy.
+LAN allow-all rules, enabled global IPv4 ICMP acceptance, and LAN-subnet WAN
+masquerade. Explicit factory reset uses the same defaults. Ordinary startup and
+upgrades preserve saved `firewall.allow_all_icmp`, including explicit false.
+Role edits alone do not regenerate policy.
 IPv6 forwarding and non-appliance deployments remain operator responsibilities.
 The API deliberately rejects IPv4/IPv6 forwarding sysctls: changing them can
 change other kernel device/RA settings that are not currently captured for
@@ -3920,6 +3965,62 @@ Require review acknowledgement for drop defaults and catch-all drops. Provide
 managed egress selection, but do not add arbitrary protocol choices, port ranges, per-rule logging controls, or configurable
 conntrack controls: these are not implemented.
 
+#### Firewall rule origins
+
+All saved legacy filter, host-policy, ingress-interface, management-input,
+masquerade and destination-rewrite rules carry:
+
+```ts
+type RuleOrigin = "manual" | "import" | "system" | "inherited";
+interface RuleSource {
+  origin: RuleOrigin;
+  import_source: string | null;
+}
+```
+
+Both fields are always serialized on rule objects. Request omission defaults
+origin to `manual` and import_source to null; explicit null origin and unknown
+origin strings return `400`. `origin:"import"` requires a provider ID matching
+`[a-z][a-z0-9_-]{0,63}` (1..64 ASCII characters); absent/null/invalid source is
+`422`. Other origins require null/omitted import_source (`422` otherwise).
+`"sando"` identifies Sando imports; other provider IDs remain distinct.
+The existing legacy `source` field remains an IP prefix, **not** provenance.
+
+Synthetic examples (individual rules, not complete transaction requests):
+
+```json
+{"source":"192.0.2.0/24","action":"accept","origin":"manual","import_source":null}
+```
+
+```json
+{"destination":"198.51.100.0/24","action":"drop","origin":"import","import_source":"sando"}
+```
+
+Origins are descriptive labels, not permissions, verified upstream identity or
+an authorization boundary. `manual` is explicitly maintained policy; `import`
+is managed by the named frontend importer; `system` describes rules derived from
+settings/built-in behavior; `inherited` describes an inherited presentation.
+When displaying a host's effective policy, show ingress-interface rules as
+inherited **without changing the original interface rule's saved manual/import
+ownership**. Do not persist derived copies or rewrite its origin to inherited
+just to render that host view. The backend adds no effective-host-rule endpoint.
+
+Labels are preserved in reads, full-package writes, revisions, restores and
+rollback; they use existing firewall/NAT write permissions. They are excluded
+from operational matching, ruleset hashes and native identity, like display
+metadata. Label-only edits do not change rule evaluation order, auto-delete or
+reclassify rules, restart workers or reset live counters. A new counter sample
+can reflect updated labels without a new counter generation. Unknown source
+ownership must not be inferred automatically; omitted origin simply means manual.
+
+The [counter endpoint](#firewall-rule-match-counters) reports these labels on
+configured logical-rule rows. Backend-generated bypass/default/setting rows
+are tagged `origin:"system", import_source:null`, including ICMP, global/input/
+host defaults and established/loopback acceptance. Interface definition rows
+retain their original saved origin; inherited host-view rendering is frontend
+work. Deny-log records remain unchanged and do not contain these labels; do not
+relabel historical packets using the current draft.
+
 #### Firewall deny log
 
 Native Linux continuously captures owned input/forwarding **drops**, including
@@ -4138,6 +4239,8 @@ Native success is `200`, schema `netcontrol-firewall-counters/v1`:
     "id": "forward:/firewall/policies/hosts/0/rules/0",
     "chain": "forward",
     "config_path": "/firewall/policies/hosts/0/rules/0",
+    "origin": "manual",
+    "import_source": null,
     "expanded_rules": 4,
     "packets": "9007199254740993",
     "bytes": "576460752303423552"
@@ -4160,6 +4263,9 @@ after confirmation/rollback refresh both metadata and the relevant config.
 Each row has a unique `id` (`chain:logical-key`), `chain` string, nullable
 `config_path` JSON pointer into that applied normalized configuration, positive
 integer `expanded_rules`, and nonnegative decimal-string `packets`/`bytes`.
+Each row also has `origin:RuleOrigin` and `import_source:string|null` as specified
+under [rule origins](#firewall-rule-origins). Generated/default/setting rows are
+system-owned; configured rule rows use the matching applied configuration labels.
 Use BigInt/exact integer arithmetic: physical u64 counters are summed as u128,
 which can exceed both JavaScript safe integers and u64. There are no
 per-second fields, historical totals, unique-connection counts or rule names
@@ -4265,7 +4371,12 @@ implicit. The forwarding policy has a LAN allow-all rule without egress matching
 default-drop for other new traffic, and stateful returns. NAT remains restricted
 to LAN-subnet IPv4 traffic exiting WAN. Show the DHCP exception and implicit
 rules clearly; deleting the DHCP/LAN allowances can affect reachability/renewal.
-Enabling the global ICMP exception also allows WAN ICMP before input drops.
+First-install provisioning and explicit factory reset set
+`firewall.allow_all_icmp: true`; previously provisioning explicitly set false.
+This allows all IPv4 ICMP types/codes on every interface, including WAN, before
+input/forwarding drops, and accepts local IPv4 ICMP output. It does not cover
+ICMPv6. Show the enabled exception rather than describing WAN as blocking all
+new traffic. Ordinary startup/upgrades do not rewrite existing saved values.
 Warn before removing the input policy: doing so removes WAN host protection.
 
 ### 6.7 NAT
@@ -5099,10 +5210,16 @@ interface Route {
   metric: number;
 }
 
+type RuleOrigin = "manual" | "import" | "system" | "inherited";
+interface RuleSource {
+  origin: RuleOrigin;
+  import_source: string | null;
+}
+
 interface Firewall {
   allow_all_icmp: boolean; // Omitted input defaults to true; null is invalid.
   policy: "accept" | "drop";
-  rules: Array<{ source?: string; destination?: string; action: "accept" | "drop" }>;
+  rules: Array<RuleSource & { source?: string; destination?: string; action: "accept" | "drop" }>;
   nat: { masquerade: MasqueradeRule[]; destination_rewrite: DestinationRewriteRule[] };
   policies?: { hosts: FirewallHost[]; interfaces: InterfacePolicy[] } | null;
   input?: InputFirewall | null;
@@ -5129,7 +5246,7 @@ interface InterfacePolicy {
   rules: HostPolicyRule[];
 }
 
-interface HostPolicyRule {
+interface HostPolicyRule extends RuleSource {
   out_interface?: string;
   destination_host?: string;
   destination?: string;
@@ -5138,13 +5255,13 @@ interface HostPolicyRule {
   action: "accept" | "drop";
 }
 
-interface MasqueradeRule {
+interface MasqueradeRule extends RuleSource {
   family: "ipv4" | "ipv6";
   source?: string;
   out_interface: string;
 }
 
-interface DestinationRewriteRule {
+interface DestinationRewriteRule extends RuleSource {
   metadata?: { display_name?: string; description?: string };
   out_interface: string; // Original WAN, before DNAT.
   protocol: "tcp" | "udp";

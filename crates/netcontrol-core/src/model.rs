@@ -410,6 +410,10 @@ pub struct NAT {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationRewriteRule {
+    #[serde(default)]
+    pub origin: RuleOrigin,
+    #[serde(default)]
+    pub import_source: Option<String>,
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
     pub out_interface: String,
@@ -421,6 +425,10 @@ pub struct DestinationRewriteRule {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MasqueradeRule {
+    #[serde(default)]
+    pub origin: RuleOrigin,
+    #[serde(default)]
+    pub import_source: Option<String>,
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
     pub family: String,
@@ -431,6 +439,10 @@ pub struct MasqueradeRule {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirewallRule {
+    #[serde(default)]
+    pub origin: RuleOrigin,
+    #[serde(default)]
+    pub import_source: Option<String>,
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -476,6 +488,10 @@ pub struct InputFirewall {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostPolicyRule {
+    #[serde(default)]
+    pub origin: RuleOrigin,
+    #[serde(default)]
+    pub import_source: Option<String>,
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -489,6 +505,38 @@ pub struct HostPolicyRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destination_ports: Vec<i64>,
     pub action: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleOrigin {
+    #[default]
+    Manual,
+    Import,
+    System,
+    Inherited,
+}
+
+impl RuleOrigin {
+    fn validate_source(self, source: Option<&str>) -> Result<()> {
+        if self == Self::Import {
+            ensure!(
+                source.is_some_and(|source| !source.is_empty()
+                    && source.len() <= 64
+                    && source.as_bytes()[0].is_ascii_lowercase()
+                    && source.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-'))),
+                "import rules require import_source matching [a-z][a-z0-9_-]{{0,63}}"
+            );
+        } else {
+            ensure!(
+                source.is_none(),
+                "import_source is only valid for origin import"
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -794,6 +842,10 @@ impl Config {
         fn strip(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::Object(object) => {
+                    if object.contains_key("origin") && object.contains_key("import_source") {
+                        object.remove("origin");
+                        object.remove("import_source");
+                    }
                     if object.get("metadata").is_some_and(|metadata| {
                         metadata.get("display_name").is_some()
                             && metadata.get("description").is_some()
@@ -1213,6 +1265,7 @@ impl Config {
             "firewall policy must be accept or drop"
         );
         for r in &self.firewall.rules {
+            r.origin.validate_source(r.import_source.as_deref())?;
             ensure!(action(&r.action), "invalid firewall action");
             let a = if r.source.is_empty() {
                 None
@@ -1270,6 +1323,7 @@ impl Config {
             }
         }
         for r in &self.firewall.nat.masquerade {
+            r.origin.validate_source(r.import_source.as_deref())?;
             ensure!(
                 ["ipv4", "ipv6"].contains(&r.family.as_str()) && names.contains(&r.out_interface),
                 "masquerade requires family and managed egress interface"
@@ -1301,6 +1355,7 @@ impl Config {
         ensure!(rules.len() <= 256, "at most 256 destination rewrite rules");
         let mut matches = BTreeSet::new();
         for rule in rules {
+            rule.origin.validate_source(rule.import_source.as_deref())?;
             let target = canonical_ip(&rule.target_address)?;
             ensure!(
                 global_unicast(target) && (self.ipv6_enabled || target.is_ipv4()),
@@ -1776,6 +1831,7 @@ impl FirewallPolicies {
             ensure!(rules.len() <= 64, "at most 64 rules per host/interface");
             let mut count = 0usize;
             for r in rules {
+                r.origin.validate_source(r.import_source.as_deref())?;
                 ensure!(
                     r.out_interface.is_empty() || valid_interface_name(&r.out_interface),
                     "invalid policy outgoing interface"

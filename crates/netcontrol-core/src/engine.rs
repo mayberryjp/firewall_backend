@@ -146,6 +146,44 @@ fn service_error(e: impl ToString) -> ApiError {
 fn internal_error(e: impl ToString) -> ApiError {
     ApiError::new(500, e)
 }
+fn annotate_rule_origins(response: &mut Value, config: &Config) -> Result<()> {
+    let configured = json!({"firewall": &config.firewall});
+    let rules = response["rules"]
+        .as_array_mut()
+        .context("backend returned invalid firewall counter rules")?;
+    for row in rules {
+        ensure!(
+            row.is_object(),
+            "backend returned invalid firewall counter row"
+        );
+        let path = row
+            .get("config_path")
+            .context("counter config_path missing")?;
+        let (origin, source) = if path.is_null() {
+            (json!("system"), Value::Null)
+        } else {
+            let path = path.as_str().context("invalid counter config_path")?;
+            let rule = configured
+                .pointer(path)
+                .context("counter config_path not found")?;
+            if path == "/firewall/allow_all_icmp" || path.ends_with("/policy") {
+                (json!("system"), Value::Null)
+            } else {
+                (
+                    rule.get("origin")
+                        .context("counter rule origin missing")?
+                        .clone(),
+                    rule.get("import_source")
+                        .context("counter import_source missing")?
+                        .clone(),
+                )
+            }
+        };
+        row["origin"] = origin;
+        row["import_source"] = source;
+    }
+    Ok(())
+}
 fn value<T: Serialize>(v: T) -> ApiResult<Value> {
     serde_json::to_value(v).map_err(service_error)
 }
@@ -1486,6 +1524,7 @@ impl Engine {
                 if !response.is_object() {
                     return Err(service_error("backend returned invalid firewall counters"));
                 }
+                annotate_rule_origins(&mut response, &config).map_err(service_error)?;
                 response["config_revision"] = value(self.state.revision)?;
                 response["transaction_id"] =
                     value(self.active().map(|transaction| &transaction.id))?;

@@ -830,15 +830,21 @@ The resulting configuration assigns WAN/LAN roles, replaces the LAN's addresses
 with the selected static IPv4 address, removes LAN DHCP-client/DNS/static routes,
 clears static WAN addressing/routes/DNS and configures a WAN DHCPv4 client.
 The forward default is drop, with an unrestricted LAN-ingress allow-all rule
-(no egress restriction), established/related return acceptance and no global
-ICMP bypass. LAN-subnet IPv4 traffic exiting WAN is masqueraded. WAN DHCP
+(no egress restriction), established/related return acceptance and the global
+IPv4 ICMP bypass enabled (`firewall.allow_all_icmp: true`). This accepts all
+IPv4 ICMP types/codes before input/forwarding drops on every interface, including
+WAN, and also accepts locally generated IPv4 ICMP. It does not cover ICMPv6.
+First installation and explicit factory reset use this setting; ordinary
+startup and upgrades preserve the saved value. LAN-subnet IPv4 traffic exiting
+WAN is masqueraded. WAN DHCP
 addresses/routes remain runtime state, not static copies. Competing default
 routes on additional ports are rejected.
 
 An explicit host-input policy defaults to drop for both IP families. It accepts
 loopback, established/related replies, all traffic entering LAN, and WAN IPv4
 UDP destination port 68 for DHCP. New WAN connections to the appliance,
-including system SSH and packets addressed to its LAN IP, are denied. Local
+including system SSH and packets addressed to its LAN IP, are denied except
+for the global IPv4 ICMP bypass. Local
 output is unrestricted. These are Netcontrol-owned nftables rules, installed
 atomically with forwarding/NAT and persisted in configuration, not a second
 UFW ruleset. The policy is editable through configuration transactions;

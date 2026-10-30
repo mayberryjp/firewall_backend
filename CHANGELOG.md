@@ -4,6 +4,16 @@
 
 ### Added
 
+- Descriptive `origin` and nullable `import_source` labels on saved filter,
+  host/interface/input and NAT rules, preserved through normal configuration
+  history and rollback without changing matching/counter identity. Rule-counter
+  rows expose saved labels; generated setting/default/bypass rows are tagged
+  `system`. Sando replacement remains frontend-owned: replace only Sando imports,
+  preserve manual rules/other import sources, and review manual-first ordering.
+  No backend import/merge/acquisition operation. Recommended SemVer bump: minor
+  (additive contract), baseline unknown, Unreleased. Required frontend work:
+  [handoff 2026-10-30-01](docs/frontend-handoffs/2026-10-30.md#2026-10-30-01-rule-origins-and-frontend-sando-replacement).
+
 - Live native firewall rule packet/byte accounting at
   `GET /api/v1/statistics/firewall` (`state.read`), aggregating kernel expansions
   for host/interface/legacy/input/NAT rules and exposing separate defaults and
@@ -176,6 +186,15 @@
   [handoff 2026-10-27-04](docs/frontend-handoffs/2026-10-27.md#2026-10-27-04-native-link-diagnostics).
 
 ### Changed
+
+- First-install WAN/LAN provisioning and explicit factory reset now enable
+  `firewall.allow_all_icmp` instead of disabling it. All IPv4 ICMP is accepted
+  to/from/through the appliance, including WAN, before managed drops; ICMPv6
+  and other policies are unchanged. Existing saved configurations are not
+  rewritten on ordinary startup or upgrade. Recommended SemVer bump: major
+  (changed deployment firewall default), baseline unknown. Required frontend
+  default/reachability messaging:
+  [handoff 2026-10-30-02](docs/frontend-handoffs/2026-10-30.md#2026-10-30-02-provisioning-enables-global-ipv4-icmp).
 
 - Software versions now derive at compile time from full Git first-parent
   history and an immutable `2026.10.30.6` seed, advancing for every commit and

@@ -110,7 +110,7 @@ pub fn candidate(mut config: Config, wan: &str, lan: &str, address: &str) -> Res
     config.dns.remove(lan);
     config.dns.remove(wan);
     config.firewall = serde_json::from_value(json!({
-        "allow_all_icmp": false,
+        "allow_all_icmp": true,
         "policy": "drop",
         "rules": [],
         "policies": {"hosts": [], "interfaces": [{"interface": lan, "rules": [{"action": "accept"}]}]},
@@ -318,6 +318,7 @@ mod tests {
     #[test]
     fn factory_reset_discards_custom_network_configuration() {
         let mut saved = initial();
+        saved.firewall.allow_all_icmp = false;
         saved.dhcp_clients.insert("lan0".into(), Default::default());
         saved.interfaces.push(
             serde_json::from_value(json!({"name":"wifi0", "kind":"ethernet",
@@ -364,6 +365,7 @@ mod tests {
             .unwrap();
         assert_eq!(lan.role, "lan");
         assert_eq!(lan.addresses, ["192.168.0.1/24"]);
+        assert!(factory.firewall.allow_all_icmp);
         assert_eq!(factory.firewall.nat.masquerade[0].source, "192.168.0.0/24");
     }
 
@@ -380,7 +382,7 @@ mod tests {
             ["192.168.0.1/24"]
         );
         assert_eq!(config.firewall.policy, "drop");
-        assert!(!config.firewall.allow_all_icmp);
+        assert!(config.firewall.allow_all_icmp);
         assert_eq!(
             config.firewall.policies.unwrap().interfaces[0].rules[0].out_interface,
             ""

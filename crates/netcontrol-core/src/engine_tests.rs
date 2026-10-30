@@ -3486,6 +3486,106 @@ fn firewall_counters_are_authorized_readonly_and_identify_provisional_configurat
 }
 
 #[test]
+fn rule_origins_are_persisted_authorized_and_rolled_back_without_backend_imports() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut candidate = config();
+    candidate.firewall.allow_all_icmp = false;
+    candidate.firewall.rules = serde_json::from_value(json!([
+        {"action":"accept","source":"192.0.2.2/32","origin":"manual"},
+        {"action":"drop","source":"192.0.2.3/32","origin":"import","import_source":"sando"},
+        {"action":"drop","source":"192.0.2.4/32","origin":"import","import_source":"other"}
+    ]))
+    .unwrap();
+    let response = submit(&mut engine, candidate.clone());
+    assert_eq!(response.status, 202, "{}", response.body);
+    assert_eq!(response.body["ignored_fields"], json!([]));
+    let id = response.body["id"].as_str().unwrap();
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    let original = engine.saved_configuration().clone();
+    let mut relabeled = original.clone();
+    relabeled.firewall.rules[1].origin = crate::RuleOrigin::Manual;
+    relabeled.firewall.rules[1].import_source = None;
+    assert_eq!(
+        relabeled.operational_value().unwrap(),
+        original.operational_value().unwrap()
+    );
+    let mut permissions = all();
+    permissions.retain(|p| p != "firewall.write");
+    let denied = engine.request("POST", "/api/v1/transactions", "", "operator", &permissions,
+                &serde_json::to_vec(&json!({"base_revision":engine.committed_revision(),"confirm_timeout_seconds":30,"config":relabeled})).unwrap());
+    assert_eq!(denied.status, 403);
+    let pending = submit(&mut engine, relabeled);
+    assert_eq!(pending.status, 202);
+    let id = pending.body["id"].as_str().unwrap().to_owned();
+    drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(engine.saved_configuration(), &original);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.saved_configuration(), &original);
+    let latest = request(&mut engine, "GET", "/api/v1/revisions/latest", Value::Null);
+    assert_eq!(
+        latest.body["config"]["firewall"]["rules"][0]["origin"],
+        "manual"
+    );
+    assert_eq!(
+        latest.body["config"]["firewall"]["rules"][1]["import_source"],
+        "sando"
+    );
+    assert_eq!(
+        latest.body["config"]["firewall"]["rules"][2]["import_source"],
+        "other"
+    );
+}
+
+#[test]
+fn rule_origins_tag_generated_counter_rows_and_keep_configured_ownership() {
+    let mut config = config();
+    config.firewall.rules = serde_json::from_value(json!([
+        {"action":"drop","origin":"import","import_source":"sando"}
+    ]))
+    .unwrap();
+    config.firewall.input = Some(
+        serde_json::from_value(json!({
+            "policy":"drop",
+            "interfaces":[{"interface":"lan0","rules":[{"action":"drop","origin":"manual"}]}]
+        }))
+        .unwrap(),
+    );
+    config.validate().unwrap();
+    let mut response = json!({"rules":[
+        {"config_path":"/firewall/rules/0"},
+        {"config_path":"/firewall/input/interfaces/0/rules/0"},
+        {"config_path":"/firewall/policy"},
+        {"config_path":"/firewall/allow_all_icmp"},
+        {"config_path":null}
+    ]});
+    annotate_rule_origins(&mut response, &config).unwrap();
+    assert_eq!(response["rules"][0]["origin"], "import");
+    assert_eq!(response["rules"][0]["import_source"], "sando");
+    assert_eq!(response["rules"][1]["origin"], "manual");
+    for index in 2..5 {
+        assert_eq!(response["rules"][index]["origin"], "system");
+        assert!(response["rules"][index]["import_source"].is_null());
+    }
+    for bad in [
+        json!({"rules":[{}]}),
+        json!({"rules":[{"config_path":"/firewall/missing"}]}),
+        json!({"rules":[0]}),
+    ] {
+        assert!(annotate_rule_origins(&mut bad.clone(), &config).is_err());
+    }
+}
+#[test]
 fn firewall_counter_backend_errors_are_unavailable_not_successful_zeroes() {
     let fixture = Fixture::new();
     let (mut engine, backend) = faulty(&fixture);
@@ -3497,7 +3597,7 @@ fn firewall_counter_backend_errors_are_unavailable_not_successful_zeroes() {
     backend.lock().unwrap().traffic_response = Some(json!(0));
     assert_eq!(get(&mut engine).status, 503);
     backend.lock().unwrap().traffic_response = Some(json!({
-        "schema":"netcontrol-firewall-counters/v1","rules":[{"packets":"18446744073709551615","bytes":"36893488147419103230"}]
+        "schema":"netcontrol-firewall-counters/v1","rules":[{"config_path":null,"packets":"18446744073709551615","bytes":"36893488147419103230"}]
     }));
     let response = get(&mut engine);
     assert_eq!(response.status, 200);

@@ -1752,6 +1752,31 @@ fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift(
         native.statistics(&desired, path, "")?["generation"],
         measured["generation"]
     );
+    let mut relabeled = desired.clone();
+    let policies = relabeled.firewall.policies.as_mut().unwrap();
+    policies.hosts[0].rules[0].origin = netcontrol_core::RuleOrigin::Import;
+    policies.hosts[0].rules[0].import_source = Some("sando".into());
+    policies.interfaces[0].rules[0].origin = netcontrol_core::RuleOrigin::Inherited;
+    relabeled.firewall.input.as_mut().unwrap().interfaces[0].rules[0].origin =
+        netcontrol_core::RuleOrigin::System;
+    relabeled.firewall.nat.masquerade[0].origin = netcontrol_core::RuleOrigin::Import;
+    relabeled.firewall.nat.masquerade[0].import_source = Some("other".into());
+    relabeled.validate()?;
+    native.apply(&desired, &relabeled)?;
+    native.observe(&relabeled)?;
+    let same_rules = native.statistics(&relabeled, path, "")?;
+    assert_eq!(same_rules["generation"], measured["generation"]);
+    assert_eq!(same_rules["ruleset_id"], measured["ruleset_id"]);
+    assert_eq!(
+        firewall_counter(&same_rules, "forward:/firewall/policies/hosts/0/rules/0")?,
+        accepted
+    );
+    assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
+    assert_eq!(
+        session(router_ns.clone(), |_, _| netfilter::fingerprint())?,
+        fingerprint
+    );
+    native.apply(&relabeled, &desired)?;
     drop(native);
     let mut native = Native::open(options)?;
     assert_eq!(

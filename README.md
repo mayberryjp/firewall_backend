@@ -105,6 +105,14 @@ records, including source, operation/item counts, time and status. Save them
 with reviewed firewall changes through normal confirmed transactions
 (`sando.write`, plus `firewall.write` for host/rule edits).
 
+Saved firewall/NAT rules expose `origin` (`manual`, `import`, `system`, `inherited`)
+and nullable `import_source`; Sando uses `origin:"import", import_source:"sando"`.
+The frontend must replace only Sando-owned rules, preserve manual rules/other
+imports, and review manual-first ordering within each affected list. The backend
+stores/validates labels and tags generated counter rows as system; it does not
+fetch, merge, delete or reorder imported rules. Labels do not affect matching or
+counter generations. See [rule origins and replacement](FRONTEND_SPEC.md#rule-source-labels-and-sando-replacement).
+
 Optional `sando.sync_enabled` (default `false`, requires `api_url`) enables
 daemon-side host metadata acquisition immediately on startup/enablement and
 hourly after each completed attempt, even with no browser open. The daemon pulls
@@ -559,7 +567,10 @@ Do not treat `202 Accepted` as a committed revision. An uncertain HTTP write
 must be reconciled through transaction reads, not blindly retried.
 Interfaces require an explicit `wan`, `lan`, or `unassigned` role; roles do not automatically
 rewrite policy. The Ubuntu appliance installer explicitly provisions those roles,
-a static LAN address, LAN-to-WAN forwarding, and IPv4 masquerade. Installed
+a static LAN address, LAN-to-WAN forwarding, and IPv4 masquerade. First-install
+provisioning and explicit factory reset enable `firewall.allow_all_icmp`, accepting
+all IPv4 ICMP to/from/through the appliance, including WAN, before managed drops.
+Ordinary startup and upgrades preserve the saved setting. Installed
 appliance mode enables host IPv4 forwarding after native policy reconciliation
 on every startup; changing roles through the API does not regenerate policy.
 

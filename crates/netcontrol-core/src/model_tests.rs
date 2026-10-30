@@ -17,6 +17,7 @@ fn vnstat_collector_requires_explicit_valid_socket_address() {
         config.vnstat.collector = Some(address.into());
         config.validate().unwrap();
     }
+
     for address in [
         "",
         "collector.example:9999",
@@ -35,6 +36,124 @@ fn vnstat_collector_requires_explicit_valid_socket_address() {
     config.validate().unwrap();
     let value = serde_json::to_value(&config).unwrap();
     assert!(value["vnstat"]["collector"].is_null());
+}
+
+#[test]
+fn rule_origins_cover_filter_input_and_nat_without_changing_operational_identity() {
+    let mut baseline = serde_json::to_value(candidate()).unwrap();
+    baseline["interfaces"].as_array_mut().unwrap().push(json!({
+        "name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,
+        "addresses":["198.51.100.1/24"]
+    }));
+    baseline["firewall"]["nat"] = json!({
+        "masquerade":[{"family":"ipv4","out_interface":"wan0"}],
+        "destination_rewrite":[{"out_interface":"wan0","protocol":"udp","destination_port":53,
+            "target_interface":"lan0","target_address":"192.0.2.53"}]
+    });
+    baseline["firewall"]["input"] = json!({"policy":"drop","interfaces":[
+        {"interface":"lan0","rules":[{"action":"accept"}]}
+    ]});
+    for policy_mode in [false, true] {
+        let mut value = baseline.clone();
+        let mut paths = vec![
+            "/firewall/nat/masquerade/0",
+            "/firewall/nat/destination_rewrite/0",
+            "/firewall/input/interfaces/0/rules/0",
+        ];
+        if policy_mode {
+            value["firewall"]["rules"] = json!([]);
+            value["firewall"]["policies"] = json!({
+                "hosts":[{"id":"client","name":"Client","addresses":["192.0.2.2"],"policy":"drop","rules":[{"action":"accept"}]}],
+                "interfaces":[{"interface":"lan0","rules":[{"action":"drop"}]}]
+            });
+            paths.extend([
+                "/firewall/policies/hosts/0/rules/0",
+                "/firewall/policies/interfaces/0/rules/0",
+            ]);
+        } else {
+            paths.push("/firewall/rules/0");
+        }
+        let original: Config = serde_json::from_value(value.clone()).unwrap();
+        original.validate().unwrap();
+        let serialized = serde_json::to_value(&original).unwrap();
+        for path in &paths {
+            assert_eq!(serialized.pointer(path).unwrap()["origin"], "manual");
+            assert!(serialized.pointer(path).unwrap()["import_source"].is_null());
+            value.pointer_mut(path).unwrap()["origin"] = json!("import");
+            value.pointer_mut(path).unwrap()["import_source"] = json!("sando");
+        }
+        let imported: Config = serde_json::from_value(value.clone()).unwrap();
+        imported.validate().unwrap();
+        assert_ne!(original, imported);
+        assert_eq!(
+            original.operational_value().unwrap(),
+            imported.operational_value().unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<Config>(serde_json::to_value(&imported).unwrap()).unwrap(),
+            imported
+        );
+        assert_eq!(imported.clone().normalized(), imported);
+        for path in paths {
+            for source in [
+                "a".to_owned(),
+                "a".repeat(64),
+                "source_2-provider".to_owned(),
+            ] {
+                let mut changed = value.clone();
+                changed.pointer_mut(path).unwrap()["import_source"] = json!(source);
+                serde_json::from_value::<Config>(changed)
+                    .unwrap()
+                    .validate()
+                    .unwrap();
+            }
+            for origin in ["manual", "system", "inherited"] {
+                let mut changed = value.clone();
+                changed.pointer_mut(path).unwrap()["origin"] = json!(origin);
+                changed.pointer_mut(path).unwrap()["import_source"] = Value::Null;
+                let changed: Config = serde_json::from_value(changed).unwrap();
+                changed.validate().unwrap();
+                assert_eq!(
+                    changed.operational_value().unwrap(),
+                    original.operational_value().unwrap()
+                );
+            }
+            for source in [
+                Value::Null,
+                json!(""),
+                json!("Sando"),
+                json!("http://example.test"),
+                json!("a b"),
+                json!("1sando"),
+                json!("_sando"),
+                json!("s\u{00e1}nd\u{00f3}"),
+                json!("a".repeat(65)),
+            ] {
+                let mut bad = value.clone();
+                bad.pointer_mut(path).unwrap()["import_source"] = source;
+                assert!(
+                    serde_json::from_value::<Config>(bad)
+                        .unwrap()
+                        .validate()
+                        .is_err(),
+                    "{path}"
+                );
+            }
+            let mut bad = value.clone();
+            bad.pointer_mut(path).unwrap()["origin"] = json!("manual");
+            assert!(
+                serde_json::from_value::<Config>(bad)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            for origin in [Value::Null, json!("imported"), json!(1)] {
+                let mut bad = value.clone();
+                bad.pointer_mut(path).unwrap()["origin"] = origin;
+                assert!(serde_json::from_value::<Config>(bad).is_err());
+            }
+        }
+    }
 }
 #[test]
 fn destination_rewrite_exact_ports_local_targets_and_strict_schema() {
@@ -695,6 +814,8 @@ fn masquerade_supports_dynamic_wan_but_not_missing_family_or_interface() {
         .dhcp_clients
         .insert("wan0".into(), DHCPClientConfig::default());
     config.firewall.nat.masquerade.push(MasqueradeRule {
+        origin: Default::default(),
+        import_source: None,
         metadata: Default::default(),
         family: "ipv4".into(),
         source: "192.0.2.0/24".into(),
@@ -785,6 +906,8 @@ fn normalization_preserves_ordered_policy_semantics() {
     other.interfaces[0].addresses.reverse();
     assert_eq!(c, other.normalized());
     c.firewall.rules.push(FirewallRule {
+        origin: Default::default(),
+        import_source: None,
         metadata: Default::default(),
         source: String::new(),
         destination: String::new(),
@@ -840,6 +963,8 @@ fn interface_route_rule_and_nat_validation_edges() {
     assert!(c.validate().is_err());
     let mut c = candidate();
     c.firewall.nat.masquerade.push(MasqueradeRule {
+        origin: Default::default(),
+        import_source: None,
         metadata: Default::default(),
         family: "ipv6".into(),
         source: "".into(),
@@ -1115,6 +1240,8 @@ fn policy_references_ports_expansion_and_family() {
                 addresses: vec!["192.0.2.10".into()],
                 policy: "drop".into(),
                 rules: vec![HostPolicyRule {
+                    origin: Default::default(),
+                    import_source: None,
                     metadata: Default::default(),
                     out_interface: "".into(),
                     destination_host: "server".into(),
@@ -1150,6 +1277,8 @@ fn policy_references_ports_expansion_and_family() {
     assert!(bad.validate().is_err());
     let mut bad = c;
     bad.firewall.rules.push(FirewallRule {
+        origin: Default::default(),
+        import_source: None,
         metadata: Default::default(),
         source: "".into(),
         destination: "".into(),
@@ -1262,6 +1391,8 @@ fn policy_expansion_accepts_exact_limit_and_rejects_one_extra() {
         for j in 0..64 {
             let count = if i == 1 && j == 63 { 29 } else { 32 };
             h.rules.push(HostPolicyRule {
+                origin: Default::default(),
+                import_source: None,
                 metadata: Default::default(),
                 out_interface: "".into(),
                 destination_host: "".into(),
