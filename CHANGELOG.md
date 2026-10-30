@@ -4,6 +4,15 @@
 
 ### Added
 
+- Credential-safe MQTT reconnect diagnostics in status and daemon
+  warnings: specific failure categories/reasons, attempt/retry counters, last
+  broker-connection time and failure history retained across retries/recovery.
+  No new configuration, topics, permissions or dependencies.
+  Recommended bump: minor for additive status diagnostics,
+  baseline unknown, Unreleased; next automatic calendar version, no manual bump.
+  Required frontend status display work:
+  [handoff 2026-10-30-08](docs/frontend-handoffs/2026-10-30.md#2026-10-30-08-mqtt-reconnect-diagnostics).
+
 - WireGuard DNS peer endpoints with immediate/60-second automatic refresh,
   IPv4-only resolution when IPv6 is disabled, persisted last-good selections,
   explicit refresh diagnostics in native state and joined worker shutdown.
@@ -295,6 +304,12 @@
   [handoff 2026-10-28-05](docs/frontend-handoffs/2026-10-28.md#2026-10-28-05-optional-dns-diagnostic-interface).
 
 ### Fixed
+
+- MQTT discovery manifest validation no longer rejects generated mixed-case
+  protocol counter IDs after saving them, which could break subsequent samples
+  or daemon startup. Shared read/write ID validation and bounded writes preserve
+  valid IDs without deleting private state. Recommended bump: patch for this fix;
+  included with the minor diagnostics addition above.
 
 - MQTT now masks cached NetFlow counters/completeness when a worker is no longer
   running, rather than presenting stale readings as current. Final discovery

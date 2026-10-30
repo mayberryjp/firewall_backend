@@ -2173,7 +2173,7 @@ unavailable manager/storage or exhausted limit `503`. Use normal API error envel
 Synthetic status example:
 
 ```json
-{"device_id":"0123456789abcdef0123456789abcdef","enabled":true,"state":"running","error":null,"last_published_at_unix":1792800000}
+{"device_id":"0123456789abcdef0123456789abcdef","enabled":true,"state":"reconnecting","error":"MQTT connection reset by peer","last_published_at_unix":1792800000,"connection_attempts":3,"reconnect_count":3,"last_connected_at_unix":1792800000,"last_failure":{"category":"connection_reset","message":"MQTT connection reset by peer","os_error_code":104,"at_unix":1792800060}}
 ```
 
 `device_id` is a stable private-store identity string. `enabled` reflects confirmed
@@ -2183,6 +2183,51 @@ is `disabled`, `connecting`, `running`, `reconnecting`, `error`, `simulated`,
 `last_published_at_unix` is nullable integer UTC Unix seconds, updated after broker
 acknowledgment of a batch, not Home Assistant ingestion; its last value can remain
 after disable/failure. Poll every 5..10 seconds on the settings screen.
+
+Reconnect diagnostics are read-only at `GET /api/v1/services/mqtt/status` with
+the same `state.read` permission:
+
+| Field | Type and semantics |
+|---|---|
+| `connection_attempts` | Nonnegative integer, initially 0; increments immediately before each session attempt, including configuration-driven new sessions. |
+| `reconnect_count` | Nonnegative integer, initially 0; increments for each failed session/connection attempt that schedules a retry, including failures before connection. Not a count of successful reconnects. Orderly disable/configuration changes do not increment it. |
+| `last_connected_at_unix` | Nullable integer UTC Unix seconds; latest successful broker CONNACK, not proof of an acknowledged telemetry batch. |
+| `last_failure` | Nullable object; most recent retry-triggering failure, retained during retries, recovery, disable and managed-worker stop/restart. |
+| `last_failure.category` | Nonnullable allowlisted string listed below; machine-readable cause, not arbitrary library text. |
+| `last_failure.message` | Nonnullable credential-safe diagnostic string. Render as text. |
+| `last_failure.os_error_code` | Nullable signed integer OS error number for a network I/O failure; platform-dependent, not a broker MQTT return code. |
+| `last_failure.at_unix` | Nonnullable integer UTC Unix seconds when the failure was observed; not necessarily when physical connectivity was lost. |
+
+Counters saturate at the unsigned 64-bit maximum. Diagnostics are daemon-lifetime
+memory, not configuration/history or on-disk state; a daemon process restart
+resets counters to 0 and nullable diagnostic fields to null. Retained
+`last_failure` is historical, not a current alarm when `state` is `running`.
+The current `error` now reports a specific safe reason rather than the previous
+generic connection-unavailable message. It remains visible during the next
+`connecting` attempt and clears on CONNACK, successful publication, disable or
+stop. Collection errors still use the existing `error` state without incrementing
+reconnect counters or replacing retry history.
+
+Failure categories:
+- Broker response: `authentication`, `authorization`, `client_id`,
+  `broker_unavailable`, `protocol`.
+- Transport/timeouts: `connection_refused`, `connection_reset`,
+  `connection_closed`, `network_timeout`, `network_unreachable`, `network_io`,
+  `connection_timeout`, `write_timeout`, `keepalive_timeout`,
+  `publication_ack_timeout`.
+- Local/TLS/worker: `source_interface`, `permission_denied`, `credentials`,
+  `configuration`, `tls_configuration`, `tls`, `tls_certificate`, `packet_size`,
+  `discovery_manifest`, `client_channel`, `worker`, `internal`.
+
+The daemon emits one warning per failed attempt with only the same allowlisted
+category/message and optional OS code. Neither the status diagnostics nor these
+warnings include endpoint URLs, usernames, password references, passwords,
+packet bodies, peer-provided text or raw library error chains. DNS/unknown I/O
+failures may be grouped as `network_io`; a peer close/reset does not prove an
+ACL rejection or duplicate client ID. Broker logs may still be needed to
+distinguish those causes. MQTT 3.1.1 does not provide publication-rejection reason
+codes: `publication_ack_timeout` identifies the observed missing acknowledgments,
+not an asserted ACL or packet-size cause.
 
 Frontend workflow: masked replacement input, never prefilled from the reference;
 upload first, save only the reference in the shared draft, then submit
@@ -2195,6 +2240,9 @@ rollback and conflict/error behavior remain. New settings also appear in
 error/dismiss; keep it out of logs, exports, URLs and persisted drafts. Discarded
 uploads still consume the private-store limit. Show the global toggle and
 connection/last-publish status without claiming Home Assistant verified ingestion.
+Show the safe current reason and historical last-failure category/time, attempts,
+retry count and last broker connection. Keep historical failures visibly separate
+from current errors; do not hide them whenever the next attempt starts.
 
 Publisher and deployment contract:
 
@@ -2217,7 +2265,11 @@ Publisher and deployment contract:
   to `homeassistant/status`. Birth `online` refreshes discovery/sample within
   five seconds when idle. LWT is retained `offline`; graceful stop/disable attempts
   offline/disconnect within three seconds. Broken sockets rely on broker LWT.
-- Stable name-hashed sensor IDs and durable component-removal manifest. Entities:
+- Stable name-hashed sensor IDs and durable component-removal manifest.
+  Component IDs preserve case and contain 1..128 ASCII letters/digits/underscores;
+  reads and writes apply the same validation, with at most 8192 manifest entries
+  and a 1 MiB file limit. Generated mixed-case protocol IDs are valid and do not
+  require deleting/recreating private state. Entities:
   configuration revision, uptime, version; interface link state and all exported
   64-bit link counters (RX/TX bytes/packets/errors/drops, multicast, collisions,
   RX length/overrun/CRC/frame/FIFO/missed/no-handler/other-host drops, TX aborted/

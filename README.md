@@ -485,6 +485,19 @@ while enabled. If outstanding QoS-1 publications make no acknowledgement progres
 for 30 seconds, the publisher reconnects and sends fresh discovery/state; it does
 not replay an offline sample backlog.
 
+For reconnect debugging, read `GET /api/v1/services/mqtt/status`. It includes a
+specific safe `error`, `connection_attempts`, `reconnect_count`,
+`last_connected_at_unix`, and retained `last_failure` with `category`, `message`,
+`at_unix` and nullable `os_error_code`. Failure history survives retries and
+recovery; these in-memory diagnostics reset when the daemon process restarts.
+The retry count includes failed initial connections, not just established
+connections lost. `last_connected_at_unix` means broker CONNACK; only
+`last_published_at_unix` proves acknowledgment of a telemetry batch.
+On systemd installations use `journalctl -u netcontrold --since "15 minutes ago"
+--no-pager` for matching safe warnings. No credential/endpoint/raw packet text is
+logged by these warnings. Correlate close/reset or acknowledgment timeouts with
+broker logs; those symptoms alone cannot identify ACL rejection or duplicate IDs.
+
 Prefer `mqtts://` (port 8883), with a system-trusted certificate and matching
 hostname. Explicit `mqtt://` (1883) sends credentials/data without TLS. Endpoint
 URLs must not contain credentials, paths other than `/`, query or fragment.
@@ -497,6 +510,10 @@ Back up `<state>.mqtt` together with the journal (default
 `/var/lib/netcontrol/native-state.json.mqtt`). Its daemon-owned private files hold
 stable device identity, password references and the discovery manifest. Preserve
 ownership/permissions; never clone this identity to another active appliance.
+Discovery component IDs preserve ASCII letter case, including kernel protocol
+counter names. Manifest reads and writes share ID/count validation and a 1 MiB
+file limit; valid generated mixed-case IDs no longer break subsequent samples
+or daemon startup. Do not delete the private store as a reconnect workaround.
 Passwords are plaintext at rest in owner-only files, not encrypted. References
 are immutable and retained for revisions; limit 256 passwords. There is no pruning
 or deletion API: do not remove files referenced by configuration/history. Missing

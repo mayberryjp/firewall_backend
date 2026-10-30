@@ -16,6 +16,7 @@ use crate::private_store::{identifier, private_file, read_private, valid_id, wri
 use anyhow::{Context, Result, ensure};
 use netcontrol_core::{Engine, MQTTConfig};
 use rumqttc::{AsyncClient, Event, EventLoop, LastWill, MqttOptions, Packet, QoS, Transport};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -129,28 +130,31 @@ impl Secrets {
             return Ok(BTreeSet::new());
         }
         let components: BTreeSet<String> = serde_json::from_slice(&read_private(&path)?)?;
-        ensure!(
-            components.len() <= 8192
-                && components.iter().all(|key| key.len() <= 128
-                    && key.bytes().all(|byte| byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || byte == b'_')),
-            "invalid MQTT discovery manifest"
-        );
+        Self::validate_components(&components)?;
         Ok(components)
     }
 
-    fn save_components(&self, components: &BTreeSet<String>) -> Result<()> {
+    fn validate_components(components: &BTreeSet<String>) -> Result<()> {
         ensure!(
-            components.len() <= 8192,
-            "MQTT discovery manifest limit reached"
+            components.len() <= 8192 && components.iter().all(|key| valid_component(key)),
+            "invalid MQTT discovery manifest"
+        );
+        Ok(())
+    }
+
+    fn save_components(&self, components: &BTreeSet<String>) -> Result<()> {
+        Self::validate_components(components)?;
+        let bytes = serde_json::to_vec(components)?;
+        ensure!(
+            bytes.len() <= 1 << 20,
+            "MQTT discovery manifest size limit exceeded"
         );
         let pending = self
             .root
             .join(format!("components-{}.pending", identifier()));
         let result = (|| {
             let mut file = private_file(&pending, true)?;
-            file.write_all(&serde_json::to_vec(components)?)?;
+            file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
             fs::rename(&pending, self.root.join("components.json"))?;
@@ -175,7 +179,7 @@ pub enum Mode {
 pub struct Manager {
     pub(crate) health: Arc<crate::health::Monitor>,
     secrets: Mutex<Secrets>,
-    status: Mutex<Value>,
+    status: Mutex<Status>,
     engine: Arc<Mutex<Engine>>,
     mode: Mode,
     started: Instant,
@@ -185,6 +189,173 @@ pub struct Manager {
 }
 
 type Publication = (String, Vec<u8>, bool);
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct Failure {
+    category: &'static str,
+    message: &'static str,
+    os_error_code: Option<i32>,
+}
+
+impl Failure {
+    const fn new(category: &'static str, message: &'static str) -> Self {
+        Self {
+            category,
+            message,
+            os_error_code: None,
+        }
+    }
+
+    fn classify(error: &anyhow::Error) -> Self {
+        use rumqttc::{ConnectReturnCode, ConnectionError, StateError};
+        if let Some(failure) = error.downcast_ref::<Self>() {
+            return *failure;
+        }
+        // Never format library errors: they can contain credentials, packets or peer data.
+        match error.downcast_ref::<ConnectionError>() {
+            Some(ConnectionError::ConnectionRefused(code)) => match code {
+                ConnectReturnCode::BadUserNamePassword => Self::new(
+                    "authentication",
+                    "MQTT broker rejected the username or password",
+                ),
+                ConnectReturnCode::NotAuthorized => Self::new(
+                    "authorization",
+                    "MQTT broker denied connection authorization",
+                ),
+                ConnectReturnCode::BadClientId => {
+                    Self::new("client_id", "MQTT broker rejected the client ID")
+                }
+                ConnectReturnCode::ServiceUnavailable => {
+                    Self::new("broker_unavailable", "MQTT broker reported unavailable")
+                }
+                _ => Self::new(
+                    "protocol",
+                    "MQTT broker rejected the protocol or connection",
+                ),
+            },
+            Some(ConnectionError::Io(error))
+            | Some(ConnectionError::MqttState(StateError::Io(error)))
+            | Some(ConnectionError::MqttState(StateError::Deserialization(
+                rumqttc::mqttbytes::Error::Io(error),
+            ))) => Self::io(error),
+            Some(ConnectionError::Tls(
+                rumqttc::TlsError::TLS(rustls::Error::InvalidCertificate(_))
+                | rumqttc::TlsError::WebPki(_),
+            )) => Self::new(
+                "tls_certificate",
+                "MQTT broker certificate validation failed; check trust, hostname and clock",
+            ),
+            Some(ConnectionError::Tls(_)) => Self::new(
+                "tls",
+                "MQTT TLS handshake failed; check certificate trust, hostname, clock and broker TLS settings",
+            ),
+            Some(ConnectionError::NetworkTimeout) => {
+                Self::new("connection_timeout", "MQTT broker connection timed out")
+            }
+            Some(ConnectionError::FlushTimeout) => {
+                Self::new("write_timeout", "MQTT socket write timed out")
+            }
+            Some(ConnectionError::MqttState(StateError::AwaitPingResp)) => Self::new(
+                "keepalive_timeout",
+                "MQTT broker did not acknowledge the keepalive ping",
+            ),
+            Some(ConnectionError::MqttState(StateError::ConnectionAborted)) => {
+                Self::new("connection_closed", "MQTT broker closed the connection")
+            }
+            Some(ConnectionError::MqttState(StateError::Deserialization(
+                rumqttc::mqttbytes::Error::OutgoingPacketTooLarge { .. }
+                | rumqttc::mqttbytes::Error::PayloadTooLong
+                | rumqttc::mqttbytes::Error::PayloadSizeLimitExceeded(_),
+            ))) => Self::new("packet_size", "MQTT packet exceeds the client size limit"),
+            Some(ConnectionError::MqttState(_)) | Some(ConnectionError::NotConnAck(_)) => {
+                Self::new("protocol", "MQTT protocol or acknowledgment sequence error")
+            }
+            Some(ConnectionError::RequestsDone) => {
+                Self::new("client_channel", "MQTT client request channel closed")
+            }
+            None => {
+                if error.downcast_ref::<rumqttc::ClientError>().is_some() {
+                    Self::new("client_channel", "MQTT client request could not be queued")
+                } else {
+                    Self::new(
+                        "internal",
+                        "MQTT session failed; inspect daemon and broker health",
+                    )
+                }
+            }
+        }
+    }
+
+    fn io(error: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        #[cfg(target_os = "linux")]
+        if error.raw_os_error() == Some(libc::ENODEV) {
+            return Self {
+                os_error_code: error.raw_os_error(),
+                ..Self::new("source_interface", "MQTT source interface does not exist")
+            };
+        }
+        let (category, message) = match error.kind() {
+            ErrorKind::ConnectionRefused => (
+                "connection_refused",
+                "MQTT TCP connection refused; check broker listener and port",
+            ),
+            ErrorKind::ConnectionReset => ("connection_reset", "MQTT connection reset by peer"),
+            ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof => {
+                ("connection_closed", "MQTT connection closed or interrupted")
+            }
+            ErrorKind::TimedOut => ("network_timeout", "MQTT network operation timed out"),
+            ErrorKind::PermissionDenied => (
+                "permission_denied",
+                "MQTT socket permission denied; check source-interface binding privileges and firewall policy",
+            ),
+            ErrorKind::AddrNotAvailable => (
+                "source_interface",
+                "MQTT local address unavailable; check the selected interface",
+            ),
+            ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable => (
+                "network_unreachable",
+                "MQTT broker network or host is unreachable",
+            ),
+            _ => (
+                "network_io",
+                "MQTT network I/O failed; check DNS, routing, source interface and broker logs",
+            ),
+        };
+        Self {
+            os_error_code: error.raw_os_error(),
+            ..Self::new(category, message)
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+#[derive(Serialize)]
+struct RecordedFailure {
+    #[serde(flatten)]
+    failure: Failure,
+    at_unix: i64,
+}
+
+#[derive(Default, Serialize)]
+struct Status {
+    device_id: String,
+    enabled: bool,
+    state: String,
+    error: Option<String>,
+    last_published_at_unix: Option<u64>,
+    connection_attempts: u64,
+    reconnect_count: u64,
+    last_connected_at_unix: Option<i64>,
+    last_failure: Option<RecordedFailure>,
+}
 
 impl Manager {
     pub fn open(root: &Path, engine: Arc<Mutex<Engine>>, mode: Mode) -> Result<Arc<Self>> {
@@ -202,9 +373,11 @@ impl Manager {
         Ok(Arc::new(Self {
             health: Arc::new(crate::health::Monitor::default()),
             secrets: Mutex::new(secrets),
-            status: Mutex::new(
-                json!({"device_id":device_id,"enabled":false,"state":"disabled","error":null,"last_published_at_unix":null}),
-            ),
+            status: Mutex::new(Status {
+                device_id: device_id.clone(),
+                state: "disabled".into(),
+                ..Status::default()
+            }),
             engine,
             mode,
             started: Instant::now(),
@@ -223,11 +396,11 @@ impl Manager {
     }
 
     pub fn status(&self) -> Result<Value> {
-        Ok(self
+        let status = self
             .status
             .lock()
-            .map_err(|_| anyhow::anyhow!("MQTT status unavailable"))?
-            .clone())
+            .map_err(|_| anyhow::anyhow!("MQTT status unavailable"))?;
+        Ok(serde_json::to_value(&*status)?)
     }
 
     pub fn create_password(&self, engine: &mut Engine, password: &str) -> Result<String> {
@@ -245,11 +418,55 @@ impl Manager {
     }
 
     fn state(&self, enabled: bool, state: &str, error: Option<&str>) {
-        if let Ok(mut value) = self.status.lock() {
-            value["enabled"] = json!(enabled);
-            value["state"] = json!(state);
-            value["error"] = json!(error);
+        self.update_status(|value| {
+            value.enabled = enabled;
+            value.state = state.into();
+            value.error = error.map(str::to_owned);
+        });
+    }
+
+    fn update_status(&self, update: impl FnOnce(&mut Status)) {
+        match self.status.lock() {
+            Ok(mut status) => update(&mut status),
+            Err(_) => tracing::error!("MQTT status unavailable"),
         }
+    }
+
+    fn attempting(&self) {
+        self.update_status(|status| {
+            status.enabled = true;
+            status.state = "connecting".into();
+            status.connection_attempts = status.connection_attempts.saturating_add(1);
+        });
+    }
+
+    fn connected(&self) {
+        self.update_status(|status| {
+            status.enabled = true;
+            status.state = "running".into();
+            status.error = None;
+            status.last_connected_at_unix = Some(time::OffsetDateTime::now_utc().unix_timestamp());
+        });
+    }
+
+    fn failed(&self, error: &anyhow::Error) {
+        let failure = Failure::classify(error);
+        tracing::warn!(
+            category = failure.category,
+            reason = failure.message,
+            os_error_code = failure.os_error_code,
+            "MQTT session failed; retrying in five seconds"
+        );
+        self.update_status(|status| {
+            status.enabled = true;
+            status.state = "reconnecting".into();
+            status.error = Some(failure.message.into());
+            status.reconnect_count = status.reconnect_count.saturating_add(1);
+            status.last_failure = Some(RecordedFailure {
+                failure,
+                at_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+            });
+        });
     }
 
     pub async fn run(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
@@ -273,11 +490,11 @@ impl Manager {
                     } else if self.mode == Mode::Unsupported {
                         self.state(true, "unavailable", Some("MQTT publishing requires Linux host mode"));
                     } else if Instant::now() >= retry {
-                        self.state(true, "connecting", None);
+                        self.attempting();
                         let result = self.session(config, stop.clone()).await;
                         if *stop.borrow() { break; }
-                        if result.is_err() {
-                            self.state(true, "reconnecting", Some("MQTT connection unavailable; check broker, TLS trust, credentials and source interface"));
+                        if let Err(error) = result {
+                            self.failed(&error);
                             retry = Instant::now() + Duration::from_secs(5);
                         }
                     }
@@ -291,7 +508,10 @@ impl Manager {
     }
 
     fn connection(&self, config: &MQTTConfig) -> Result<(AsyncClient, EventLoop)> {
-        let (host, port, tls) = config.broker()?;
+        let (host, port, tls) = config.broker().context(Failure::new(
+            "configuration",
+            "MQTT broker endpoint is invalid",
+        ))?;
         let mut options = MqttOptions::new(format!("netcontrol_{}", self.device_id), host, port);
         options.set_keep_alive(Duration::from_secs(30));
         options.set_clean_session(true);
@@ -306,27 +526,45 @@ impl Manager {
             let secrets = self
                 .secrets
                 .lock()
-                .map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?;
-            let password = secrets.password(&config.password_ref)?;
+                .map_err(|_| Failure::new("credentials", "MQTT password store unavailable"))?;
+            let password = secrets
+                .password(&config.password_ref)
+                .context(Failure::new(
+                    "credentials",
+                    "MQTT stored password could not be read",
+                ))?;
             options.set_credentials(&config.username, &**password);
         }
         if tls {
             let mut roots = rustls::RootCertStore::empty();
             for certificate in rustls_native_certs::load_native_certs().certs {
-                roots.add(certificate)?;
+                roots.add(certificate).context(Failure::new(
+                    "tls_configuration",
+                    "MQTT trusted CA certificate could not be loaded",
+                ))?;
             }
-            ensure!(!roots.is_empty(), "MQTT TLS trust store is empty");
+            ensure!(
+                !roots.is_empty(),
+                Failure::new("tls_configuration", "MQTT TLS trust store is empty")
+            );
             let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
-            .with_safe_default_protocol_versions()?
+            .with_safe_default_protocol_versions()
+            .context(Failure::new(
+                "tls_configuration",
+                "MQTT TLS configuration failed",
+            ))?
             .with_root_certificates(roots)
             .with_no_client_auth();
             options.set_transport(Transport::tls_with_config(tls.into()));
         }
         let (client, mut events) = AsyncClient::new(options, 8);
         events.network_options.set_connection_timeout(5);
-        bind_source(&mut events, &config.source_interface)?;
+        bind_source(&mut events, &config.source_interface).context(Failure::new(
+            "source_interface",
+            "MQTT source interface binding setup failed",
+        ))?;
         Ok((client, events))
     }
 
@@ -543,7 +781,9 @@ impl Manager {
                     if let Ok(engine) = self.engine.try_lock() {
                         if engine.saved_configuration().mqtt != config { break; }
                     }
-                    ensure!(acknowledgement_deadline.is_none_or(|deadline| Instant::now() < deadline), "MQTT publication acknowledgement timed out");
+                    ensure!(acknowledgement_deadline.is_none_or(|deadline| Instant::now() < deadline), Failure::new(
+                        "publication_ack_timeout", "MQTT broker did not acknowledge publications for 30 seconds; check publish ACLs, packet limits and broker logs"
+                    ));
                     if connected && collecting.is_none() && pending == 0 && queue.is_empty() && Instant::now() >= next_sample {
                         let manager = self.clone();
                         let settings = config.clone();
@@ -567,7 +807,9 @@ impl Manager {
                             }
                             if force_discovery || previous_discovery.as_ref() != Some(&discovery) {
                                 let secrets = self.secrets.lock().map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?;
-                                let before = secrets.components()?;
+                                let before = secrets.components().context(Failure::new(
+                                    "discovery_manifest", "MQTT discovery manifest could not be read or validated"
+                                ))?;
                                 let after: BTreeSet<_> = discovery["components"].as_object().unwrap().keys().cloned().collect();
                                 // Entities of a section that could not be enumerated now are kept, not removed.
                                 let kept: BTreeSet<_> = before.iter().filter(|key| retained.iter().any(|kind| key.starts_with(&format!("{kind}_")))).cloned().collect();
@@ -583,7 +825,9 @@ impl Manager {
                                     queue.push_back((format!("{base}/availability"), b"offline".to_vec(), true));
                                     continue;
                                 }
-                                secrets.save_components(&before.union(&after).cloned().collect())?;
+                                secrets.save_components(&before.union(&after).cloned().collect()).context(Failure::new(
+                                    "discovery_manifest", "MQTT discovery manifest could not be saved"
+                                ))?;
                                 if removed {
                                     queue.push_back((discovery_topic.clone(), removal_payload, true));
                                 }
@@ -604,10 +848,10 @@ impl Manager {
                         }
                     }
                 }
-                event = event_receiver.recv() => match event.context("MQTT event worker stopped")?? {
+                event = event_receiver.recv() => match event.context(Failure::new("worker", "MQTT event worker stopped"))?? {
                     Event::Incoming(Packet::ConnAck(_)) => {
                         connected = true;
-                        self.state(true, "running", None);
+                        self.connected();
                         client.try_subscribe("homeassistant/status", QoS::AtLeastOnce)?;
                     }
                     Event::Incoming(Packet::Publish(publication)) if publication.topic == "homeassistant/status" && publication.payload == "online" => {
@@ -619,12 +863,13 @@ impl Manager {
                         acknowledgement_deadline = (pending > 0).then(|| Instant::now() + Duration::from_secs(30));
                         if pending == 0 && queue.is_empty() && batch_has_state {
                             if let Some(keys) = manifest.take() {
-                                self.secrets.lock().map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?.save_components(&keys)?;
+                                self.secrets.lock().map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?.save_components(&keys).context(Failure::new(
+                                    "discovery_manifest", "MQTT discovery manifest could not be saved"
+                                ))?;
                             }
                             self.state(true, "running", None);
-                            if let Ok(mut status) = self.status.lock() {
-                                status["last_published_at_unix"] = json!(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
-                            }
+                            let published = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                            self.update_status(|status| status.last_published_at_unix = Some(published));
                             batch_has_state = false;
                         }
                     }
@@ -683,14 +928,22 @@ pub(crate) fn metric_key(kind: &str, name: &str, field: &str) -> String {
     )
 }
 
+fn valid_component(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 fn validate_telemetry(discovery: &Value, state: &Value) -> Result<()> {
+    let components = discovery["components"]
+        .as_object()
+        .context("MQTT components missing")?;
+    ensure!(components.len() <= 4096, "MQTT entity limit exceeded");
     ensure!(
-        discovery["components"]
-            .as_object()
-            .context("MQTT components missing")?
-            .len()
-            <= 4096,
-        "MQTT entity limit exceeded"
+        components.keys().all(|key| valid_component(key)),
+        "invalid MQTT discovery component ID"
     );
     ensure!(
         serde_json::to_vec(discovery)?.len() <= 1 << 20
@@ -1357,6 +1610,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mqtt_status_api_exposes_only_safe_failure_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(netcontrol_core::Simulator::new()),
+            )
+            .unwrap(),
+        ));
+        let manager = Manager::open(
+            &directory.path().join("mqtt"),
+            engine.clone(),
+            Mode::Simulated,
+        )
+        .unwrap();
+        let mut app = App::new(
+            engine,
+            Authentication::Scoped(vec![Credential {
+                name: "reader".into(),
+                token_sha256: crate::identity::digest("synthetic-reader-token"),
+                permissions: vec!["state.read".into()],
+            }]),
+            false,
+        );
+        App::attach_mqtt(&mut app, manager.clone()).unwrap();
+        manager.attempting();
+        manager.failed(&anyhow::Error::new(rumqttc::ConnectionError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "sensitive-private-data",
+            ),
+        )));
+        let (code, response) = api(
+            app,
+            "GET",
+            "/api/v1/services/mqtt/status",
+            Value::Null,
+            "synthetic-reader-token",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert_eq!(response["state"], "reconnecting");
+        assert_eq!(response["connection_attempts"], 1);
+        assert_eq!(response["reconnect_count"], 1);
+        assert_eq!(response["last_failure"]["category"], "connection_reset");
+        assert_eq!(response["error"], response["last_failure"]["message"]);
+        assert!(response["last_failure"]["at_unix"].is_i64());
+        assert!(response["last_connected_at_unix"].is_null());
+        assert!(!response.to_string().contains("sensitive"));
+    }
+
+    #[tokio::test]
     async fn mqtt_api_secrets_permissions_confirmation_and_simulated_shutdown() {
         let directory = tempfile::tempdir().unwrap();
         let engine = Arc::new(Mutex::new(
@@ -1573,6 +1878,193 @@ mod tests {
         assert_eq!(manager.status().unwrap()["state"], "stopped");
     }
 
+    #[test]
+    fn mqtt_failures_are_classified_without_formatting_sensitive_errors() {
+        use rumqttc::{ConnectReturnCode, ConnectionError, StateError};
+        let cases = [
+            (
+                ConnectionError::ConnectionRefused(ConnectReturnCode::BadUserNamePassword),
+                "authentication",
+            ),
+            (
+                ConnectionError::ConnectionRefused(ConnectReturnCode::NotAuthorized),
+                "authorization",
+            ),
+            (
+                ConnectionError::ConnectionRefused(ConnectReturnCode::BadClientId),
+                "client_id",
+            ),
+            (
+                ConnectionError::ConnectionRefused(ConnectReturnCode::ServiceUnavailable),
+                "broker_unavailable",
+            ),
+            (
+                ConnectionError::ConnectionRefused(ConnectReturnCode::RefusedProtocolVersion),
+                "protocol",
+            ),
+            (ConnectionError::NetworkTimeout, "connection_timeout"),
+            (ConnectionError::FlushTimeout, "write_timeout"),
+            (
+                ConnectionError::MqttState(StateError::AwaitPingResp),
+                "keepalive_timeout",
+            ),
+            (
+                ConnectionError::MqttState(StateError::ConnectionAborted),
+                "connection_closed",
+            ),
+            (
+                ConnectionError::MqttState(StateError::Deserialization(
+                    rumqttc::mqttbytes::Error::PayloadSizeLimitExceeded(1 << 20),
+                )),
+                "packet_size",
+            ),
+            (
+                ConnectionError::MqttState(StateError::Deserialization(
+                    rumqttc::mqttbytes::Error::OutgoingPacketTooLarge {
+                        pkt_size: 1 << 21,
+                        max: 1 << 20,
+                    },
+                )),
+                "packet_size",
+            ),
+            (
+                ConnectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "sensitive-endpoint-and-password",
+                )),
+                "connection_reset",
+            ),
+            (
+                ConnectionError::Tls(rumqttc::TlsError::Io(std::io::Error::other(
+                    "sensitive-TLS-peer-data",
+                ))),
+                "tls",
+            ),
+            (
+                ConnectionError::Tls(rumqttc::TlsError::TLS(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ))),
+                "tls_certificate",
+            ),
+            (
+                ConnectionError::NotConnAck(Packet::Publish(rumqttc::Publish::new(
+                    "sensitive-topic",
+                    QoS::AtLeastOnce,
+                    "sensitive-payload",
+                ))),
+                "protocol",
+            ),
+            (ConnectionError::RequestsDone, "client_channel"),
+        ];
+        for (error, category) in cases {
+            let failure =
+                Failure::classify(&anyhow::Error::new(error).context("sensitive-wrapper"));
+            assert_eq!(failure.category, category);
+            assert!(
+                !serde_json::to_string(&failure)
+                    .unwrap()
+                    .contains("sensitive")
+            );
+            assert!(!format!("{failure:?} {failure}").contains("sensitive"));
+        }
+        let unknown = anyhow::anyhow!("sensitive-unknown-error");
+        assert_eq!(Failure::classify(&unknown).category, "internal");
+        let setup = unknown.context(Failure::new(
+            "credentials",
+            "MQTT stored password could not be read",
+        ));
+        assert_eq!(Failure::classify(&setup).category, "credentials");
+        assert!(!Failure::classify(&setup).message.contains("sensitive"));
+        let io = Failure::io(&std::io::Error::from_raw_os_error(1));
+        assert_eq!(io.os_error_code, Some(1));
+    }
+
+    #[test]
+    fn mqtt_failure_history_survives_retry_recovery_disable_and_stop() {
+        #[derive(Clone)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(netcontrol_core::Simulator::new()),
+            )
+            .unwrap(),
+        ));
+        let manager =
+            Manager::open(&directory.path().join("mqtt"), engine, Mode::Simulated).unwrap();
+        let initial = manager.status().unwrap();
+        assert_eq!(initial["connection_attempts"], 0);
+        assert_eq!(initial["reconnect_count"], 0);
+        assert!(initial["last_connected_at_unix"].is_null());
+        assert!(initial["last_failure"].is_null());
+        manager.attempting();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let log = Log(output.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || log.clone())
+            .finish();
+        let before = time::OffsetDateTime::now_utc().unix_timestamp();
+        let error = anyhow::Error::new(rumqttc::ConnectionError::ConnectionRefused(
+            rumqttc::ConnectReturnCode::BadUserNamePassword,
+        ))
+        .context("sensitive-password-endpoint-reference");
+        tracing::subscriber::with_default(subscriber, || manager.failed(&error));
+        let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("\"category\":\"authentication\""));
+        assert!(logged.contains("MQTT broker rejected the username or password"));
+        assert!(!logged.contains("sensitive"));
+        let failed = manager.status().unwrap();
+        assert_eq!(failed["state"], "reconnecting");
+        assert_eq!(failed["connection_attempts"], 1);
+        assert_eq!(failed["reconnect_count"], 1);
+        assert_eq!(failed["last_failure"]["category"], "authentication");
+        assert!(failed["last_failure"]["at_unix"].is_i64());
+        assert!(
+            (before..=time::OffsetDateTime::now_utc().unix_timestamp())
+                .contains(&failed["last_failure"]["at_unix"].as_i64().unwrap())
+        );
+        assert!(failed["last_failure"]["os_error_code"].is_null());
+        assert_eq!(failed["error"], failed["last_failure"]["message"]);
+        manager.attempting();
+        assert_eq!(manager.status().unwrap()["error"], failed["error"]);
+        manager.connected();
+        let recovered = manager.status().unwrap();
+        assert_eq!(recovered["connection_attempts"], 2);
+        assert_eq!(recovered["reconnect_count"], 1);
+        assert!(recovered["last_connected_at_unix"].is_i64());
+        assert!(recovered["error"].is_null());
+        assert_eq!(recovered["last_failure"], failed["last_failure"]);
+        manager.failed(&anyhow::Error::new(Failure::new(
+            "publication_ack_timeout",
+            "MQTT publication acknowledgment timed out",
+        )));
+        let latest = manager.status().unwrap();
+        assert_eq!(latest["reconnect_count"], 2);
+        assert_eq!(
+            latest["last_failure"]["category"],
+            "publication_ack_timeout"
+        );
+        for state in ["disabled", "stopped"] {
+            manager.state(false, state, None);
+            let status = manager.status().unwrap();
+            assert!(status["error"].is_null());
+            assert_eq!(status["last_failure"], latest["last_failure"]);
+            assert_eq!(status["reconnect_count"], 2);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mqtt_missing_source_interface_never_falls_back() {
@@ -1592,12 +2084,13 @@ mod tests {
             ..Default::default()
         };
         let (_client, mut events) = manager.connection(&config).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), events.poll())
-                .await
-                .unwrap()
-                .is_err()
-        );
+        let error = tokio::time::timeout(Duration::from_secs(2), events.poll())
+            .await
+            .unwrap()
+            .unwrap_err();
+        let failure = Failure::classify(&error.into());
+        assert_eq!(failure.category, "source_interface");
+        assert_eq!(failure.os_error_code, Some(libc::ENODEV));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), listener.accept())
                 .await
@@ -1741,6 +2234,9 @@ mod tests {
                 let endpoint = format!("mqtt://{}", listener.local_addr()?);
                 let engine = Arc::new(Mutex::new(Engine::open(&directory.path().join("state.json"), Box::new(Simulator::new()))?));
                 let manager = Manager::open(&directory.path().join("mqtt"), engine.clone(), Mode::Native)?;
+                manager.secrets.lock().unwrap().save_components(&BTreeSet::from([
+                    metric_key("protocol", "snmp/Tcp", "RetransSegs"),
+                ]))?;
                 manager.health.observe(Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})), &[], false);
                 let password_ref = manager.create_password(&mut engine.lock().unwrap(), "synthetic-broker-password")?;
                 let mut config = physical.clone();
@@ -1791,6 +2287,11 @@ mod tests {
                 }).await.with_context(|| format!("MQTT sample sequence incomplete: status={}, connections={connections:?}, broker_finished={}", manager.status().unwrap(), broker.is_finished()))??;
                 ensure!(host_discovered, "host sensors missing from discovery");
                 ensure!(connections == [1, 1, 2, 3], "MQTT connection was not persistent or failed to reconnect after disconnect/acknowledgement timeout");
+                let diagnostics = manager.status()?;
+                ensure!(diagnostics["connection_attempts"] == 3 && diagnostics["reconnect_count"] == 2, "MQTT reconnect diagnostics did not track actual sessions: {diagnostics}");
+                ensure!(diagnostics["last_failure"]["category"] == "publication_ack_timeout", "MQTT acknowledgment timeout reason was lost after reconnect: {diagnostics}");
+                ensure!(diagnostics["last_connected_at_unix"].is_i64() && diagnostics["last_failure"]["at_unix"].is_i64(), "MQTT diagnostic timestamps missing");
+                ensure!(diagnostics["error"].is_null(), "MQTT current error was not cleared after reconnect");
                 config.mqtt.enabled = false;
                 let transaction = submit(&config, test_revision(1));
                 ensure!(transaction.status == 202 && confirm(transaction.body["id"].as_str().unwrap()).status == 200, "MQTT disable failed");
@@ -1813,6 +2314,105 @@ mod tests {
                 Ok(())
             })
         }).join().map_err(|_| anyhow::anyhow!("MQTT namespace fixture panicked"))?
+    }
+
+    #[test]
+    fn mqtt_protocol_discovery_manifest_survives_manager_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("mqtt");
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(netcontrol_core::Simulator::new()),
+            )
+            .unwrap(),
+        ));
+        let manager = Manager::open(&root, engine.clone(), Mode::Simulated).unwrap();
+        let identity = manager.device_id.clone();
+        let reference = manager
+            .secrets
+            .lock()
+            .unwrap()
+            .create_password("synthetic-manifest-fixture")
+            .unwrap();
+        let statistics = json!({"interfaces":[],"protocols":[
+            {"name":"snmp","status":"available","groups":{"Tcp":{"RetransSegs":"42","CurrEstab":"5"}}},
+            {"name":"snmp6","status":"available","groups":{"IPv6":{"Ip6InOctets":"9007199254740993"}}}
+        ]});
+        let host = crate::mqtt_stats::protocols(&statistics).unwrap();
+        let (discovery, _) = telemetry(
+            &identity,
+            &MQTTConfig::default(),
+            test_revision(0),
+            1,
+            &statistics,
+            &host,
+        )
+        .unwrap();
+        let components: BTreeSet<_> = discovery["components"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert!(components.contains(&metric_key("protocol", "snmp/Tcp", "RetransSegs")));
+        assert!(components.contains(&metric_key("protocol", "snmp6/IPv6", "Ip6InOctets")));
+        manager
+            .secrets
+            .lock()
+            .unwrap()
+            .save_components(&components)
+            .unwrap();
+        drop(manager);
+
+        let manager = Manager::open(&root, engine, Mode::Simulated).unwrap();
+        assert_eq!(manager.device_id, identity);
+        let secrets = manager.secrets.lock().unwrap();
+        assert_eq!(secrets.components().unwrap(), components);
+        assert_eq!(
+            &**secrets.password(&reference).unwrap(),
+            "synthetic-manifest-fixture"
+        );
+    }
+
+    #[test]
+    fn mqtt_discovery_manifest_validation_is_symmetric() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = Secrets::open(&directory.path().join("mqtt")).unwrap();
+        let valid = BTreeSet::from(["A".repeat(128), "metric_09_MixedCase".into()]);
+        secrets.save_components(&valid).unwrap();
+        assert_eq!(secrets.components().unwrap(), valid);
+        let path = secrets.root.join("components.json");
+        for key in [
+            "",
+            "bad-key",
+            "bad/key",
+            "bad.key",
+            "bad key",
+            "non_ascii_\u{e9}",
+        ] {
+            let invalid = BTreeSet::from([key.to_owned()]);
+            assert!(secrets.save_components(&invalid).is_err(), "{key:?}");
+            assert_eq!(secrets.components().unwrap(), valid);
+            crate::private_store::write_private(&path, &serde_json::to_vec(&invalid).unwrap())
+                .unwrap();
+            assert!(secrets.components().is_err(), "{key:?}");
+            secrets.save_components(&valid).unwrap();
+            assert!(validate_telemetry(&json!({"components":{key:{}}}), &json!({})).is_err());
+        }
+        for invalid in [
+            BTreeSet::from(["a".repeat(129)]),
+            (0..8193).map(|index| format!("metric_{index}")).collect(),
+            (0..8192).map(|index| format!("{index:0128}")).collect(),
+        ] {
+            assert!(secrets.save_components(&invalid).is_err());
+            assert_eq!(secrets.components().unwrap(), valid);
+        }
+        let maximum = (0..8192).map(|index| format!("metric_{index}")).collect();
+        secrets.save_components(&maximum).unwrap();
+        assert_eq!(secrets.components().unwrap(), maximum);
+        secrets.save_components(&BTreeSet::new()).unwrap();
+        assert!(secrets.components().unwrap().is_empty());
     }
 
     #[test]
