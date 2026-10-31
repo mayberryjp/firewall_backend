@@ -1150,7 +1150,7 @@ accept no query parameters:
 
 | GET endpoint | Response |
 | --- | --- |
-| `/api/v1/statistics` | `{sample, interfaces, protocols, gateways?, link_diagnostics}` |
+| `/api/v1/statistics` | `{sample, interfaces, protocols, gateways?, link_diagnostics, uptime}` |
 | `/api/v1/statistics/interfaces` | `{sample, interfaces}` |
 | `/api/v1/statistics/interfaces/{name}` | `{sample, interface}` |
 | `/api/v1/statistics/protocols` | `{sample, protocols}` |
@@ -1166,6 +1166,22 @@ accept no query parameters:
 not an atomic kernel snapshot. Display freshness independently of configuration
 freshness. An unavailable source/link has its own status and error; missing
 counters/groups are null, not zero. Optional counter fields can be absent.
+
+The aggregate response includes a required top-level `uptime` object:
+`{scope, collected_at, status, data, error}`. Native `scope` is `"host"`:
+Linux `/proc/uptime` in the daemon's existing context, **seconds since host
+boot**, not daemon runtime or the configured network lab namespace. `collected_at`
+is RFC3339 UTC and also closes the aggregate sample's collection window.
+Available `data` is `{uptime_seconds, idle_seconds}`, both finite nonnegative
+JSON numbers in seconds (fractional values allowed). CPU-summed `idle_seconds`
+may exceed uptime. `status: "available"` has `error: null`; a failed read or
+invalid kernel value gives `status: "unavailable"`, `data: null`, an explanatory
+error string, and aggregate `sample.status: "partial"` while preserving other
+statistics. The simulator reports `scope: "simulator"`, `status: "simulated"`,
+null `data`/`collected_at` and an explanatory error, never the development host's
+uptime. The object is absent from narrower networking statistics endpoints.
+No queries, permissions, configuration fields, saved state or reset operations
+are added. CLI `show statistics` exposes the same aggregate object.
 
 Interface records include `name`, optional `index`, `kind`, `ownership`, `mtu`,
 `admin_up`, `oper_state`, optional `mac`, `status`, optional `counter_bits`
@@ -1365,8 +1381,9 @@ operator kernel-module prerequisites; API reads never repair them.
 
 `GET /api/v1/statistics/host` is a read-only API-key-authenticated `state.read`
 operation. No query parameters or configuration fields. It is deliberately
-**not** included in `GET /api/v1/statistics`: only poll it when displaying host
-health. CLI equivalent: `show statistics host`.
+**not** included in `GET /api/v1/statistics`: only the lightweight host `uptime`
+object is included there. Poll this endpoint when displaying full host health.
+CLI equivalent: `show statistics host`.
 
 It reads procfs/sysfs and calls `statvfs` in the **daemon's** existing process/
 mount context, without entering the configured networking lab namespace.

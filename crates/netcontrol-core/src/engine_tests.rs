@@ -4214,6 +4214,34 @@ fn simulator_statistics_are_explicitly_unmeasured() {
     assert_eq!(r.body["interface"]["status"], "simulated");
     assert!(r.body["interface"]["counters"].is_null());
     assert!(r.body["interface"].get("pid").is_none());
+    assert!(r.body.get("uptime").is_none());
+    let before = request(&mut e, "GET", "/api/v1/state", Value::Null).body;
+    let aggregate = e.request(
+        "GET",
+        "/api/v1/statistics",
+        "",
+        "reader",
+        &["state.read".into()],
+        &[],
+    );
+    assert_eq!(aggregate.status, 200);
+    assert_eq!(aggregate.body["sample"]["status"], "simulated");
+    assert_eq!(
+        aggregate.body["uptime"],
+        json!({
+            "scope":"simulator","status":"simulated","data":null,
+            "error":"simulator does not measure host uptime","collected_at":null
+        })
+    );
+    assert_eq!(
+        request(&mut e, "GET", "/api/v1/state", Value::Null).body,
+        before
+    );
+    assert_eq!(
+        e.request("GET", "/api/v1/statistics", "", "reader", &[], &[])
+            .status,
+        403
+    );
     let runtime = request(&mut e, "GET", "/api/v1/runtime", Value::Null);
     assert!(
         runtime.body["appliance_services"]

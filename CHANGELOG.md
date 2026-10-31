@@ -4,6 +4,15 @@
 
 ### Added
 
+- Host uptime in the aggregate `GET /api/v1/statistics` response: a top-level
+  `uptime` object with host seconds since boot, summed CPU idle seconds,
+  independent host scope, collection time and explicit source errors. Failed
+  reads mark the aggregate partial; simulator data remains unmeasured. Full
+  host-health collection and narrower statistics responses are unchanged.
+  Release impact: additive, next automatic calendar version, no manual bump.
+  Required frontend types/display work:
+  [handoff 2026-10-30-10](docs/frontend-handoffs/2026-10-30.md#2026-10-30-10-aggregate-host-uptime).
+
 - Fixed read-only loopback classification in interface discovery:
   `role: "loopback"` and `addressing_type: "static"`, including down/unaddressed
   links. Other discovery rows have null values without inferring managed roles

@@ -251,7 +251,8 @@ impl Backend for Simulator {
         match path {
             "/api/v1/statistics/link-diagnostics" => Ok(diagnostics),
             "/api/v1/statistics" => Ok(
-                json!({"sample":sample,"interfaces":interfaces,"protocols":protocols,"gateways":gateways,"link_diagnostics":diagnostics,"bgp":self.bgp_status(config)?}),
+                json!({"sample":sample,"interfaces":interfaces,"protocols":protocols,"gateways":gateways,"link_diagnostics":diagnostics,"bgp":self.bgp_status(config)?,
+                    "uptime":{"scope":"simulator","status":"simulated","data":null,"error":"simulator does not measure host uptime","collected_at":null}}),
             ),
             "/api/v1/statistics/interfaces" => Ok(json!({"sample":sample,"interfaces":interfaces})),
             "/api/v1/statistics/protocols" => Ok(json!({"sample":sample,"protocols":protocols})),

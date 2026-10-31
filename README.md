@@ -562,6 +562,12 @@ part of this section: use the per-interface `dns` settings. See the
 
 ### Host health
 
+`GET /api/v1/statistics` (CLI `show statistics`) includes a top-level `uptime`
+object with host seconds since boot and summed CPU idle seconds. It uses the
+daemon-visible `/proc/uptime`, not process runtime or a lab network namespace.
+Source failures mark the aggregate partial with explicit unavailable/null uptime;
+the simulator never measures the development host.
+
 `GET /api/v1/statistics/host` (`state.read`) reads Linux CPU ticks/scheduler,
 memory/swap, load/uptime, VM/OOM counters, pressure stalls, disk I/O, local
 filesystem space/inodes and thermal/hwmon temperatures/fans in-process.

@@ -2192,6 +2192,49 @@ fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift(
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn native_aggregate_uptime_is_host_scoped_and_readonly() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    let desired = Config::empty();
+    native.repair(&desired)?;
+    let ownership = fs::read(native.state.join("ownership.json"))?;
+    let before: f64 = fs::read_to_string("/proc/uptime")?
+        .split_whitespace()
+        .next()
+        .context("uptime missing")?
+        .parse()?;
+    let aggregate = native.statistics(&desired, "/api/v1/statistics", "")?;
+    let after: f64 = fs::read_to_string("/proc/uptime")?
+        .split_whitespace()
+        .next()
+        .context("uptime missing")?
+        .parse()?;
+    assert_eq!(aggregate["sample"]["scope"], native.identity);
+    assert_eq!(aggregate["uptime"]["scope"], "host");
+    assert_eq!(aggregate["uptime"]["status"], "available");
+    assert!(aggregate["uptime"]["error"].is_null());
+    let uptime = aggregate["uptime"]["data"]["uptime_seconds"]
+        .as_f64()
+        .context("uptime missing")?;
+    assert!(uptime >= before && uptime <= after);
+    assert!(
+        aggregate["uptime"]["data"]["idle_seconds"]
+            .as_f64()
+            .context("idle missing")?
+            >= 0.0
+    );
+    assert_eq!(
+        aggregate["uptime"]["collected_at"],
+        aggregate["sample"]["collected_at"]
+    );
+    let interfaces = native.statistics(&desired, "/api/v1/statistics/interfaces", "")?;
+    assert!(interfaces.get("uptime").is_none());
+    assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/conntrack modules"]
 fn native_connection_statistics_observe_udp_without_mutating_owned_state() -> Result<()> {
     let fixture = Fixture::new()?;

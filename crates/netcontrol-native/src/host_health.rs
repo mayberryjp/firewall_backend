@@ -79,6 +79,27 @@ pub(crate) fn snapshot() -> Result<Value> {
     snapshot_at(Path::new("/proc"), Path::new("/sys"))
 }
 
+pub(crate) fn add_uptime(statistics: &mut Value) -> Result<()> {
+    add_uptime_at(statistics, Path::new("/proc"))
+}
+
+fn uptime_section(proc: &Path) -> Value {
+    section(read(&proc.join("uptime")).and_then(|s| uptime(&s)))
+}
+
+fn add_uptime_at(statistics: &mut Value, proc: &Path) -> Result<()> {
+    let mut value = uptime_section(proc);
+    value["scope"] = json!("host");
+    let collected_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    value["collected_at"] = json!(collected_at);
+    if !available(&value) {
+        statistics["sample"]["status"] = json!("partial");
+    }
+    statistics["sample"]["collected_at"] = json!(collected_at);
+    statistics["uptime"] = value;
+    Ok(())
+}
+
 fn snapshot_at(proc: &Path, sys: &Path) -> Result<Value> {
     let started = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let boot_id = read(&proc.join("sys/kernel/random/boot_id"))?;
@@ -102,10 +123,6 @@ fn snapshot_at(proc: &Path, sys: &Path) -> Result<Value> {
             read(&proc.join("meminfo")).and_then(|s| memory(&s)),
         ),
         ("load", read(&proc.join("loadavg")).and_then(|s| load(&s))),
-        (
-            "uptime",
-            read(&proc.join("uptime")).and_then(|s| uptime(&s)),
-        ),
         ("vm", read(&proc.join("vmstat")).and_then(|s| vm(&s))),
         (
             "disks",
@@ -117,6 +134,7 @@ fn snapshot_at(proc: &Path, sys: &Path) -> Result<Value> {
     ] {
         sections.insert(name.into(), section(result));
     }
+    sections.insert("uptime".into(), uptime_section(proc));
     for name in ["cpu", "memory", "io"] {
         sections.insert(
             format!("pressure_{name}"),
@@ -548,6 +566,61 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn aggregate_uptime_preserves_host_scope_and_reports_source_failures() {
+        let fixture = Fixture::new();
+        for (text, expected) in [
+            ("0 0\n", json!({"uptime_seconds":0.0,"idle_seconds":0.0})),
+            (
+                "10.5 50\n",
+                json!({"uptime_seconds":10.5,"idle_seconds":50.0}),
+            ),
+        ] {
+            fixture.write("uptime", text);
+            let mut stats = json!({"sample":{"scope":"lab","status":"available"},"interfaces":[]});
+            add_uptime_at(&mut stats, &fixture.0).unwrap();
+            assert_eq!(stats["sample"]["scope"], "lab");
+            assert_eq!(stats["sample"]["status"], "available");
+            assert_eq!(stats["uptime"]["scope"], "host");
+            assert_eq!(stats["uptime"]["status"], "available");
+            assert_eq!(stats["uptime"]["data"], expected);
+            assert!(stats["uptime"]["error"].is_null());
+            assert_eq!(
+                stats["uptime"]["collected_at"],
+                stats["sample"]["collected_at"]
+            );
+            assert!(
+                OffsetDateTime::parse(stats["uptime"]["collected_at"].as_str().unwrap(), &Rfc3339)
+                    .is_ok()
+            );
+            assert_eq!(stats["interfaces"], json!([]));
+        }
+        for text in ["", "1", "1 2 3", "-1 0", "NaN 0", "inf 0", "1 -1"] {
+            fixture.write("uptime", text);
+            let mut stats = json!({"sample":{"scope":"lab","status":"available"}});
+            add_uptime_at(&mut stats, &fixture.0).unwrap();
+            assert_eq!(stats["sample"]["status"], "partial");
+            assert_eq!(stats["uptime"]["status"], "unavailable");
+            assert!(stats["uptime"]["data"].is_null());
+            assert!(!stats["uptime"]["error"].as_str().unwrap().is_empty());
+        }
+        let mut stats = json!({"sample":{"scope":"lab","status":"available"}});
+        add_uptime_at(&mut stats, &fixture.0.join("missing")).unwrap();
+        assert_eq!(stats["sample"]["status"], "partial");
+        assert_eq!(stats["uptime"]["status"], "unavailable");
+        assert!(stats["uptime"]["data"].is_null());
+        assert!(
+            stats["uptime"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("uptime")
+        );
+        fixture.write("uptime", "10 20\n");
+        add_uptime_at(&mut stats, &fixture.0).unwrap();
+        assert_eq!(stats["sample"]["status"], "partial");
+        assert_eq!(stats["uptime"]["status"], "available");
     }
 
     #[test]

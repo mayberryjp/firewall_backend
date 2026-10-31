@@ -1492,6 +1492,7 @@ impl Backend for Native {
             if gateways["sample"]["status"] == "partial" {
                 value["sample"]["status"] = json!("partial");
             }
+            crate::host_health::add_uptime(&mut value)?;
         }
         Ok(value)
     }

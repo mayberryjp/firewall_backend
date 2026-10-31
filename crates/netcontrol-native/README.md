@@ -196,6 +196,12 @@ sources fail independently. Collection does not load sensor drivers or probe
 network/FUSE mounts. See [the full host-health contract](../../FRONTEND_SPEC.md#host-health-sensors)
 for scope, exact decimal counters, bounds, supported filesystems and limitations.
 
+The aggregate `GET /api/v1/statistics` also reads only `/proc/uptime` from that
+same daemon context and exposes a host-scoped `uptime` object with collection
+time, source status/error and nullable data (`uptime_seconds`, `idle_seconds`).
+Source failure marks the aggregate partial without discarding networking data;
+the full host-health snapshot remains a separate opt-in read.
+
 ## Conntrack connection snapshots
 
 `GET /api/v1/statistics/connections` reads namespace-wide Linux conntrack state
