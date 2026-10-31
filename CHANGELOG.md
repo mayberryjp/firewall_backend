@@ -337,6 +337,12 @@
 
 ### Fixed
 
+- Fixed static musl package compilation of interface capability discovery by
+  converting the ethtool ioctl request to libc's target-specific argument type,
+  matching the existing Linux socket helpers. No API, configuration or runtime
+  behavior changes. Release impact: fix, next automatic calendar version,
+  no manual bump; frontend impact: none.
+
 - MQTT discovery manifest validation no longer rejects generated mixed-case
   protocol counter IDs after saving them, which could break subsequent samples
   or daemon startup. Shared read/write ID validation and bounded writes preserve

@@ -232,7 +232,7 @@ fn ethtool(socket: &OwnedFd, name: &str, bytes: &[u8]) -> Result<Vec<u8>> {
         *target = byte as libc::c_char;
     }
     request.ifr_ifru.ifru_data = data.as_mut_ptr().cast();
-    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCETHTOOL, &mut request) } < 0 {
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCETHTOOL as _, &mut request) } < 0 {
         return Err(std::io::Error::last_os_error())
             .context(format!("ethtool command 0x{:x} on {name}", word(bytes, 0)?));
     }
