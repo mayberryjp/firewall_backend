@@ -3652,6 +3652,58 @@ Renames must similarly surface dependencies. Up does not imply carrier/readiness
 
 #### Host interface discovery and selection
 
+##### Interface capability snapshots
+
+`GET /api/v1/interface-capabilities` requires API-key authentication and
+`state.read`. It returns `InterfaceCapabilitySnapshot | null`; null means no
+refresh has been performed. GET never probes hardware or runs state observation.
+`POST /api/v1/interface-capabilities/refresh` requires `state.read` plus
+`interfaces.write`, performs one synchronous passive scan of all links in the
+backend namespace, and returns the atomically persisted snapshot with 200.
+Both paths accept no body (including `{}`) or query parameters (400); wrong
+methods return 405, authentication/permissions return 401/403. Fatal scan errors
+return 503, persistence errors 500; either preserves the last saved snapshot.
+Upgrade/restart guards can return 409 on POST. Source failures within a completed
+scan return 200 with `inventory.status: "partial"` and explicit `errors`.
+Partial snapshots replace prior data; do not merge old evidence into new rows.
+
+The snapshot is daemon-owned journal state, not a `Config` field. Never include
+it in transactions or expose an inventory editor. Refresh does not advance
+configuration revisions, apply changes, enable acceleration, affect ownership
+or roll back with configuration transactions. There is no automatic scan at
+startup, polling or hotplug. Keep the original UTC timestamp, scope and boot ID
+visible: cached current-link values are not live statistics.
+
+Rows include unmanaged/down/virtual/loopback interfaces, kernel index/MAC/kind,
+nullable driver/firmware/bus identity, nullable PCI identifiers/NUMA node,
+nullable link details, supported/advertised/partner-advertised link modes,
+nullable channel limits/counts, queue CPU masks and performance capabilities.
+Link speeds are Mbps; duplex is `half`/`full` or null. Down/unknown current speed
+is null, never a manufactured negotiated speed. Link-mode lists include media,
+autonegotiation, pause and FEC bits as well as speed modes; filter on nonnull
+`speed_mbps`/`duplex` for a speed/duplex capability list. Preserve unknown kernel
+bit IDs with null names/speeds instead of dropping them.
+
+Capabilities identify RSS, RPS, RFS, accelerated RFS, XPS, XPS RX-queue mapping,
+generic/native/hardware XDP, redirect/scatter-gather, AF_XDP copy/zero-copy,
+DPDK and `ethtool:<driver-feature-name>` offloads. `support` is
+`supported`, `unsupported`, `unknown` or `not_applicable`; nullable `enabled`
+means activation could not be observed. Evidence is not operational verification,
+performance benefit or proof of hardware offload. DPDK, accelerated RFS, generic
+XDP and AF_XDP copy readiness remain unknown pending dedicated validation.
+Missing APIs, permissions or driver replies mean unknown with diagnostics,
+not unsupported hardware. Do not offer automatic tuning based on these rows.
+
+In optional lab namespaces sysfs identity/queues are explicitly omitted because
+the sysfs mount may belong to another namespace; ethtool/netdev queries remain
+namespace-local. Simulator rows have `source: "simulator"`,
+`status: "simulated"`, null hardware/index/MAC/link/channel measurements and
+unknown performance support. Containers observe their namespace, not external
+host NICs. See the [design](docs/INTERFACE_CAPABILITIES.md) and required
+[frontend handoff](docs/frontend-handoffs/2026-10-31.md#2026-10-31-01-interface-capability-inventory).
+
+##### Live interface selection
+
 `GET /api/v1/interfaces/discovered` requires the normal API key and `state.read`.
 It returns `DiscoveredInterface[]`, including unmanaged links and loopback in
 the backend's network namespace. Native mode defaults to the daemon's current
@@ -5216,6 +5268,8 @@ Paths below are relative to `/api/v1`.
 | GET | `/parent-interfaces` | `ParentInterface[]` |
 | GET | `/interfaces` | Observed `Interface[]` |
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
+| GET | `/interface-capabilities` | Persisted `InterfaceCapabilitySnapshot \| null`; `state.read`, no implicit scan |
+| POST | `/interface-capabilities/refresh` | No body/query -> `200 InterfaceCapabilitySnapshot`; `state.read` + `interfaces.write`, passive scan and durable save |
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |
 | POST | `/diagnostics/dns-lookup` | Timed configured- or explicit-resolver diagnostic result `200`; `diagnostics.run` |
@@ -5483,6 +5537,84 @@ interface DiscoveredInterface {
   ownership: "managed" | "unmanaged" | "loopback";
   role: "loopback" | null; // Fixed for actual loopbacks; otherwise null, join managed settings.
   addressing_type: "static" | null; // Fixed static for loopbacks; otherwise origin is not inferred.
+}
+
+interface InterfaceCapabilitySnapshot {
+  collected_at: string; // RFC3339 UTC, not a live sample timestamp.
+  scope: string;
+  inventory: {
+    source: "native" | "simulator";
+    status: "observed" | "partial" | "simulated";
+    kernel_release: string | null;
+    boot_id: string | null;
+    errors: string[];
+    interfaces: InterfaceCapabilities[]; // Sorted by name.
+  };
+}
+
+interface InterfaceCapabilities {
+  name: string;
+  index: number | null;
+  mac: string | null;
+  kind: string; // Native link kind, including veth, loopback and unsupported kinds.
+  driver: {
+    name: string;
+    version: string | null;
+    firmware_version: string | null;
+    expansion_rom_version: string | null;
+    bus_address: string | null;
+  } | null;
+  hardware: {
+    bus: string | null;
+    address: string | null;
+    vendor_id: string | null;
+    device_id: string | null;
+    subsystem_vendor_id: string | null;
+    subsystem_device_id: string | null;
+    revision: string | null; // PCI IDs/revision are hexadecimal strings.
+    numa_node: number | null; // Unknown/unassigned (-1 from sysfs) is null.
+  } | null;
+  link: {
+    carrier: boolean | null;
+    speed_mbps: number | null;
+    duplex: "half" | "full" | null;
+    autonegotiation: boolean | null;
+    supported_modes: InterfaceLinkMode[];
+    advertised_modes: InterfaceLinkMode[];
+    partner_advertised_modes: InterfaceLinkMode[];
+  } | null;
+  channels: {
+    max_rx: number;
+    max_tx: number;
+    max_other: number;
+    max_combined: number;
+    rx: number;
+    tx: number;
+    other: number;
+    combined: number;
+  } | null;
+  queues: {
+    name: string;
+    rps_cpus: string | null;
+    rps_flow_count: number | null; // Table entries, not packets.
+    xps_cpus: string | null;
+    xps_rxqs: string | null; // Hexadecimal RX-queue mask, not CPU mask.
+  }[];
+  capabilities: {
+    name: string;
+    support: "supported" | "unsupported" | "unknown" | "not_applicable";
+    enabled: boolean | null;
+    evidence: string[];
+    reason: string | null;
+  }[];
+  errors: string[];
+}
+
+interface InterfaceLinkMode {
+  bit: number;
+  name: string | null;
+  speed_mbps: number | null;
+  duplex: "half" | "full" | null;
 }
 
 interface ManagedInterface {

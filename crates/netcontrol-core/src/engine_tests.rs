@@ -1437,10 +1437,12 @@ fn persistent_envelope_shape_is_explicit_and_rust_only() {
             "desired",
             "active_transaction",
             "initialized_at",
+            "interface_capabilities",
             "transactions"
         ])
     );
     assert!(envelope["state"]["active_transaction"].is_null());
+    assert!(envelope["state"]["interface_capabilities"].is_null());
     assert!(envelope["state"]["initialized_at"].is_string());
     assert_eq!(envelope["state"]["transactions"], json!({}));
 }
@@ -1594,6 +1596,7 @@ struct Faults {
     deny_log_calls: usize,
     discovery_error: bool,
     discovery_calls: usize,
+    capability_calls: usize,
     reporting_identities: Vec<SystemConfig>,
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
@@ -1675,6 +1678,29 @@ impl Backend for FaultBackend {
             "mtu":65536,"up":true,"addresses":["127.0.0.1/8","::1/128"],"ownership":"loopback",
             "role":"loopback","addressing_type":"static"
         }]))
+    }
+    fn discover_interface_capabilities(&mut self) -> Result<crate::InterfaceInventory> {
+        let mut f = self.0.lock().unwrap();
+        f.capability_calls += 1;
+        ensure!(!f.discovery_error, "injected capabilities read failure");
+        Ok(crate::InterfaceInventory {
+            source: crate::InventorySource::Native,
+            status: crate::InventoryStatus::Partial,
+            kernel_release: Some("synthetic-kernel".into()),
+            boot_id: Some("synthetic-boot".into()),
+            errors: vec![],
+            interfaces: vec![crate::InterfaceCapabilities {
+                name: "eth0".into(),
+                index: Some(2),
+                kind: "ethernet".into(),
+                capabilities: vec![crate::PerformanceCapability::unknown(
+                    "dpdk",
+                    "PMD validation not performed",
+                )],
+                errors: vec!["synthetic partial source".into()],
+                ..Default::default()
+            }],
+        })
     }
     fn observe_for_repair(&mut self, _: &Config) -> Result<Config> {
         let f = self.0.lock().unwrap();
@@ -2263,6 +2289,183 @@ fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
             .as_str()
             .unwrap()
             .contains("injected discovery read failure")
+    );
+}
+
+#[test]
+fn capabilities_refresh_is_explicit_authorized_persisted_and_separate_from_config() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    let path = "/api/v1/interface-capabilities";
+    let refresh = "/api/v1/interface-capabilities/refresh";
+    let before = fs::read(fixture.path()).unwrap();
+    let desired = engine.state.desired.clone();
+    let revision = engine.state.revision;
+    assert!(
+        engine
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .body
+            .is_null()
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    assert_eq!(faults.lock().unwrap().capability_calls, 0);
+    for (method, target, query, actor, permissions, body, status) in [
+        ("GET", path, "", "", all(), "", 401),
+        ("GET", path, "", "reader", vec![], "", 403),
+        (
+            "POST",
+            refresh,
+            "",
+            "reader",
+            vec!["state.read".into()],
+            "",
+            403,
+        ),
+        ("POST", path, "", "operator", all(), "", 405),
+        ("GET", refresh, "", "operator", all(), "", 405),
+        ("DELETE", path, "", "operator", all(), "", 405),
+        ("GET", path, "unexpected=1", "operator", all(), "", 400),
+        ("GET", path, "", "operator", all(), "{}", 400),
+        ("POST", refresh, "unexpected=1", "operator", all(), "", 400),
+        ("POST", refresh, "", "operator", all(), "{}", 400),
+    ] {
+        assert_eq!(
+            engine
+                .request(method, target, query, actor, &permissions, body.as_bytes())
+                .status,
+            status
+        );
+    }
+    assert_eq!(faults.lock().unwrap().capability_calls, 0);
+    faults.lock().unwrap().fail_observe = true;
+    let reply = engine.request("POST", refresh, "", "operator", &all(), &[]);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["inventory"]["status"], "partial");
+    assert_eq!(
+        reply.body["inventory"]["interfaces"][0]["capabilities"][0]["support"],
+        "unknown"
+    );
+    assert_eq!(engine.state.desired, desired);
+    assert_eq!(engine.state.revision, revision);
+    assert_eq!(faults.lock().unwrap().apply_count, 0);
+    assert_eq!(faults.lock().unwrap().capability_calls, 1);
+    let saved = reply.body;
+    assert_eq!(
+        engine
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .body,
+        saved
+    );
+    faults.lock().unwrap().discovery_error = true;
+    let failed = engine.request("POST", refresh, "", "operator", &all(), &[]);
+    assert_eq!(failed.status, 503);
+    assert!(
+        failed.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("injected capabilities read failure")
+    );
+    assert_eq!(
+        engine
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .body,
+        saved
+    );
+    faults.lock().unwrap().discovery_error = false;
+    engine.store.fail_after.set(Some(0));
+    assert_eq!(
+        engine
+            .request("POST", refresh, "", "operator", &all(), &[])
+            .status,
+        500
+    );
+    assert_eq!(
+        engine
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .body,
+        saved
+    );
+    drop(engine);
+    faults.lock().unwrap().fail_observe = false;
+    let calls = faults.lock().unwrap().capability_calls;
+    let mut reopened =
+        Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    assert_eq!(
+        reopened
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .body,
+        saved
+    );
+    assert_eq!(faults.lock().unwrap().capability_calls, calls);
+    assert_eq!(reopened.state.revision, revision);
+    assert_eq!(reopened.state.desired, desired);
+}
+
+#[test]
+fn capabilities_survive_transaction_rollback_and_respect_maintenance() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let refresh = "/api/v1/interface-capabilities/refresh";
+    let mut candidate = config();
+    candidate.interfaces[0].name = "capabilities".into();
+    let tx = request(
+        &mut engine,
+        "POST",
+        "/api/v1/transactions",
+        json!({
+            "base_revision":test_revision(0), "confirm_timeout_seconds":30, "config":candidate
+        }),
+    );
+    assert_eq!(tx.status, 202, "{}", tx.body);
+    let refreshed = engine.request("POST", refresh, "", "operator", &all(), &[]);
+    assert_eq!(refreshed.status, 200);
+    assert_eq!(refreshed.body["inventory"]["source"], "simulator");
+    let resource = engine.request(
+        "GET",
+        "/api/v1/interfaces/capabilities",
+        "",
+        "reader",
+        &all(),
+        &[],
+    );
+    assert_eq!(resource.status, 200);
+    assert_eq!(resource.body["name"], "capabilities");
+    assert!(refreshed.body["inventory"]["kernel_release"].is_null());
+    assert!(refreshed.body["inventory"]["interfaces"][0]["index"].is_null());
+    let id = tx.body["id"].as_str().unwrap();
+    engine.rollback(id, "test rollback").unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/interface-capabilities",
+                "",
+                "reader",
+                &all(),
+                &[]
+            )
+            .body,
+        refreshed.body
+    );
+    engine.set_upgrade_maintenance(true).unwrap();
+    assert_eq!(
+        engine
+            .request("POST", refresh, "", "operator", &all(), &[])
+            .status,
+        409
+    );
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/interface-capabilities",
+                "",
+                "reader",
+                &all(),
+                &[]
+            )
+            .status,
+        200
     );
 }
 

@@ -4,6 +4,19 @@
 
 ### Added
 
+- Explicit passive NIC capability inventory:
+  `POST /api/v1/interface-capabilities/refresh` reads all namespace-local links
+  once and atomically persists daemon-owned observations;
+  `GET /api/v1/interface-capabilities` retrieves them without rescanning.
+  Driver/firmware/PCI identity, supported/advertised speed-duplex modes, queues,
+  steering, XDP and offload evidence distinguish unknown support from disabled
+  features. No tuning, rebinding, automatic scans or configuration revision
+  changes; DPDK and accelerated-RFS readiness require future validation.
+  Release impact: additive, next automatic calendar version, no manual bump.
+  [Design](docs/INTERFACE_CAPABILITIES.md); required frontend contract review and
+  optional inspector UI:
+  [handoff 2026-10-31-01](docs/frontend-handoffs/2026-10-31.md#2026-10-31-01-interface-capability-inventory).
+
 - Host uptime in the aggregate `GET /api/v1/statistics` response: a top-level
   `uptime` object with host seconds since boot, summed CPU idle seconds,
   independent host scope, collection time and explicit source errors. Failed

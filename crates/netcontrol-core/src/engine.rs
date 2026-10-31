@@ -74,6 +74,7 @@ struct State {
     active_transaction: Option<String>,
     initialized_at: DateTime<Utc>,
     transactions: BTreeMap<String, Transaction>,
+    interface_capabilities: Option<crate::InterfaceCapabilitySnapshot>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -407,6 +408,7 @@ impl Engine {
                     active_transaction: None,
                     initialized_at,
                     transactions: BTreeMap::new(),
+                    interface_capabilities: None,
                 };
                 store.save(&s).context("initialize durable journal")?;
                 s
@@ -561,6 +563,46 @@ impl Engine {
                 409,
                 "configuration writes are blocked during software upgrade",
             ));
+        }
+        if path == "/api/v1/interface-capabilities"
+            || path == "/api/v1/interface-capabilities/refresh"
+        {
+            require(permissions, "state.read")?;
+            let refresh = path.ends_with("/refresh");
+            if method != if refresh { "POST" } else { "GET" } {
+                return Err(ApiError::new(405, "method not allowed"));
+            }
+            if refresh {
+                require(permissions, "interfaces.write")?;
+            }
+            if !query.is_empty() || !body.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "interface capabilities accept no body or query parameters",
+                ));
+            }
+            if refresh {
+                let mut inventory =
+                    self.backend
+                        .discover_interface_capabilities()
+                        .map_err(|e| {
+                            service_error(format!("interface capabilities discovery: {e:#}"))
+                        })?;
+                inventory.interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+                let snapshot = crate::InterfaceCapabilitySnapshot {
+                    collected_at: self.now().to_rfc3339(),
+                    scope: self.state.scope.clone(),
+                    inventory,
+                };
+                let mut next = self.state.clone();
+                next.interface_capabilities = Some(snapshot);
+                validate_state(&next)
+                    .map_err(|e| service_error(format!("invalid interface capabilities: {e:#}")))?;
+                self.persist(next).map_err(|e| {
+                    internal_error(format!("persist interface capabilities: {e:#}"))
+                })?;
+            }
+            return value(&self.state.interface_capabilities).map(|v| Reply::value(200, v));
         }
         if path == "/api/v1/firewall/deny-log" {
             require(permissions, "firewall.logs.read")?;
@@ -1885,6 +1927,28 @@ pub fn validate_offline_state(payload: &[u8]) -> Result<()> {
 }
 
 fn validate_state(s: &State) -> Result<()> {
+    if let Some(snapshot) = &s.interface_capabilities {
+        ensure!(
+            snapshot.scope == s.scope,
+            "interface capability snapshot scope mismatch"
+        );
+        DateTime::parse_from_rfc3339(&snapshot.collected_at)
+            .context("invalid interface capability collection time")?;
+        let mut names = BTreeSet::new();
+        ensure!(
+            snapshot.inventory.interfaces.len() <= 8192,
+            "too many inventory interfaces"
+        );
+        for interface in &snapshot.inventory.interfaces {
+            ensure!(
+                !interface.name.is_empty()
+                    && interface.name.len() <= 15
+                    && !interface.name.contains(['/', '\0'])
+                    && names.insert(&interface.name),
+                "invalid/duplicate interface capability identity"
+            );
+        }
+    }
     s.desired
         .validate()
         .context("invalid desired configuration")?;

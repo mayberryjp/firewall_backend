@@ -90,6 +90,44 @@ fn firewall_counter<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value> {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_capabilities_discovery_is_namespace_scoped_and_passive() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    session(native.namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .dummy("caps-test0".into())
+                .execute()
+                .await?;
+            Ok(())
+        })
+    })?;
+    let before = native.discover_interfaces()?;
+    let inventory = native.discover_interface_capabilities()?;
+    assert_eq!(inventory.source, netcontrol_core::InventorySource::Native);
+    assert_eq!(inventory.interfaces.len(), 2);
+    let dummy = inventory
+        .interfaces
+        .iter()
+        .find(|row| row.name == "caps-test0")
+        .context("namespace dummy missing from capabilities")?;
+    assert_eq!(dummy.kind, "dummy");
+    assert!(dummy.hardware.is_none());
+    assert!(dummy.queues.is_empty());
+    assert!(
+        dummy
+            .errors
+            .iter()
+            .any(|error| error.contains("lab network namespace"))
+    );
+    assert_eq!(native.discover_interfaces()?, before);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
 fn native_loopback_discovery_has_fixed_role_and_static_addressing() -> Result<()> {
     let fixture = Fixture::new()?;
     let mut native = Native::open(fixture.options())?;

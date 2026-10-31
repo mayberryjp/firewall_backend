@@ -44,6 +44,7 @@ mod firewall {
 }
 mod adoption;
 mod bgp;
+mod capabilities;
 mod deny_log;
 #[cfg(feature = "nftables")]
 mod destination_rewrite;
@@ -1125,6 +1126,13 @@ impl Backend for Native {
         let managed = self.ownership()?.managed_interfaces;
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::discover(handle, &managed))
+        })
+    }
+    fn discover_interface_capabilities(&mut self) -> Result<netcontrol_core::InterfaceInventory> {
+        self.check_scope()?;
+        let host_mode = self.options.namespace.is_empty();
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(capabilities::discover(handle, host_mode))
         })
     }
     fn scope(&self) -> Result<String> {

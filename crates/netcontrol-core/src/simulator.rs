@@ -94,6 +94,34 @@ impl Backend for Simulator {
                 .collect::<Vec<_>>()
         ))
     }
+    fn discover_interface_capabilities(&mut self) -> Result<crate::InterfaceInventory> {
+        Ok(crate::InterfaceInventory {
+            source: crate::InventorySource::Simulator,
+            status: crate::InventoryStatus::Simulated,
+            kernel_release: None,
+            boot_id: None,
+            errors: vec![],
+            interfaces: self
+                .state
+                .interfaces
+                .iter()
+                .map(|link| crate::InterfaceCapabilities {
+                    name: link.name.clone(),
+                    kind: link.kind.clone(),
+                    capabilities: crate::PERFORMANCE_CAPABILITIES
+                        .iter()
+                        .map(|name| {
+                            crate::PerformanceCapability::unknown(
+                                name,
+                                "simulator does not inspect host hardware",
+                            )
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+        })
+    }
     fn apply(&mut self, _before: &Config, after: &Config) -> Result<()> {
         after.validate()?;
         if let Some(p) = &after.firewall.policies {

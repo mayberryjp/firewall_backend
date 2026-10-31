@@ -50,6 +50,20 @@ configuration must produce explicit errors rather than permissive defaults or
 successful no-op operations. Existing on-device data must never be deleted to
 force a new schema to load.
 
+## Interface capability snapshots
+
+Explicit NIC capability inventory is available separately:
+`POST /api/v1/interface-capabilities/refresh` (`state.read` and
+`interfaces.write`, no body/query) reads all links once and durably saves the
+snapshot. `GET /api/v1/interface-capabilities` (`state.read`) returns it, or
+null before the first refresh, without rescanning. Driver/firmware and PCI
+identity, supported/advertised speed-duplex modes, queues, steering, XDP and
+offload evidence are daemon-owned observations, not editable configuration.
+Unknown/partial results are explicit; no tuning or device rebinding occurs.
+DPDK readiness requires future PMD-specific validation. See the
+[design](docs/INTERFACE_CAPABILITIES.md) and
+[frontend contract](FRONTEND_SPEC.md#interface-capability-snapshots).
+
 ## Read-only loopback interfaces
 
 `GET /api/v1/interfaces/discovered` (`state.read`) includes every live link.

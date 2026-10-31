@@ -7,6 +7,8 @@ pub use deny_log::{DenyLogQuery, DenyRecord};
 mod dynamic_dns;
 pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;
+mod interface_capabilities;
+pub use interface_capabilities::*;
 mod mdns;
 mod model;
 mod sando;
@@ -80,6 +82,9 @@ pub trait Backend: Send {
     fn observe(&mut self, expected: &Config) -> Result<Config>;
     fn discover_interfaces(&mut self) -> Result<Value> {
         anyhow::bail!("interface discovery is not supported by this backend")
+    }
+    fn discover_interface_capabilities(&mut self) -> Result<InterfaceInventory> {
+        anyhow::bail!("interface capability discovery is not supported by this backend")
     }
     fn observe_for_repair(&mut self, expected: &Config) -> Result<Config> {
         self.observe(expected)

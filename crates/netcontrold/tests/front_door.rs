@@ -111,6 +111,93 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn capabilities_http_refresh_and_persisted_read_contract() {
+    use netcontrold::http::Credential;
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(
+            &directory.path().join("state.json"),
+            Box::new(Simulator::new()),
+        )
+        .unwrap(),
+    ));
+    let service = router(App::new(
+        engine.clone(),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+            Credential {
+                name: "operator".into(),
+                token_sha256: netcontrold::identity::digest("operator"),
+                permissions: vec!["state.read".into(), "interfaces.write".into()],
+            },
+        ]),
+        false,
+    ));
+    let mut snapshot = Value::Null;
+    for (method, path, body, token, expected) in [
+        ("GET", "/api/v1/interface-capabilities", "", "invalid", 401),
+        ("GET", "/api/v1/interface-capabilities", "", "reader", 200),
+        (
+            "POST",
+            "/api/v1/interface-capabilities/refresh",
+            "",
+            "reader",
+            403,
+        ),
+        (
+            "POST",
+            "/api/v1/interface-capabilities/refresh?unexpected=1",
+            "",
+            "operator",
+            400,
+        ),
+        (
+            "POST",
+            "/api/v1/interface-capabilities/refresh",
+            "{}",
+            "operator",
+            400,
+        ),
+        (
+            "POST",
+            "/api/v1/interface-capabilities/refresh",
+            "",
+            "operator",
+            200,
+        ),
+        ("GET", "/api/v1/interface-capabilities", "", "reader", 200),
+    ] {
+        let response = service
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        if expected == 200 && method == "POST" {
+            assert_eq!(value["inventory"]["source"], "simulator");
+            assert_eq!(value["inventory"]["status"], "simulated");
+            assert!(value["collected_at"].as_str().is_some());
+            snapshot = value;
+        } else if expected == 200 {
+            assert_eq!(value, snapshot);
+        }
+    }
+}
+
+#[tokio::test]
 async fn deny_log_http_auth_permission_validation_and_no_store() {
     use netcontrold::http::Credential;
     let directory = tempfile::tempdir().unwrap();
@@ -1404,6 +1491,26 @@ async fn scoped_credentials_permissions_and_api_body_limit() {
     for (method, path, body, status) in [
         ("GET", "/api/v1/state", String::new(), 200),
         ("GET", "/api/v1/interfaces/discovered", String::new(), 200),
+        ("GET", "/api/v1/interface-capabilities", String::new(), 200),
+        (
+            "GET",
+            "/api/v1/interface-capabilities?unexpected=1",
+            String::new(),
+            400,
+        ),
+        (
+            "GET",
+            "/api/v1/interface-capabilities",
+            "{}".to_owned(),
+            400,
+        ),
+        ("POST", "/api/v1/interface-capabilities", String::new(), 405),
+        (
+            "POST",
+            "/api/v1/interface-capabilities/refresh",
+            String::new(),
+            403,
+        ),
         (
             "GET",
             "/api/v1/interfaces/discovered?unexpected=1",
