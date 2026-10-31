@@ -89,6 +89,63 @@ fn firewall_counter<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_loopback_discovery_has_fixed_role_and_static_addressing() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut native = Native::open(fixture.options())?;
+    for raised in [false, true] {
+        if raised {
+            session(native.namespace.clone(), |rt, handle| {
+                rt.block_on(async {
+                    let index = networking::links(handle)
+                        .await?
+                        .iter()
+                        .find(|link| {
+                            link.header
+                                .flags
+                                .contains(&netlink_packet_route::link::LinkFlag::Loopback)
+                        })
+                        .context("loopback missing")?
+                        .header
+                        .index;
+                    handle.link().set(index).up().execute().await?;
+                    handle
+                        .link()
+                        .add()
+                        .dummy("lo-test0".into())
+                        .execute()
+                        .await?;
+                    Ok(())
+                })
+            })?;
+        }
+        let inventory = native.discover_interfaces()?;
+        let rows = inventory.as_array().context("discovery is not an array")?;
+        let loopback = rows
+            .iter()
+            .find(|row| row["kind"] == "loopback")
+            .context("loopback not discovered")?;
+        assert_eq!(loopback["role"], "loopback");
+        assert_eq!(loopback["addressing_type"], "static");
+        assert_eq!(loopback["ownership"], "loopback");
+        assert_eq!(loopback["up"], raised);
+        for row in rows.iter().filter(|row| row["kind"] != "loopback") {
+            assert!(row.as_object().unwrap().contains_key("role"));
+            assert!(row["role"].is_null());
+            assert!(row.as_object().unwrap().contains_key("addressing_type"));
+            assert!(row["addressing_type"].is_null());
+        }
+        if raised {
+            assert!(
+                rows.iter()
+                    .any(|row| row["name"] == "lo-test0" && row["kind"] == "dummy")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and raw sockets"]
 fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()> {
     use futures_util::TryStreamExt;

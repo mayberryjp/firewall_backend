@@ -10,6 +10,64 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn loopback_role_and_addressing_are_readonly_inventory_only() {
+    for kind in ["ethernet", "dummy", "wireguard", "vlan"] {
+        let mut config = candidate();
+        config.interfaces[0].kind = kind.into();
+        if kind == "wireguard" {
+            config.interfaces[0].wireguard = Some(
+                serde_json::from_value(json!({
+                    "key_ref":"fixture-key","listen_port":51820,"peers":[]
+                }))
+                .unwrap(),
+            );
+        } else if kind == "vlan" {
+            let mut parent = config.interfaces[0].clone();
+            parent.name = "trunk0".into();
+            parent.kind = "ethernet".into();
+            parent.addresses.clear();
+            config.interfaces.push(parent);
+            config.interfaces[0].vlan = Some(VLAN {
+                parent: "trunk0".into(),
+                id: 100,
+            });
+        }
+        config.validate().unwrap();
+        config.interfaces[0].role = "loopback".into();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("loopback is reserved"), "{kind}: {error}");
+    }
+    for role in ["loopback", "wan", "lan", "unassigned"] {
+        let mut config = candidate();
+        config.interfaces[0].kind = "loopback".into();
+        config.interfaces[0].role = role.into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("loopback interfaces are read-only")
+        );
+    }
+    let mut config = Config::empty();
+    config
+        .dhcp_clients
+        .insert("lo".into(), DHCPClientConfig::default());
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("DHCP client interface lo is not configured")
+    );
+    for addressing_type in ["static", "dhcp", "slaac", "none"] {
+        let mut value = serde_json::to_value(candidate()).unwrap();
+        value["interfaces"][0]["addressing_type"] = json!(addressing_type);
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
+}
+
+#[test]
 fn vnstat_collector_requires_explicit_valid_socket_address() {
     let mut config = candidate();
     config.vnstat.enabled = true;

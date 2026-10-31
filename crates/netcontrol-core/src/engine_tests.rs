@@ -1668,10 +1668,12 @@ impl Backend for FaultBackend {
         ensure!(!f.discovery_error, "injected discovery read failure");
         Ok(json!([{
             "name":"eth0","kind":"ethernet","index":2,"mac":"02:00:00:00:00:01",
-            "mtu":1500,"up":true,"addresses":["192.0.2.10/24","fe80::1/64"],"ownership":"unmanaged"
+            "mtu":1500,"up":true,"addresses":["192.0.2.10/24","fe80::1/64"],"ownership":"unmanaged",
+            "role":null,"addressing_type":null
         }, {
             "name":"lo","kind":"loopback","index":1,"mac":"00:00:00:00:00:00",
-            "mtu":65536,"up":true,"addresses":["127.0.0.1/8","::1/128"],"ownership":"loopback"
+            "mtu":65536,"up":true,"addresses":["127.0.0.1/8","::1/128"],"ownership":"loopback",
+            "role":"loopback","addressing_type":"static"
         }]))
     }
     fn observe_for_repair(&mut self, _: &Config) -> Result<Config> {
@@ -2096,6 +2098,75 @@ fn failed_factory_reset_rolls_back_and_active_transactions_block_reset() {
 }
 
 #[test]
+fn loopback_inventory_metadata_cannot_be_submitted_or_enabled_for_dhcp() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let baseline = fs::read(fixture.path()).unwrap();
+    let candidate = || serde_json::to_value(config()).unwrap();
+    let mut cases = Vec::new();
+    let mut reserved_role = candidate();
+    reserved_role["interfaces"][0]["role"] = json!("loopback");
+    cases.push((reserved_role, 422, "loopback is reserved"));
+    for role in ["loopback", "lan", "wan", "unassigned"] {
+        let mut loopback = candidate();
+        loopback["interfaces"][0]["kind"] = json!("loopback");
+        loopback["interfaces"][0]["role"] = json!(role);
+        cases.push((loopback, 422, "loopback interfaces are read-only"));
+    }
+    let mut dhcp = candidate();
+    dhcp["dhcp_clients"] = json!({"lo":{}});
+    cases.push((dhcp, 422, "DHCP client interface lo is not configured"));
+    for addressing_type in ["static", "dhcp", "slaac", "none"] {
+        let mut copied_discovery_field = candidate();
+        copied_discovery_field["interfaces"][0]["kind"] = json!("loopback");
+        copied_discovery_field["interfaces"][0]["role"] = json!("loopback");
+        copied_discovery_field["interfaces"][0]["addressing_type"] = json!(addressing_type);
+        cases.push((
+            copied_discovery_field,
+            422,
+            "loopback interfaces are read-only",
+        ));
+    }
+    for (config, status, message) in cases {
+        let reply = request(
+            &mut engine,
+            "POST",
+            "/api/v1/transactions",
+            json!({
+                "base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":config
+            }),
+        );
+        assert_eq!(reply.status, status, "{}", reply.body);
+        assert!(
+            reply.body["error"].as_str().unwrap().contains(message),
+            "{}",
+            reply.body
+        );
+        assert_eq!(fs::read(fixture.path()).unwrap(), baseline);
+    }
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let reply = request(
+        &mut engine,
+        "GET",
+        "/api/v1/interfaces/discovered",
+        Value::Null,
+    );
+    assert_eq!(reply.status, 200);
+    assert!(!reply.body.as_array().unwrap().is_empty());
+    for row in reply.body.as_array().unwrap() {
+        assert!(row.as_object().unwrap().contains_key("role"));
+        assert!(row["role"].is_null());
+        assert!(row.as_object().unwrap().contains_key("addressing_type"));
+        assert!(row["addressing_type"].is_null());
+    }
+}
+
+#[test]
 fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
     let fixture = Fixture::new();
     let (mut engine, faults) = faulty(&fixture);
@@ -2110,6 +2181,15 @@ fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
     assert_eq!(reply.body.as_array().unwrap().len(), 2);
     assert_eq!(reply.body[0]["name"], "eth0");
     assert_eq!(reply.body[0]["ownership"], "unmanaged");
+    assert!(reply.body[0].as_object().unwrap().contains_key("role"));
+    assert!(reply.body[0]["role"].is_null());
+    assert!(
+        reply.body[0]
+            .as_object()
+            .unwrap()
+            .contains_key("addressing_type")
+    );
+    assert!(reply.body[0]["addressing_type"].is_null());
     assert_eq!(
         reply.body[0]["addresses"],
         json!(["192.0.2.10/24", "fe80::1/64"])
@@ -2117,6 +2197,8 @@ fn interface_discovery_is_readonly_authorized_and_independent_of_observation() {
     assert_eq!(reply.body[1]["name"], "lo");
     assert_eq!(reply.body[1]["kind"], "loopback");
     assert_eq!(reply.body[1]["ownership"], "loopback");
+    assert_eq!(reply.body[1]["role"], "loopback");
+    assert_eq!(reply.body[1]["addressing_type"], "static");
     assert_eq!(
         reply.body[1]["addresses"],
         json!(["127.0.0.1/8", "::1/128"])

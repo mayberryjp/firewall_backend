@@ -4,6 +4,16 @@
 
 ### Added
 
+- Fixed read-only loopback classification in interface discovery:
+  `role: "loopback"` and `addressing_type: "static"`, including down/unaddressed
+  links. Other discovery rows have null values without inferring managed roles
+  or address origin. Kernel loopback flags determine kind, not interface names.
+  Managed roles remain WAN/LAN/Unassigned; loopbacks remain nonconfigurable,
+  with no DHCP/SLAAC or alternate role support. Recommended bump: minor for
+  additive discovery fields, baseline unknown, Unreleased; next automatic
+  calendar version, no manual bump. Required frontend work:
+  [handoff 2026-10-30-09](docs/frontend-handoffs/2026-10-30.md#2026-10-30-09-fixed-loopback-role-and-static-addressing).
+
 - Credential-safe MQTT reconnect diagnostics in status and daemon
   warnings: specific failure categories/reasons, attempt/retry counters, last
   broker-connection time and failure history retained across retries/recovery.

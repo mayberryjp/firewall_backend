@@ -1144,13 +1144,17 @@ impl Config {
         let mut relay_addresses = BTreeSet::new();
         for l in &self.interfaces {
             ensure!(
+                l.kind != "loopback",
+                "loopback interfaces are read-only and cannot appear in managed configuration"
+            );
+            ensure!(
                 valid_interface_name(&l.name) && names.insert(&l.name),
                 "invalid or duplicate interface name {:?}",
                 l.name
             );
             ensure!(
                 ["wan", "lan", "unassigned"].contains(&l.role.as_str()),
-                "interface {}: role must be wan, lan or unassigned",
+                "interface {}: role must be wan, lan or unassigned; loopback is reserved for read-only loopback interfaces",
                 l.name
             );
             ensure!(

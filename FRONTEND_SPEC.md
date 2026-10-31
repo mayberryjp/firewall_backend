@@ -324,7 +324,7 @@ routes, not backend endpoints.
 | --- | --- |
 | `/connect` | Credential entry and connection status |
 | `/overview` | Summary, safety state, active transaction, runtime health |
-| `/interfaces` | Host discovery and managed interfaces; kind filters for Ethernet/dummy/VLAN/WireGuard |
+| `/interfaces` | All live interfaces, including read-only loopback; managed Ethernet/dummy/VLAN/WireGuard |
 | `/interfaces/:name` | Interface detail and staged editor |
 | `/parents` | Read-only adopted parent inventory |
 | `/routes` | Routes |
@@ -3587,7 +3587,7 @@ not proof that existing firewall hosts/rules should be deleted.
 
 ### 6.2 Managed interfaces and VLANs
 
-Table columns: name, kind, WAN/LAN role, administrative up/down, MTU, addresses, VLAN parent/ID
+Table columns: name, kind, role (including read-only Loopback), administrative up/down, MTU, addresses, VLAN parent/ID
 when applicable, staged-change indicator, and actions. Filters: text, kind, and
 administrative state, and role. Detail views include desired/observed comparison.
 
@@ -3604,6 +3604,10 @@ or VLAN parents, or silently assign a default. Omitted, null, empty, uppercase,
 and unknown values are invalid (422); non-string JSON values are malformed (400).
 Apply validation to all managed kinds and include role edits in review diffs.
 Multiple interfaces may share a role; no WAN/LAN count requirement exists.
+`loopback` is a reserved discovery-only role, never a choice in any managed
+interface editor. Read-only loopbacks always have role `loopback`; their role
+cannot be changed to WAN, LAN or Unassigned. Do not extend `ManagedInterface.role`
+with this value or submit loopback rows in managed configuration.
 
 Roles are descriptive metadata, not automatic firewall zones or NAT/routing
 configuration. Preserve them in client types, full-package payloads, shared
@@ -3643,7 +3647,9 @@ silently generate one or reset state. Preserve the state location and machine
 identity across restart/reboot; isolated lab scopes remain boot-bound.
 
 Discovery is read-only, does not require successful configured-state observation
-or healthy service workers, and does not assign roles or take NIC ownership.
+or healthy service workers, and does not assign WAN/LAN roles or take NIC ownership.
+It classifies actual kernel loopback links using the loopback flag, not a name
+such as `lo` or a prefix heuristic.
 It rejects query parameters with 400, unsupported POST with 405, missing/invalid
 keys with 401 and missing `state.read` with 403. Real read failures return 503,
 not an empty success. `GET /api/v1/interfaces` retains its managed-config meaning.
@@ -3663,6 +3669,41 @@ choices, not an implicit supported-kind whitelist. Linux loopback is normally
 named `lo`; preserve the actual backend name rather than inventing a `lo0` alias.
 Loopback is visible/read-only, not eligible for adoption, deletion or submission
 as a configurable Ethernet interface.
+
+Every discovery row includes read-only `role` and `addressing_type` fields:
+
+| Discovered kind | `role` | `addressing_type` | Editing |
+|---|---|---|---|
+| Actual loopback | `"loopback"` | `"static"` | None; fixed values, regardless of up/down state or active address count. |
+| Any other kind, managed or unmanaged | `null` | `null` | Do not infer role or addressing origin from discovery. Join managed settings separately as below. |
+
+Render loopbacks as **Loopback** role and **Static** addressing by default, using
+these explicit values. Both are fixed read-only labels, not selectors: no other
+role or Static/DHCP/SLAAC/None addressing choice is supported for a loopback.
+An empty loopback address list does not change it to DHCP, None or Unassigned.
+Other interfaces must never offer the Loopback role; their normal managed-role
+choices remain WAN/LAN/Unassigned. A role filter may include Loopback to find
+these read-only rows. Null discovery metadata is not the managed `unassigned`
+role, disabled addressing, or proof of static/DHCP origin.
+
+Synthetic loopback discovery row:
+
+```json
+{
+  "name": "lo", "kind": "loopback", "index": 1,
+  "mac": "00:00:00:00:00:00", "mtu": 65536, "up": true,
+  "addresses": ["127.0.0.1/8", "::1/128"],
+  "ownership": "loopback", "role": "loopback", "addressing_type": "static"
+}
+```
+
+These are inventory fields, not new desired-configuration fields. Full-package
+transactions still reject a managed `loopback` kind or a `loopback` role on other
+managed kinds with `422`. Adding `dhcp_clients.lo` is also `422` because loopback
+cannot be a managed DHCP client. Discovery stays GET-only (`405` for POST); no
+loopback role/addressing mutation API is added. Existing unknown-property
+projection/`ignored_fields` behavior is unchanged: do not copy a discovered row
+or its read-only `addressing_type` into candidate configuration.
 
 Join discovered rows with managed configuration by technical `name`. Display
 `DiscoveredInterface.addresses` as **Active addresses**, including DHCP IPv4,
@@ -5423,6 +5464,8 @@ interface DiscoveredInterface {
   up: boolean;
   addresses: string[];
   ownership: "managed" | "unmanaged" | "loopback";
+  role: "loopback" | null; // Fixed for actual loopbacks; otherwise null, join managed settings.
+  addressing_type: "static" | null; // Fixed static for loopbacks; otherwise origin is not inferred.
 }
 
 interface ManagedInterface {

@@ -87,7 +87,9 @@ impl Backend for Simulator {
                     "mtu": link.mtu,
                     "up": link.up,
                     "addresses": link.addresses,
-                    "ownership": "managed"
+                    "ownership": "managed",
+                    "role": null,
+                    "addressing_type": null
                 }))
                 .collect::<Vec<_>>()
         ))

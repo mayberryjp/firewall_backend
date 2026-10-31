@@ -145,6 +145,10 @@ impl Network {
         let mut names = BTreeSet::new();
         for link in &self.interfaces {
             ensure!(
+                link.kind != "loopback",
+                "loopback interfaces are read-only and cannot appear in managed configuration"
+            );
+            ensure!(
                 crate::safe_name(&link.name, 15) && link.name != "lo",
                 "invalid managed interface name"
             );
@@ -159,7 +163,7 @@ impl Network {
             );
             ensure!(
                 matches!(link.role.as_str(), "wan" | "lan" | "unassigned"),
-                "interface role must be wan, lan or unassigned"
+                "interface role must be wan, lan or unassigned; loopback is reserved for read-only loopback interfaces"
             );
             ensure!((576..=65535).contains(&link.mtu), "invalid interface MTU");
             match link.kind.as_str() {
@@ -336,6 +340,39 @@ pub fn parse_prefix(value: &str, network: bool) -> Result<(IpAddr, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_role_is_not_a_managed_role_and_loopback_kind_is_readonly() {
+        let value = serde_json::json!({
+            "interfaces":[{"name":"nic0","kind":"ethernet","role":"lan","mtu":1500,"up":true,"addresses":[]}],
+            "routes":[],"firewall":{}
+        });
+        let mut network = Network::parse(&value).unwrap();
+        network.validate(&BTreeSet::new()).unwrap();
+        for kind in ["ethernet", "dummy", "wireguard", "vlan"] {
+            network.interfaces[0].kind = kind.into();
+            network.interfaces[0].role = "loopback".into();
+            assert!(
+                network
+                    .validate(&BTreeSet::new())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("loopback is reserved")
+            );
+        }
+        for role in ["loopback", "wan", "lan", "unassigned"] {
+            network.interfaces[0].kind = "loopback".into();
+            network.interfaces[0].role = role.into();
+            assert!(
+                network
+                    .validate(&BTreeSet::new())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("loopback interfaces are read-only")
+            );
+        }
+    }
+
     #[test]
     fn ethernet_vlan_and_main_routes_are_explicitly_supported() {
         let mut value = serde_json::json!({

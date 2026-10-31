@@ -50,6 +50,22 @@ configuration must produce explicit errors rather than permissive defaults or
 successful no-op operations. Existing on-device data must never be deleted to
 force a new schema to load.
 
+## Read-only loopback interfaces
+
+`GET /api/v1/interfaces/discovered` (`state.read`) includes every live link.
+Actual kernel loopback links always report `role: "loopback"` and
+`addressing_type: "static"`, including when down or without addresses. Both are
+fixed read-only labels; loopbacks cannot be adopted, edited, deleted, assigned
+another role or configured for DHCP/SLAAC. Identify them by kernel flags, not
+interface-name guesses.
+
+Other discovery rows include null for both fields; join their managed
+configuration for roles/addressing settings rather than infer them from active
+addresses. Managed role choices remain `wan`, `lan` and `unassigned`; never offer
+`loopback` for another interface. No new desired-config address-type field is
+added. See the [discovery contract](FRONTEND_SPEC.md#host-interface-discovery-and-selection)
+and [frontend handoff](docs/frontend-handoffs/2026-10-30.md#2026-10-30-09-fixed-loopback-role-and-static-addressing).
+
 ## WireGuard DNS peers
 
 WireGuard peers accept DNS endpoints such as `vpn.example.test:51820`, as well
@@ -639,7 +655,7 @@ edits:
 
 Do not treat `202 Accepted` as a committed revision. An uncertain HTTP write
 must be reconciled through transaction reads, not blindly retried.
-Interfaces require an explicit `wan`, `lan`, or `unassigned` role; roles do not automatically
+Managed interfaces require an explicit `wan`, `lan`, or `unassigned` role; roles do not automatically
 rewrite policy. The Ubuntu appliance installer explicitly provisions those roles,
 a static LAN address, LAN-to-WAN forwarding, and IPv4 masquerade. First-install
 provisioning and explicit factory reset enable `firewall.allow_all_icmp`, accepting

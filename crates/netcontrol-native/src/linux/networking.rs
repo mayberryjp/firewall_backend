@@ -25,6 +25,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loopback_kind_uses_kernel_flags_not_interface_name() {
+        let mut link = LinkMessage::default();
+        link.header.flags = vec![LinkFlag::Loopback];
+        link.attributes.push(LinkAttribute::IfName("local0".into()));
+        assert_eq!(kind(&link), "loopback");
+        link.header.flags.clear();
+        assert_eq!(kind(&link), "device");
+        link.attributes = vec![LinkAttribute::IfName("lo".into())];
+        assert_eq!(kind(&link), "device");
+    }
+
+    #[test]
     fn owned_route_scope_matches_linux_address_family_semantics() -> Result<()> {
         let names = BTreeMap::from([(7, "test0".to_string())]);
         for (family, destination, gateway, scope) in [
@@ -187,6 +199,9 @@ pub(super) fn name(link: &LinkMessage) -> String {
         .unwrap_or_default()
 }
 fn kind(link: &LinkMessage) -> String {
+    if link.header.flags.contains(&LinkFlag::Loopback) {
+        return "loopback".into();
+    }
     for a in &link.attributes {
         if let LinkAttribute::LinkInfo(info) = a {
             for v in info {
@@ -196,11 +211,7 @@ fn kind(link: &LinkMessage) -> String {
             }
         }
     }
-    if name(link) == "lo" {
-        "loopback".into()
-    } else {
-        "device".into()
-    }
+    "device".into()
 }
 fn mtu(link: &LinkMessage) -> u32 {
     link.attributes
@@ -281,7 +292,9 @@ pub async fn discover(handle: &Handle, managed: &BTreeSet<String>) -> Result<Val
         inventory.push(json!({
             "name":p.name,"kind":if ethernet_kind(&p.kind) { "ethernet" } else { &p.kind },
             "index":p.index,"mac":p.mac,"mtu":p.mtu,"up":p.up,
-            "addresses":prefixes,"ownership":ownership
+            "addresses":prefixes,"ownership":ownership,
+            "role":if ownership == "loopback" { Some("loopback") } else { None },
+            "addressing_type":if ownership == "loopback" { Some("static") } else { None }
         }));
     }
     inventory.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));

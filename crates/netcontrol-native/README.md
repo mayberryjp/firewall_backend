@@ -383,7 +383,12 @@ hand-back. Preserve state and use console-assisted operator recovery.
 VLAN dependencies
 are created parent-first and removed child-first; identity changes recreate
 affected descendants. Every managed link has an explicit `wan`/`lan`/`unassigned` metadata
-role. Global addresses are reconciled exactly; unmanaged link-local addresses
+role. Loopbacks remain read-only discovery, classified using the kernel loopback
+flag rather than their name. They always report `role: "loopback"` and
+`addressing_type: "static"`; other discovered links report null for both fields,
+without inferring their managed role or address origin. Loopback role/kind and
+DHCP settings cannot be submitted as managed configuration.
+Global addresses are reconciled exactly; unmanaged link-local addresses
 are left alone. New IPv6 addresses use NODAD for synchronous isolated-lab
 verification. Desired addresses are static; managed DHCP lease addresses are
 added only to the effective native view. Production DAD workflows are not
