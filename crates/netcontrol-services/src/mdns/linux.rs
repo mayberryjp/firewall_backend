@@ -807,8 +807,50 @@ fn fingerprint(payload: &[u8]) -> u64 {
 struct Counts {
     values: BTreeMap<&'static str, u64>,
     receive_loss_tracking: bool,
+    filters: Vec<FilterCount>,
+}
+struct FilterCount {
+    filter: String,
+    matched_packets: u64,
+    transmitted_packets: u64,
+    last_used_at: Option<String>,
+    last_transmitted_at: Option<String>,
 }
 impl Counts {
+    fn new(filters: &[String], receive_loss_tracking: bool) -> Self {
+        Self {
+            receive_loss_tracking,
+            filters: filters
+                .iter()
+                .map(|filter| FilterCount {
+                    filter: filter.clone(),
+                    matched_packets: 0,
+                    transmitted_packets: 0,
+                    last_used_at: None,
+                    last_transmitted_at: None,
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+    fn matched(&mut self, entries: u64) {
+        let at = now();
+        for (index, filter) in self.filters.iter_mut().enumerate() {
+            if entries & (1u64 << index) != 0 {
+                filter.matched_packets = filter.matched_packets.saturating_add(1);
+                filter.last_used_at = Some(at.clone());
+            }
+        }
+    }
+    fn transmitted(&mut self, entries: u64) {
+        let at = now();
+        for (index, filter) in self.filters.iter_mut().enumerate() {
+            if entries & (1u64 << index) != 0 {
+                filter.transmitted_packets = filter.transmitted_packets.saturating_add(1);
+                filter.last_transmitted_at = Some(at.clone());
+            }
+        }
+    }
     fn add(&mut self, key: &'static str, n: u64) {
         let count = self.values.entry(key).or_default();
         *count = count.saturating_add(n);
@@ -818,6 +860,20 @@ impl Counts {
             for (key, count) in &self.values {
                 row[*key] = json!(count.to_string());
             }
+            row["filter_counters"] = json!(
+                self.filters
+                    .iter()
+                    .map(|filter| {
+                        netcontrol_core::MDNSFilterCounters {
+                            filter: filter.filter.clone(),
+                            matched_packets: filter.matched_packets.to_string(),
+                            transmitted_packets: filter.transmitted_packets.to_string(),
+                            last_used_at: filter.last_used_at.clone(),
+                            last_transmitted_at: filter.last_transmitted_at.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            );
             row["collected_at"] = json!(now());
             row["receive_drops"] = if self.receive_loss_tracking {
                 json!(
@@ -1104,36 +1160,46 @@ pub(crate) fn prepare(config: MDNSConfig, names: Vec<String>) -> Result<Run> {
     bail!("mDNS interfaces did not stabilize before readiness")
 }
 
+struct Outgoing<'a> {
+    message: &'a Message,
+    attribution: Option<&'a Attribution>,
+}
 fn emit(
     ports: &mut [Port],
     index: usize,
-    message: &Message,
+    outgoing: Outgoing<'_>,
     destination: SocketAddr,
     recent: &mut VecDeque<Fingerprint>,
     counts: &mut Counts,
 ) -> Result<bool> {
-    let parts = match message.split(ports[index].budget) {
+    let parts = match outgoing.message.split_messages(ports[index].budget) {
         Ok(parts) => parts,
         Err(_) => {
             counts.add("oversize_drops", 1);
             return Ok(false);
         }
     };
-    if parts.len() > 256 || parts.iter().map(Vec::len).sum::<usize>() > 2 * 1024 * 1024 {
+    if parts.len() > 256
+        || parts.iter().map(|part| part.encode().len()).sum::<usize>() > 2 * 1024 * 1024
+    {
         counts.add("queue_drops", 1);
         return Ok(false);
     }
     let mut sent = false;
-    for bytes in parts {
+    for part in parts {
         if !ports[index].egress.take() {
             counts.add("rate_limit_drops", 1);
             continue;
         }
+        let bytes = part.encode();
         match ports[index].send(&bytes, destination) {
             Ok(()) => {
                 sent = true;
                 counts.add("transmitted_packets", 1);
                 counts.add("transmitted_bytes", bytes.len() as u64);
+                if let Some(attribution) = outgoing.attribution {
+                    counts.transmitted(attribution.entries(&part));
+                }
                 if recent.len() >= 8192 {
                     recent.pop_front();
                 }
@@ -1181,10 +1247,11 @@ fn run(
     ctx: ContextState,
     watch: LinkWatch,
 ) -> Result<()> {
-    let mut counts = Counts {
-        receive_loss_tracking: ports.iter().all(|port| port.receive_loss_tracking),
-        ..Counts::default()
-    };
+    let mut counts = Counts::new(
+        &config.reflection.filters,
+        ports.iter().all(|port| port.receive_loss_tracking),
+    );
+    counts.snapshot(&ctx);
     let mut recent = VecDeque::<Fingerprint>::new();
     let mut ingress_recent = VecDeque::<Fingerprint>::new();
     let mut requests = VecDeque::<Request>::new();
@@ -1262,7 +1329,10 @@ fn run(
                     emit(
                         &mut ports,
                         i,
-                        &message,
+                        Outgoing {
+                            message: &message,
+                            attribution: None,
+                        },
                         destination,
                         &mut recent,
                         &mut counts,
@@ -1317,7 +1387,10 @@ fn run(
                     emit(
                         &mut ports,
                         request.port,
-                        &reply,
+                        Outgoing {
+                            message: &reply,
+                            attribution: None,
+                        },
                         request.source,
                         &mut recent,
                         &mut counts,
@@ -1328,7 +1401,10 @@ fn run(
                     emit(
                         &mut ports,
                         request.port,
-                        &response(multicast),
+                        Outgoing {
+                            message: &response(multicast),
+                            attribution: None,
+                        },
                         destination,
                         &mut recent,
                         &mut counts,
@@ -1536,11 +1612,15 @@ fn run(
                         .map(|(_, port)| port.policy.associations.len())
                         .sum::<usize>();
                     ports[i].policy.limit = 8192usize.saturating_sub(used);
-                    message = ports[i].policy.filter(&message, Instant::now());
+                    let (filtered, attribution) = ports[i]
+                        .policy
+                        .filter_with_attribution(&message, Instant::now());
+                    message = filtered;
                     if message.empty() {
                         counts.add("policy_drops", 1);
                         continue;
                     }
+                    counts.matched(attribution.entries(&message));
                     let mut request_index = None;
                     if message.flags & 0x8000 != 0 {
                         for request in &requests {
@@ -1554,7 +1634,10 @@ fn run(
                                 emit(
                                     &mut ports,
                                     request.port,
-                                    &reply,
+                                    Outgoing {
+                                        message: &reply,
+                                        attribution: Some(&attribution),
+                                    },
                                     request.source,
                                     &mut recent,
                                     &mut counts,
@@ -1618,7 +1701,10 @@ fn run(
                         let sent = emit(
                             &mut ports,
                             j,
-                            &message,
+                            Outgoing {
+                                message: &message,
+                                attribution: Some(&attribution),
+                            },
                             destination,
                             &mut recent,
                             &mut counts,
@@ -1660,6 +1746,178 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filter_counts_are_exact_saturating_and_reset_with_a_new_worker() {
+        let filters: Vec<_> = (0..64).map(|index| format!("host{index}.local.")).collect();
+        let mut counts = Counts::new(&filters, true);
+        counts.matched(u64::MAX);
+        counts.transmitted(1u64 << 63);
+        assert!(
+            counts
+                .filters
+                .iter()
+                .all(|filter| filter.matched_packets == 1)
+        );
+        assert_eq!(counts.filters[0].transmitted_packets, 0);
+        assert_eq!(counts.filters[63].transmitted_packets, 1);
+        counts.filters[0].matched_packets = u64::MAX;
+        counts.filters[0].transmitted_packets = u64::MAX;
+        counts.matched(1);
+        counts.transmitted(1);
+        let ctx = ContextState {
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            status: std::sync::Arc::new(std::sync::Mutex::new(json!({}))),
+        };
+        counts.snapshot(&ctx);
+        let status = ctx.status.lock().unwrap().clone();
+        assert_eq!(
+            status["filter_counters"][0]["matched_packets"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(
+            status["filter_counters"][0]["transmitted_packets"],
+            u64::MAX.to_string()
+        );
+        assert!(status["filter_counters"][0]["last_used_at"].is_string());
+        assert!(status["filter_counters"][0]["last_transmitted_at"].is_string());
+        assert_eq!(
+            status["filter_counters"][1]["last_transmitted_at"],
+            serde_json::Value::Null
+        );
+        Counts::new(&filters, true).snapshot(&ctx);
+        let status = ctx.status.lock().unwrap();
+        assert_eq!(
+            status["filter_counters"][0],
+            json!({
+                "filter":"host0.local.","matched_packets":"0","transmitted_packets":"0",
+                "last_used_at":null,"last_transmitted_at":null
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "requires NETCONTROL_INTEGRATION=1 and fresh Linux network namespace/veth privileges"]
+    fn native_mdns_filter_send_counts_fragments_losses_and_publication_exclusion() {
+        isolated(|clients| {
+            let filters = vec!["printer.local.".into(), "private.local.".into()];
+            let mut ports = vec![Port::open("lan1", false, &filters)?];
+            ports[0].budget = 512;
+            let peer = inside(clients[0].clone(), || Port::open("peer1", false, &[]))?;
+            let message = response(
+                filters
+                    .iter()
+                    .map(|name| Record {
+                        name: Name::text(name),
+                        kind: 16,
+                        class: 1,
+                        ttl: 120,
+                        data: Data::Bytes(vec![0; 400]),
+                    })
+                    .collect(),
+            );
+            let (message, attribution) = ports[0]
+                .policy
+                .filter_with_attribution(&message, Instant::now());
+            let destination = SocketAddr::new(ports[0].group(), 5353);
+            let mut counts = Counts::new(&filters, true);
+            let mut recent = VecDeque::new();
+            counts.matched(attribution.entries(&message));
+            ensure!(
+                emit(
+                    &mut ports,
+                    0,
+                    Outgoing {
+                        message: &message,
+                        attribution: Some(&attribution)
+                    },
+                    destination,
+                    &mut recent,
+                    &mut counts
+                )?,
+                "fragment sends failed"
+            );
+            for _ in 0..2 {
+                let part = received(&peer, "192.0.1.1".parse()?, true)?;
+                ensure!(part.records[0].len() == 1, "fragment contents incorrect");
+            }
+            ensure!(
+                counts.values["transmitted_packets"] == 2,
+                "expected two sends"
+            );
+            ensure!(
+                counts
+                    .filters
+                    .iter()
+                    .all(|filter| filter.transmitted_packets == 1),
+                "fragment attribution credited an absent filter"
+            );
+            emit(
+                &mut ports,
+                0,
+                Outgoing {
+                    message: &message,
+                    attribution: None,
+                },
+                destination,
+                &mut recent,
+                &mut counts,
+            )?;
+            ensure!(
+                counts
+                    .filters
+                    .iter()
+                    .all(|filter| filter.transmitted_packets == 1),
+                "publication sends incremented filter counters"
+            );
+            ports[0].egress.tokens = -1_000_000.0;
+            ensure!(
+                !emit(
+                    &mut ports,
+                    0,
+                    Outgoing {
+                        message: &message,
+                        attribution: Some(&attribution)
+                    },
+                    destination,
+                    &mut recent,
+                    &mut counts
+                )?,
+                "rate-limited sends succeeded"
+            );
+            ensure!(
+                counts.values["rate_limit_drops"] == 2,
+                "rate loss not counted"
+            );
+            ports[0].egress = Bucket::new();
+            ensure!(
+                emit(
+                    &mut ports,
+                    0,
+                    Outgoing {
+                        message: &message,
+                        attribution: Some(&attribution)
+                    },
+                    "[ff02::fb]:5353".parse()?,
+                    &mut recent,
+                    &mut counts
+                )
+                .is_err(),
+                "invalid-family send unexpectedly succeeded"
+            );
+            ensure!(
+                counts.values["send_errors"] == 1,
+                "send failure not counted"
+            );
+            ensure!(
+                counts
+                    .filters
+                    .iter()
+                    .all(|filter| filter.transmitted_packets == 1),
+                "failed sends incremented filter counters"
+            );
+            Ok(())
+        });
+    }
     #[test]
     fn token_bucket_and_reply_matching_are_bounded() {
         let mut bucket = Bucket::new();
@@ -2037,6 +2295,8 @@ mod tests {
                 (true, "_ipp._tcp.local."),
                 (false, "printer.local."),
                 (true, "printer.local."),
+                (false, "printer._ipp._tcp.local."),
+                (true, "printer._ipp._tcp.local."),
             ] {
                 let mut config = MDNSConfig {
                     enabled: true,
@@ -2045,7 +2305,7 @@ mod tests {
                     ..MDNSConfig::default()
                 };
                 config.reflection.enabled = true;
-                config.reflection.filters = vec![filter.into()];
+                config.reflection.filters = vec![filter.into(), "_unused._udp.local.".into()];
                 let mut worker = crate::worker::Worker::start(
                     "mdns-wire-test".into(),
                     None,
@@ -2137,6 +2397,36 @@ mod tests {
                     excluded.receive()?.is_none(),
                     "mDNS leaked to unselected interface"
                 );
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let status = worker.snapshot();
+                    let entry = &status["filter_counters"][0];
+                    if entry["matched_packets"]
+                        .as_str()
+                        .is_some_and(|value| value.parse::<u64>().unwrap() >= 2)
+                        && entry["transmitted_packets"]
+                            .as_str()
+                            .is_some_and(|value| value.parse::<u64>().unwrap() >= 2)
+                    {
+                        ensure!(
+                            entry["filter"] == filter
+                                && entry["last_used_at"].is_string()
+                                && entry["last_transmitted_at"].is_string(),
+                            "filter identity/timestamps missing"
+                        );
+                        ensure!(
+                            status["filter_counters"][1]["matched_packets"] == "0"
+                                && status["filter_counters"][1]["transmitted_packets"] == "0",
+                            "unmatched filter was credited"
+                        );
+                        break;
+                    }
+                    ensure!(
+                        Instant::now() < until,
+                        "filter counters did not update: {status}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
                 let followup = Message {
                     questions: vec![Question {
                         name: Name::text("printer._ipp._tcp.local."),
@@ -2196,6 +2486,27 @@ mod tests {
                     "mDNS worker failed: {}",
                     worker.snapshot()
                 );
+                worker.restart()?;
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let status = worker.snapshot();
+                    if status["filter_counters"][0]["matched_packets"] == "0"
+                        && status["filter_counters"][0]["last_used_at"].is_null()
+                    {
+                        ensure!(
+                            status["filter_counters"][0]["transmitted_packets"] == "0"
+                                && status["filter_counters"][0]["last_transmitted_at"].is_null(),
+                            "restart retained filter transmissions"
+                        );
+                        break;
+                    }
+                    ensure!(
+                        Instant::now() < until,
+                        "restart did not reset counters: {status}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                worker.shutdown()?;
                 drop((peer1, peer2, excluded));
                 drop(ownership()?);
             }

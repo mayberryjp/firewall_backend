@@ -2768,6 +2768,14 @@ type MDNSCounterName =
   | "policy_drops" | "duplicate_drops" | "rate_limit_drops"
   | "queue_drops" | "oversize_drops" | "unsupported_record_drops" | "send_errors";
 
+interface MDNSFilterCounters {
+  filter: string; // Applied canonical reflection filter, not an array index.
+  matched_packets: string; // Exact unsigned decimal string.
+  transmitted_packets: string; // Successful per-destination datagram sends.
+  last_used_at: Timestamp | null; // Last admitted match; null before any match.
+  last_transmitted_at: Timestamp | null; // Null before any successful send.
+}
+
 interface MDNSStatus extends Record<MDNSCounterName, string> {
   name: "mdns";
   scope: "managed";
@@ -2780,6 +2788,7 @@ interface MDNSStatus extends Record<MDNSCounterName, string> {
   effective_families: ("ipv4" | "ipv6")[];
   reflection_enabled: boolean;
   publishing_enabled: boolean;
+  filter_counters: MDNSFilterCounters[];
   receive_drops: string | null;
   statistics_complete: boolean;
   warnings: string[];
@@ -2876,6 +2885,32 @@ cast it to an NTP sample or discard it as an unknown service. Its status fields:
   Disabled/simulated rows claim no measured completeness (`statistics_complete:
   false`, `receive_drops: null`) and have empty `warnings`; do not render these
   unmeasured statistics as an unhealthy service.
+- `filter_counters` contains one row per **applied** `reflection.filters`
+  entry, in applied order, even when disabled or reflection is off; empty
+  filters produce `[]` (unfiltered reflection has no invented wildcard row).
+  Join by canonical `filter`, never by row index or the committed/draft list.
+  `matched_packets` counts each admitted ingress datagram once per contributing
+  filter, across questions and all record sections, including learned bounded
+  DNS-SD dependencies. It is sampled after policy filtering, before later
+  returned-packet/egress suppression; a match need not produce a send.
+  Provider/instance browse solicitation and service enumeration count as
+  matches, not proof that a matching device exists.
+  `transmitted_packets` counts each successfully sent reflected datagram
+  containing attributed questions/records, per destination and per fragment;
+  unrelated fragments, failed/rate-limited sends and appliance publishing do
+  not increment it. Legacy unicast reflection replies count too.
+  Overlapping entries may both receive credit; never sum these rows to infer
+  the global packet total. Both numbers are saturating `u64` decimal strings.
+  `last_used_at` updates on a match; `last_transmitted_at` on a successful send;
+  both are UTC RFC3339 strings or null before that event.
+  Rows reset to `"0"`/null each worker run, including automatic retry, explicit
+  restart and configuration replacement/rollback; they are not persisted.
+  Disabled/simulated rows are unmeasured zeroes, not evidence of inactivity.
+  Existing `state`, `started_at`, `restart_count`, `collected_at`, error/warnings
+  and `statistics_complete` identify lifecycle and sample limitations.
+  Poll with the existing 2..5-second single-flight interval; render Matched,
+  Forwarded and Last used next to each filter without JavaScript `number`
+  conversion, and retain drafts while showing applied/provisional activity.
 - Optional `retrying`, `restart_count`, `last_error` have the shared native
   supervisor semantics in section 6.1.3. Link/port/socket failures are visible
   and retry automatically without manual repair or global configuration locks.
@@ -3044,6 +3079,10 @@ packet delivery. Runtime validators must accept `UDPRelayStatus` as a distinct
 `appliance_services` member, not require generic or mDNS-only fields. `limits` has
 `interfaces:32`, `payload_bytes:65507`, `packets_per_second:200`, `burst:400`,
 `poll_ms:100`, `shutdown_ms:1000`. Do not show simulated rows as live traffic.
+For per-entry usage badges, join status `instance_id` to configured `id`, show
+Received/Forwarded plus optional payload bytes and drop/error details. UDP
+relay does not currently expose a per-instance last-used timestamp:
+`collected_at` is the latest sample time, not the last packet time.
 
 Use compact instance rows and one owning editor. Offer Govee (4001,
 239.255.255.250) and ECHONET Lite (3610, 224.0.23.0) presets that populate a

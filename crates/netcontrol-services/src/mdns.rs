@@ -41,6 +41,11 @@ impl Name {
                     &service.0[..]
                 }
     }
+    fn enumerated_by(&self, filter: &Self) -> bool {
+        filter == self
+            || filter.instance_of(self)
+            || (filter.0.len() > 4 && filter.0[1] == b"_sub" && filter.0[2..] == self.0)
+    }
     fn text(value: &str) -> Self {
         Self(
             value
@@ -111,7 +116,21 @@ struct Question {
     kind: u16,
     class: u16,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl Question {
+    fn solicited_by(&self, filter: &Name, query: bool) -> bool {
+        // Browsing solicits a provider before its SRV target is known, but
+        // question permission never authorizes response records.
+        query
+            && self.name.0.last().is_some_and(|label| label == b"local")
+            && (((filter.host() || filter.instance_of(&self.name))
+                && self.name.service()
+                && matches!(self.kind, 12 | 255))
+                || (self.name.instance()
+                    && matches!(self.kind, 16 | 33 | 255)
+                    && (filter.host() || self.name.instance_of(filter))))
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Data {
     Bytes(Vec<u8>),
     Name(Name),
@@ -327,9 +346,16 @@ impl Message {
     // Responses are independent RR datagrams. Query known-answer continuations
     // repeat their question section and use TC except on the final datagram.
     fn split(&self, budget: usize) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .split_messages(budget)?
+            .iter()
+            .map(Self::encode)
+            .collect())
+    }
+    fn split_messages(&self, budget: usize) -> Result<Vec<Self>> {
         ensure!(budget >= 512, "mDNS egress MTU too small");
         if self.encode().len() <= budget {
-            return Ok(vec![self.encode()]);
+            return Ok(vec![self.clone()]);
         }
         let query = self.flags & 0x8000 == 0;
         let mut current = Self {
@@ -359,7 +385,7 @@ impl Message {
                         result.len() < 256,
                         "mDNS datagram batch exceeds queue bound"
                     );
-                    result.push(current.encode());
+                    result.push(current);
                     current = Self {
                         id: self.id,
                         flags: self.flags,
@@ -379,7 +405,7 @@ impl Message {
                 result.len() < 256,
                 "mDNS datagram batch exceeds queue bound"
             );
-            result.push(current.encode());
+            result.push(current);
         }
         ensure!(
             result.len() <= 256,
@@ -393,59 +419,143 @@ struct Policy {
     filters: Vec<Name>,
     associations: BTreeMap<Name, Instant>,
     parents: BTreeMap<Name, Name>,
+    origins: BTreeMap<Name, (u64, Instant)>,
     limit: usize,
 }
+
+#[derive(Default)]
+struct Attribution {
+    questions: BTreeMap<(Name, u16), u64>,
+    records: BTreeMap<(Name, u16, Data), u64>,
+}
+impl Attribution {
+    fn entries(&self, message: &Message) -> u64 {
+        let questions = message.questions.iter().fold(0, |mask, question| {
+            mask | self
+                .questions
+                .get(&(question.name.clone(), question.kind))
+                .copied()
+                .unwrap_or(0)
+        });
+        message
+            .records
+            .iter()
+            .flatten()
+            .fold(questions, |mask, record| {
+                mask | self
+                    .records
+                    .get(&(record.name.clone(), record.kind, record.data.clone()))
+                    .copied()
+                    .unwrap_or(0)
+            })
+    }
+}
+
 impl Policy {
     fn new(filters: &[String]) -> Self {
         Self {
             filters: filters.iter().map(|f| Name::text(f)).collect(),
             associations: BTreeMap::new(),
             parents: BTreeMap::new(),
+            origins: BTreeMap::new(),
             limit: 8192,
         }
+    }
+    fn entries(&self, name: &Name) -> u64 {
+        self.filters.iter().enumerate().fold(
+            self.origins.get(name).map_or(0, |(entries, _)| *entries),
+            |mask, (index, filter)| mask | if filter == name { 1u64 << index } else { 0 },
+        )
+    }
+    fn enumeration_entries(&self, name: &Name) -> u64 {
+        let direct = self
+            .filters
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (index, filter)| {
+                mask | if name.enumerated_by(filter) {
+                    1u64 << index
+                } else {
+                    0
+                }
+            });
+        self.associations
+            .keys()
+            .filter(|instance| instance.instance_of(name))
+            .fold(direct, |mask, instance| mask | self.entries(instance))
+    }
+    fn question_entries(&self, question: &Question, query: bool) -> u64 {
+        let mut entries = self.entries(&question.name);
+        for (index, filter) in self.filters.iter().enumerate() {
+            if question.name == Name::text("_services._dns-sd._udp.local.")
+                || question.solicited_by(filter, query)
+            {
+                entries |= 1u64 << index;
+            }
+        }
+        entries
+    }
+    fn attribution(&self, message: &Message) -> Attribution {
+        let mut result = Attribution::default();
+        for question in &message.questions {
+            result.questions.insert(
+                (question.name.clone(), question.kind),
+                self.question_entries(question, message.flags & 0x8000 == 0),
+            );
+        }
+        for record in message.records.iter().flatten() {
+            let entries = match &record.data {
+                Data::Name(target)
+                    if record.kind == 12
+                        && record.name == Name::text("_services._dns-sd._udp.local.") =>
+                {
+                    self.enumeration_entries(target)
+                }
+                Data::Name(target) | Data::Srv(_, target) | Data::Nsec(target, _) => {
+                    self.entries(&record.name) | self.entries(target)
+                }
+                Data::Bytes(_) => self.entries(&record.name),
+            };
+            *result
+                .records
+                .entry((record.name.clone(), record.kind, record.data.clone()))
+                .or_default() |= entries;
+        }
+        result
     }
     fn allowed(&self, name: &Name) -> bool {
         self.filters.contains(name) || self.associations.contains_key(name)
     }
     fn enumerated(&self, name: &Name) -> bool {
-        self.filters.iter().any(|filter| {
-            filter == name
-                || filter.instance_of(name)
-                || (filter.0.len() > 4 && filter.0[1] == b"_sub" && filter.0[2..] == name.0)
-        }) || self
-            .associations
-            .keys()
-            .any(|instance| instance.instance_of(name))
+        self.filters.iter().any(|filter| name.enumerated_by(filter))
+            || self
+                .associations
+                .keys()
+                .any(|instance| instance.instance_of(name))
     }
     fn question_allowed(&self, question: &Question, query: bool) -> bool {
-        if self.allowed(&question.name)
+        self.allowed(&question.name)
             || question.name == Name::text("_services._dns-sd._udp.local.")
-        {
-            return true;
-        }
-        if !query || question.name.0.last().is_none_or(|label| label != b"local") {
-            return false;
-        }
-        let provider = self.filters.iter().any(Name::host);
-        // Browsing must reach a provider before its SRV target is known.
-        // Questions never authorize records; every section is still filtered.
-        ((provider
             || self
                 .filters
                 .iter()
-                .any(|filter| filter.instance_of(&question.name)))
-            && question.name.service()
-            && matches!(question.kind, 12 | 255))
-            || (question.name.instance()
-                && matches!(question.kind, 16 | 33 | 255)
-                && (provider
-                    || self
-                        .filters
-                        .iter()
-                        .any(|filter| question.name.instance_of(filter))))
+                .any(|filter| question.solicited_by(filter, query))
     }
     fn associate(&mut self, name: &Name, ttl: u32, now: Instant, parent: &Name) {
-        if name == parent || self.filters.contains(name) {
+        if name == parent {
+            return;
+        }
+        let entries = self.entries(parent);
+        if self.filters.contains(name) {
+            let expires = self
+                .associations
+                .get(parent)
+                .copied()
+                .unwrap_or(now + Duration::from_secs(ttl.min(120) as u64))
+                .min(now + Duration::from_secs(ttl.min(120) as u64));
+            let origin = self.origins.entry(name.clone()).or_insert((0, expires));
+            origin.0 |= entries;
+            origin.1 = origin.1.max(expires);
             return;
         }
         if self.associations.contains_key(name) || self.associations.len() < self.limit {
@@ -463,6 +573,10 @@ impl Policy {
                 self.associations.insert(name.clone(), expires);
                 self.parents.insert(name.clone(), parent.clone());
             }
+            let expires = self.associations[name];
+            let origin = self.origins.entry(name.clone()).or_insert((0, expires));
+            origin.0 |= entries;
+            origin.1 = expires;
         }
     }
     fn prune(&mut self, now: Instant) {
@@ -482,10 +596,21 @@ impl Policy {
             self.parents
                 .retain(|name, _| self.associations.contains_key(name));
         }
+        self.origins.retain(|name, (_, expires)| {
+            *expires > now && (self.filters.contains(name) || self.associations.contains_key(name))
+        });
     }
+    #[cfg(test)]
     fn filter(&mut self, message: &Message, now: Instant) -> Message {
+        self.filter_with_attribution(message, now).0
+    }
+    fn filter_with_attribution(
+        &mut self,
+        message: &Message,
+        now: Instant,
+    ) -> (Message, Attribution) {
         if self.filters.is_empty() {
-            return message.clone();
+            return (message.clone(), Attribution::default());
         }
         self.prune(now);
         // Fixed-point traversal admits only PTR instances and SRV providers
@@ -544,20 +669,141 @@ impl Policy {
                 Data::Bytes(_) => self.allowed(&r.name),
             });
         }
+        let attribution = self.attribution(&output);
         for record in output.records.iter().flatten().filter(|r| r.ttl == 0) {
             self.associations.remove(&record.name);
+            self.origins.remove(&record.name);
             if let Data::Name(name) = &record.data {
                 self.associations.remove(name);
+                self.origins.remove(name);
             }
         }
         self.prune(now);
-        output
+        (output, attribution)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filter_attribution_tracks_overlap_dependencies_expiry_and_goodbyes() {
+        let now = Instant::now();
+        let filters = [
+            "_ipp._tcp.local.",
+            "printer._ipp._tcp.local.",
+            "printer.local.",
+            "_unused._udp.local.",
+        ]
+        .map(str::to_owned);
+        let mut policy = Policy::new(&filters);
+        let (output, attribution) = policy.filter_with_attribution(&discovery(), now);
+        assert_eq!(output.records[0].len(), 4);
+        assert_eq!(attribution.entries(&output), 0b111);
+        let address = Message {
+            flags: 0x8400,
+            records: [vec![output.records[0][3].clone()], Vec::new(), Vec::new()],
+            ..Message::default()
+        };
+        let (output, attribution) = policy.filter_with_attribution(&address, now);
+        assert_eq!(attribution.entries(&output), 0b111);
+        let (output, attribution) =
+            policy.filter_with_attribution(&address, now + Duration::from_secs(121));
+        assert_eq!(attribution.entries(&output), 0b100);
+
+        let mut policy = Policy::new(&filters[..2]);
+        let mut goodbye = discovery();
+        for record in goodbye.records.iter_mut().flatten() {
+            record.ttl = 0;
+        }
+        let (output, attribution) = policy.filter_with_attribution(&goodbye, now);
+        assert_eq!(attribution.entries(&output), 0b11);
+        let (output, attribution) = policy.filter_with_attribution(&address, now);
+        assert!(output.empty());
+        assert_eq!(attribution.entries(&output), 0);
+        assert!(policy.origins.is_empty());
+    }
+    #[test]
+    fn filter_attribution_is_per_fragment_and_survives_legacy_reconstruction() {
+        let mut policy = Policy::new(&["printer.local.".into(), "private.local.".into()]);
+        let mut message = Message {
+            flags: 0x8400,
+            ..Message::default()
+        };
+        for name in ["printer.local.", "private.local."] {
+            message.records[0].push(record(name, 16, Data::Bytes(vec![0; 400])));
+        }
+        let (output, attribution) = policy.filter_with_attribution(&message, Instant::now());
+        assert_eq!(attribution.entries(&output), 0b11);
+        let parts = output.split_messages(512).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(attribution.entries(&parts[0]), 0b01);
+        assert_eq!(attribution.entries(&parts[1]), 0b10);
+        let mut legacy = parts[0].clone();
+        legacy.legacy(&Message {
+            id: 42,
+            questions: vec![Question {
+                name: Name::text("unrelated.local."),
+                kind: 1,
+                class: 1,
+            }],
+            ..Message::default()
+        });
+        assert_eq!(attribution.entries(&legacy), 0b01);
+        assert_eq!(attribution.entries(&Message::default()), 0);
+    }
+    #[test]
+    fn filter_attribution_covers_browse_subtype_enumeration_and_all_64_entries() {
+        let mut policy = Policy::new(&[
+            "_print._sub._ipp._tcp.local.".into(),
+            "printer._ipp._tcp.local.".into(),
+            "printer.local.".into(),
+        ]);
+        let query = Message {
+            questions: vec![Question {
+                name: Name::text("_ipp._tcp.local."),
+                kind: 12,
+                class: 1,
+            }],
+            ..Message::default()
+        };
+        let (output, attribution) = policy.filter_with_attribution(&query, Instant::now());
+        assert_eq!(attribution.entries(&output), 0b110);
+        let enumeration = Message {
+            flags: 0x8400,
+            records: [
+                vec![record(
+                    "_services._dns-sd._udp.local.",
+                    12,
+                    Data::Name(Name::text("_ipp._tcp.local.")),
+                )],
+                Vec::new(),
+                Vec::new(),
+            ],
+            ..Message::default()
+        };
+        let (output, attribution) = policy.filter_with_attribution(&enumeration, Instant::now());
+        assert_eq!(attribution.entries(&output), 0b011);
+        let filters: Vec<_> = (0..64).map(|i| format!("host{i}.local.")).collect();
+        let mut policy = Policy::new(&filters);
+        let query = Message {
+            questions: vec![Question {
+                name: Name::text("_services._dns-sd._udp.local."),
+                kind: 12,
+                class: 1,
+            }],
+            ..Message::default()
+        };
+        let (output, attribution) = policy.filter_with_attribution(&query, Instant::now());
+        assert_eq!(attribution.entries(&output), u64::MAX);
+        assert!(policy.associations.is_empty());
+        assert!(policy.origins.is_empty());
+        let mut unfiltered = Policy::new(&[]);
+        let (output, attribution) =
+            unfiltered.filter_with_attribution(&discovery(), Instant::now());
+        assert_eq!(output, discovery());
+        assert_eq!(attribution.entries(&output), 0);
+    }
     fn record(name: &str, kind: u16, data: Data) -> Record {
         Record {
             name: Name::text(name),
@@ -909,6 +1155,7 @@ mod tests {
             );
         }
         assert_eq!(full.associations.len(), 8192);
+        assert_eq!(full.origins.len(), 8192);
         assert!(full.filter(&discovery(), now).empty());
         assert_eq!(full.associations.len(), 8192);
         let mut short = discovery();

@@ -784,6 +784,13 @@ the worker opens no firewall holes. Discovery does not grant access to a
 printer/casting service, make IPv6 link-local addresses routable, or forward
 SSDP/media traffic. Use only one active reflector per connected domain.
 
+Status includes per-reflection-filter matched/forwarded packet counters and
+last-match/last-send timestamps alongside the service totals. Counts are exact
+decimal strings, reset on each worker run and do not prove remote delivery;
+appliance publishing is excluded. See the
+[counter handoff](docs/frontend-handoffs/2026-11-01.md#2026-11-01-01-mdns-and-udp-relay-entry-usage-counters)
+for the mDNS shape and existing per-instance UDP relay counters.
+
 See the [current frontend contract](FRONTEND_SPEC.md#617-native-mdns--dns-sd),
 [build and qualification spec](docs/MDNS_SPEC.md) and
 [synthetic example](examples/mdns.json). The example is not a safe replacement

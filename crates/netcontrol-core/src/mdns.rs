@@ -27,6 +27,26 @@ pub struct MDNSReflection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MDNSFilterCounters {
+    pub filter: String,
+    pub matched_packets: String,
+    pub transmitted_packets: String,
+    pub last_used_at: Option<String>,
+    pub last_transmitted_at: Option<String>,
+}
+impl MDNSFilterCounters {
+    pub fn new(filter: String) -> Self {
+        Self {
+            filter,
+            matched_packets: "0".into(),
+            transmitted_packets: "0".into(),
+            last_used_at: None,
+            last_transmitted_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MDNSPublishing {
     pub enabled: bool,
@@ -249,6 +269,7 @@ impl MDNSConfig {
             "effective_interfaces":self.effective_interfaces(config),
             "effective_families":[],
             "reflection_enabled":self.reflection.enabled,"publishing_enabled":self.publishing.enabled,
+            "filter_counters":self.reflection.filters.iter().cloned().map(MDNSFilterCounters::new).collect::<Vec<_>>(),
             "receive_drops":null,"statistics_complete":false,
             "warnings":if matches!(state, "disabled" | "simulated") {vec![]} else {vec!["receive_loss_accounting_unavailable"]},
             "limits":{"interfaces":32,"payload_bytes":9000,"records":512,"fingerprints":8192,
@@ -302,6 +323,29 @@ mod tests {
         assert_eq!(
             config.mdns.status(&config, "running")["warnings"],
             json!(["receive_loss_accounting_unavailable"])
+        );
+    }
+
+    #[test]
+    fn filter_counter_status_has_configured_identity_and_unmeasured_zeroes() {
+        let mut config = Config::default();
+        config.mdns.reflection.filters = vec!["_ipp._tcp.local.".into(), "printer.local.".into()];
+        for state in ["disabled", "simulated", "running", "error", "stopped"] {
+            let status = config.mdns.status(&config, state);
+            assert_eq!(
+                status["filter_counters"],
+                json!([
+                    {"filter":"_ipp._tcp.local.","matched_packets":"0","transmitted_packets":"0",
+                     "last_used_at":null,"last_transmitted_at":null},
+                    {"filter":"printer.local.","matched_packets":"0","transmitted_packets":"0",
+                     "last_used_at":null,"last_transmitted_at":null}
+                ])
+            );
+        }
+        config.mdns.reflection.filters.clear();
+        assert_eq!(
+            config.mdns.status(&config, "simulated")["filter_counters"],
+            json!([])
         );
     }
 
@@ -465,7 +509,9 @@ mod tests {
             .filter(|p| p.as_str() != "mdns.write")
             .cloned()
             .collect::<Vec<_>>();
-        let candidate = config();
+        let mut candidate = config();
+        candidate.mdns.reflection.filters =
+            vec!["_ipp._tcp.local.".into(), "printer.local.".into()];
         let body = serde_json::to_vec(
             &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":candidate}),
         )
@@ -498,6 +544,23 @@ mod tests {
         );
         assert_eq!(status.body["instances"][0]["state"], "simulated");
         assert_eq!(status.body["instances"][0]["received_packets"], "0");
+        let expected_counters = json!([
+            MDNSFilterCounters::new("_ipp._tcp.local.".into()),
+            MDNSFilterCounters::new("printer.local.".into())
+        ]);
+        assert_eq!(
+            status.body["instances"][0]["filter_counters"],
+            expected_counters
+        );
+        let runtime = engine.request("GET", "/api/v1/runtime", "", "operator", &all, &[]);
+        assert_eq!(runtime.status, 200, "{}", runtime.body);
+        let row = runtime.body["appliance_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "mdns")
+            .unwrap();
+        assert_eq!(row["filter_counters"], expected_counters);
         for service in [
             "mdns",
             "ntp",

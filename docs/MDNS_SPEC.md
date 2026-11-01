@@ -427,6 +427,28 @@ Status contract:
   `hop_limit_drops`, `policy_drops`, `duplicate_drops`, `rate_limit_drops`,
   `queue_drops`, `oversize_drops`, `unsupported_record_drops`,
   `receive_drops` (nullable if kernel cannot report), `send_errors`.
+- `filter_counters`: one row per applied reflection filter, including inactive
+  entries; `[]` when filters are empty. Row:
+  `{filter: string, matched_packets: string, transmitted_packets: string,
+  last_used_at: string | null, last_transmitted_at: string | null}`.
+  Counts saturate at `u64::MAX`, serialize as exact decimal strings and reset
+  with timestamps to zero/null on each worker run, including retry/restart and
+  configuration replacement/rollback. No saved-state/config fields are added.
+  Match once per ingress datagram per contributing filter after policy
+  filtering, before later returned-packet/egress suppression. Include admitted
+  queries, all RR sections and learned DNS-SD dependencies; capture attribution
+  before goodbye pruning. Provider/instance browse solicitation and enumeration
+  are usage, not proof of a matching device. Bounded origin masks share the
+  existing association lifetime (120 seconds maximum), and track at most the
+  admitted association names plus the 64 configured filter names per policy.
+  Forwarded counts include successful per-destination reflected datagrams and
+  legacy unicast replies, attributed separately for each split fragment;
+  exclude unrelated fragments, send failures, rate drops and appliance
+  publication/probes/goodbyes. Overlapping filters may both receive credit:
+  their totals are not additive global counts or delivery guarantees.
+  `last_used_at` is the last match, `last_transmitted_at` the last successful
+  reflected send; UTC RFC3339/null. Disabled/simulated rows stay unmeasured.
+  Identify rows by canonical applied `filter`, not array index or a draft.
 - `statistics_complete: boolean`; false after known receive/queue/rate loss,
   or when receive-loss accounting is unavailable. It is not a delivery metric.
 - Bounded warnings with stable reason strings, no captured TXT data, device

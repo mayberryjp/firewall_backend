@@ -4,6 +4,16 @@
 
 ### Added
 
+- Per-reflection-filter mDNS usage counters in existing service/runtime status:
+  exact decimal-string matched and successfully forwarded packet counts plus
+  nullable last-match/last-send timestamps, with dependency/overlap attribution,
+  per-fragment accounting and worker-run resets. Publishing remains separate.
+  No new configuration, endpoints, permissions or persisted history.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Required frontend counter display/types; existing UDP relay counter shape is
+  documented alongside it:
+  [handoff 2026-11-01-01](docs/frontend-handoffs/2026-11-01.md#2026-11-01-01-mdns-and-udp-relay-entry-usage-counters).
+
 - Explicit passive NIC capability inventory:
   `POST /api/v1/interface-capabilities/refresh` reads all namespace-local links
   once and atomically persists daemon-owned observations;

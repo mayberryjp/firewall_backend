@@ -23,7 +23,10 @@ pub use udp_broadcast_relay::{UDPBroadcastRelayConfig, UDPRelayInstance, UDPRela
 
 pub use dynamic_dns::{DynamicDNSAddressSource, DynamicDNSConfig};
 pub use engine::{Engine, PERMISSIONS, Reply, TimezoneCheck, Transaction, validate_offline_state};
-pub use mdns::{MDNSConfig, MDNSInterfaceMode, MDNSPublishing, MDNSReflection, valid_mdns_name};
+pub use mdns::{
+    MDNSConfig, MDNSFilterCounters, MDNSInterfaceMode, MDNSPublishing, MDNSReflection,
+    valid_mdns_name,
+};
 pub use model::*;
 pub use sando::{SandoConfig, SandoImportState, SandoImportStatus};
 pub use simulator::Simulator;
