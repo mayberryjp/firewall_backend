@@ -13,6 +13,8 @@ mod mdns;
 mod model;
 mod rps;
 pub use rps::{MAX_CPU_ID, cpu_mask, parse_cpu_list, parse_cpu_mask, rps_target, validate_rps};
+mod tuning;
+pub use tuning::{NIC_OFFLOAD_FEATURES, NicOffloads, RfsConfig, validate_nic_offloads};
 mod sando;
 mod simulator;
 mod store;

@@ -1908,3 +1908,74 @@ fn rps_requires_canonical_masks_and_managed_ethernet_parents() {
             .is_none()
     );
 }
+
+#[test]
+fn rfs_and_offloads_require_explicit_physical_targets_and_valid_dependencies() {
+    let value = serde_json::json!({
+        "interfaces":[{"name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],
+        "kernel":{
+            "rps":{"eno1/rx-0":"2"},
+            "rfs":{"sock_flow_entries":4096,"queues":{"eno1/rx-0":1024}},
+            "offloads":{"eno1":{"rx-checksum":true,"rx-lro":false}}
+        }
+    });
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    config.validate().unwrap();
+    assert_eq!(
+        config.operational_value().unwrap()["kernel"],
+        serde_json::to_value(&config.kernel).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_value::<Config>(serde_json::to_value(&config).unwrap()).unwrap(),
+        config
+    );
+    for (pointer, replacement) in [
+        ("/kernel/rps/eno1~1rx-0", serde_json::json!("0")),
+        ("/kernel/rps", serde_json::json!({})),
+        ("/interfaces/0/kind", serde_json::json!("dummy")),
+        ("/kernel/rfs/sock_flow_entries", serde_json::json!(512)),
+        (
+            "/kernel/rfs/queues",
+            serde_json::json!({"missing/rx-0":1024}),
+        ),
+        (
+            "/kernel/offloads",
+            serde_json::json!({"missing":{"rx-checksum":true}}),
+        ),
+        ("/kernel/offloads/eno1/rx-lro", serde_json::json!(true)),
+    ] {
+        let mut invalid = value.clone();
+        *invalid.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            serde_json::from_value::<Config>(invalid)
+                .unwrap()
+                .validate()
+                .is_err(),
+            "{pointer}"
+        );
+    }
+    for (pointer, replacement) in [
+        ("/kernel/rfs/queues/eno1~1rx-0", serde_json::json!("1024")),
+        ("/kernel/rfs/sock_flow_entries", serde_json::json!(-1)),
+        ("/kernel/offloads/eno1/rx-checksum", serde_json::json!("on")),
+        ("/kernel/offloads", serde_json::Value::Null),
+    ] {
+        let mut invalid = value.clone();
+        *invalid.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            serde_json::from_value::<Config>(invalid).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut disabled = config;
+    disabled.kernel.rps.clear();
+    disabled.kernel.rfs = Some(crate::RfsConfig {
+        sock_flow_entries: 0,
+        queues: [("eno1/rx-0".into(), 0)].into(),
+    });
+    disabled.validate().unwrap();
+    disabled.kernel.rfs = None;
+    disabled.kernel.offloads.clear();
+    let kernel = serde_json::to_value(disabled.kernel).unwrap();
+    assert!(kernel.get("rfs").is_none() && kernel.get("offloads").is_none());
+}

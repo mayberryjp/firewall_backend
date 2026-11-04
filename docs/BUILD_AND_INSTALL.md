@@ -1144,11 +1144,14 @@ NICs selected for Netcontrol management. Native DHCPv4 is in-process; DNS
 publication uses systemd-resolved in host mode, not an embedded DNS server.
 
 WireGuard private keys must already exist in the private key
-directory (see [Creating a WireGuard private key](#creating-a-wireguard-private-key)). Add `--allow-host-tunables`, `--allow-host-services`, or
-`--gateway-monitoring` only after reviewing their host-wide effects and
+directory (see [Creating a WireGuard private key](#creating-a-wireguard-private-key)).
+Host mode enables configured host tuning and acquires its exclusive lock
+automatically; do not add `--allow-host-tunables` for appliance tuning.
+That option is only needed for host-global sysctls from an explicit lab namespace.
+Add `--allow-host-services` or `--gateway-monitoring` only after reviewing their host-wide effects and
 capabilities. Competing clock/logging services must not retain ownership when
 the corresponding native workers are enabled. Syslog TLS needs system CA roots.
-These opt-ins do not configure networking or enable services by themselves.
+These options do not configure networking or enable services by themselves.
 Host mode can interrupt the API/SSH connection while applying; use
 `commit confirmed`, independent connectivity verification and console access.
 

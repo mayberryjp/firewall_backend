@@ -59,6 +59,7 @@ mod ipv6;
 mod link_monitor;
 mod netfilter;
 mod networking;
+mod offloads;
 mod rps;
 mod rps_recommendations;
 mod sysctl;
@@ -296,7 +297,7 @@ impl Native {
                 },
             )?;
         }
-        let (host_namespace, host_lock) = if options.allow_host_tunables {
+        let (host_namespace, host_lock) = if host_mode || options.allow_host_tunables {
             let metadata = fs::symlink_metadata("/run")?;
             ensure!(
                 metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
@@ -368,9 +369,12 @@ impl Native {
             "native ownership belongs to another host/namespace/parent identity; state is not reset"
         );
         ensure!(
-            (ownership.kernel_baseline.host.is_empty() && ownership.kernel_baseline.rps.is_empty())
+            (ownership.kernel_baseline.host.is_empty()
+                && ownership.kernel_baseline.rps.is_empty()
+                && ownership.kernel_baseline.rfs.is_none()
+                && ownership.kernel_baseline.offloads.is_empty())
                 || native.host_namespace.is_some(),
-            "host tunable ownership requires explicit allow_host_tunables for recovery"
+            "host tunable recovery requires host mode or allow_host_tunables for a lab namespace"
         );
         native.bgp.recover()?;
         let originals = ownership.handover_originals(
@@ -559,9 +563,9 @@ impl Native {
         );
         ensure!(
             network.kernel.host.is_empty() || self.host_namespace.is_some(),
-            "host-global kernel tunables require explicit allow_host_tunables"
+            "host-global kernel tunables require host mode or allow_host_tunables for a lab namespace"
         );
-        self.allow_rps(&network.kernel)?;
+        self.allow_tuning(&network.kernel)?;
         for key in network.kernel.rps.keys() {
             let (name, _) = netcontrol_core::rps_target(key)?;
             ensure!(
@@ -631,7 +635,7 @@ impl Native {
         ownership: &mut Ownership,
     ) -> Result<()> {
         self.check_scope()?;
-        self.allow_rps(&kernel)?;
+        self.allow_tuning(&kernel)?;
         let mut before = Network::parse(before)?;
         let mut after = Network::parse(after)?;
         let leases = self
@@ -694,6 +698,12 @@ impl Native {
             })?;
         }
         rps::Io::system().write(&kernel.rps, &kernel.rps_identity)?;
+        rps::Io::system().write_rfs(&kernel.rfs, &kernel.rfs_identity)?;
+        offloads::Io::system().write_requested(
+            &kernel.offloads,
+            &kernel.offload_requested,
+            &kernel.offload_identity,
+        )?;
         ownership.scope = self.identity.clone();
         // Set by caller after actual kernel convergence; never synthesize a live fingerprint.
         ownership.firewall_fingerprint = Some(fingerprint);
@@ -709,6 +719,11 @@ impl Native {
         // removing a key from the desired configuration and changing it externally.
         let baseline = self.ownership()?.kernel_baseline;
         keys.capture_originals(&baseline);
+        let (features, requested, identities) =
+            offloads::Io::system().complete_state(&keys.offloads, &keys.offload_identity)?;
+        keys.offloads = features;
+        keys.offload_requested = requested;
+        keys.offload_identity = identities;
         self.read_kernel(&keys)
     }
 
@@ -720,7 +735,7 @@ impl Native {
     }
 
     fn read_kernel(&self, keys: &Kernel) -> Result<Kernel> {
-        self.allow_rps(keys)?;
+        self.allow_tuning(keys)?;
         let values = keys.namespace.clone();
         let namespace = session(self.namespace.clone(), move |_, _| {
             sysctl::read_scope(&values, "namespace")
@@ -731,16 +746,24 @@ impl Native {
             let handle = self
                 .host_namespace
                 .clone()
-                .context("host tunables require operator allow_host_tunables")?;
+                .context("host tunable ownership is unavailable")?;
             let values = keys.host.clone();
             host_session(handle, move |_, _| sysctl::read_scope(&values, "host"))?
         };
         let (rps, rps_identity) = rps::Io::system().read(&keys.rps, &keys.rps_identity)?;
+        let (rfs, rfs_identity) = rps::Io::system().read_rfs(&keys.rfs, &keys.rfs_identity)?;
+        let (offloads, offload_requested, offload_identity) =
+            offloads::Io::system().read_state(&keys.offloads, &keys.offload_identity)?;
         Ok(Kernel {
             namespace,
             host,
             rps,
             rps_identity,
+            rfs,
+            rfs_identity,
+            offloads,
+            offload_requested,
+            offload_identity,
         })
     }
 
@@ -752,11 +775,11 @@ impl Native {
         Ok(())
     }
 
-    fn allow_rps(&self, values: &Kernel) -> Result<()> {
+    fn allow_tuning(&self, values: &Kernel) -> Result<()> {
         ensure!(
-            values.rps.is_empty()
+            (values.rps.is_empty() && values.rfs.is_none() && values.offloads.is_empty())
                 || (self.options.namespace.is_empty() && self.host_namespace.is_some()),
-            "RPS tuning requires native host mode and explicit allow_host_tunables"
+            "RPS/RFS/NIC offload tuning requires native host mode and exclusive host tunable ownership"
         );
         Ok(())
     }
@@ -802,7 +825,7 @@ impl Native {
                             Ok(values) => {
                                 queue_count += values.len();
                                 ensure!(queue_count <= 4096, "performance RX queue limit exceeded");
-                                queues = json!(values.into_iter().map(|(name,mask)| json!({"name":name,"rps_cpus":mask})).collect::<Vec<_>>());
+                                queues = json!(values.into_iter().map(|(name,mask,flows)| json!({"name":name,"rps_cpus":mask,"rps_flow_cnt":flows})).collect::<Vec<_>>());
                             }
                             Err(error) => errors.push(format!("RX queues: {error:#}")),
                         }
@@ -858,14 +881,25 @@ impl Native {
         snapshot["sample"]["backend_scope"] = json!(self.identity);
         snapshot["interfaces"] = json!(interfaces);
         snapshot["configured_rps"] = json!(config.kernel.rps);
+        snapshot["configured_rfs"] = json!(config.kernel.rfs);
+        snapshot["configured_offloads"] = json!(config.kernel.offloads);
+        snapshot["rfs"] = match rps::Io::system().rfs_entries() {
+            Ok(entries) => json!({"status":"ready","sock_flow_entries":entries,"error":null}),
+            Err(error) => {
+                snapshot["sample"]["status"] = json!("partial");
+                json!({"status":"unavailable","sock_flow_entries":null,"error":format!("{error:#}")})
+            }
+        };
         snapshot["tuning_available"] = json!(self.host_namespace.is_some());
         snapshot["recommendations"] = json!(rps_recommendations::recommendations(&snapshot)?);
         Ok(snapshot)
     }
 
     fn preflight_kernel(&self, values: &Kernel) -> Result<()> {
-        self.allow_rps(values)?;
+        self.allow_tuning(values)?;
         rps::Io::system().preflight(&values.rps, &values.rps_identity)?;
+        rps::Io::system().preflight_rfs(&values.rfs, &values.rfs_identity)?;
+        offloads::Io::system().preflight(&values.offloads, &values.offload_identity)?;
         let namespace = values.namespace.clone();
         session(self.namespace.clone(), move |_, _| {
             for (name, value) in namespace {
@@ -877,7 +911,7 @@ impl Native {
             let handle = self
                 .host_namespace
                 .clone()
-                .context("host tunables require operator allow_host_tunables")?;
+                .context("host tunable ownership is unavailable")?;
             let host = values.host.clone();
             host_session(handle, move |_, _| {
                 for (name, value) in host {
@@ -1039,7 +1073,7 @@ impl Native {
             ownership.committed_config = Some(after.clone());
             ownership
                 .kernel_baseline
-                .release_rps(&Network::parse(after)?.kernel);
+                .release_tuning(&Network::parse(after)?.kernel);
             ownership.boot = self.boot.clone();
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))
@@ -1297,7 +1331,6 @@ impl Backend for Native {
             let before = before.operational_value()?;
             let after = after.operational_value()?;
             self.services.validate(&after)?;
-            self.preflight(&before)?;
             self.preflight(&after)?;
             let mut ownership = self.ownership()?;
             if self.options.namespace.is_empty()
@@ -1392,7 +1425,7 @@ impl Backend for Native {
                 ownership.committed_config = Some(after.clone());
                 ownership
                     .kernel_baseline
-                    .release_rps(&Network::parse(&after)?.kernel);
+                    .release_tuning(&Network::parse(&after)?.kernel);
                 ownership.boot = self.boot.clone();
                 self.services.apply(&before, &after)?;
                 self.dhcp_monitors.configure(&after)?;
@@ -1860,6 +1893,8 @@ fn trusted_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
+
 fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T> {
     let file = OpenOptions::new()
         .read(true)
@@ -1870,13 +1905,18 @@ fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T> {
         metadata.is_file()
             && metadata.uid() == unsafe { libc::geteuid() }
             && metadata.mode() & 0o077 == 0
-            && metadata.len() <= 16 * 1024 * 1024,
+            && metadata.len() <= MAX_STATE_BYTES as u64,
         "untrusted native state file"
     );
     serde_json::from_reader(file).context("decode native state")
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let encoded = serde_json::to_vec(value)?;
+    ensure!(
+        encoded.len() <= MAX_STATE_BYTES,
+        "native state exceeds 16 MiB recovery limit"
+    );
     let pending = path.with_extension("writing");
     // A crash before rename can leave this non-authoritative staging file behind.
     if pending.try_exists()? {
@@ -1897,7 +1937,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&pending)?;
     let result = (|| {
-        file.write_all(&serde_json::to_vec(value)?)?;
+        file.write_all(&encoded)?;
         file.sync_all()?;
         fs::rename(&pending, path)?;
         File::open(path.parent().context("state parent")?)?.sync_all()?;
@@ -1918,6 +1958,31 @@ fn remove_durable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn oversized_feature_snapshots_cannot_replace_readable_recovery_state() -> Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "netcontrol-state-size-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&root)?;
+        let path = root.join("state.json");
+        write_json(&path, &"original")?;
+        let before = fs::read(&path)?;
+        assert!(write_json(&path, &"x".repeat(MAX_STATE_BYTES)).is_err());
+        assert_eq!(fs::read(&path)?, before);
+        assert!(!path.with_extension("writing").exists());
+        let boundary = "x".repeat(MAX_STATE_BYTES - 2);
+        write_json(&path, &boundary)?;
+        assert_eq!(fs::metadata(&path)?.len(), MAX_STATE_BYTES as u64);
+        assert_eq!(read_json::<String>(&path)?, boundary);
+        fs::remove_file(path)?;
+        fs::remove_dir(root)?;
+        Ok(())
+    }
 
     fn inherited_ownership() -> Ownership {
         let mut ownership = Ownership::default();

@@ -12,8 +12,8 @@ must be designed against current code before implementation. The
 | Milestone | Status | Outcome |
 | --- | --- | --- |
 | 1. Diagnostics and transactional RPS | Backend implemented locally, Unreleased; frontend and physical acceptance pending | Identify CPU pressure and support explicitly reviewed, rollback-aware RPS trials |
-| 2. Safe NIC offload management | Next backend build; planned | Inspect and explicitly manage supported NIC offloads through confirmed transactions |
-| 3. WAN smart queue management | Planned after milestone 2 | Reduce latency under load using supported CAKE/FQ-CoDel-based shaping |
+| 2. Safe NIC offload management and RFS | Backend implemented locally, Unreleased; physical/frontend acceptance pending | Explicit driver feature controls and RFS budgets with confirmed transactions, original capture and recovery |
+| 3. WAN smart queue management | Explicitly deferred by user | No ALTQ/CAKE/FQ-CoDel/HTB or ingress shaping is implemented |
 
 No measured appliance speedup has been established. Most important checksum,
 segmentation, GRO and VLAN offloads were already enabled in the supplied
@@ -55,14 +55,26 @@ Frontend work:
 Physical acceptance is required before production tuning. Milestone 2 code can
 be developed without enabling unverified settings on an appliance.
 
-## 2. Next build: safe NIC offload management
+## 2. Safe NIC offload management and RFS
 
 ### Scope
 
-Add live inspection and explicit control of driver-supported, changeable
+Implemented live inspection and explicit control of driver-supported, changeable
 checksum, GRO/GSO, TSO and VLAN offloads. Preserve individual feature names,
 support/changeability, enabled state and error evidence. Do not equate feature
 availability with a performance benefit.
+
+Also implemented explicit RFS global/per-queue table sizes, with bounded
+power-of-two budgets, RPS dependencies, identity checks and native recovery.
+RFS targets local socket applications, not a promise of faster forwarding.
+Active **and requested** offload bitmaps participate in exact readback and
+original restoration. Driver side effects and oversized recovery snapshots fail
+explicitly. Automatic host-mode tuning availability does not enable any setting.
+See the [current contract](../FRONTEND_SPEC.md#explicit-rfs-and-nic-offload-configuration),
+[handoff 2026-11-04-06](frontend-handoffs/2026-11-04.md#2026-11-04-06-nic-offload-controls-and-rfs)
+and [journal](journal/2026-11-04.md#nic-offload-controls-and-rfs).
+The following implementation checklist is retained as acceptance context, not
+authorization to deploy or a claim that physical acceptance is complete.
 
 ### Implementation sequence
 
@@ -73,7 +85,7 @@ availability with a performance benefit.
    Decide the supported feature set and dependency handling from verified
    kernel/driver semantics, not guessed aliases or an "enable all" profile.
 3. Implement bounded direct Rust/kernel inspection and writes, with physical
-   interface identity checks, operator opt-in and explicit permissions.
+   interface identity checks, automatic host-mode tuning ownership and explicit permissions.
    No external ethtool process or arbitrary command endpoint.
 4. Capture original values durably before mutation. Integrate with complete
    confirmed transactions, exact post-write readback, apply failure recovery,
@@ -105,7 +117,11 @@ availability with a performance benefit.
 Do not enable `rx-all`, `rx-fcs` or every disabled feature as a generic speed
 optimization. Most useful offloads may already be enabled.
 
-## 3. Following build: WAN smart queue management
+## 3. Deferred: WAN smart queue management
+
+The user explicitly deferred **all traffic shaping** while requesting offload
+and RFS controls. The following is future design context only, not delivered
+functionality or authorization to implement/enable it.
 
 Goal: improve latency during uploads/downloads, not promise a higher link rate.
 
@@ -131,7 +147,8 @@ and verify management connectivity and rollback.
 
 - Ring-buffer/coalescing controls: first verify driver support and measure
   throughput-versus-latency tradeoffs.
-- RFS: prioritize local application traffic needs separately from forwarding.
+- Hardware accelerated RFS-specific driver controls: software RFS table
+  configuration is implemented; no new hardware ntuple/RSS tuning is included.
 - RSS/multiqueue controls: current inventory did not establish usable support.
 - nftables software flow acceleration: first resolve policy-change, logging,
   counter, accounting and shaping interactions; no silent datapath bypass.
@@ -146,8 +163,9 @@ and verify management connectivity and rollback.
    [canonical contract](../FRONTEND_SPEC.md).
 2. Check the working tree and preserve unrelated changes. Reconfirm which
    milestones are actually implemented, reviewed, deployed and measured.
-3. Start milestone 2 unless priorities have changed; do not repeat milestone 1
-   implementation or treat its physical acceptance as already complete.
+3. Finish physical/frontend acceptance for milestones 1 and 2; do not repeat
+   delivered controls or treat container tests as physical acceptance.
+   Traffic shaping remains deferred unless explicitly requested again.
 4. Keep new work under Unreleased and use automatic calendar versioning.
    Planned runtime additions are expected to be additive, but document actual
    contract impact when designed; do not manually bump the release seed.

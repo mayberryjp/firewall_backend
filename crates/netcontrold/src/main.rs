@@ -61,7 +61,10 @@ struct Options {
     keys: PathBuf,
     #[arg(long, value_delimiter = ',')]
     adopt_parents: Vec<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Allow host-global sysctls from an explicit lab namespace; host mode enables tuning automatically"
+    )]
     allow_host_tunables: bool,
     #[arg(long, env = "NETCONTROL_ALLOW_HOST_SERVICES")]
     allow_host_services: bool,

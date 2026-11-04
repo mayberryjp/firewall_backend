@@ -176,6 +176,53 @@ impl Backend for Simulator {
                 live.insert(name.clone(), values.get(name).unwrap_or(value).clone());
             }
         }
+        if let Some(desired) = &after.kernel.rfs {
+            let original = self.original.rfs.get_or_insert_with(|| crate::RfsConfig {
+                sock_flow_entries: self
+                    .live
+                    .rfs
+                    .as_ref()
+                    .map_or(0, |live| live.sock_flow_entries),
+                queues: Default::default(),
+            });
+            for name in desired.queues.keys() {
+                original.queues.entry(name.clone()).or_insert_with(|| {
+                    self.live
+                        .rfs
+                        .as_ref()
+                        .and_then(|live| live.queues.get(name))
+                        .copied()
+                        .unwrap_or(0)
+                });
+            }
+        }
+        self.live.rfs = self.original.rfs.clone();
+        if let Some(desired) = &after.kernel.rfs {
+            let live = self.live.rfs.as_mut().expect("RFS originals captured");
+            live.sock_flow_entries = desired.sock_flow_entries;
+            live.queues.extend(desired.queues.clone());
+        }
+        for (name, features) in &after.kernel.offloads {
+            let original = self.original.offloads.entry(name.clone()).or_default();
+            for feature in features.keys() {
+                original.entry(feature.clone()).or_insert_with(|| {
+                    self.live
+                        .offloads
+                        .get(name)
+                        .and_then(|live| live.get(feature))
+                        .copied()
+                        .unwrap_or(false)
+                });
+            }
+        }
+        self.live.offloads.clone_from(&self.original.offloads);
+        for (name, features) in &after.kernel.offloads {
+            self.live
+                .offloads
+                .entry(name.clone())
+                .or_default()
+                .extend(features.clone());
+        }
         self.state = after.normalized();
         Ok(())
     }
@@ -254,6 +301,8 @@ impl Backend for Simulator {
                     "started_at":null,"collected_at":null,"sample_interval_seconds":null,
                     "allowed_cpus_scope":null,"atomic":false,"identity_stable":false},
                 "sections":sections,"interfaces":null,"configured_rps":config.kernel.rps,
+                "configured_rfs":config.kernel.rfs,"configured_offloads":config.kernel.offloads,
+                "rfs":{"status":"simulated","sock_flow_entries":null,"error":null},
                 "tuning_available":false,"recommendations":[]
             }));
         }

@@ -179,6 +179,10 @@ kernel host|namespace KEY VALUE
 no kernel host|namespace KEY
 kernel rps INTERFACE/rx-N MASK
 no kernel rps INTERFACE/rx-N
+kernel rfs JSON
+no kernel rfs
+kernel offload INTERFACE FEATURE enable|disable
+no kernel offload INTERFACE [FEATURE]
 ```
 
 `show statistics performance` reads passive CPU/IRQ/softnet and physical RX-queue
@@ -186,12 +190,30 @@ evidence (`state.read`). `kernel rps` stages a canonical lowercase hexadecimal
 CPU mask, for example `c` selects CPUs 2 and 3; this is a synthetic example,
 not an appliance recommendation. Mask `0` explicitly disables RPS; `no kernel
 rps` restores the queue's captured original mask on apply. Changes require
-`transactions.write`, `interfaces.write`, `kernel.host.write`, native host mode
-and operator `allow_host_tunables`. Use a managed physical Ethernet parent, not a
+`transactions.write`, `interfaces.write`, `kernel.host.write` and native host mode,
+which automatically acquires tuning ownership without an extra launch flag.
+Use a managed physical Ethernet parent, not a
 VLAN/tunnel. `commit check` validates configuration, not live queue/CPU/write
 availability. Apply still requires `commit confirmed` and explicit `confirm`
 after independent connectivity/performance checks. No IRQ or other tuning is
 changed. See the [contract](../FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning).
+
+`kernel rfs` replaces the candidate's typed global/per-queue RFS object, for
+example `kernel rfs {"sock_flow_entries":4096,"queues":{"eno1/rx-0":1024}}`.
+This is synthetic, not a recommended appliance setting. Counts are zero or powers
+of two up to 1048576; positive queue counts need explicit nonzero candidate RPS
+masks, and their sum cannot exceed the global count. `no kernel rfs` restores
+captured global/queue originals on apply. RFS is primarily for local applications.
+
+`kernel offload eno1 rx-checksum enable` stages one exact driver feature;
+`disable` explicitly owns a false setting. `no kernel offload eno1 rx-checksum`
+restores that feature's original setting; omitting FEATURE releases all offload
+ownership on that interface. No external ethtool command runs. Missing/fixed
+features, incoherent dependencies and unexpected side effects fail explicitly;
+LRO cannot be enabled. These commands use the same permissions, automatic
+host-mode ownership, confirmed transaction and recovery workflow as RPS.
+No offloads or RFS are enabled by merely displaying capabilities. See the
+[complete feature/count contract](../FRONTEND_SPEC.md#explicit-rfs-and-nic-offload-configuration).
 
 Route-add commands explicitly stage `enabled: true`. Route deletion matches the
 specified path/table/metric regardless of its enabled flag or metadata, so a

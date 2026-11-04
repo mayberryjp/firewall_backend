@@ -675,6 +675,10 @@ pub struct KernelConfig {
     pub host: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub rps: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rfs: Option<crate::RfsConfig>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub offloads: crate::NicOffloads,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1149,6 +1153,28 @@ impl Config {
                     .iter()
                     .any(|link| link.name == name && link.kind == "ethernet"),
                 "RPS requires a managed physical Ethernet interface; configure the parent, not a VLAN or tunnel"
+            );
+        }
+        let rfs_queues = self.kernel.rfs.iter().flat_map(|rfs| rfs.queues.iter());
+        for (key, count) in rfs_queues {
+            let (name, _) = crate::rps_target(key)?;
+            ensure!(
+                self.interfaces
+                    .iter()
+                    .any(|link| link.name == name && link.kind == "ethernet"),
+                "RFS requires a managed physical Ethernet interface"
+            );
+            ensure!(
+                *count == 0 || self.kernel.rps.get(key).is_some_and(|mask| mask != "0"),
+                "positive RFS queue counts require an explicit nonzero RPS mask on the same queue"
+            );
+        }
+        for name in self.kernel.offloads.keys() {
+            ensure!(
+                self.interfaces
+                    .iter()
+                    .any(|link| link.name == *name && link.kind == "ethernet"),
+                "NIC offloads require a managed physical Ethernet interface"
             );
         }
         let mut names = BTreeSet::new();
@@ -1897,6 +1923,10 @@ pub fn kernel_catalog() -> Vec<KernelParameter> {
 impl KernelConfig {
     pub fn validate(&self) -> Result<()> {
         crate::validate_rps(&self.rps)?;
+        if let Some(rfs) = &self.rfs {
+            rfs.validate()?;
+        }
+        crate::validate_nic_offloads(&self.offloads)?;
         for (scope, map) in [("namespace", &self.namespace), ("host", &self.host)] {
             for (name, value) in map {
                 let p = kernel_catalog()

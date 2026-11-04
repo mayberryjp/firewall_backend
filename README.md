@@ -79,8 +79,9 @@ Explicit `kernel.rps` entries map physical managed Ethernet RX queues to canonic
 Linux CPU masks, for example `{"eno1/rx-0":"c"}` selects CPUs 2 and 3.
 This is a synthetic illustration, not a recommended mask for another appliance.
 Use complete confirmed configuration transactions with `transactions.write`,
-`kernel.host.write` and `interfaces.write`. Native host mode and operator
-`allow_host_tunables` opt-in are required. No IRQ, offload, RSS, RFS or VLAN queue
+`kernel.host.write` and `interfaces.write`. Native host mode enables tuning
+automatically and acquires its exclusive host-tunables lock at startup; no
+extra launch flag or permission refresh is required. No IRQ, offload, RSS, RFS or VLAN queue
 settings are changed automatically. Zero disables RPS; removing an entry restores
 its captured original mask. Native durable intents cover apply failures and
 interrupted recovery, and confirmation timeout restores the prior configuration.
@@ -90,6 +91,30 @@ and `no kernel rps INTERFACE/rx-N` in the normal candidate/confirmed workflow.
 See the [contract](FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning) and
 [frontend handoff](docs/frontend-handoffs/2026-11-04.md#2026-11-04-03-performance-diagnostics-and-transactional-rps).
 Real hardware connectivity and performance acceptance remain operator work.
+
+## NIC offloads and RFS
+
+Explicit `kernel.offloads` maps managed physical Ethernet names to exact Linux
+feature booleans for checksum, scatter/gather, segmentation, GRO and VLAN
+offloads. Driver support/changeability is freshly checked; unsafe LRO enabling
+is rejected. Full active and requested feature state is captured so coupled or
+unrelated changes cannot silently succeed and original settings can be restored.
+No external ethtool process is used.
+
+Optional `kernel.rfs` sets the host-global `sock_flow_entries` budget and
+per-RX-queue table sizes, with zero/power-of-two validation and explicit nonzero
+RPS dependencies. This targets local socket consumers, not generic forwarded
+traffic acceleration. Global changes affect other local applications.
+
+Both use automatic host-mode tuning availability with exclusive ownership,
+permissions, confirmed transactions, original
+capture, exact readback, rollback and recovery as RPS. Nothing is enabled
+automatically. Inspect existing kernel/runtime and capability APIs; do not copy
+observational identity/requested-bit metadata into editable configuration.
+See the [contract](FRONTEND_SPEC.md#explicit-rfs-and-nic-offload-configuration)
+and [frontend handoff](docs/frontend-handoffs/2026-11-04.md#2026-11-04-06-nic-offload-controls-and-rfs).
+All traffic shaping remains explicitly deferred; no ALTQ/CAKE/FQ-CoDel/HTB or
+ingress redirection is installed.
 
 ## Read-only loopback interfaces
 

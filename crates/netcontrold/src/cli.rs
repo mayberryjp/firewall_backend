@@ -54,6 +54,8 @@ Configuration commands:
   exporter JSON / no exporter NAME / gateway-monitor JSON / no gateway-monitor NAME
   kernel host|namespace KEY VALUE / no kernel host|namespace KEY
   kernel rps INTERFACE/rx-N MASK / no kernel rps INTERFACE/rx-N
+  kernel rfs JSON / no kernel rfs
+  kernel offload INTERFACE FEATURE enable|disable / no kernel offload INTERFACE [FEATURE]
   set /JSON/pointer JSON               Typed schema edit; array '-' appends
   delete /JSON/pointer                 Delete optional/defaulted field or array element
   load candidate JSON                 Replace private candidate, never live state
@@ -987,6 +989,52 @@ fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
         }
         [service @ ("ntp" | "syslog" | "vnstat"), state] => {
             config[*service]["enabled"] = json!(enabled(state)?)
+        }
+        ["kernel", "rfs", ..] => {
+            let rfs: netcontrol_core::RfsConfig = serde_json::from_str(
+                command_input(line, "kernel rfs").context("RFS JSON object required")?,
+            )?;
+            config["kernel"]["rfs"] = serde_json::to_value(rfs)?;
+        }
+        ["no", "kernel", "rfs"] => {
+            config["kernel"]
+                .as_object_mut()
+                .context("kernel object required")?
+                .remove("rfs");
+        }
+        ["kernel", "offload", interface, feature, state] => {
+            if config["kernel"]["offloads"].is_null() {
+                config["kernel"]["offloads"] = json!({});
+            }
+            if config["kernel"]["offloads"][*interface].is_null() {
+                config["kernel"]["offloads"][*interface] = json!({});
+            }
+            config["kernel"]["offloads"][*interface][*feature] = json!(enabled(state)?);
+        }
+        ["no", "kernel", "offload", interface, feature] => {
+            let features = config["kernel"]["offloads"][*interface]
+                .as_object_mut()
+                .context("offload feature map not found")?;
+            ensure!(
+                features.remove(*feature).is_some(),
+                "offload feature not found"
+            );
+            if features.is_empty() {
+                config["kernel"]["offloads"]
+                    .as_object_mut()
+                    .context("offload map required")?
+                    .remove(*interface);
+            }
+        }
+        ["no", "kernel", "offload", interface] => {
+            ensure!(
+                config["kernel"]["offloads"]
+                    .as_object_mut()
+                    .context("offload map required")?
+                    .remove(*interface)
+                    .is_some(),
+                "offload interface not found"
+            );
         }
         ["kernel", scope @ ("host" | "namespace" | "rps"), key, value] => {
             if config["kernel"][*scope].is_null() {

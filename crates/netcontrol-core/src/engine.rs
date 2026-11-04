@@ -299,6 +299,14 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ("kernel.host.write", a.kernel.host != b.kernel.host),
         ("kernel.host.write", a.kernel.rps != b.kernel.rps),
         ("interfaces.write", a.kernel.rps != b.kernel.rps),
+        (
+            "kernel.host.write",
+            a.kernel.rfs != b.kernel.rfs || a.kernel.offloads != b.kernel.offloads,
+        ),
+        (
+            "interfaces.write",
+            a.kernel.rfs != b.kernel.rfs || a.kernel.offloads != b.kernel.offloads,
+        ),
         ("nat.write", a.firewall.nat != b.firewall.nat),
     ] {
         if different {
@@ -1556,6 +1564,8 @@ impl Engine {
             if !expected.kernel.namespace.is_empty()
                 || !expected.kernel.host.is_empty()
                 || !expected.kernel.rps.is_empty()
+                || expected.kernel.rfs.is_some()
+                || !expected.kernel.offloads.is_empty()
             {
                 return Err(service_error(
                     "backend does not expose kernel rollback snapshots",

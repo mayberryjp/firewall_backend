@@ -73,6 +73,16 @@ pub struct Kernel {
     pub rps: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rps_identity: BTreeMap<String, RpsIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rfs: Option<netcontrol_core::RfsConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rfs_identity: BTreeMap<String, RpsIdentity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub offloads: netcontrol_core::NicOffloads,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub offload_requested: netcontrol_core::NicOffloads,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub offload_identity: BTreeMap<String, RpsIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -89,6 +99,30 @@ impl Kernel {
         self.host.extend(values.host.clone());
         self.rps.extend(values.rps.clone());
         self.rps_identity.extend(values.rps_identity.clone());
+        if let Some(values) = &values.rfs {
+            let rfs = self.rfs.get_or_insert_with(|| values.clone());
+            rfs.sock_flow_entries = values.sock_flow_entries;
+            rfs.queues.extend(values.queues.clone());
+        }
+        self.rfs_identity.extend(values.rfs_identity.clone());
+        for (name, features) in &values.offloads {
+            self.offloads
+                .entry(name.clone())
+                .or_default()
+                .extend(features.clone());
+            self.offload_requested
+                .entry(name.clone())
+                .or_default()
+                .extend(features.clone());
+        }
+        for (name, features) in &values.offload_requested {
+            self.offload_requested
+                .entry(name.clone())
+                .or_default()
+                .extend(features.clone());
+        }
+        self.offload_identity
+            .extend(values.offload_identity.clone());
     }
 
     pub fn capture_originals(&mut self, values: &Self) {
@@ -106,19 +140,65 @@ impl Kernel {
         for (name, identity) in &values.rps_identity {
             self.rps_identity.insert(name.clone(), identity.clone());
         }
+        if let Some(values) = &values.rfs {
+            let rfs = self.rfs.get_or_insert_with(|| values.clone());
+            for (name, value) in &values.queues {
+                rfs.queues.entry(name.clone()).or_insert(*value);
+            }
+        }
+        self.rfs_identity.extend(values.rfs_identity.clone());
+        for (name, features) in &values.offloads {
+            let original = self.offloads.entry(name.clone()).or_default();
+            for (feature, value) in features {
+                original.entry(feature.clone()).or_insert(*value);
+            }
+            for (name, features) in &values.offload_requested {
+                let original = self.offload_requested.entry(name.clone()).or_default();
+                for (feature, value) in features {
+                    original.entry(feature.clone()).or_insert(*value);
+                }
+            }
+        }
+        self.offload_identity
+            .extend(values.offload_identity.clone());
     }
 
     pub fn same_values(&self, other: &Self) -> bool {
-        self.namespace == other.namespace && self.host == other.host && self.rps == other.rps
+        self.namespace == other.namespace
+            && self.host == other.host
+            && self.rps == other.rps
+            && self.rfs == other.rfs
+            && self.offloads == other.offloads
+            && self.offload_requested == other.offload_requested
     }
 
-    pub fn release_rps(&mut self, desired: &Self) {
+    pub fn release_tuning(&mut self, desired: &Self) {
         self.rps.retain(|key, _| desired.rps.contains_key(key));
         self.rps_identity.retain(|name, _| {
             self.rps.keys().any(|key| {
                 netcontrol_core::rps_target(key).is_ok_and(|(interface, _)| interface == name)
             })
         });
+        if let (Some(original), Some(desired)) = (&mut self.rfs, &desired.rfs) {
+            original
+                .queues
+                .retain(|key, _| desired.queues.contains_key(key));
+        } else if desired.rfs.is_none() {
+            self.rfs = None;
+        }
+        self.rfs_identity.retain(|name, _| {
+            self.rfs.as_ref().is_some_and(|rfs| {
+                rfs.queues.keys().any(|key| {
+                    netcontrol_core::rps_target(key).is_ok_and(|(interface, _)| interface == name)
+                })
+            })
+        });
+        self.offloads
+            .retain(|name, _| desired.offloads.contains_key(name));
+        self.offload_requested
+            .retain(|name, _| desired.offloads.contains_key(name));
+        self.offload_identity
+            .retain(|name, _| self.offloads.contains_key(name));
     }
 }
 
@@ -194,6 +274,31 @@ impl Network {
 
     pub fn validate(&self, parents: &BTreeSet<String>) -> Result<()> {
         netcontrol_core::validate_rps(&self.kernel.rps)?;
+        netcontrol_core::validate_nic_offloads(&self.kernel.offloads)?;
+        if let Some(rfs) = &self.kernel.rfs {
+            rfs.validate()?;
+            for (key, count) in &rfs.queues {
+                let (name, _) = netcontrol_core::rps_target(key)?;
+                ensure!(
+                    self.interfaces
+                        .iter()
+                        .any(|link| link.name == name && link.kind == "ethernet"),
+                    "RFS requires a managed physical Ethernet interface"
+                );
+                ensure!(
+                    *count == 0 || self.kernel.rps.get(key).is_some_and(|mask| mask != "0"),
+                    "positive RFS counts require explicit nonzero RPS on the same queue"
+                );
+            }
+        }
+        for name in self.kernel.offloads.keys() {
+            ensure!(
+                self.interfaces
+                    .iter()
+                    .any(|link| link.name == *name && link.kind == "ethernet"),
+                "NIC offloads require a managed physical Ethernet interface"
+            );
+        }
         for key in self.kernel.rps.keys() {
             let (name, _) = netcontrol_core::rps_target(key)?;
             ensure!(
@@ -445,9 +550,93 @@ mod tests {
         let restored: Kernel =
             serde_json::from_slice(&serde_json::to_vec(&baseline).unwrap()).unwrap();
         assert_eq!(restored, baseline);
-        baseline.release_rps(&Kernel::default());
+        baseline.release_tuning(&Kernel::default());
         assert!(baseline.rps.is_empty());
         assert!(baseline.rps_identity.is_empty());
+    }
+
+    #[test]
+    fn tuning_baselines_preserve_full_feature_wishes_and_shared_rfs_originals() {
+        let mut baseline = Kernel {
+            rfs: Some(netcontrol_core::RfsConfig {
+                sock_flow_entries: 0,
+                queues: [("eno1/rx-0".into(), 1024)].into(),
+            }),
+            offloads: [(
+                "eno1".into(),
+                [
+                    ("rx-gro".into(), false),
+                    ("tx-tcp-segmentation".into(), false),
+                ]
+                .into(),
+            )]
+            .into(),
+            offload_requested: [(
+                "eno1".into(),
+                [
+                    ("rx-gro".into(), false),
+                    ("tx-tcp-segmentation".into(), true),
+                ]
+                .into(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let desired = Kernel {
+            rfs: Some(netcontrol_core::RfsConfig {
+                sock_flow_entries: 4096,
+                queues: [("eno1/rx-0".into(), 2048)].into(),
+            }),
+            offloads: [("eno1".into(), [("rx-gro".into(), true)].into())].into(),
+            ..Default::default()
+        };
+        let mut target = baseline.clone();
+        target.overlay(&desired);
+        assert_eq!(target.rfs.as_ref().unwrap().sock_flow_entries, 4096);
+        assert_eq!(target.rfs.as_ref().unwrap().queues["eno1/rx-0"], 2048);
+        assert!(target.offloads["eno1"]["rx-gro"]);
+        assert!(target.offload_requested["eno1"]["rx-gro"]);
+        assert!(!target.offloads["eno1"]["tx-tcp-segmentation"]);
+        assert!(target.offload_requested["eno1"]["tx-tcp-segmentation"]);
+        let mut captured = target.clone();
+        captured
+            .rfs
+            .as_mut()
+            .unwrap()
+            .queues
+            .insert("eno1/rx-1".into(), 512);
+        baseline.capture_originals(&captured);
+        assert_eq!(baseline.rfs.as_ref().unwrap().sock_flow_entries, 0);
+        assert_eq!(baseline.rfs.as_ref().unwrap().queues["eno1/rx-0"], 1024);
+        assert_eq!(baseline.rfs.as_ref().unwrap().queues["eno1/rx-1"], 512);
+        assert!(!baseline.offloads["eno1"]["rx-gro"]);
+        assert!(baseline.offload_requested["eno1"]["tx-tcp-segmentation"]);
+        let persisted = serde_json::to_value(&baseline).unwrap();
+        let restored: Kernel = serde_json::from_value(persisted).unwrap();
+        assert!(restored.same_values(&baseline));
+        let mut drift = baseline.clone();
+        drift
+            .offload_requested
+            .get_mut("eno1")
+            .unwrap()
+            .insert("tx-tcp-segmentation".into(), false);
+        assert!(!drift.same_values(&baseline));
+        baseline.release_tuning(&desired);
+        assert!(
+            !baseline
+                .rfs
+                .as_ref()
+                .unwrap()
+                .queues
+                .contains_key("eno1/rx-1")
+        );
+        assert_eq!(baseline.offloads["eno1"].len(), 2);
+        baseline.release_tuning(&Kernel::default());
+        assert!(
+            baseline.rfs.is_none()
+                && baseline.offloads.is_empty()
+                && baseline.offload_requested.is_empty()
+        );
     }
 
     #[test]

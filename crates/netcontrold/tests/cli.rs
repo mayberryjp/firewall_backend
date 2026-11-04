@@ -1014,3 +1014,35 @@ fn performance_rps_cli_stages_confirms_and_restores() {
             .contains("simulated")
     );
 }
+
+#[test]
+fn offload_and_rfs_cli_use_the_confirmed_candidate_workflow() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, r#"set /interfaces [{"name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}]"#);
+    f.ok(&mut cli, "kernel rps eno1/rx-0 2");
+    f.ok(
+        &mut cli,
+        r#"kernel rfs {"sock_flow_entries": 4096, "queues": {"eno1/rx-0": 1024}}"#,
+    );
+    f.ok(&mut cli, "kernel offload eno1 rx-checksum enable");
+    f.ok(&mut cli, "kernel offload eno1 rx-gro disable");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    let live = f.request("/api/v1/kernel/tunables");
+    assert_eq!(live["observed"]["rfs"]["sock_flow_entries"], 4096);
+    assert_eq!(live["observed"]["offloads"]["eno1"]["rx-checksum"], true);
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "no kernel rfs");
+    f.ok(&mut cli, "no kernel offload eno1 rx-gro");
+    f.ok(&mut cli, "no kernel offload eno1");
+    f.ok(&mut cli, "no kernel rps eno1/rx-0");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    let live = f.request("/api/v1/kernel/tunables");
+    assert_eq!(live["observed"]["rfs"]["sock_flow_entries"], 0);
+    assert_eq!(live["observed"]["offloads"]["eno1"]["rx-checksum"], false);
+}

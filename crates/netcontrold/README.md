@@ -18,6 +18,9 @@ options are `--keys`, comma-separated `--adopt-parents`,
 configuration CLI; `--ssh-host-key` selects its persistent private Ed25519 host
 key, default `<state>.ssh-key`, and requires `--ssh-listen`.
 All options use conventional double-hyphen syntax.
+Host mode enables configured host tuning and acquires the exclusive tunables
+lock automatically. `--allow-host-tunables` is only needed to allow host-global
+sysctls from an explicit lab namespace; it is not an appliance prerequisite.
 Daemon executable paths, child UID/GID, child runtime directories, and obsolete
 external-service binary flags do not exist.
 Specifically removed: `--softflowd-binary`, `--softflowd-runtime-dir`,

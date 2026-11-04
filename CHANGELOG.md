@@ -16,6 +16,15 @@
 
 ### Fixed
 
+- Native host mode now enables configured host tuning and acquires its exclusive
+  lock automatically, without `--allow-host-tunables`. RPS and other supported
+  tuning retain authorization, hardware validation, confirmed transactions and
+  rollback; no settings are enabled automatically. The flag remains applicable
+  to host-global sysctls from an explicit lab namespace.
+  Release impact: fix, Unreleased; next automatic calendar version.
+  Required frontend prerequisite-message correction:
+  [handoff 2026-11-04-05](docs/frontend-handoffs/2026-11-04.md#2026-11-04-05-host-tuning-without-startup-opt-in).
+
 - Exclude daemon-managed software version and release-check metadata from native
   ownership plans. Saved update results and binary-version changes no longer
   cause false startup/reboot ownership mismatches or native network mutation.
@@ -24,6 +33,17 @@
   Release impact: fix, next automatic calendar version; no frontend action.
 
 ### Added
+
+- Transactional physical-NIC checksum, scatter/gather, TSO/GSO, GRO and VLAN
+  offload controls plus explicit RFS global/per-queue budgets. Exact active and
+  requested feature snapshots preserve latent wishes, detect driver side effects
+  and support original restoration/rollback/recovery. Unsupported/fixed settings,
+  unsafe LRO enabling and oversized recovery state fail explicitly. API, CLI,
+  simulator and diagnostics share the contract; no automatic enable-all profile,
+  new permissions, external ethtool process or traffic shaping is added.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Required frontend types, controls and confirmation/error handling:
+  [handoff 2026-11-04-06](docs/frontend-handoffs/2026-11-04.md#2026-11-04-06-nic-offload-controls-and-rfs).
 
 - Descriptive Linux aliases for configured physical Ethernet interfaces:
   `DISPLAY_NAME [WAN|LAN|UNASSIGNED]`, or the role alone without a display name.
@@ -41,8 +61,8 @@
 
 - Passive host CPU/IRQ/softnet and physical RX-queue performance diagnostics at
   `GET /api/v1/statistics/performance`, with evidence-based RPS trial candidates.
-  Explicit `kernel.rps` CPU masks use complete confirmed transactions, host-mode
-  opt-in, permission checks, exact kernel readback and durable original-mask
+  Explicit `kernel.rps` CPU masks use complete confirmed transactions, automatic
+  host-mode ownership, permission checks, exact kernel readback and durable original-mask
   recovery. No automatic tuning, IRQ changes or datapath acceleration.
   SSH supports performance inspection and candidate RPS edits.
   Release impact: additive, Unreleased; next automatic calendar version.

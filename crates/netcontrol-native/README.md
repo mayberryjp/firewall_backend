@@ -21,9 +21,11 @@ optional userspace-program backend is never selected.
   does not require `CAP_SYS_ADMIN`. Entering a different namespace requires
   applicable `setns` capabilities (normally `CAP_SYS_ADMIN` in the relevant user
   namespaces). Service-specific capabilities are additional; blanket
-  `--privileged` is not a prerequisite. Host sysctl writes need
-  explicit `allow_host_tunables` and exclusive ownership of the trusted
-  root-owned `/run/netcontrol-host-tunables.lock`. The normal management listener
+  `--privileged` is not a prerequisite. Host mode automatically acquires
+  exclusive ownership of the trusted root-owned
+  `/run/netcontrol-host-tunables.lock`, enabling configured host tuning without
+  an extra launch flag. Only explicit lab namespaces need `allow_host_tunables`
+  to manage host-global sysctls. The normal management listener
   remains outside the managed namespace.
 - A dedicated absolute services state directory. Its `native` child is private
   (0700); state files are private (0600), atomically replaced and directory-synced.
@@ -36,8 +38,9 @@ optional userspace-program backend is never selected.
 
 `NativeOptions.namespace` defaults to the empty string (current-daemon host mode).
 Other deserialization defaults are keys `/etc/netcontrol/keys`, services state
-`/var/lib/netcontrol/services`, no adopted parents, and all host/probe opt-ins
-disabled. Unknown option fields are rejected. On non-Linux platforms,
+`/var/lib/netcontrol/services`, no adopted parents, and host-service/probe opt-ins
+disabled. The `allow_host_tunables` option defaults to false but is not required
+in host mode. Unknown option fields are rejected. On non-Linux platforms,
 `Native::open` fails explicitly; portable parsing tests do not imply native
 networking support.
 
@@ -66,8 +69,8 @@ cgroup/process CPU visibility is not the scope of all kernel networking work.
 
 `kernel.rps` maps `INTERFACE/rx-N` to canonical lowercase Linux hexadecimal CPU
 masks. Only managed physical Ethernet interfaces are eligible; set the physical
-parent, not each VLAN. Use host mode with `allow_host_tunables`, the existing
-exclusive host-tunables lock and writable sysfs. Every change also needs
+parent, not each VLAN. Host mode automatically holds the exclusive
+host-tunables lock; writable sysfs is still required. Every change also needs
 `transactions.write`, `interfaces.write` and `kernel.host.write`.
 Opening a control is not proof it will accept a write: exact readback is required.
 CPU IDs must be online at preflight. There is no automatic CPU-hotplug retuning,
@@ -86,10 +89,55 @@ RX queues, read permissions, write permissions or offline selected CPUs are
 explicit errors, never successful no-ops or automatic defaults.
 
 This adds no datapath bypass: nftables, connection tracking, accounting and
-services retain their existing paths. RFS/RSS/XPS, NIC offload switches, qdisc
-shaping, XDP/AF_XDP and DPDK are not configured. See the
+services retain their existing paths. RFS and NIC offloads are separate explicit
+controls described below; RPS alone does not change them. RSS/XPS, qdisc shaping,
+XDP/AF_XDP and DPDK are not configured. See the
 [frontend contract](../../FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning)
 for sampling, recommendations and before/after acceptance.
+
+### NIC offloads and RFS
+
+`kernel.offloads` maps managed physical Ethernet names to exact Linux feature
+booleans. Checksum, scatter/gather, TSO/GSO, GRO and VLAN offloads are supported
+only when the driver exposes mutable features. User-facing group aliases and
+unknown keys are rejected; `rx-lro` may be disabled but not enabled on a forwarding
+firewall. No blanket pfSense/FreeBSD offload profile or automatic tuning is used.
+
+The in-process ethtool ioctl implementation captures **all** active and requested
+feature bits before mutation, including inactive wishes and fixed features.
+Writes preserve unrelated state, require coherent dependencies and verify exact
+full readback; unexpected driver coupling is an error, not a silently altered
+configuration. Baselines and per-operation snapshots retain both bitmaps and
+physical identity. Removing a feature restores its original value; the complete
+baseline remains protected while any offload on that interface is owned.
+Removing the interface entry restores/relinquishes its full feature state.
+
+`kernel.rfs` contains explicit global `sock_flow_entries` and queue entry counts.
+Zero disables a table; positive values must be powers of two up to 1048576,
+maximum 64 queues and a summed queue budget no greater than the global table.
+Positive queues require explicit nonzero RPS masks on the same physical queues.
+This steers local socket consumers, not generic forwarded traffic. Global changes
+affect other host applications; table reallocations reset learned flow placement.
+Removing the object restores original global/owned queue values; removing a queue
+restores its original count. Missing kernel controls fail explicitly.
+
+Host mode owns tuning automatically, with the exclusive host lock, kernel
+privileges and existing API permissions/confirmation still required. Lab
+namespaces cannot tune physical queues or offloads even with the lab host-sysctl
+flag. No setting is enabled merely by startup or a diagnostics read. Native
+intents cover failures, pending rollback, restart/reboot and original restoration.
+Full snapshots must fit the native 16 MiB per-file recovery limit; an oversized
+intent is rejected before mutation, without replacing existing state.
+
+Inspect configuration/effective/readback through `GET /api/v1/kernel/tunables`
+or runtime; native `offload_requested`/identity maps are observational only.
+Use explicit capability refresh for current support/fixed-bit evidence and
+remember saved inventory can be stale after tuning. Offloads affect capture/
+counter packet granularity; confirm management, NAT, VLAN and WireGuard behavior
+under representative load before accepting a change. No physical-driver speedup
+is established by simulator/veth tests. Traffic shaping remains deferred.
+See the [contract](../../FRONTEND_SPEC.md#explicit-rfs-and-nic-offload-configuration)
+and [handoff](../../docs/frontend-handoffs/2026-11-04.md#2026-11-04-06-nic-offload-controls-and-rfs).
 
 ## Firewall deny logging
 

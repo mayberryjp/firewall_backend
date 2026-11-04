@@ -4715,3 +4715,129 @@ fn performance_rps_pending_restart_timeout_restores_committed_masks() {
     assert_eq!(observed.body["observed"]["rps"]["eno1/rx-0"], "2");
     assert!(engine.active().is_none());
 }
+
+#[test]
+fn nic_offload_and_rfs_transactions_are_permission_checked_saved_and_reversible() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let baseline: Config = serde_json::from_value(json!({
+        "interfaces":[{"name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],
+        "kernel":{"rps":{"eno1/rx-0":"2"}}
+    })).unwrap();
+    let reply = submit(&mut engine, baseline.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let mut rfs_only = baseline.clone();
+    rfs_only.kernel.rfs = Some(crate::RfsConfig {
+        sock_flow_entries: 4096,
+        queues: [("eno1/rx-0".into(), 1024)].into(),
+    });
+    let mut offloads_only = baseline.clone();
+    offloads_only
+        .kernel
+        .offloads
+        .insert("eno1".into(), [("rx-checksum".into(), true)].into());
+    for candidate in [&rfs_only, &offloads_only] {
+        for denied in ["interfaces.write", "kernel.host.write"] {
+            let permissions: Vec<_> = all()
+                .into_iter()
+                .filter(|permission| permission != denied)
+                .collect();
+            let reply = engine.request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "operator",
+                &permissions,
+                &serde_json::to_vec(&json!({"base_revision":engine.state.revision,
+                    "confirm_timeout_seconds":30,"config":candidate}))
+                .unwrap(),
+            );
+            assert_eq!(reply.status, 403, "{}", reply.body);
+            assert!(reply.body["error"].as_str().unwrap().contains(denied));
+        }
+    }
+    let mut candidate = rfs_only;
+    candidate.kernel.offloads = offloads_only.kernel.offloads;
+    let revision = engine.state.revision;
+    let reply = submit(&mut engine, candidate.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let id = reply.body["id"].as_str().unwrap();
+    let observed = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(observed.body["observed"]["rfs"]["sock_flow_entries"], 4096);
+    assert_eq!(
+        observed.body["observed"]["offloads"]["eno1"]["rx-checksum"],
+        true
+    );
+    assert_eq!(
+        observed.body["captured_original"]["rfs"]["sock_flow_entries"],
+        0
+    );
+    assert_eq!(
+        observed.body["captured_original"]["offloads"]["eno1"]["rx-checksum"],
+        false
+    );
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.state.revision, revision);
+    assert_eq!(engine.state.desired.kernel, baseline.kernel);
+    let observed = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(observed.body["observed"]["rfs"]["sock_flow_entries"], 0);
+    assert_eq!(
+        observed.body["observed"]["offloads"]["eno1"]["rx-checksum"],
+        false
+    );
+    let reply = submit(&mut engine, candidate.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(candidate.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(engine.state.desired.kernel, candidate.kernel);
+    let mut provisional = candidate;
+    provisional.kernel.rfs.as_mut().unwrap().sock_flow_entries = 8192;
+    provisional
+        .kernel
+        .offloads
+        .get_mut("eno1")
+        .unwrap()
+        .insert("rx-checksum".into(), false);
+    let reply = submit(&mut engine, provisional.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let committed = engine.state.desired.clone();
+    let revision = engine.state.revision;
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(provisional).unwrap()),
+    )
+    .unwrap();
+    engine.now = Some(engine.active().unwrap().confirmation_deadline);
+    engine.tick().unwrap();
+    assert_eq!(engine.state.desired, committed);
+    assert_eq!(engine.state.revision, revision);
+    let observed = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(observed.body["observed"]["rfs"]["sock_flow_entries"], 4096);
+    assert_eq!(
+        observed.body["observed"]["offloads"]["eno1"]["rx-checksum"],
+        true
+    );
+    assert!(engine.active().is_none());
+}

@@ -179,6 +179,20 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
         gateway_monitoring: false,
     };
     let mut native = Native::open(options.clone())?;
+    assert!(native.host_namespace.is_some());
+    assert!(native._host_lock.is_some());
+    let competing_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/run/netcontrol-host-tunables.lock")?;
+    assert_eq!(
+        unsafe { libc::flock(competing_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK)
+    );
     let scope = native.scope()?;
     assert!(scope.starts_with("linux:host:"));
     let empty = Config::empty();
@@ -188,7 +202,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     assert_eq!(first["schema"], "netcontrol-performance/v1");
     assert_eq!(first["sample"]["scope"], "host");
     assert_eq!(first["sample"]["backend_scope"], scope);
-    assert_eq!(first["tuning_available"], false);
+    assert_eq!(first["tuning_available"], true);
     assert_eq!(first["recommendations"], json!([]));
     assert_eq!(first["sections"]["cpu"]["status"], "available");
     let first_cpus = first["sections"]["cpu"]["data"]["rows"]
@@ -230,14 +244,26 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
         session(namespace.clone(), |_, _| netfilter::fingerprint())?,
         unchanged_firewall
     );
-    assert!(
-        native
-            .allow_rps(&Kernel {
-                rps: [("nic0/rx-0".into(), "1".into())].into(),
-                ..Default::default()
-            })
-            .is_err()
-    );
+    for tuning in [
+        Kernel {
+            rps: [("nic0/rx-0".into(), "1".into())].into(),
+            ..Default::default()
+        },
+        Kernel {
+            rfs: Some(netcontrol_core::RfsConfig {
+                sock_flow_entries: 0,
+                queues: [("nic0/rx-0".into(), 0)].into(),
+            }),
+            ..Default::default()
+        },
+        Kernel {
+            offloads: [("nic0".into(), [("rx-checksum".into(), true)].into())].into(),
+            ..Default::default()
+        },
+    ] {
+        native.allow_tuning(&tuning)?;
+        assert!(native.preflight_kernel(&tuning).is_err());
+    }
     let baseline = row(&mut native, "nic0")?;
     assert_eq!(baseline["kind"], "ethernet");
     assert_eq!(baseline["ownership"], "unmanaged");
@@ -299,6 +325,27 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
 
     native.apply(&empty, &desired)?;
     native.observe(&desired)?;
+    let unchanged = fs::read(native.state.join("ownership.json"))?;
+    for offloads in [true, false] {
+        let mut rejected = desired.clone();
+        if offloads {
+            rejected
+                .kernel
+                .offloads
+                .insert("nic0".into(), [("rx-checksum".into(), true)].into());
+        } else {
+            rejected.kernel.rfs = Some(netcontrol_core::RfsConfig {
+                sock_flow_entries: 0,
+                queues: [("nic0/rx-0".into(), 0)].into(),
+            });
+        }
+        rejected.validate()?;
+        assert!(native.apply(&desired, &rejected).is_err());
+        native.apply(&rejected, &desired)?;
+        native.observe(&desired)?;
+        assert_eq!(fs::read(native.state.join("ownership.json"))?, unchanged);
+        assert!(!native.state.join("intent.json").exists());
+    }
     assert_eq!(link_alias(namespace.clone(), "nic0")?, "WAN");
     assert_eq!(link_alias(namespace.clone(), "nic100")?, "");
     assert_eq!(

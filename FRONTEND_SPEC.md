@@ -1418,12 +1418,16 @@ Register this read-only route in the API Explorer. It never writes capability
 snapshots, configuration, revisions or tuning, and sends no probe traffic.
 
 The envelope is `schema:"netcontrol-performance/v1"`, `sample`, `sections`,
-`interfaces`, `configured_rps`, `tuning_available`, `recommendations`,
+`interfaces`, `configured_rps`, `configured_rfs`, `configured_offloads`, `rfs`,
+`tuning_available`, `recommendations`,
 `config_revision` and `transaction_id`. The last two identify the committed
 calendar revision and nullable provisionally applied transaction. `configured_rps`
 reflects that applied configuration, not necessarily committed desired state.
-`tuning_available` means native operator opt-in, not caller write authorization
-or verified performance benefit.
+`tuning_available` means native host-tuning ownership is available, not caller
+write authorization, per-device hardware support or verified performance benefit.
+Native host mode acquires this ownership automatically at daemon startup.
+Do not require `--allow-host-tunables`, a daemon restart with changed options or
+a permission-enabling refresh before offering supported tuning controls.
 
 `sample` contains:
 
@@ -1489,7 +1493,9 @@ operations. Source files are bounded; these are not hard preemptive I/O deadline
 
 `interfaces[]` has `name`, numeric `index`, `mac`, native `kind`, `up`,
 `physical`, `managed`, nullable VLAN `parent_index`/`parent`, nullable
-`rx_queues:[{name,rps_cpus}]`, nullable numeric `irqs[]` and `errors:string[]`.
+`rx_queues:[{name,rps_cpus,rps_flow_cnt}]`, nullable numeric `irqs[]` and `errors:string[]`.
+`rps_flow_cnt` is the current nonnegative integer RFS queue table entry count,
+not a packet counter. Unreadable queue controls produce explicit interface errors.
 Queue masks are observed canonical hexadecimal strings. Nonphysical links
 retain null physical queue/IRQ evidence. `managed` means a configured Ethernet
 record; unmanaged/down links remain visible. VLAN parent references can be
@@ -1545,8 +1551,9 @@ Use the full `POST /api/v1/transactions` candidate and current `base_revision`,
 10..300-second confirmation timeout and explicit confirm/rollback. Changes,
 confirmation, rollback and revision restores require `transactions.write`,
 `kernel.host.write`, `interfaces.write`, plus permissions for other changes.
-Native host mode and operator `allow_host_tunables` with the exclusive host
-tunables lock are prerequisites. Do not copy native `rps_identity` observations
+Native host mode automatically acquires the exclusive host-tunables lock;
+no separate operator opt-in is required. Hardware support and actual kernel
+write permissions are still checked. Do not copy native `rps_identity` observations
 into editable configuration. No new permission, RPS write endpoint or GET tuning.
 
 Known JSON type/null errors are `400`; invalid masks/keys, limits and unmanaged
@@ -1579,7 +1586,133 @@ alone is insufficient. Verify independent management/VLAN/WireGuard reachability
 and compare CPU distribution, rates, drops and latency before confirming.
 Do not label the trial faster without measured improvement. No before/after
 records are saved by this endpoint; UI comparison/export is frontend-owned.
-No RFS/RSS/XPS, offload, IRQ, qdisc, flowtable, XDP/AF_XDP or DPDK changes.
+RFS and NIC offloads have separate explicit controls below. RPS alone changes
+none of them. No RSS/XPS, IRQ, qdisc, flowtable, XDP/AF_XDP or DPDK controls.
+
+##### Explicit RFS and NIC offload configuration
+
+These settings use the existing complete-candidate transaction API and the same
+`transactions.write`, `interfaces.write`, `kernel.host.write`, native host mode,
+automatic host-mode tuning availability and exclusive host-tunables lock
+prerequisites as RPS. No tuning GET or separate enable endpoint is added. Do not enable anything
+automatically from a capability snapshot or recommendation.
+
+`kernel.rfs?: {sock_flow_entries:number, queues:Record<string,number>} | null`
+is omitted when unmanaged. Omitted/null releases RFS ownership; a present object
+requires both fields and rejects unknown fields. Global `sock_flow_entries` and
+every queue count must be zero or a power of two up to **1048576**. Maximum 64
+queues, with the same managed physical Ethernet `INTERFACE/rx-N` keys as RPS.
+The sum of configured queue counts must not exceed the global count.
+Positive queue counts additionally require an explicitly configured nonzero RPS
+mask on the same queue. Neither RPS nor CPU choices are added implicitly.
+
+RFS steers receive work toward CPUs running local socket consumers; it is not a
+generic acceleration switch for forwarded/NAT traffic. The global table affects
+other local applications and reallocating tables discards learned flow placement.
+Coordinate with other tuning tools; do not concurrently manage the same controls.
+Zero explicitly disables/owns a table; removing a queue restores its original
+count. Removing the entire RFS object restores the original global and owned
+queue tables, then releases ownership. RPS itself remains independent.
+
+`kernel.offloads?: Record<string,Record<string,boolean>>` is nonnull, defaults to
+empty/unmanaged, and is omitted when empty. At most 32 managed physical Ethernet
+interfaces; each feature map must be nonempty. Keys are exact unprefixed Linux
+feature names, not group aliases such as `tso`, `gro` or `ethtool:rx-checksum`.
+The configurable allowlist is:
+
+```text
+rx-checksum
+tx-checksum-ipv4
+tx-checksum-ip-generic
+tx-checksum-ipv6
+tx-scatter-gather
+tx-scatter-gather-fraglist
+tx-tcp-segmentation
+tx-tcp6-segmentation
+tx-tcp-ecn-segmentation
+tx-tcp-mangleid-segmentation
+tx-generic-segmentation
+tx-gso-partial
+rx-gro
+rx-gro-hw
+rx-udp-gro-forwarding
+rx-lro
+rx-vlan-hw-parse
+tx-vlan-hw-insert
+rx-vlan-stag-hw-parse
+tx-vlan-stag-hw-insert
+```
+
+`rx-lro:true` is rejected: LRO is not safe to enable on a forwarding firewall.
+It can be explicitly disabled; unmanaged original settings are not automatically
+changed. Availability is driver-specific: a name on this list is not proof of
+support. Native preflight freshly checks feature existence/changeability,
+physical identity and controls; fixed or unsupported requested features fail,
+even if their active value already matches. Do not automatically enable all
+supported features or disable Linux offloads based on another OS's defaults.
+
+Synthetic **configuration fragment, not a complete transaction or recommendation**:
+
+```json
+{
+  "kernel": {
+    "rps": {"eno1/rx-0": "2"},
+    "rfs": {"sock_flow_entries": 4096, "queues": {"eno1/rx-0": 1024}},
+    "offloads": {"eno1": {"rx-checksum": true, "rx-lro": false}}
+  }
+}
+```
+
+Each boolean requests the exact active and requested feature value. Kernel
+dependency changes are not silently accepted: submit a coherent set of dependent
+features in the same candidate. The backend captures all feature active and
+requested bits, including inactive wishes and features outside the configurable
+allowlist, before mutation; unrelated changes and readback mismatches fail and
+trigger recovery. Removing a feature restores its original setting while other
+features on that interface remain owned. Removing the interface entry restores
+the whole captured feature state and releases offload ownership.
+
+Original values/identities and complete pre-operation snapshots participate in
+native durable intents, failure recovery, explicit/deadline rollback, restart,
+reboot and unmanagement. Interface MAC/same-boot index guards reject replacement.
+Failed recovery keeps its intent/error; missing drivers, devices or controls
+never produce successful no-ops. Confirmation follows independent connectivity
+checks, not a claimed performance improvement.
+Complete native snapshots must fit the existing 16 MiB per-file recovery limit;
+an oversized intent fails before kernel mutation rather than persisting an
+unreadable recovery record.
+
+Existing status behavior: malformed types/unknown fields `400`; invalid counts,
+dependencies, references, allowlist or LRO enable `422`; authentication `401/403`;
+stale/busy `409`; provisional apply `202`; confirm/rollback `200`; native
+preflight/write/readback/recovery failure `500`. Kernel/runtime source failures
+remain `503` rather than fabricated values.
+
+`GET /api/v1/kernel/tunables` and `GET /api/v1/runtime` expose the new configured,
+effective, observed and captured-original `rfs`/`offloads` maps. Native observations
+also include daemon-owned `rfs_identity`, `offload_identity` and
+`offload_requested` (full feature-request bits). These fields are not editable
+KernelConfig fields and must not enter transaction candidates. Empty optional
+native maps may be omitted. `GET /api/v1/state` and revisions retain only desired
+configuration, not driver metadata.
+
+Performance diagnostics add `configured_rfs` (object/null),
+`configured_offloads` (object) and
+`rfs:{status:"ready"|"unavailable"|"simulated",sock_flow_entries:number|null,error:string|null}`.
+Global RFS source failure makes the sample partial with an explicit error.
+Simulator observations are modeled state, never measured hardware; its RFS
+global evidence is simulated/null. Capability inventory remains a separate
+timestamped cache; explicit refresh, no automatic refresh polling, is unchanged.
+
+Required frontend tasks: preserve both fields in full-package edits/imports/
+history; provide explicit physical-NIC feature controls with support/fixed/error
+evidence and dependency review; make LRO disable-only; add global/per-queue RFS
+budget and RPS dependency validation. Distinguish disable from restore-original,
+desired from active/requested bits, and cached inventory from fresh readback.
+Use pending confirmation/error UI and before/after CPU, throughput, drops and
+latency comparisons; offload changes affect packet capture/accounting granularity.
+There is **no ALTQ, CAKE/FQ-CoDel, HTB, ingress IFB or other shaping implementation**;
+all traffic shaping was explicitly deferred.
 
 #### Host health sensors
 
