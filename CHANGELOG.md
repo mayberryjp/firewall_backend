@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Exclude daemon-managed software version and release-check metadata from native
+  ownership plans. Saved update results and binary-version changes no longer
+  cause false startup/reboot ownership mismatches or native network mutation.
+  Software metadata remains saved and readable; actual network mismatches,
+  strict decoding and recovery safeguards remain enforced.
+  Release impact: fix, next automatic calendar version; no frontend action.
+
 ### Added
 
 - Per-reflection-filter mDNS usage counters in existing service/runtime status:

@@ -402,6 +402,46 @@ fn mqtt_settings_do_not_change_native_operational_configuration() {
 }
 
 #[test]
+fn software_metadata_is_saved_but_never_changes_native_operational_configuration() {
+    let before = candidate();
+    let operational = before.operational_value().unwrap();
+    let states = [
+        json!({
+            "version":"2026.11.04.1","repository":null,"latest_version":null,
+            "update_available":null,"last_checked_at":null,"error":null
+        }),
+        json!({
+            "version":"2026.11.04.1","repository":"example/netcontrol",
+            "latest_version":"2026.11.04.2","update_available":true,
+            "last_checked_at":"2026-11-04T00:00:00Z","error":null
+        }),
+        json!({
+            "version":"2026.11.04.1","repository":"example/netcontrol",
+            "latest_version":null,"update_available":null,
+            "last_checked_at":"2026-11-04T00:01:00Z","error":"release check failed"
+        }),
+    ];
+    for metadata in states {
+        let mut after = before.clone();
+        after.software = serde_json::from_value(metadata.clone()).unwrap();
+        after.validate().unwrap();
+        let saved = serde_json::to_value(&after).unwrap();
+        assert_eq!(saved["software"], metadata);
+        assert_eq!(serde_json::from_value::<Config>(saved).unwrap(), after);
+        assert!(after.operational_value().unwrap().get("software").is_none());
+        assert_eq!(after.operational_value().unwrap(), operational);
+
+        let recorded: Config = serde_json::from_value(operational.clone()).unwrap();
+        assert_eq!(
+            recorded.operational_value().unwrap(),
+            after.operational_value().unwrap()
+        );
+        after.interfaces[0].mtu = 1400;
+        assert_ne!(after.operational_value().unwrap(), operational);
+    }
+}
+
+#[test]
 fn sando_state_is_saved_but_never_changes_native_operational_configuration() {
     let before = candidate();
     assert_eq!(

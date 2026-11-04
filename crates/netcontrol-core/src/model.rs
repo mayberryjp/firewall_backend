@@ -965,6 +965,7 @@ impl Config {
             value["mdns"]["publishing"]["hostname"] = serde_json::json!(self.system.hostname);
         }
         value.as_object_mut().unwrap().remove("mqtt");
+        value.as_object_mut().unwrap().remove("software");
         value.as_object_mut().unwrap().remove("system");
         value.as_object_mut().unwrap().remove("dynamic_dns");
         value.as_object_mut().unwrap().remove("sando");

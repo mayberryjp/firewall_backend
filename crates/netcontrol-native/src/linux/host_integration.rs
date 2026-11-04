@@ -211,6 +211,17 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     native.observe(&mqtt_desired)?;
     assert_eq!(fs::read(&ownership_path)?, unchanged_ownership);
     assert!(!native.state.join("intent.json").exists());
+    let mut software_desired = desired.clone();
+    software_desired.software = serde_json::from_value(json!({
+        "version":"2026.11.04.1","repository":"example/netcontrol",
+        "latest_version":"2026.11.04.2","update_available":true,
+        "last_checked_at":"2026-11-04T00:00:00Z","error":null
+    }))?;
+    software_desired.validate()?;
+    native.apply(&desired, &software_desired)?;
+    native.observe(&software_desired)?;
+    assert_eq!(fs::read(&ownership_path)?, unchanged_ownership);
+    assert!(!native.state.join("intent.json").exists());
     let mut recorded = native.ownership()?;
     recorded.committed_config = Some(serde_json::to_value(&mqtt_desired)?);
     native.save_ownership(&recorded)?;
@@ -270,7 +281,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     // Restore the committed candidate through the explicit reboot path, not a drift bypass.
     let mut ownership = native.ownership()?;
     ownership.boot = "synthetic-previous-boot".into();
-    let mut committed = serde_json::to_value(&desired)?;
+    let mut committed = serde_json::to_value(&software_desired)?;
     committed.as_object_mut().unwrap().remove("mqtt");
     ownership.committed_config = Some(committed);
     native.save_ownership(&ownership)?;
