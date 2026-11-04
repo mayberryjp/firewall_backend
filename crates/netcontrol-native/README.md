@@ -789,8 +789,11 @@ rather than silently skip, if the environment flag, Linux capabilities, mounted
 namespace support or required kernel modules are missing:
 
 ```text
-NETCONTROL_INTEGRATION=1 cargo test -p netcontrol-native -- --ignored
+NETCONTROL_INTEGRATION=1 cargo test -p netcontrol-native --locked -- --ignored --test-threads=1
 ```
+
+Host-mode fixtures share the exclusive host-tunables lock despite their isolated
+network namespaces, so run privileged tests serially, as CI does.
 
 Lab tests provision and unmount only uniquely named fixture namespace mounts
 under the crate's working directory. The host-mode fixture launches a child test

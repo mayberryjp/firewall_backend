@@ -274,10 +274,12 @@ Linux kernel and privileged protocol tests are separate:
 
 ```sh
 NETCONTROL_INTEGRATION=1 cargo test \
-  -p netcontrol-native -p netcontrol-services --locked -- --ignored
+  -p netcontrol-native -p netcontrol-services --locked -- --ignored --test-threads=1
 ```
 
 Run these only on an appropriately privileged, disposable Linux test machine.
+Run fixtures serially: isolated host-mode fixtures still share the exclusive
+host-tunables lock. CI uses the same single-threaded test setting.
 Portable Windows tests and Linux cross-compilation do not establish native
 runtime correctness. Consult the [change journal](docs/journal/2026-10-19.md)
 for actual validation results and known limits of the rewrite.

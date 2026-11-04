@@ -16,6 +16,11 @@
 
 ### Fixed
 
+- Serialize privileged CI integration tests so isolated Ethernet and WireGuard
+  host-mode fixtures do not contend for the shared host-tunables lock. Keep all
+  test coverage, production locking and release validation gates unchanged.
+  Release impact: CI-only fix; no runtime/API contract or frontend action.
+
 - Native host mode now enables configured host tuning and acquires its exclusive
   lock automatically, without `--allow-host-tunables`. RPS and other supported
   tuning retain authorization, hardware validation, confirmed transactions and
