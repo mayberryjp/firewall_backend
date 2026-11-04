@@ -32,9 +32,9 @@ Configuration commands:
   domain NAME / no domain             Cosmetic domain label; never applied to the host or resolver
   timezone ZONE / no timezone         Managed IANA time zone, e.g. UTC or America/New_York
   interface NAME [ethernet|dummy|vlan|wireguard] / no interface NAME
-  ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
+  ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
   ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
-  no ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
+  no ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
   firewall policy accept|drop / firewall allow-all-icmp enable|disable
   firewall rule SOURCE|any DESTINATION|any accept|drop / no firewall rule INDEX
   firewall host JSON / firewall interface-policy JSON

@@ -380,6 +380,26 @@ read-only and unrelated drift is not automatically overwritten.
 Linux namespace tests cover these lifecycle paths, rollback and foreign-route
 protection; physical-appliance DHCP/networkd/resolved acceptance remains separate.
 
+Routes may explicitly set `"gateway":"dhcp"` to follow the interface lease's
+lowest-metric IPv4 default-route gateway. This requires an IPv4 destination and
+a configured DHCPv4 client on the same managed Ethernet interface, including
+when the route is disabled. Equal-best leased defaults must agree on one numeric
+unicast gateway; missing/direct defaults, invalid gateways and ambiguous next
+hops fail explicitly. Classless lease routes remain authoritative; there is no
+fallback to the DHCP server, another WAN or a previously configured router.
+Without a valid matching lease, the enabled route is suspended.
+
+The shared lease lock protects effective-route resolution and kernel verification.
+Gateway-only and address/site changes remove only previous/next owned routes,
+then install resolved protocol-242 routes after the lease's protocol-243 routes.
+Lease intents retain old/new lease next hops for rollback and interrupted recovery;
+foreign routes still block replacement. Saved configuration, history, destination,
+table and metric retain their operator-selected values, including the `"dhcp"`
+token; runtime learned routes remain numeric/direct. Literal gateways remain
+pinned. This adds no policy rules or automatic WireGuard endpoint-loop prevention:
+review the endpoint host route's underlay table/metric and surrounding policy.
+See the [route contract](../../FRONTEND_SPEC.md#64-routes).
+
 Host handover still requires physical-appliance runtime acceptance. Restart handover-selection
 regression tests cover owned/released interfaces and the lab/non-inherited
 boundary; real networkd/resolved reboot and recovery acceptance remains required.

@@ -257,7 +257,12 @@ impl Network {
                 routes.insert((&route.destination, route.table, route.metric)),
                 "duplicate route key"
             );
-            if !route.gateway.is_empty() {
+            if route.gateway == "dhcp" {
+                ensure!(
+                    destination.is_ipv4() && self.dhcp_clients.contains_key(&route.interface),
+                    "DHCP route gateway requires an IPv4 destination and DHCPv4 on its managed interface"
+                );
+            } else if !route.gateway.is_empty() {
                 let gateway: IpAddr = route
                     .gateway
                     .parse()

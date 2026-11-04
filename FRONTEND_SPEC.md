@@ -3908,7 +3908,9 @@ lease-dependent: without a valid matching lease they remain configured but are
 suspended in the native route plan. Acquisition/renewal/address replacement
 restores missing configured protocol-242 routes after DHCP routes; expiry/NAK
 removes the dependent static routes. This does not change `enabled`, revision,
-history or the configured static gateway. An unreachable pinned gateway or an
+history or a configured literal gateway. Routes with `gateway:"dhcp"` instead
+resolve their next hop from that interface's current lease, as specified in
+[Routes](#64-routes). An unreachable pinned gateway or an
 unowned conflicting route remains an explicit backend/worker error, not a
 successful fallback. IPv6 routes and other interfaces are outside this recovery.
 Use `dhcp_clients.leases` acquisition/lifetime and `errors` for status; do not
@@ -4156,8 +4158,56 @@ routes enabled; explicit false remains disabled. This is ordinary field defaulti
 not a file-rewrite utility or reset. Other schema/validation requirements remain
 strict. Deploy backend support before offering disabled-route controls.
 
-Gateway omission means a direct route; never substitute `0.0.0.0`. Managed
-interface options come from the draft, not adopted parents. Explain reserved
+Gateway omission or `""` means a direct route; never substitute `0.0.0.0`.
+Otherwise `gateway` accepts a canonical numeric address or the exact lowercase
+string `"dhcp"`. `"dhcp"` requires an IPv4 destination and a DHCPv4 client on the
+same managed interface, including for disabled routes. IPv6, blackhole targets,
+other spellings and DHCP-less interfaces reject this mode with `422`. Null and
+non-string gateways remain `400`. Literal gateways remain pinned; they are
+never automatically rewritten to a new site's router.
+
+Synthetic route fragment (requires configured Ethernet `eno1` and
+`dhcp_clients.eno1`; keep the operator-selected table and metric):
+
+```json
+{"enabled":true,"destination":"203.0.113.10/32","gateway":"dhcp","interface":"eno1","table":254,"metric":10}
+```
+
+For `"dhcp"`, the runtime plan selects the lowest-metric IPv4 default route
+(`0.0.0.0/0`, table 254) from that interface's valid matching lease. Equal-best
+defaults must agree on one numeric unicast gateway. No default, a direct default
+without a next hop, an invalid gateway or differing equal-best gateways produces
+an explicit worker/backend error; never fall back to another WAN, DHCP server
+address, an old pinned gateway or an arbitrary router. DHCP classless routes are
+authoritative: if they suppress the Router option and contain no default, this
+mode cannot resolve. Specific leased routes do not override the selected default
+gateway for configured DHCP-following routes.
+
+Without a valid matching lease, enabled routes remain configured and suspended,
+as above. Acquisition, renewal, gateway-only changes and address/site changes
+resolve and install the owned protocol-242 routes after DHCP routes. Loss removes
+them; failed lease updates restore the previous lease and its resolved routes
+through existing recovery intents. Table, metric, destination, interface,
+`enabled`, revision and saved `"dhcp"` value do not change with the lease.
+Desired/observed configuration reads and revisions retain `"dhcp"`, not the
+resolved address. Runtime lease routes remain numeric/direct learned routes;
+they are not a list of resolved configured routes. No new status field is added.
+
+Offer a Direct / Static address / DHCP gateway selector and only enable the last
+choice for IPv4 routes on draft DHCP-managed Ethernet interfaces. Preserve this
+choice across draft edits, exports, disabled routes, history and rollback.
+Show waiting/error state using the applied runtime lease/error map, not a
+fabricated installed gateway. Keep the existing transaction permissions,
+confirmation, `500` apply/recovery errors and `503` observation failures.
+Deploy backend support before submitting `"dhcp"`.
+
+For a WireGuard endpoint host route, operators must verify its existing table,
+metric and routing policy keep the endpoint on the underlay rather than the
+tunnel. This mode does not select a table, add policy rules, alter AllowedIPs or
+remove other routes to prevent tunnel recursion. Switching a pinned route is an
+explicit configuration transaction; no saved route is automatically converted.
+
+Managed interface options come from the draft, not adopted parents. Explain reserved
 tables and protocol 242 ownership; protocol is not an editable field.
 
 #### Blackhole target

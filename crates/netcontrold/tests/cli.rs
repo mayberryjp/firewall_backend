@@ -402,6 +402,32 @@ fn global_ipv6_cli_stages_checks_commits_and_rolls_back() {
 }
 
 #[test]
+fn dhcp_route_gateway_cli_stages_validates_confirms_and_removes() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, "interface wan0 ethernet");
+    f.ok(&mut cli, "role wan");
+    f.ok(&mut cli, "no shutdown");
+    f.ok(&mut cli, "exit");
+    f.ok(&mut cli, r#"set /dhcp_clients {"wan0":{}}"#);
+    f.ok(&mut cli, "ip route 203.0.113.10/32 wan0 dhcp 254 10");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30 DHCP endpoint route");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(f.request("/api/v1/routes")[0]["gateway"], "dhcp");
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "delete /dhcp_clients/wan0");
+    f.fail(&mut cli, "commit check", "DHCP route gateway");
+    f.ok(&mut cli, r#"set /dhcp_clients {"wan0":{}}"#);
+    f.ok(&mut cli, "no ip route 203.0.113.10/32 wan0 dhcp 254 10");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30 Remove DHCP endpoint route");
+    f.ok(&mut cli, "rollback");
+    assert_eq!(f.request("/api/v1/routes")[0]["gateway"], "dhcp");
+}
+
+#[test]
 fn ethernet_candidate_main_routes_and_readonly_discovery_use_shared_engine() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

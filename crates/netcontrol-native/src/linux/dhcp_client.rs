@@ -46,6 +46,52 @@ impl Lease {
         now().is_ok_and(|time| time < self.acquired_at.saturating_add(u64::from(self.lifetime)))
     }
 
+    fn route(&self, configured: &Route) -> Result<Route> {
+        let mut resolved = configured.clone();
+        if configured.gateway != "dhcp" {
+            return Ok(resolved);
+        }
+        let defaults: Vec<_> = self
+            .routes
+            .iter()
+            .filter(|route| {
+                route.interface == configured.interface
+                    && route.table == 254
+                    && route.destination == "0.0.0.0/0"
+            })
+            .collect();
+        let selected = defaults
+            .iter()
+            .min_by_key(|route| route.metric)
+            .with_context(|| {
+                format!(
+                    "DHCP gateway for {} requires a leased IPv4 default route",
+                    configured.interface
+                )
+            })?;
+        ensure!(
+            defaults
+                .iter()
+                .filter(|route| route.metric == selected.metric)
+                .all(|route| route.gateway == selected.gateway),
+            "ambiguous DHCP default gateways on {}",
+            configured.interface
+        );
+        let gateway: Ipv4Addr = selected.gateway.parse().with_context(|| {
+            format!(
+                "DHCP default route on {} has no numeric IPv4 gateway",
+                configured.interface
+            )
+        })?;
+        ensure!(
+            !gateway.is_unspecified() && !gateway.is_multicast() && !gateway.is_broadcast(),
+            "invalid DHCP default gateway on {}",
+            configured.interface
+        );
+        resolved.gateway = gateway.to_string();
+        Ok(resolved)
+    }
+
     fn wire(&self) -> Result<DhcpV4Lease> {
         let (address, prefix) = self
             .address
@@ -158,17 +204,38 @@ pub struct Addressing {
     pub routes: Vec<Route>,
 }
 
+pub fn lease_routes(
+    interface: &str,
+    configured: &[Route],
+    lease: Option<&Lease>,
+) -> Result<Vec<Route>> {
+    let Some(lease) = lease else {
+        return Ok(Vec::new());
+    };
+    let mut resolved = Vec::new();
+    for route in configured {
+        let (destination, _) = crate::model::parse_prefix(&route.destination, true)?;
+        if destination.is_ipv4() {
+            ensure!(
+                route.interface == interface,
+                "DHCP static route interface mismatch"
+            );
+            resolved.push(lease.route(route)?);
+        }
+    }
+    Ok(resolved)
+}
+
 pub fn effective(network: &mut Network, state: &State) -> Result<()> {
     let mut routes = Vec::new();
     for route in &network.routes {
         let (destination, _) = crate::model::parse_prefix(&route.destination, true)?;
-        if !destination.is_ipv4()
-            || !network.dhcp_clients.contains_key(&route.interface)
-            || state.leases.get(&route.interface).is_some_and(|lease| {
-                lease.valid() && network.dhcp_clients.get(&route.interface) == Some(&lease.client)
-            })
-        {
+        if !destination.is_ipv4() || !network.dhcp_clients.contains_key(&route.interface) {
             routes.push(route.clone());
+        } else if let Some(lease) = state.leases.get(&route.interface).filter(|lease| {
+            lease.valid() && network.dhcp_clients.get(&route.interface) == Some(&lease.client)
+        }) {
+            routes.push(lease.route(route)?);
         }
     }
     network.routes = routes;
@@ -629,6 +696,7 @@ fn run(task: ClientTask) -> Result<()> {
                                 let mut state = shared.lock().map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?;
                                 let previous = state.leases.get(&name).cloned();
                                 let addressing = state.addressing.get(&name).cloned().context("DHCP addressing missing")?;
+                                lease_routes(&name, &addressing.routes, Some(&next))?;
                                 let intent_path = path.with_extension("intent");
                                 write_json(&intent_path, &LeaseIntent { after: next.clone() })?;
                                 let operation = change_lease(namespace.clone(), publish_dns, name.clone(), previous.clone(), Some(next.clone()), addressing.clone())
@@ -669,6 +737,79 @@ fn run(task: ClientTask) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dhcp_gateway_routes_resolve_only_from_matching_valid_leases() -> Result<()> {
+        let config: Config = serde_json::from_value(json!({
+            "interfaces":[{"name":"wan0","kind":"ethernet","role":"wan","mtu":1500,"up":true}],
+            "dhcp_clients":{"wan0":{}},
+            "routes":[
+                {"destination":"203.0.113.10/32","gateway":"dhcp","interface":"wan0","table":10001,"metric":10},
+                {"enabled":false,"destination":"203.0.113.11/32","gateway":"dhcp","interface":"wan0","table":254,"metric":10}
+            ]
+        }))?;
+        config.validate()?;
+        let network = Network::parse(&config.operational_value()?)?;
+        network.validate(&Default::default())?;
+        let mut state = State::default();
+        let check = |state: &State| -> Result<Network> {
+            let mut actual = network.clone();
+            effective(&mut actual, state)?;
+            Ok(actual)
+        };
+        assert!(check(&state)?.routes.is_empty());
+        let lease: Lease = serde_json::from_value(json!({
+            "client":{}, "address":"192.0.2.10/24", "server":"192.0.2.1",
+            "acquired_at":now()?, "lifetime":3600, "renewal":1800, "rebinding":3150,
+            "routes":[
+                {"destination":"192.0.2.0/24","interface":"wan0","table":254,"metric":0},
+                {"destination":"0.0.0.0/0","gateway":"192.0.2.1","interface":"wan0","table":254,"metric":100}
+            ], "dns":[], "domain":"", "mtu":null
+        }))?;
+        state.leases.insert("wan0".into(), lease.clone());
+        let resolved = check(&state)?;
+        assert_eq!(resolved.routes.len(), 1);
+        assert_eq!(resolved.routes[0].gateway, "192.0.2.1");
+        assert_eq!(resolved.routes[0].table, 10001);
+        assert_eq!(resolved.routes[0].metric, 10);
+        let current = state.leases.get_mut("wan0").unwrap();
+        current.routes[1].gateway = "192.0.2.2".into();
+        assert_eq!(check(&state)?.routes[0].gateway, "192.0.2.2");
+        state.leases.get_mut("wan0").unwrap().lifetime = 0;
+        assert!(check(&state)?.routes.is_empty());
+        state.leases.insert("wan0".into(), lease.clone());
+        state.leases.get_mut("wan0").unwrap().client.route_metric = 500;
+        assert!(check(&state)?.routes.is_empty());
+        for gateway in ["", "0.0.0.0", "224.0.0.1", "255.255.255.255", "2001:db8::1"] {
+            state.leases.insert("wan0".into(), lease.clone());
+            state.leases.get_mut("wan0").unwrap().routes[1].gateway = gateway.into();
+            assert!(check(&state).is_err(), "{gateway}");
+        }
+        state.leases.insert("wan0".into(), lease.clone());
+        state.leases.get_mut("wan0").unwrap().routes.pop();
+        assert!(
+            check(&state)
+                .unwrap_err()
+                .to_string()
+                .contains("requires a leased")
+        );
+        state.leases.insert("wan0".into(), lease);
+        let mut alternative = state.leases["wan0"].routes[1].clone();
+        alternative.gateway = "192.0.2.2".into();
+        state
+            .leases
+            .get_mut("wan0")
+            .unwrap()
+            .routes
+            .push(alternative);
+        assert!(check(&state).unwrap_err().to_string().contains("ambiguous"));
+        state.leases.get_mut("wan0").unwrap().routes[2].metric = 200;
+        assert_eq!(check(&state)?.routes[0].gateway, "192.0.2.1");
+        let mut wrong_family = network.clone();
+        wrong_family.routes[0].destination = "2001:db8::/64".into();
+        assert!(wrong_family.validate(&Default::default()).is_err());
+        Ok(())
+    }
 
     #[test]
     fn dhcp_static_routes_follow_valid_matching_leases() -> Result<()> {

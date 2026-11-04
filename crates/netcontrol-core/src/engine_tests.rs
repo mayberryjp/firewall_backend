@@ -1145,6 +1145,80 @@ fn dhcp_gateway_monitor_saves_without_static_address_route_or_lease() {
 }
 
 #[test]
+fn dhcp_route_gateway_permission_persistence_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut desired = config();
+    desired.interfaces[0].kind = "ethernet".into();
+    desired.interfaces[0].addresses.clear();
+    desired
+        .dhcp_clients
+        .insert("lan0".into(), Default::default());
+    desired.routes = serde_json::from_value(json!([{
+        "destination":"203.0.113.10/32","gateway":"dhcp","interface":"lan0",
+        "table":254,"metric":10
+    }]))
+    .unwrap();
+    let reply = submit(&mut engine, desired.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/routes", Value::Null).body[0]["gateway"],
+        "dhcp"
+    );
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(desired.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(engine.saved_configuration(), &desired);
+    let mut pinned = desired.clone();
+    pinned.routes[0].gateway = "192.0.2.1".into();
+    let permissions: Vec<_> = all().into_iter().filter(|p| p != "routes.write").collect();
+    let body = serde_json::to_vec(&json!({
+        "base_revision":engine.committed_revision(),"confirm_timeout_seconds":30,"config":pinned
+    }))
+    .unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "limited",
+                &permissions,
+                &body
+            )
+            .status,
+        403
+    );
+    let reply = submit(&mut engine, pinned);
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                reply.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.saved_configuration(), &desired);
+    let mut invalid = desired.clone();
+    invalid.dhcp_clients.clear();
+    let reply = submit(&mut engine, invalid);
+    assert_eq!(reply.status, 422, "{}", reply.body);
+}
+
+#[test]
 fn static_route_enabled_permission_restart_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

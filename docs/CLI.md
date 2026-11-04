@@ -135,6 +135,14 @@ provided.
 
 Global editors include:
 
+For an IPv4 route on a DHCP-managed Ethernet interface, use `dhcp` instead of a
+literal gateway to follow that interface lease's IPv4 default-route gateway:
+`ip route 203.0.113.10/32 eno1 dhcp 254 10`. `direct` remains a no-gateway route;
+literal gateways remain pinned. Table/metric stay operator-selected. Missing or
+ambiguous lease gateways fail explicitly; no valid lease suspends installation.
+Keep WireGuard endpoint-loop prevention in the surrounding underlay routing
+policy. See the [complete route contract](../FRONTEND_SPEC.md#64-routes).
+
 ```text
 interface NAME [ethernet|dummy|vlan|wireguard]
 no interface NAME
@@ -143,9 +151,9 @@ hostname NAME
 no hostname
 timezone ZONE
 no timezone
-ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
+ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
 ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
-no ip route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
+no ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
 firewall policy accept|drop
 firewall allow-all-icmp enable|disable
 firewall rule SOURCE|any DESTINATION|any accept|drop

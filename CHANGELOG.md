@@ -13,6 +13,16 @@
 
 ### Added
 
+- Explicit DHCP-following route gateways with `"gateway":"dhcp"` for IPv4 routes
+  on DHCP-managed Ethernet interfaces. Current lease default gateways drive
+  owned route installation, site/gateway changes, expiry and recovery without
+  rewriting saved destinations, tables, metrics or literal gateways.
+  Missing/ambiguous next hops and foreign-route conflicts fail explicitly;
+  no automatic WireGuard routing policy is added.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Required frontend gateway selection/types and lifecycle messaging:
+  [handoff 2026-11-04-01](docs/frontend-handoffs/2026-11-04.md#2026-11-04-01-dhcp-following-route-gateways).
+
 - Per-reflection-filter mDNS usage counters in existing service/runtime status:
   exact decimal-string matched and successfully forwarded packet counts plus
   nullable last-match/last-send timestamps, with dependency/overlap attribution,

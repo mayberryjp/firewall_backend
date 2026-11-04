@@ -1418,7 +1418,8 @@ async fn install_route(
 async fn dhcp_static_routes(
     handle: &Handle,
     interface: &str,
-    configured: &[Route],
+    previous: &[Route],
+    next: &[Route],
     install: bool,
 ) -> Result<()> {
     let available = links(handle).await?;
@@ -1434,11 +1435,7 @@ async fn dhcp_static_routes(
         .await?;
     let mut missing = Vec::new();
     let mut remove = Vec::new();
-    for route in configured {
-        let (destination, _) = parse_prefix(&route.destination, true)?;
-        if !destination.is_ipv4() {
-            continue;
-        }
+    for route in previous.iter().chain(next) {
         ensure!(
             route.interface == interface,
             "DHCP static route interface mismatch"
@@ -1450,19 +1447,22 @@ async fn dhcp_static_routes(
                 continue;
             }
             crate::ensure_unchanged(
-                message.header.protocol == RouteProtocol::Other(PROTOCOL)
-                    && decode_route(message, &names)? == *route,
+                message.header.protocol == RouteProtocol::Other(PROTOCOL) && {
+                    let observed = decode_route(message, &names)?;
+                    previous.contains(&observed) || next.contains(&observed)
+                },
                 format!(
                     "DHCP static route {} conflicts with existing route",
                     route.destination
                 ),
             )?;
-            found = true;
-            if !install {
+            let observed = decode_route(message, &names)?;
+            found |= observed == *route;
+            if !next.contains(&observed) && !remove.contains(message) {
                 remove.push(message.clone());
             }
         }
-        if install && !found {
+        if install && !found && next.contains(route) && !missing.contains(&route) {
             missing.push(route);
         }
     }
@@ -1483,19 +1483,14 @@ async fn dhcp_static_routes(
         .execute()
         .try_collect()
         .await?;
-    for route in configured {
-        let (destination, _) = parse_prefix(&route.destination, true)?;
-        if !destination.is_ipv4() {
-            continue;
-        }
+    for route in previous.iter().chain(next) {
         let key = (route.table, route.metric, route.destination.clone());
         let mut matches = 0;
         for message in &observed {
             if route_key(message)? == key {
                 ensure!(
-                    install
-                        && message.header.protocol == RouteProtocol::Other(PROTOCOL)
-                        && decode_route(message, &names)? == *route,
+                    message.header.protocol == RouteProtocol::Other(PROTOCOL)
+                        && next.contains(&decode_route(message, &names)?),
                     "DHCP-dependent static route {} did not converge",
                     route.destination
                 );
@@ -1503,7 +1498,13 @@ async fn dhcp_static_routes(
             }
         }
         ensure!(
-            matches == usize::from(install),
+            !install
+                || matches
+                    == usize::from(next.iter().any(|wanted| {
+                        wanted.table == route.table
+                            && wanted.metric == route.metric
+                            && wanted.destination == route.destination
+                    })),
             "DHCP-dependent static route {} did not converge",
             route.destination
         );
@@ -1519,6 +1520,8 @@ pub async fn dhcp_lease(
     addressing: &super::dhcp_client::Addressing,
     publish_dns: bool,
 ) -> Result<()> {
+    let previous_static = super::dhcp_client::lease_routes(name, &addressing.routes, previous)?;
+    let next_static = super::dhcp_client::lease_routes(name, &addressing.routes, next)?;
     let link = links(handle)
         .await?
         .into_iter()
@@ -1549,10 +1552,8 @@ pub async fn dhcp_lease(
             );
         }
     }
-    // Remove only this client's configured routes before lease loss removes its address.
-    if next.is_none() {
-        dhcp_static_routes(handle, name, &addressing.routes, false).await?;
-    }
+    // Validate ownership and remove obsolete next hops before changing lease addresses/routes.
+    dhcp_static_routes(handle, name, &previous_static, &next_static, false).await?;
     let mtu = next.and_then(|lease| lease.mtu).unwrap_or(addressing.mtu);
     if mtu != 0 {
         handle.link().set(index).mtu(mtu).execute().await?;
@@ -1637,7 +1638,7 @@ pub async fn dhcp_lease(
             }
             request.execute().await?;
         }
-        dhcp_static_routes(handle, name, &addressing.routes, true).await?;
+        dhcp_static_routes(handle, name, &previous_static, &next_static, true).await?;
     }
     if publish_dns {
         super::adoption::set_dns(index, &addressing.dns, next)?;

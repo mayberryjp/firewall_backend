@@ -663,6 +663,61 @@ fn mqtt_configuration_defaults_validation_and_no_inline_password() {
 }
 
 #[test]
+fn dhcp_route_gateway_requires_ipv4_and_matching_client_even_when_disabled() {
+    let mut config = candidate();
+    config.interfaces[0].kind = "ethernet".into();
+    config.interfaces[0].addresses.clear();
+    config
+        .dhcp_clients
+        .insert("lan0".into(), Default::default());
+    config.routes[0].gateway = "dhcp".into();
+    for enabled in [true, false] {
+        config.routes[0].enabled = enabled;
+        config.validate().unwrap();
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["routes"][0]["gateway"], "dhcp");
+        assert_eq!(serde_json::from_value::<Config>(saved).unwrap(), config);
+        config.ipv6_enabled = false;
+        config.validate().unwrap();
+        config.ipv6_enabled = true;
+
+        let mut invalid = config.clone();
+        invalid.dhcp_clients.clear();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("DHCP route gateway")
+        );
+        let mut invalid = config.clone();
+        invalid.routes[0].destination = "2001:db8::/64".into();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("DHCP route gateway")
+        );
+        let mut invalid = config.clone();
+        invalid.blackhole.name = "drop0".into();
+        invalid.routes[0].interface = "drop0".into();
+        assert!(
+            invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("blackhole")
+        );
+        for gateway in ["DHCP", "auto", "dhcp4", " dhcp", "dhcp "] {
+            let mut invalid = config.clone();
+            invalid.routes[0].gateway = gateway.into();
+            assert!(invalid.validate().is_err(), "{gateway}");
+        }
+    }
+}
+
+#[test]
 fn static_route_enabled_controls_operational_projection() {
     let mut config = candidate();
     config.validate().unwrap();

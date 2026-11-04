@@ -821,12 +821,18 @@ impl Native {
             "reboot configuration does not match durable native ownership; refusing implicit adoption"
         );
         self.preflight(after)?;
-        let expected = Network::parse(
+        let mut expected = Network::parse(
             ownership
                 .committed_config
                 .as_ref()
                 .context("missing reboot configuration")?,
         )?;
+        let leases = self
+            .dhcp
+            .state
+            .lock()
+            .map_err(|_| anyhow!("DHCP state poisoned"))?;
+        dhcp_client::effective(&mut expected, &leases)?;
         let originals = ownership.ethernet_originals.clone();
         let keys = self.wireguard_dns.control.clone();
         let (mut before, fingerprint) = session(self.namespace.clone(), move |rt, handle| {
@@ -836,6 +842,7 @@ impl Native {
                 netfilter::fingerprint()?,
             ))
         })?;
+        drop(leases);
         let mut previous = ownership.clone();
         // A prior-boot lease or interface index must never be resurrected.
         ownership.ipv6_original = None;

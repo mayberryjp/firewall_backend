@@ -1351,7 +1351,12 @@ impl Config {
                 !blackhole.targets(&r.interface) || r.gateway.is_empty(),
                 "routes to the blackhole cannot have a gateway"
             );
-            if !r.gateway.is_empty() {
+            if r.gateway == "dhcp" {
+                ensure!(
+                    a.is_ipv4() && self.dhcp_clients.contains_key(&r.interface),
+                    "DHCP route gateway requires an IPv4 destination and DHCPv4 on its managed interface"
+                );
+            } else if !r.gateway.is_empty() {
                 ensure!(
                     canonical_ip(&r.gateway)?.is_ipv4() == a.is_ipv4(),
                     "route gateway family mismatch"
@@ -1570,7 +1575,9 @@ impl Config {
         }
         for route in &self.routes {
             prefixes.push(&route.destination);
-            literals.push(&route.gateway);
+            if route.gateway != "dhcp" {
+                literals.push(&route.gateway);
+            }
         }
         for rule in &self.firewall.rules {
             ensure!(
