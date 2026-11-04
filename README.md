@@ -66,6 +66,31 @@ DPDK readiness requires future PMD-specific validation. See the
 [design](docs/INTERFACE_CAPABILITIES.md) and
 [frontend contract](FRONTEND_SPEC.md#interface-capability-snapshots).
 
+## Performance diagnostics and safe RPS tuning
+
+`GET /api/v1/statistics/performance` (`state.read`, no body/query) collects
+passive host CPU, network softirq, softnet, IRQ and interface/queue evidence.
+It is separate from cached capability inventory: reads neither save capability
+snapshots nor change configuration. Compare successive samples under the same
+representative load alongside existing interface rates, queue drops and gateway
+latency; a recommendation is a trial candidate, never proof of a speed increase.
+
+Explicit `kernel.rps` entries map physical managed Ethernet RX queues to canonical
+Linux CPU masks, for example `{"eno1/rx-0":"c"}` selects CPUs 2 and 3.
+This is a synthetic illustration, not a recommended mask for another appliance.
+Use complete confirmed configuration transactions with `transactions.write`,
+`kernel.host.write` and `interfaces.write`. Native host mode and operator
+`allow_host_tunables` opt-in are required. No IRQ, offload, RSS, RFS or VLAN queue
+settings are changed automatically. Zero disables RPS; removing an entry restores
+its captured original mask. Native durable intents cover apply failures and
+interrupted recovery, and confirmation timeout restores the prior configuration.
+
+SSH supports `show statistics performance`, `kernel rps INTERFACE/rx-N MASK`
+and `no kernel rps INTERFACE/rx-N` in the normal candidate/confirmed workflow.
+See the [contract](FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning) and
+[frontend handoff](docs/frontend-handoffs/2026-11-04.md#2026-11-04-03-performance-diagnostics-and-transactional-rps).
+Real hardware connectivity and performance acceptance remain operator work.
+
 ## Read-only loopback interfaces
 
 `GET /api/v1/interfaces/discovered` (`state.read`) includes every live link.

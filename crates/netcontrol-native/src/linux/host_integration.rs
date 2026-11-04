@@ -3,6 +3,7 @@ use super::*;
 use futures_util::TryStreamExt;
 use netlink_packet_route::{
     address::{AddressAttribute, AddressFlag},
+    link::{LinkAttribute, LinkMessage},
     route::{RouteProtocol, RouteScope},
 };
 use std::os::unix::fs::DirBuilderExt;
@@ -23,6 +24,46 @@ fn row(native: &mut Native, name: &str) -> Result<Value> {
         .find(|v| v["name"] == name)
         .cloned()
         .context("inventory interface missing")
+}
+
+fn fixture_link(namespace: Arc<File>, name: &str) -> Result<LinkMessage> {
+    let name = name.to_owned();
+    session(namespace, move |rt, handle| {
+        rt.block_on(async {
+            networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|link| networking::name(link) == name)
+                .context("fixture link missing")
+        })
+    })
+}
+
+fn link_alias(namespace: Arc<File>, name: &str) -> Result<String> {
+    Ok(fixture_link(namespace, name)?
+        .attributes
+        .into_iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::IfAlias(value) => Some(value),
+            _ => None,
+        })
+        .unwrap_or_default())
+}
+
+fn change_alias(namespace: Arc<File>, name: &str, alias: &str) -> Result<()> {
+    let index = fixture_link(namespace.clone(), name)?.header.index;
+    let alias = alias.to_owned();
+    session(namespace, move |rt, handle| {
+        rt.block_on(async {
+            let mut request = handle.link().set(index);
+            request
+                .message_mut()
+                .attributes
+                .push(LinkAttribute::IfAlias(alias));
+            request.execute().await?;
+            Ok(())
+        })
+    })
 }
 
 fn foreign_routes(namespace: Arc<File>) -> Result<usize> {
@@ -118,6 +159,9 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             Ok(())
         })
     })?;
+    change_alias(namespace.clone(), "nic0", "Original physical label")?;
+    change_alias(namespace.clone(), "peer0", "Original peer label")?;
+    change_alias(namespace.clone(), "unrelated0", "Unmanaged label")?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
@@ -138,6 +182,62 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     let scope = native.scope()?;
     assert!(scope.starts_with("linux:host:"));
     let empty = Config::empty();
+    let unchanged_ownership = serde_json::to_value(native.ownership()?)?;
+    let unchanged_firewall = session(namespace.clone(), |_, _| netfilter::fingerprint())?;
+    let first = native.statistics(&empty, "/api/v1/statistics/performance", "")?;
+    assert_eq!(first["schema"], "netcontrol-performance/v1");
+    assert_eq!(first["sample"]["scope"], "host");
+    assert_eq!(first["sample"]["backend_scope"], scope);
+    assert_eq!(first["tuning_available"], false);
+    assert_eq!(first["recommendations"], json!([]));
+    assert_eq!(first["sections"]["cpu"]["status"], "available");
+    let first_cpus = first["sections"]["cpu"]["data"]["rows"]
+        .as_array()
+        .context("live CPU rows missing")?;
+    assert!(!first_cpus.is_empty());
+    assert!(
+        first_cpus
+            .iter()
+            .all(|cpu| cpu["delta"].is_null() && cpu["busy_percent"].is_null())
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1050));
+    let second = native.statistics(&empty, "/api/v1/statistics/performance", "")?;
+    assert_eq!(second["sample"]["identity_stable"], true);
+    assert_eq!(second["sections"]["cpu"]["data"]["baseline"], "ready");
+    let second_cpus = second["sections"]["cpu"]["data"]["rows"]
+        .as_array()
+        .context("second live CPU rows missing")?;
+    assert!(second_cpus.iter().any(|cpu| {
+        cpu["busy_percent"]
+            .as_f64()
+            .is_some_and(|busy| (0.0..=100.0).contains(&busy))
+            && cpu["delta"]["total_ticks"].as_str().is_some()
+    }));
+    assert!(matches!(
+        second["sample"]["status"].as_str(),
+        Some("available" | "partial")
+    ));
+    assert!(
+        second["sample"]["sample_interval_seconds"]
+            .as_f64()
+            .is_some_and(|interval| interval >= 1.0)
+    );
+    assert_eq!(
+        serde_json::to_value(native.ownership()?)?,
+        unchanged_ownership
+    );
+    assert_eq!(
+        session(namespace.clone(), |_, _| netfilter::fingerprint())?,
+        unchanged_firewall
+    );
+    assert!(
+        native
+            .allow_rps(&Kernel {
+                rps: [("nic0/rx-0".into(), "1".into())].into(),
+                ..Default::default()
+            })
+            .is_err()
+    );
     let baseline = row(&mut native, "nic0")?;
     assert_eq!(baseline["kind"], "ethernet");
     assert_eq!(baseline["ownership"], "unmanaged");
@@ -187,6 +287,10 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             .is_err()
     );
     assert_eq!(row(&mut native, "nic0")?, baseline);
+    assert_eq!(
+        link_alias(namespace.clone(), "nic0")?,
+        "Original physical label"
+    );
     assert!(!native.state.join("intent.json").exists());
     assert_eq!(
         session(namespace.clone(), |_, _| netfilter::fingerprint())?,
@@ -195,6 +299,16 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
 
     native.apply(&empty, &desired)?;
     native.observe(&desired)?;
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "WAN");
+    assert_eq!(link_alias(namespace.clone(), "nic100")?, "");
+    assert_eq!(
+        link_alias(namespace.clone(), "peer0")?,
+        "Original peer label"
+    );
+    assert_eq!(
+        link_alias(namespace.clone(), "unrelated0")?,
+        "Unmanaged label"
+    );
     let managed = row(&mut native, "nic0")?;
     assert_eq!(managed["ownership"], "managed");
     assert_eq!(managed["index"], baseline["index"]);
@@ -334,13 +448,85 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     let ownership_before = fs::read(native.state.join("ownership.json"))?;
     let mut described = desired.clone();
     described.interfaces[0].metadata.display_name = "Office LAN".into();
+    let runtime_before = native.services.status();
     native.apply(&desired, &described)?;
     assert_eq!(native.observe(&described)?, described);
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "Office LAN [WAN]");
+    assert_eq!(native.services.status(), runtime_before);
     assert_eq!(
         fs::read(native.state.join("ownership.json"))?,
         ownership_before
     );
     assert!(!native.state.join("intent.json").exists());
+    assert!(!native.state.join("interface-alias-intent.json").exists());
+    let alias_state_path = native.state.join("interface-aliases.json");
+    let alias_state_before = fs::read(&alias_state_path)?;
+    let mut annotated = described.clone();
+    annotated.interfaces[0].metadata.description = "No kernel label change".into();
+    native.apply(&described, &annotated)?;
+    assert_eq!(fs::read(&alias_state_path)?, alias_state_before);
+    assert_eq!(
+        fs::read(native.state.join("ownership.json"))?,
+        ownership_before
+    );
+
+    let mut lan = described.clone();
+    lan.interfaces[0].role = "lan".into();
+    native.apply(&described, &lan)?;
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "Office LAN [LAN]");
+    native.apply(&lan, &described)?;
+    let mut unicode = described.clone();
+    unicode.interfaces[0].metadata.display_name = "\u{1f310}".repeat(128);
+    unicode.validate()?;
+    native.apply(&described, &unicode)?;
+    let long_alias = link_alias(namespace.clone(), "nic0")?;
+    assert!(long_alias.len() <= 255);
+    assert!(long_alias.ends_with(" [WAN]"));
+    assert_eq!(native.observe(&unicode)?, unicode);
+    native.apply(&unicode, &described)?;
+
+    // Force a kernel label failure after nic0 changes; every label must roll back.
+    let mut rejected = described.clone();
+    rejected.interfaces[0].metadata.display_name = "Partially applied".into();
+    let mut peer = rejected.interfaces[0].clone();
+    peer.name = "peer0".into();
+    peer.addresses.clear();
+    peer.metadata.display_name = "Rejected\0suffix".into();
+    rejected.interfaces.push(peer);
+    assert!(native.reconcile_interface_aliases(&rejected).is_err());
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "Office LAN [WAN]");
+    assert_eq!(
+        link_alias(namespace.clone(), "peer0")?,
+        "Original peer label"
+    );
+    assert_eq!(fs::read(&alias_state_path)?, alias_state_before);
+    assert!(!native.state.join("interface-alias-intent.json").exists());
+
+    let saved: Value = read_json(&alias_state_path)?;
+    let link = fixture_link(namespace.clone(), "nic0")?;
+    write_json(
+        &native.state.join("interface-alias-intent.json"),
+        &json!({
+            "before": saved,
+            "links": {"nic0": {
+                "interface": networking::parent(&link),
+                "boot": native.boot,
+                "alias": "Office LAN [WAN]"
+            }}
+        }),
+    )?;
+    change_alias(namespace.clone(), "nic0", "Interrupted label update")?;
+    native.recover()?;
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "Office LAN [WAN]");
+    assert_eq!(fs::read(&alias_state_path)?, alias_state_before);
+    assert!(!native.state.join("interface-alias-intent.json").exists());
+
+    change_alias(namespace.clone(), "nic0", "")?;
+    native.observe(&described)?;
+    native.repair(&described)?;
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "Office LAN [WAN]");
+    native.apply(&described, &desired)?;
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "WAN");
 
     // Core expires pending transactions before startup repair; do not replay the expired candidate.
     let mut ownership = native.ownership()?;
@@ -365,6 +551,10 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     native.apply(&desired, &empty)?;
     native.observe(&empty)?;
     assert_eq!(row(&mut native, "nic0")?, baseline);
+    assert_eq!(
+        link_alias(namespace.clone(), "nic0")?,
+        "Original physical label"
+    );
     native.apply(&empty, &desired)?;
 
     let mut down = value.clone();
@@ -373,8 +563,13 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     let down: Config = serde_json::from_value(down)?;
     native.apply(&desired, &down)?;
     native.observe(&down)?;
+    assert_eq!(link_alias(namespace.clone(), "nic0")?, "WAN");
     native.apply(&down, &empty)?;
     assert_eq!(row(&mut native, "nic0")?, baseline);
+    assert_eq!(
+        link_alias(namespace.clone(), "nic0")?,
+        "Original physical label"
+    );
 
     // Persist originals only in the intent, then emulate process loss before ownership save.
     let before = serde_json::to_value(&empty)?;
@@ -406,6 +601,18 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     native.observe(&empty)?;
     assert_eq!(row(&mut native, "nic0")?, baseline);
     assert_eq!(row(&mut native, "unrelated0")?, unrelated);
+    assert_eq!(
+        link_alias(namespace.clone(), "nic0")?,
+        "Original physical label"
+    );
+    assert_eq!(
+        link_alias(namespace.clone(), "peer0")?,
+        "Original peer label"
+    );
+    assert_eq!(
+        link_alias(namespace.clone(), "unrelated0")?,
+        "Unmanaged label"
+    );
     assert_eq!(foreign_routes(namespace)?, foreign_count);
     Ok(())
 }

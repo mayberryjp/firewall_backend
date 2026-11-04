@@ -69,6 +69,57 @@ pub struct Kernel {
     pub namespace: BTreeMap<String, String>,
     #[serde(default)]
     pub host: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rps: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rps_identity: BTreeMap<String, RpsIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RpsIdentity {
+    pub index: u32,
+    pub mac: String,
+    pub boot: String,
+}
+
+impl Kernel {
+    pub fn overlay(&mut self, values: &Self) {
+        self.namespace.extend(values.namespace.clone());
+        self.host.extend(values.host.clone());
+        self.rps.extend(values.rps.clone());
+        self.rps_identity.extend(values.rps_identity.clone());
+    }
+
+    pub fn capture_originals(&mut self, values: &Self) {
+        for (original, observed) in [
+            (&mut self.namespace, &values.namespace),
+            (&mut self.host, &values.host),
+            (&mut self.rps, &values.rps),
+        ] {
+            for (name, value) in observed {
+                original
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        for (name, identity) in &values.rps_identity {
+            self.rps_identity.insert(name.clone(), identity.clone());
+        }
+    }
+
+    pub fn same_values(&self, other: &Self) -> bool {
+        self.namespace == other.namespace && self.host == other.host && self.rps == other.rps
+    }
+
+    pub fn release_rps(&mut self, desired: &Self) {
+        self.rps.retain(|key, _| desired.rps.contains_key(key));
+        self.rps_identity.retain(|name, _| {
+            self.rps.keys().any(|key| {
+                netcontrol_core::rps_target(key).is_ok_and(|(interface, _)| interface == name)
+            })
+        });
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -142,6 +193,16 @@ impl Network {
     }
 
     pub fn validate(&self, parents: &BTreeSet<String>) -> Result<()> {
+        netcontrol_core::validate_rps(&self.kernel.rps)?;
+        for key in self.kernel.rps.keys() {
+            let (name, _) = netcontrol_core::rps_target(key)?;
+            ensure!(
+                self.interfaces
+                    .iter()
+                    .any(|link| link.name == name && link.kind == "ethernet"),
+                "RPS requires a managed physical Ethernet interface"
+            );
+        }
         let mut names = BTreeSet::new();
         for link in &self.interfaces {
             ensure!(
@@ -345,6 +406,49 @@ pub fn parse_prefix(value: &str, network: bool) -> Result<(IpAddr, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rps_originals_overlay_release_and_reboot_identity_are_durable() {
+        let first = RpsIdentity {
+            index: 2,
+            mac: "02:00:00:00:00:01".into(),
+            boot: "boot-a".into(),
+        };
+        let mut baseline = Kernel {
+            rps: [("eno1/rx-0".into(), "0".into())].into(),
+            rps_identity: [("eno1".into(), first.clone())].into(),
+            ..Default::default()
+        };
+        let desired = Kernel {
+            rps: [("eno1/rx-0".into(), "c".into())].into(),
+            ..Default::default()
+        };
+        let mut effective = baseline.clone();
+        effective.overlay(&desired);
+        assert_eq!(effective.rps["eno1/rx-0"], "c");
+        let captured = Kernel {
+            rps: [("eno1/rx-0".into(), "c".into())].into(),
+            rps_identity: [(
+                "eno1".into(),
+                RpsIdentity {
+                    index: 5,
+                    boot: "boot-b".into(),
+                    ..first
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        baseline.capture_originals(&captured);
+        assert_eq!(baseline.rps["eno1/rx-0"], "0");
+        assert_eq!(baseline.rps_identity["eno1"].index, 5);
+        let restored: Kernel =
+            serde_json::from_slice(&serde_json::to_vec(&baseline).unwrap()).unwrap();
+        assert_eq!(restored, baseline);
+        baseline.release_rps(&Kernel::default());
+        assert!(baseline.rps.is_empty());
+        assert!(baseline.rps_identity.is_empty());
+    }
 
     #[test]
     fn loopback_role_is_not_a_managed_role_and_loopback_kind_is_readonly() {

@@ -53,6 +53,8 @@ mod linux;
 mod model;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod netlink_decode;
+#[cfg(target_os = "linux")]
+mod performance;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod statistics;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

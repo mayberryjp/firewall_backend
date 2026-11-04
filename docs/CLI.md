@@ -177,7 +177,21 @@ gateway-monitor JSON
 no gateway-monitor NAME
 kernel host|namespace KEY VALUE
 no kernel host|namespace KEY
+kernel rps INTERFACE/rx-N MASK
+no kernel rps INTERFACE/rx-N
 ```
+
+`show statistics performance` reads passive CPU/IRQ/softnet and physical RX-queue
+evidence (`state.read`). `kernel rps` stages a canonical lowercase hexadecimal
+CPU mask, for example `c` selects CPUs 2 and 3; this is a synthetic example,
+not an appliance recommendation. Mask `0` explicitly disables RPS; `no kernel
+rps` restores the queue's captured original mask on apply. Changes require
+`transactions.write`, `interfaces.write`, `kernel.host.write`, native host mode
+and operator `allow_host_tunables`. Use a managed physical Ethernet parent, not a
+VLAN/tunnel. `commit check` validates configuration, not live queue/CPU/write
+availability. Apply still requires `commit confirmed` and explicit `confirm`
+after independent connectivity/performance checks. No IRQ or other tuning is
+changed. See the [contract](../FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning).
 
 Route-add commands explicitly stage `enabled: true`. Route deletion matches the
 specified path/table/metric regardless of its enabled flag or metadata, so a

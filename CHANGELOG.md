@@ -25,6 +25,30 @@
 
 ### Added
 
+- Descriptive Linux aliases for configured physical Ethernet interfaces:
+  `DISPLAY_NAME [WAN|LAN|UNASSIGNED]`, or the role alone without a display name.
+  Real names and unmanaged/virtual links remain unchanged. Label-only edits
+  avoid network/worker restarts; original aliases, failed updates and restart
+  recovery are durably protected. Long UTF-8 display prefixes are shortened
+  only in the kernel alias, retaining the complete role and saved metadata.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Optional frontend explanation:
+  [handoff 2026-11-04-04](docs/frontend-handoffs/2026-11-04.md#2026-11-04-04-physical-interface-descriptive-aliases).
+
+- Saved a resumable [performance roadmap](docs/PERFORMANCE_ROADMAP.md) covering
+  remaining RPS acceptance, planned transactional NIC offload management and
+  later WAN smart queue management. Documentation only; no runtime/API change.
+
+- Passive host CPU/IRQ/softnet and physical RX-queue performance diagnostics at
+  `GET /api/v1/statistics/performance`, with evidence-based RPS trial candidates.
+  Explicit `kernel.rps` CPU masks use complete confirmed transactions, host-mode
+  opt-in, permission checks, exact kernel readback and durable original-mask
+  recovery. No automatic tuning, IRQ changes or datapath acceleration.
+  SSH supports performance inspection and candidate RPS edits.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Required frontend types/editor/confirmation work:
+  [handoff 2026-11-04-03](docs/frontend-handoffs/2026-11-04.md#2026-11-04-03-performance-diagnostics-and-transactional-rps).
+
 - Explicit DHCP-following route gateways with `"gateway":"dhcp"` for IPv4 routes
   on DHCP-managed Ethernet interfaces. Current lease default gateways drive
   owned route installation, site/gateway changes, expiry and recovery without

@@ -982,3 +982,35 @@ fn confirmation_timeout_rolls_back_even_after_cli_session_is_dropped() {
             .is_empty()
     );
 }
+#[test]
+fn performance_rps_cli_stages_confirms_and_restores() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    let sample: Value =
+        serde_json::from_str(&f.ok(&mut cli, "show statistics performance")).unwrap();
+    assert_eq!(sample["sample"]["status"], "simulated");
+    f.configure(&mut cli);
+    f.ok(&mut cli,r#"set /interfaces [{"name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}]"#);
+    f.ok(&mut cli, "kernel rps eno1/rx-0 c");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/kernel/tunables")["observed"]["rps"]["eno1/rx-0"],
+        "c"
+    );
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "no kernel rps eno1/rx-0");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/kernel/tunables")["observed"]["rps"]["eno1/rx-0"],
+        "0"
+    );
+    let denied = Fixture::new(&["state.read"]);
+    assert!(
+        denied
+            .ok(&mut CliSession::new(), "show statistics performance")
+            .contains("simulated")
+    );
+}

@@ -297,6 +297,8 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
             a.kernel.namespace != b.kernel.namespace,
         ),
         ("kernel.host.write", a.kernel.host != b.kernel.host),
+        ("kernel.host.write", a.kernel.rps != b.kernel.rps),
+        ("interfaces.write", a.kernel.rps != b.kernel.rps),
         ("nat.write", a.firewall.nat != b.firewall.nat),
     ] {
         if different {
@@ -796,10 +798,18 @@ impl Engine {
         }
         if method == "GET" {
             require(permissions, "state.read")?;
-            if path == "/api/v1/statistics/firewall" && !body.is_empty() {
+            if matches!(
+                path,
+                "/api/v1/statistics/firewall" | "/api/v1/statistics/performance"
+            ) && !body.is_empty()
+            {
                 return Err(ApiError::new(
                     400,
-                    "firewall counters accept no request body",
+                    if path == "/api/v1/statistics/firewall" {
+                        "firewall counters accept no request body"
+                    } else {
+                        "performance diagnostics accept no request body"
+                    },
                 ));
             }
             return self.get(path, query).map(|v| Reply::value(200, v));
@@ -1543,7 +1553,10 @@ impl Engine {
                 kernel["desired"] = value(&self.state.desired.kernel)?;
                 return Ok(kernel);
             }
-            if !expected.kernel.namespace.is_empty() || !expected.kernel.host.is_empty() {
+            if !expected.kernel.namespace.is_empty()
+                || !expected.kernel.host.is_empty()
+                || !expected.kernel.rps.is_empty()
+            {
                 return Err(service_error(
                     "backend does not expose kernel rollback snapshots",
                 ));
@@ -1574,6 +1587,14 @@ impl Engine {
                     return Err(service_error("backend returned invalid firewall counters"));
                 }
                 annotate_rule_origins(&mut response, &config).map_err(service_error)?;
+            }
+            if matches!(
+                path,
+                "/api/v1/statistics/firewall" | "/api/v1/statistics/performance"
+            ) {
+                if !response.is_object() {
+                    return Err(service_error("backend returned invalid statistics"));
+                }
                 response["config_revision"] = value(self.state.revision)?;
                 response["transaction_id"] =
                     value(self.active().map(|transaction| &transaction.id))?;
@@ -1877,6 +1898,7 @@ fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
         "/api/v1/statistics/interfaces",
         "/api/v1/statistics/protocols",
         "/api/v1/statistics/host",
+        "/api/v1/statistics/performance",
         "/api/v1/statistics/firewall",
         "/api/v1/statistics/link-diagnostics",
         "/api/v1/statistics/gateways",

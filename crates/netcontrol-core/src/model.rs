@@ -673,6 +673,8 @@ pub struct SoftflowdConfig {
 pub struct KernelConfig {
     pub namespace: BTreeMap<String, String>,
     pub host: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub rps: BTreeMap<String, String>,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1140,6 +1142,15 @@ impl Config {
         }
         self.vnstat.validate(self.ipv6_enabled)?;
         self.kernel.validate()?;
+        for key in self.kernel.rps.keys() {
+            let (name, _) = crate::rps_target(key)?;
+            ensure!(
+                self.interfaces
+                    .iter()
+                    .any(|link| link.name == name && link.kind == "ethernet"),
+                "RPS requires a managed physical Ethernet interface; configure the parent, not a VLAN or tunnel"
+            );
+        }
         let mut names = BTreeSet::new();
         let mut vlan_ids = BTreeSet::new();
         let mut relay_addresses = BTreeSet::new();
@@ -1885,6 +1896,7 @@ pub fn kernel_catalog() -> Vec<KernelParameter> {
 }
 impl KernelConfig {
     pub fn validate(&self) -> Result<()> {
+        crate::validate_rps(&self.rps)?;
         for (scope, map) in [("namespace", &self.namespace), ("host", &self.host)] {
             for (name, value) in map {
                 let p = kernel_catalog()

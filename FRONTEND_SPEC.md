@@ -76,7 +76,8 @@ Do not present as supported:
   and dynamic global IPv6 inheritance are not implemented.
 - Static SNAT, general DNAT/port forwarding beyond destination rewrite,
   arbitrary protocol matches/port ranges, sets, conntrack
-  controls, traffic control, device tuning, or hardware offload.
+  controls, traffic control, NIC offload/channel/ring/coalescing tuning, or
+  hardware offload. Explicit RPS tuning is documented separately below.
 - Private-key upload/generation, key-file listing, package installation, arbitrary
   commands, process identity configuration, or systemd control.
 - Calendar-aggregated throughput/history, flow records, collector-delivery
@@ -269,7 +270,8 @@ Valid interface example (technical identity is still `eno1`):
   for the corresponding objects. No new permission or HTTP method/path is added.
 - Native operational configuration excludes these annotations. Metadata-only
   applies verify the existing configuration but do not take the native network
-  mutation/worker-restart path. Saved state, transaction candidates/previous
+  mutation/worker-restart path. Linux Ethernet display names separately update
+  descriptive link aliases as described below. Saved state, transaction candidates/previous
   configs and revision details retain annotations. Normal drift checks remain.
   Observed resource metadata is configuration-derived, not evidence that Linux
   or a remote peer reports that display name. Discovery/runtime identifiers
@@ -281,6 +283,32 @@ Valid interface example (technical identity is still `eno1`):
   labels. Blank labels fall back to the existing name/ID/prefix/key. Sort/search
   may include labels without changing backend object identity or rule ordering.
   Render all annotation text as text, never raw HTML.
+
+**Linux physical-interface labels:** configured `kind:"ethernet"` interfaces
+receive one descriptive `IFLA_IFALIAS`, not a rename or an alternative interface
+name. A nonempty `metadata.display_name` becomes `DISPLAY_NAME [ROLE]`, with
+uppercase `WAN`, `LAN` or `UNASSIGNED`; an empty display name uses the role alone.
+For example, `Internet uplink` with `role:"wan"` produces
+`alias Internet uplink [WAN]` under the unchanged `eno1` entry in `ip -d link show`.
+It does not produce `WAN@eno1`: `NAME@PARENT` describes link topology, not a label.
+
+Linux permits a single alias of at most 255 UTF-8 bytes. If necessary, only the
+display-name prefix is shortened at a UTF-8 character boundary to leave room for
+the complete role suffix. Saved text and its existing 128-character validation
+remain unchanged. Descriptions do not affect aliases. Unmanaged NICs, configured
+VLAN/dummy/WireGuard interfaces and actual interface identifiers are untouched.
+
+Aliases are reapplied on successful native apply/startup repair, including
+name/role edits and clearing a display name. Metadata-only updates do not restart
+networking/workers or change native network ownership. Original aliases are
+durably preserved and restored on unmanagement; interrupted/failed label updates
+restore their pre-update aliases with identity checks. Errors use the existing
+transaction failure/recovery flow, not a success-shaped fallback. Cosmetic alias
+drift alone does not become network drift; configured metadata in API replies
+is still not an independent kernel alias observation. There are no new fields,
+endpoints, permissions or stricter text limits. Optional frontend work: explain
+the combined kernel label and possible display-prefix shortening without
+replacing technical keys or shortening the saved name.
 
 ### 1.5 Native mDNS implementation status
 
@@ -1376,6 +1404,182 @@ support, CAP_NET_RAW for capture and appropriate namespace-entry privileges;
 Ubuntu install/full source upgrade loads/persists modules. No unprivileged-BPF
 sysctl, AppArmor or lockdown weakening. Other package/manual upgrade paths need
 operator kernel-module prerequisites; API reads never repair them.
+
+#### Performance diagnostics and RPS tuning
+
+`GET /api/v1/statistics/performance` requires API-key authentication and
+`state.read`. No query or body (including `{}`/`null`) is accepted: `400`.
+Other methods return `405`, authentication/permission failures `401`/`403`.
+Native collection requires current-daemon host mode; explicit lab namespaces,
+fatal interface enumeration/identity failures and collection-limit failures
+return `503`. Individual missing sources return `200` with explicit partial
+evidence, not zero measurements. Responses retain `Cache-Control: no-store`.
+Register this read-only route in the API Explorer. It never writes capability
+snapshots, configuration, revisions or tuning, and sends no probe traffic.
+
+The envelope is `schema:"netcontrol-performance/v1"`, `sample`, `sections`,
+`interfaces`, `configured_rps`, `tuning_available`, `recommendations`,
+`config_revision` and `transaction_id`. The last two identify the committed
+calendar revision and nullable provisionally applied transaction. `configured_rps`
+reflects that applied configuration, not necessarily committed desired state.
+`tuning_available` means native operator opt-in, not caller write authorization
+or verified performance benefit.
+
+`sample` contains:
+
+- `scope:"host"`, opaque `backend_scope`, RFC3339 UTC `started_at`/`collected_at`.
+- `status:"available"|"partial"`; `atomic:false`.
+- Nullable monotonic `sample_interval_seconds`, measured since the prior
+  diagnostics request in this daemon, not a configured poll interval.
+- `allowed_cpus_scope:"collector_thread"`: the collector's process/cgroup
+  constraints do not scope all host kernel networking.
+- `identity_stable`: initial/final boot, online, allowed and isolated CPU
+  evidence agrees. Changes/unavailable identity clear all baselines and null
+  all source intervals, deltas, rates and CPU percentages. Topology and affinity
+  are not final-rechecked; collection is still non-atomic.
+
+`sections` has `boot_id`, `online_cpus`, `allowed_cpus`, `isolated_cpus`,
+`topology`, `cpu`, `softirqs`, `softnet`, `interrupts`, `irq_affinity` and
+`identity_recheck`. Each uses `{status,data,error}`: status
+`available|partial|unavailable`, unavailable data null with explicit string error;
+partial data retains nested errors. CPU-list data are numeric ID arrays.
+Never turn unavailable evidence into empty lists or zero counts.
+
+- `topology.data:{partial,cpus,numa}`: CPU rows have `cpu_id`,
+  evidence-wrapped integer `physical_package_id` and `core_id`, and nullable
+  numeric `numa_node_ids[]`. `numa` is evidence-wrapped node/CPU-list data.
+- `irq_affinity.data:{partial,rows}`: each row has numeric `irq` and
+  `smp_affinity_list`/`effective_affinity_list` evidence wrappers, whose data
+  contains `cpu_ids[]`.
+- `identity_recheck.data:{partial,stable,checks}`: checks for boot/online/
+  allowed/isolated evidence retain `initial`, `final`, `matches` and `error`.
+
+Counter-section data (`cpu`, `softirqs`, `softnet`, `interrupts`) contains
+`partial`, `metadata`, nullable `sample_interval_seconds`, `baseline` and `rows`.
+Use **each source's interval/baseline**, not the envelope interval. Row `counts`
+and nonnull `delta` values are exact unsigned decimal strings; nonnull
+`per_second` values are floating-point rates. The entire delta/rate object is
+null without a valid baseline. Baselines reset on source failure, boot/CPU/
+topology/layout identity change or any counter decrease; no wrap inference.
+IRQ action-description or affinity changes reset IRQ baselines too. Baseline
+labels include `ready`, `initial_or_source_recovered`,
+`topology_or_source_layout_changed`, `counter_reset`, `nonpositive_interval`,
+`monotonic_clock_reset`, `identity_unavailable`, `identity_unstable` and
+`cpu_identity_unavailable`. Only `ready` permits rates.
+
+| Section | Row identity | Count/delta/rate fields |
+| --- | --- | --- |
+| `cpu` | `cpu_id` | `user_ticks`, `nice_ticks`, `system_ticks`, `idle_ticks`, `iowait_ticks`, `irq_ticks`, `softirq_ticks`, `steal_ticks`, `guest_ticks`, `guest_nice_ticks`, `total_ticks`, `busy_ticks` |
+| `softirqs` | `cpu_id` | `net_rx`, `net_tx` (invocations, not packets) |
+| `softnet` | Modern `cpu_id` | `processed`, `dropped`, `time_squeeze` (kernel events, not unique packet-loss totals) |
+| `interrupts` | `irq`, `cpu_id`, `description` | `interrupts`; numeric hardware IRQs only |
+
+CPU ticks use USER_HZ units. Total excludes additional guest double-counting;
+busy excludes idle/iowait. Nullable `busy_percent`/`softirq_percent` use tick
+deltas, with zero-total intervals remaining null. Modern softnet layouts use
+hexadecimal column 13 as CPU ID, never row position. Historical 11-column
+layouts retain counts with `cpu_id:null`, `row_index` and no deltas/rates;
+12-column layouts are unavailable. Metadata documents units/source/coverage.
+
+Collection is on demand, with no background worker or persisted benchmark
+history. CPU/IRQ collection is bounded to 32 MiB/sample, 4096 CPUs/IRQs and
+65536 IRQ-CPU rows. Interface collection is bounded to 8192 links, 4096 physical
+RX queues, 65536 NIC-IRQ associations, and checks its five-second budget between
+operations. Source files are bounded; these are not hard preemptive I/O deadlines.
+
+`interfaces[]` has `name`, numeric `index`, `mac`, native `kind`, `up`,
+`physical`, `managed`, nullable VLAN `parent_index`/`parent`, nullable
+`rx_queues:[{name,rps_cpus}]`, nullable numeric `irqs[]` and `errors:string[]`.
+Queue masks are observed canonical hexadecimal strings. Nonphysical links
+retain null physical queue/IRQ evidence. `managed` means a configured Ethernet
+record; unmanaged/down links remain visible. VLAN parent references can be
+followed to the physical NIC; veth peer indices are not mislabeled as parents.
+NIC IRQ association comes from device sysfs, not action-name guessing.
+
+`recommendations[]` contains RPS candidates only for up, managed physical NICs
+with exactly one observed RX queue, RPS disabled and no interface-source errors:
+
+- Fields: `kind:"rps"`, `target:"INTERFACE/rx-N"`,
+  `status:"trial"|"insufficient_evidence"`, nullable `suggested_mask`,
+  nullable `evidence`, string `reason`, `automatic:false`, `tuning_available`.
+- A concrete trial requires stable identity, available topology/isolation/
+  effective-affinity evidence, and ready CPU/NET_RX/IRQ intervals of 1..30
+  seconds aligned within 0.1 seconds. An associated active IRQ CPU must have
+  busy >=80%, softirq >=30% and positive NET_RX and NIC IRQ deltas.
+- Choose at most two online, allowed, nonisolated idle CPUs (busy <=50%,
+  softirq <=10%), outside that NIC's effective IRQ affinity. Require distinct
+  physical cores, excluding the busy core's SMT siblings, in the same package
+  and NUMA node as the observed busy IRQ CPU. This is IRQ-CPU locality evidence,
+  not proof of the NIC's own NUMA placement. Rank by lower busy percentage,
+  then CPU ID. Missing/ambiguous evidence returns a null mask with reason.
+- Evidence records `irq_cpu`, measured `busy_percent`/`softirq_percent`,
+  `cpu_sample_interval_seconds`, `target_cpus[]` and `locality`.
+  This is a conservative experiment, not a bottleneck diagnosis or speed claim.
+  Never auto-submit, auto-confirm, enable all CPUs or edit IRQ affinity.
+
+Simulator responses use the same envelope with `sample.status:"simulated"`,
+scope/backend_scope `simulator`, null timestamps/interval/allowed scope,
+`identity_stable:false`, null section data and interfaces, and no recommendations.
+They never read host performance or claim operational support.
+
+##### Explicit RPS configuration and lifecycle
+
+New optional `kernel.rps` is a nonnull `Record<string,string>`; omitted/empty
+means no owned RPS settings. It is omitted from serialization when empty.
+Synthetic fragment only, not a complete transaction or recommended CPU choice:
+
+```json
+{"kernel":{"rps":{"eno1/rx-0":"c"}}}
+```
+
+`c` selects CPUs 2 and 3. Keys use an existing managed physical Ethernet
+interface and canonical `rx-N` queue index 0..4095, maximum 64 settings.
+Masks are lowercase comma-separated hexadecimal 32-bit words, highest word
+unpadded, subsequent words exactly eight digits; CPU IDs 0..8191.
+No `0x`, whitespace, uppercase or redundant leading zeros. `0` disables RPS.
+Every selected CPU must be online at native apply preflight. VLANs, tunnels,
+dummy/veth software links and unsupported/missing queues cannot be tuned.
+The physical-device sysfs check is native preflight, not just core validation.
+
+Use the full `POST /api/v1/transactions` candidate and current `base_revision`,
+10..300-second confirmation timeout and explicit confirm/rollback. Changes,
+confirmation, rollback and revision restores require `transactions.write`,
+`kernel.host.write`, `interfaces.write`, plus permissions for other changes.
+Native host mode and operator `allow_host_tunables` with the exclusive host
+tunables lock are prerequisites. Do not copy native `rps_identity` observations
+into editable configuration. No new permission, RPS write endpoint or GET tuning.
+
+Known JSON type/null errors are `400`; invalid masks/keys, limits and unmanaged
+or non-Ethernet references are `422`; authentication `401`/`403`, stale/busy
+transaction `409`, native apply/readback/recovery errors use existing `500`
+transaction behavior. Source availability errors on diagnostic reads are `503`
+or explicit `200` partial evidence as above. Submit success is provisional
+`202`; confirm/rollback `200`. Preserve errors and inspect uncertain outcomes,
+never automatically retry mutation.
+
+`GET /api/v1/kernel/tunables` and existing runtime reads expose `rps` in
+desired/configured/effective/observed/captured-original maps. Native maps may
+also expose daemon-owned `rps_identity:{INTERFACE:{index,mac,boot}}`. Normal
+state/revision reads preserve desired masks. Capture original values/identities
+durably before writes, verify exact readback, and restore through native intents
+on apply failure/interrupted recovery. Failed recovery retains its intent and
+error. Remove an entry to restore its original mask and release queue ownership;
+set `0` to explicitly own a disabled setting. Confirmation timeout/restart
+rollback restores the previous configuration; reboot reapplies verified saved
+settings. Same-boot index and MAC checks reject replacement. Missing devices,
+changed CPU availability or unreadable controls fail explicitly; no automatic
+hotplug repair, permissive fallback or external tuning coordination.
+
+Frontend tasks: preserve `kernel.rps` in all full-package drafts/history/imports;
+offer explicit mask review/edit/removal only with permissions and prerequisites;
+show source errors, first/reset samples and pending transaction identity.
+Capture before/after diagnostics under the same load, plus existing interface
+throughput, link-diagnostic drops/backlog and gateway RTT/loss. A first sample
+alone is insufficient. Verify independent management/VLAN/WireGuard reachability,
+and compare CPU distribution, rates, drops and latency before confirming.
+Do not label the trial faster without measured improvement. No before/after
+records are saved by this endpoint; UI comparison/export is frontend-owned.
+No RFS/RSS/XPS, offload, IRQ, qdisc, flowtable, XDP/AF_XDP or DPDK changes.
 
 #### Host health sensors
 
@@ -5381,6 +5585,8 @@ Paths below are relative to `/api/v1`.
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
 | GET | `/interface-capabilities` | Persisted `InterfaceCapabilitySnapshot \| null`; `state.read`, no implicit scan |
 | GET | `/interface-capabilities/refresh` | No body/query -> `200 InterfaceCapabilitySnapshot`; `state.read` + `interfaces.write`, explicit passive scan and durable save; never auto-run/prefetch/poll |
+| GET | `/statistics/performance` | No body/query -> live host CPU/IRQ/softnet, physical RX queues and conservative RPS trial evidence; `state.read`, no tuning or persisted scan |
+| GET | `/kernel/tunables` | Desired/configured/effective/observed/original kernel maps, including explicit RPS masks and native read-only identity evidence |
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |
 | POST | `/diagnostics/dns-lookup` | Timed configured- or explicit-resolver diagnostic result `200`; `diagnostics.run` |

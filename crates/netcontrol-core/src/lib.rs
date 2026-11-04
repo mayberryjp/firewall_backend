@@ -11,6 +11,8 @@ mod interface_capabilities;
 pub use interface_capabilities::*;
 mod mdns;
 mod model;
+mod rps;
+pub use rps::{MAX_CPU_ID, cpu_mask, parse_cpu_list, parse_cpu_mask, rps_target, validate_rps};
 mod sando;
 mod simulator;
 mod store;

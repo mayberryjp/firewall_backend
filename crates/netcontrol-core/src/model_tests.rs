@@ -1872,3 +1872,39 @@ fn softflowd_all_fields_and_timeout_limits_are_validated() {
         assert!(bad.validate().is_err(), "case {change}");
     }
 }
+#[test]
+fn rps_requires_canonical_masks_and_managed_ethernet_parents() {
+    let mut config: Config = serde_json::from_value(serde_json::json!({
+        "interfaces":[{"name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],
+        "kernel":{"rps":{"eno1/rx-0":"e"}}
+    })).unwrap();
+    config.validate().unwrap();
+    let saved = serde_json::to_value(&config).unwrap();
+    assert_eq!(saved["kernel"]["rps"]["eno1/rx-0"], "e");
+    assert_eq!(
+        config.operational_value().unwrap()["kernel"]["rps"]["eno1/rx-0"],
+        "e"
+    );
+    for (key, mask) in [
+        ("eno1/rx-0", "00"),
+        ("eno1/rx-0", "0x1"),
+        ("eno1/rx-00", "1"),
+        ("eno1/tx-0", "1"),
+        ("absent/rx-0", "1"),
+        ("../rx-0", "1"),
+    ] {
+        config.kernel.rps = [(key.into(), mask.into())].into();
+        assert!(config.validate().is_err(), "{key}={mask}");
+    }
+    config.kernel.rps = [("eno1/rx-0".into(), "0".into())].into();
+    config.interfaces[0].kind = "dummy".into();
+    assert!(config.validate().is_err());
+    config.interfaces[0].kind = "ethernet".into();
+    config.validate().unwrap();
+    config.kernel.rps.clear();
+    assert!(
+        serde_json::to_value(&config).unwrap()["kernel"]
+            .get("rps")
+            .is_none()
+    );
+}

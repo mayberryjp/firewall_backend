@@ -18,7 +18,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   show state / runtime / interfaces / routes / firewall / kernel
   show interfaces discovered          Read-only inventory, including unmanaged host NICs
   show transactions / transaction ID / revisions / revision yyyy.mm.dd.iteration
-    show statistics [host|interfaces|protocols|gateways|link-diagnostics|vnstat]
+    show statistics [host|interfaces|protocols|gateways|link-diagnostics|performance|vnstat]
   commit check                        Normalize and validate; no networking changes
   commit confirmed SECONDS [TEXT]     Apply full candidate; 10..300 seconds to confirm
   confirm [ID] / rollback [ID]         Explicit transaction action; last local ID if omitted
@@ -53,6 +53,7 @@ Configuration commands:
   vnstat enable|disable
   exporter JSON / no exporter NAME / gateway-monitor JSON / no gateway-monitor NAME
   kernel host|namespace KEY VALUE / no kernel host|namespace KEY
+  kernel rps INTERFACE/rx-N MASK / no kernel rps INTERFACE/rx-N
   set /JSON/pointer JSON               Typed schema edit; array '-' appends
   delete /JSON/pointer                 Delete optional/defaulted field or array element
   load candidate JSON                 Replace private candidate, never live state
@@ -550,6 +551,7 @@ impl CliSession {
                         | "protocols"
                         | "gateways"
                         | "link-diagnostics"
+                        | "performance"
                         | "vnstat"
                 ) =>
             {
@@ -986,10 +988,13 @@ fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
         [service @ ("ntp" | "syslog" | "vnstat"), state] => {
             config[*service]["enabled"] = json!(enabled(state)?)
         }
-        ["kernel", scope @ ("host" | "namespace"), key, value] => {
+        ["kernel", scope @ ("host" | "namespace" | "rps"), key, value] => {
+            if config["kernel"][*scope].is_null() {
+                config["kernel"][*scope] = json!({});
+            }
             config["kernel"][*scope][*key] = json!(value)
         }
-        ["no", "kernel", scope @ ("host" | "namespace"), key] => {
+        ["no", "kernel", scope @ ("host" | "namespace" | "rps"), key] => {
             ensure!(
                 config["kernel"][*scope]
                     .as_object_mut()

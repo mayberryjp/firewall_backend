@@ -142,6 +142,12 @@ impl Backend for Simulator {
         }
         for (scope, values, original, live) in [
             (
+                "rps",
+                &after.kernel.rps,
+                &mut self.original.rps,
+                &mut self.live.rps,
+            ),
+            (
                 "namespace",
                 &after.kernel.namespace,
                 &mut self.original.namespace,
@@ -156,10 +162,13 @@ impl Backend for Simulator {
         ] {
             for name in values.keys() {
                 if !original.contains_key(name) {
-                    let value = live
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_else(|| simulated_kernel_default(scope, name));
+                    let value = live.get(name).cloned().unwrap_or_else(|| {
+                        if scope == "rps" {
+                            "0".into()
+                        } else {
+                            simulated_kernel_default(scope, name)
+                        }
+                    });
                     original.insert(name.clone(), value);
                 }
             }
@@ -230,6 +239,22 @@ impl Backend for Simulator {
             return Ok(json!({
                 "schema":"netcontrol-firewall-counters/v1","generation":null,"ruleset_id":null,"rules":[],
                 "sample":{"scope":"simulator","started_at":Utc::now(),"collected_at":Utc::now(),"status":"simulated"}
+            }));
+        }
+        if path == "/api/v1/statistics/performance" {
+            let sections: serde_json::Map<String,Value> = [
+                "boot_id","online_cpus","allowed_cpus","isolated_cpus","topology",
+                "cpu","softirqs","softnet","interrupts","irq_affinity","identity_recheck"
+            ].into_iter().map(|name| (name.into(),json!({
+                "status":"simulated","data":null,"error":"simulator does not measure host performance"
+            }))).collect();
+            return Ok(json!({
+                "schema":"netcontrol-performance/v1",
+                "sample":{"scope":"simulator","backend_scope":"simulator","status":"simulated",
+                    "started_at":null,"collected_at":null,"sample_interval_seconds":null,
+                    "allowed_cpus_scope":null,"atomic":false,"identity_stable":false},
+                "sections":sections,"interfaces":null,"configured_rps":config.kernel.rps,
+                "tuning_available":false,"recommendations":[]
             }));
         }
         if path == "/api/v1/statistics/host" {

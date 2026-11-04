@@ -54,10 +54,13 @@ mod dhcp_monitors;
 mod host_integration;
 #[cfg(all(test, feature = "nftables"))]
 mod integration;
+mod interface_aliases;
 mod ipv6;
 mod link_monitor;
 mod netfilter;
 mod networking;
+mod rps;
+mod rps_recommendations;
 mod sysctl;
 mod wireguard;
 mod wireguard_dns;
@@ -73,6 +76,7 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 }
 
 pub struct Native {
+    performance: crate::performance::Monitor,
     bgp: bgp::Manager,
     link_monitor: link_monitor::Monitor,
     deny_log: deny_log::Monitor,
@@ -335,6 +339,7 @@ impl Native {
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
         let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
+            performance: Default::default(),
             wireguard_dns: wireguard_dns::Manager::new(
                 namespace.clone(),
                 options.keys.clone(),
@@ -363,7 +368,8 @@ impl Native {
             "native ownership belongs to another host/namespace/parent identity; state is not reset"
         );
         ensure!(
-            ownership.kernel_baseline.host.is_empty() || native.host_namespace.is_some(),
+            (ownership.kernel_baseline.host.is_empty() && ownership.kernel_baseline.rps.is_empty())
+                || native.host_namespace.is_some(),
             "host tunable ownership requires explicit allow_host_tunables for recovery"
         );
         native.bgp.recover()?;
@@ -526,8 +532,7 @@ impl Native {
             );
         }
         let mut effective = ownership.kernel_baseline.clone();
-        effective.namespace.extend(network.kernel.namespace.clone());
-        effective.host.extend(network.kernel.host.clone());
+        effective.overlay(&network.kernel);
         self.verify_kernel(&effective)?;
         let keys = self.wireguard_dns.control.clone();
         let lease_state = leases.clone();
@@ -556,6 +561,17 @@ impl Native {
             network.kernel.host.is_empty() || self.host_namespace.is_some(),
             "host-global kernel tunables require explicit allow_host_tunables"
         );
+        self.allow_rps(&network.kernel)?;
+        for key in network.kernel.rps.keys() {
+            let (name, _) = netcontrol_core::rps_target(key)?;
+            ensure!(
+                network
+                    .interfaces
+                    .iter()
+                    .any(|link| link.name == name && link.kind == "ethernet"),
+                "RPS requires a managed physical Ethernet interface"
+            );
+        }
         firewall::validate(&network.firewall)?;
         let allowed_names: BTreeSet<_> = network
             .interfaces
@@ -615,6 +631,7 @@ impl Native {
         ownership: &mut Ownership,
     ) -> Result<()> {
         self.check_scope()?;
+        self.allow_rps(&kernel)?;
         let mut before = Network::parse(before)?;
         let mut after = Network::parse(after)?;
         let leases = self
@@ -676,6 +693,7 @@ impl Native {
                 sysctl::verify_scope(&values, "host")
             })?;
         }
+        rps::Io::system().write(&kernel.rps, &kernel.rps_identity)?;
         ownership.scope = self.identity.clone();
         // Set by caller after actual kernel convergence; never synthesize a live fingerprint.
         ownership.firewall_fingerprint = Some(fingerprint);
@@ -686,18 +704,11 @@ impl Native {
         let before = Network::parse(before)?;
         let after = Network::parse(after)?;
         let mut keys = before.kernel;
-        keys.namespace.extend(after.kernel.namespace);
-        keys.host.extend(after.kernel.host);
+        keys.overlay(&after.kernel);
         // Include restored-but-retained baseline keys so drift cannot be bypassed by
         // removing a key from the desired configuration and changing it externally.
         let baseline = self.ownership()?.kernel_baseline;
-        for (name, value) in baseline.namespace {
-            keys.namespace.entry(name).or_insert(value);
-        }
-
-        for (name, value) in baseline.host {
-            keys.host.entry(name).or_insert(value);
-        }
+        keys.capture_originals(&baseline);
         self.read_kernel(&keys)
     }
 
@@ -709,6 +720,7 @@ impl Native {
     }
 
     fn read_kernel(&self, keys: &Kernel) -> Result<Kernel> {
+        self.allow_rps(keys)?;
         let values = keys.namespace.clone();
         let namespace = session(self.namespace.clone(), move |_, _| {
             sysctl::read_scope(&values, "namespace")
@@ -723,15 +735,137 @@ impl Native {
             let values = keys.host.clone();
             host_session(handle, move |_, _| sysctl::read_scope(&values, "host"))?
         };
-        Ok(Kernel { namespace, host })
+        let (rps, rps_identity) = rps::Io::system().read(&keys.rps, &keys.rps_identity)?;
+        Ok(Kernel {
+            namespace,
+            host,
+            rps,
+            rps_identity,
+        })
     }
 
     fn verify_kernel(&self, values: &Kernel) -> Result<()> {
-        crate::ensure_unchanged(self.read_kernel(values)? == *values, "kernel tunable drift")?;
+        crate::ensure_unchanged(
+            self.read_kernel(values)?.same_values(values),
+            "kernel tunable drift",
+        )?;
         Ok(())
     }
 
+    fn allow_rps(&self, values: &Kernel) -> Result<()> {
+        ensure!(
+            values.rps.is_empty()
+                || (self.options.namespace.is_empty() && self.host_namespace.is_some()),
+            "RPS tuning requires native host mode and explicit allow_host_tunables"
+        );
+        Ok(())
+    }
+
+    fn performance_snapshot(&mut self, config: &Config) -> Result<Value> {
+        self.check_scope()?;
+        ensure!(
+            self.options.namespace.is_empty(),
+            "performance diagnostics require native host mode; host sysfs cannot describe a lab namespace"
+        );
+        let interfaces = session(self.namespace.clone(), |rt, handle| {
+            rt.block_on(async {
+                let started = std::time::Instant::now();
+                let links = networking::links(handle).await?;
+                ensure!(links.len() <= 8192, "performance interface limit exceeded");
+                let names: BTreeMap<_,_> = links.iter().map(|link| {
+                    let parent = networking::parent(link);
+                    (parent.index, parent.name)
+                }).collect();
+                let mut rows = vec![];
+                let mut queue_count = 0usize;
+                let mut irq_count = 0usize;
+                let io = rps::Io::system();
+                for link in &links {
+                    ensure!(started.elapsed() < std::time::Duration::from_secs(5), "performance interface collection exceeded time limit");
+                    let parent = networking::parent(link);
+                    let parent_index = (parent.kind == "vlan").then(|| {
+                        link.attributes.iter().find_map(|attribute| match attribute {
+                            netlink_packet_route::link::LinkAttribute::Link(index) => Some(*index),
+                            _ => None,
+                        })
+                    }).flatten();
+                    let mut errors = vec![];
+                    let physical = match fs::symlink_metadata(format!("/sys/class/net/{}/device",parent.name)) {
+                        Ok(metadata) => metadata.file_type().is_symlink(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => { errors.push(format!("physical identity: {error}")); false }
+                    };
+                    let mut queues = Value::Null;
+                    let mut irqs = Value::Null;
+                    if physical {
+                        match io.queues(&parent.name) {
+                            Ok(values) => {
+                                queue_count += values.len();
+                                ensure!(queue_count <= 4096, "performance RX queue limit exceeded");
+                                queues = json!(values.into_iter().map(|(name,mask)| json!({"name":name,"rps_cpus":mask})).collect::<Vec<_>>());
+                            }
+                            Err(error) => errors.push(format!("RX queues: {error:#}")),
+                        }
+                        match io.irqs(&parent.name) {
+                            Ok(values) => {
+                                irq_count += values.len();
+                                ensure!(irq_count <= 65536, "performance NIC IRQ limit exceeded");
+                                irqs = json!(values);
+                            }
+                            Err(error) => errors.push(format!("NIC IRQs: {error:#}")),
+                        }
+                    }
+                    rows.push(json!({
+                        "name":parent.name,"index":parent.index,"mac":parent.mac,
+                        "kind":parent.kind,"up":parent.up,"physical":physical,
+                        "parent_index":parent_index,"parent":parent_index.and_then(|index| names.get(&index)),
+                        "rx_queues":queues,"irqs":irqs,"errors":errors
+                    }));
+                }
+                let current: BTreeSet<_> = networking::links(handle).await?.iter().map(|link| {
+                    let p = networking::parent(link);
+                    (p.name,p.index,p.mac)
+                }).collect();
+                for row in &rows {
+                    ensure!(current.contains(&(
+                        row["name"].as_str().context("missing interface name")?.to_owned(),
+                        u32::try_from(row["index"].as_u64().context("missing interface index")?)?,
+                        row["mac"].as_str().context("missing MAC")?.to_owned()
+                    )), "interface identity changed during performance diagnostics");
+                }
+                ensure!(started.elapsed() < std::time::Duration::from_secs(5), "performance interface collection exceeded time limit");
+                rows.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
+                Ok(rows)
+            })
+        })?;
+        let mut snapshot = self.performance.snapshot()?;
+        let mut interfaces = interfaces;
+        for row in &mut interfaces {
+            row["managed"] = json!(
+                config
+                    .interfaces
+                    .iter()
+                    .any(|link| link.name == row["name"] && link.kind == "ethernet")
+            );
+        }
+        if interfaces.iter().any(|row| {
+            row["errors"]
+                .as_array()
+                .is_some_and(|errors| !errors.is_empty())
+        }) {
+            snapshot["sample"]["status"] = json!("partial");
+        }
+        snapshot["sample"]["backend_scope"] = json!(self.identity);
+        snapshot["interfaces"] = json!(interfaces);
+        snapshot["configured_rps"] = json!(config.kernel.rps);
+        snapshot["tuning_available"] = json!(self.host_namespace.is_some());
+        snapshot["recommendations"] = json!(rps_recommendations::recommendations(&snapshot)?);
+        Ok(snapshot)
+    }
+
     fn preflight_kernel(&self, values: &Kernel) -> Result<()> {
+        self.allow_rps(values)?;
+        rps::Io::system().preflight(&values.rps, &values.rps_identity)?;
         let namespace = values.namespace.clone();
         session(self.namespace.clone(), move |_, _| {
             for (name, value) in namespace {
@@ -756,6 +890,7 @@ impl Native {
     }
 
     fn recover(&mut self) -> Result<()> {
+        self.recover_interface_aliases()?;
         let path = self.state.join("intent.json");
         if !path.try_exists()? {
             return Ok(());
@@ -872,20 +1007,7 @@ impl Native {
                 .entry(name.clone())
                 .or_insert_with(|| snapshot.clone());
         }
-        for (name, value) in &kernel_before.namespace {
-            ownership
-                .kernel_baseline
-                .namespace
-                .entry(name.clone())
-                .or_insert_with(|| value.clone());
-        }
-        for (name, value) in &kernel_before.host {
-            ownership
-                .kernel_baseline
-                .host
-                .entry(name.clone())
-                .or_insert_with(|| value.clone());
-        }
+        ownership.kernel_baseline.capture_originals(&kernel_before);
         let intent = Intent {
             scope: self.identity.clone(),
             before: before.clone(),
@@ -899,8 +1021,7 @@ impl Native {
         write_json(&self.state.join("intent.json"), &intent)?;
         let mut target = ownership.kernel_baseline.clone();
         let desired = Network::parse(after)?;
-        target.namespace.extend(desired.kernel.namespace);
-        target.host.extend(desired.kernel.host);
+        target.overlay(&desired.kernel);
         let result = (|| -> Result<()> {
             self.stop_services()?;
             self.dhcp.configure(after)?;
@@ -916,6 +1037,9 @@ impl Native {
                 .ethernet_originals
                 .retain(|name, _| ownership.managed_interfaces.contains(name));
             ownership.committed_config = Some(after.clone());
+            ownership
+                .kernel_baseline
+                .release_rps(&Network::parse(after)?.kernel);
             ownership.boot = self.boot.clone();
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))
@@ -1167,142 +1291,130 @@ impl Backend for Native {
     }
 
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()> {
-        self.recover()?;
-        let before = before.operational_value()?;
-        let after = after.operational_value()?;
-        self.services.validate(&after)?;
-        self.preflight(&before)?;
-        self.preflight(&after)?;
-        let mut ownership = self.ownership()?;
-        if self.options.namespace.is_empty()
-            && !ownership.boot.is_empty()
-            && ownership.boot != self.boot
-        {
-            return self.reconcile_after_boot(&after, ownership, Some(&before));
-        }
-        if let Err(drift) = self.verify(&before) {
-            let after_names: BTreeSet<_> = Network::parse(&after)?
-                .interfaces
-                .into_iter()
-                .map(|l| l.name)
-                .collect();
-            let recorded_target = ownership.committed_config.as_ref() == Some(&after)
-                || (ownership.committed_config.is_none()
-                    && after == Config::empty().operational_value()?);
-            if recorded_target && ownership.managed_interfaces == after_names {
-                match self.verify(&after) {
-                    Ok(()) => {
-                        self.repair_services(&after)?;
-                        return Ok(());
-                    }
-                    Err(error)
-                        if self.options.namespace.is_empty()
-                            && error
-                                .downcast_ref::<netcontrol_core::BackendDrift>()
-                                .is_some() =>
-                    {
-                        return self.reconcile_after_boot(&after, ownership, None);
-                    }
-                    Err(_) => {}
-                }
+        let alias_config = after;
+        (|| -> Result<()> {
+            self.recover()?;
+            let before = before.operational_value()?;
+            let after = after.operational_value()?;
+            self.services.validate(&after)?;
+            self.preflight(&before)?;
+            self.preflight(&after)?;
+            let mut ownership = self.ownership()?;
+            if self.options.namespace.is_empty()
+                && !ownership.boot.is_empty()
+                && ownership.boot != self.boot
+            {
+                return self.reconcile_after_boot(&after, ownership, Some(&before));
             }
-            return Err(
-                drift.context("native drift guard: committed configuration differs from kernel")
-            );
-        }
-        if before == after && ownership.committed_config.is_some() {
-            self.verify_services(&after)?;
-            return Ok(());
-        }
-        let before_network = Network::parse(&before)?;
-        let after_network = Network::parse(&after)?;
-        let ethernet_before = session(self.namespace.clone(), move |rt, handle| {
-            rt.block_on(networking::preflight(
-                handle,
-                &before_network,
-                &after_network,
-            ))?;
-            rt.block_on(networking::capture_ethernet(
-                handle,
-                &before_network,
-                &after_network,
-            ))
-        })?;
-        let captured = self.capture_kernel(&before, &after)?;
-        let previous_ownership = ownership.clone();
-        for (name, snapshot) in &ethernet_before {
-            ownership
-                .ethernet_originals
-                .entry(name.clone())
-                .or_insert_with(|| snapshot.clone());
-        }
-        for (name, value) in &captured.namespace {
-            ownership
-                .kernel_baseline
-                .namespace
-                .entry(name.clone())
-                .or_insert_with(|| value.clone());
-        }
-        for (name, value) in &captured.host {
-            ownership
-                .kernel_baseline
-                .host
-                .entry(name.clone())
-                .or_insert_with(|| value.clone());
-        }
-        let mut kernel_target = ownership.kernel_baseline.clone();
-        kernel_target
-            .namespace
-            .extend(Network::parse(&after)?.kernel.namespace);
-        kernel_target
-            .host
-            .extend(Network::parse(&after)?.kernel.host);
-        let intent = Intent {
-            scope: self.identity.clone(),
-            before: before.clone(),
-            after: after.clone(),
-            kernel_before: captured.clone(),
-            ownership_before: previous_ownership,
-            ethernet_before,
-            ethernet_originals: ownership.ethernet_originals.clone(),
-            ipv6_before: self.capture_ipv6(&before)?,
-        };
-        write_json(&self.state.join("intent.json"), &intent)?;
-        // Stop services before interface changes; their manager must restore prior workers on failure.
-        let operation = (|| -> Result<()> {
-            self.stop_services()?;
-            self.dhcp.configure(&after)?;
-            self.network_apply(&before, &after, kernel_target, &mut ownership)?;
-            ownership.firewall_config = Some(Network::parse(&after)?.firewall);
-            ownership.managed_interfaces = Network::parse(&after)?
-                .interfaces
-                .iter()
-                .map(|l| l.name.clone())
-                .collect();
-            ownership
-                .ethernet_originals
-                .retain(|name, _| ownership.managed_interfaces.contains(name));
-            ownership.committed_config = Some(after.clone());
-            ownership.boot = self.boot.clone();
-            self.services.apply(&before, &after)?;
-            self.dhcp_monitors.configure(&after)?;
-            self.bgp.configure(&after)?;
-            self.wireguard_dns.configure(&after)?;
-            self.log("native networking and services converged")?;
-            self.save_ownership(&ownership)?;
-            remove_durable(&self.state.join("intent.json"))
-        })();
-        if let Err(error) = operation {
-            return match self.recover() {
-                Ok(()) => {
-                    Err(error.context("native apply failed; previous configuration restored"))
+            if let Err(drift) = self.verify(&before) {
+                let after_names: BTreeSet<_> = Network::parse(&after)?
+                    .interfaces
+                    .into_iter()
+                    .map(|l| l.name)
+                    .collect();
+                let recorded_target = ownership.committed_config.as_ref() == Some(&after)
+                    || (ownership.committed_config.is_none()
+                        && after == Config::empty().operational_value()?);
+                if recorded_target && ownership.managed_interfaces == after_names {
+                    match self.verify(&after) {
+                        Ok(()) => {
+                            self.repair_services(&after)?;
+                            return Ok(());
+                        }
+                        Err(error)
+                            if self.options.namespace.is_empty()
+                                && error
+                                    .downcast_ref::<netcontrol_core::BackendDrift>()
+                                    .is_some() =>
+                        {
+                            return self.reconcile_after_boot(&after, ownership, None);
+                        }
+                        Err(_) => {}
+                    }
                 }
-                Err(rollback) => Err(anyhow!(
-                    "native apply failed: {error:#}; rollback incomplete: {rollback:#}; durable recovery intent retained"
-                )),
+                return Err(drift
+                    .context("native drift guard: committed configuration differs from kernel"));
+            }
+            if before == after && ownership.committed_config.is_some() {
+                self.verify_services(&after)?;
+                return Ok(());
+            }
+            let before_network = Network::parse(&before)?;
+            let after_network = Network::parse(&after)?;
+            let ethernet_before = session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::preflight(
+                    handle,
+                    &before_network,
+                    &after_network,
+                ))?;
+                rt.block_on(networking::capture_ethernet(
+                    handle,
+                    &before_network,
+                    &after_network,
+                ))
+            })?;
+            let captured = self.capture_kernel(&before, &after)?;
+            let previous_ownership = ownership.clone();
+            for (name, snapshot) in &ethernet_before {
+                ownership
+                    .ethernet_originals
+                    .entry(name.clone())
+                    .or_insert_with(|| snapshot.clone());
+            }
+            ownership.kernel_baseline.capture_originals(&captured);
+            let mut kernel_target = ownership.kernel_baseline.clone();
+            kernel_target.overlay(&Network::parse(&after)?.kernel);
+            let intent = Intent {
+                scope: self.identity.clone(),
+                before: before.clone(),
+                after: after.clone(),
+                kernel_before: captured.clone(),
+                ownership_before: previous_ownership,
+                ethernet_before,
+                ethernet_originals: ownership.ethernet_originals.clone(),
+                ipv6_before: self.capture_ipv6(&before)?,
             };
-        }
-        Ok(())
+            write_json(&self.state.join("intent.json"), &intent)?;
+            // Stop services before interface changes; their manager must restore prior workers on failure.
+            let operation = (|| -> Result<()> {
+                self.stop_services()?;
+                self.dhcp.configure(&after)?;
+                self.network_apply(&before, &after, kernel_target, &mut ownership)?;
+                ownership.firewall_config = Some(Network::parse(&after)?.firewall);
+                ownership.managed_interfaces = Network::parse(&after)?
+                    .interfaces
+                    .iter()
+                    .map(|l| l.name.clone())
+                    .collect();
+                ownership
+                    .ethernet_originals
+                    .retain(|name, _| ownership.managed_interfaces.contains(name));
+                ownership.committed_config = Some(after.clone());
+                ownership
+                    .kernel_baseline
+                    .release_rps(&Network::parse(&after)?.kernel);
+                ownership.boot = self.boot.clone();
+                self.services.apply(&before, &after)?;
+                self.dhcp_monitors.configure(&after)?;
+                self.bgp.configure(&after)?;
+                self.wireguard_dns.configure(&after)?;
+                self.log("native networking and services converged")?;
+                self.save_ownership(&ownership)?;
+                remove_durable(&self.state.join("intent.json"))
+            })();
+            if let Err(error) = operation {
+                return match self.recover() {
+                    Ok(()) => {
+                        Err(error.context("native apply failed; previous configuration restored"))
+                    }
+                    Err(rollback) => Err(anyhow!(
+                        "native apply failed: {error:#}; rollback incomplete: {rollback:#}; durable recovery intent retained"
+                    )),
+                };
+            }
+            Ok(())
+        })()?;
+        self.reconcile_interface_aliases(alias_config)
     }
 
     fn retry_dhcp(&mut self, config: &Config, interface: &str) -> Result<()> {
@@ -1332,9 +1444,11 @@ impl Backend for Native {
             "factory reset requires host mode"
         );
         self.recover()?;
+        let alias_config = after;
         let before = before.operational_value()?;
         let after = after.operational_value()?;
-        self.reconcile_after_boot(&after, self.ownership()?, Some(&before))
+        self.reconcile_after_boot(&after, self.ownership()?, Some(&before))?;
+        self.reconcile_interface_aliases(alias_config)
     }
 
     fn mdns_status(&mut self, _config: &Config) -> Result<Value> {
@@ -1374,10 +1488,9 @@ impl Backend for Native {
         let desired = Network::parse(&config.operational_value()?)?.kernel;
         let baseline = self.ownership()?.kernel_baseline;
         let mut effective = baseline.clone();
-        effective.namespace.extend(desired.namespace.clone());
-        effective.host.extend(desired.host.clone());
+        effective.overlay(&desired);
         let observed = self.read_kernel(&effective)?;
-        value["kernel_tunables"] = json!({"desired":desired,"configured":desired,"effective":effective,"observed":observed,"captured_original":baseline,"drift":effective != observed});
+        value["kernel_tunables"] = json!({"desired":desired,"configured":desired,"effective":effective,"observed":observed,"captured_original":baseline,"drift":!effective.same_values(&observed)});
         let names: Vec<_> = Network::parse(&config.operational_value()?)?
             .interfaces
             .into_iter()
@@ -1435,6 +1548,9 @@ impl Backend for Native {
             query.is_empty(),
             "statistics endpoints do not accept query parameters"
         );
+        if path == "/api/v1/statistics/performance" {
+            return self.performance_snapshot(config);
+        }
         if path == "/api/v1/statistics/host" {
             return crate::host_health::snapshot();
         }
@@ -1549,6 +1665,7 @@ impl Backend for Native {
             && config == &Config::empty()
         {
             self.repair_services(&value)?;
+            self.reconcile_interface_aliases(config)?;
             return Ok(self.services.status());
         }
         if ownership.committed_config.is_none() {
@@ -1598,6 +1715,7 @@ impl Backend for Native {
                 write_json(&adoption_path, &receipt)?;
             }
         }
+        self.reconcile_interface_aliases(config)?;
         Ok(self.services.status())
     }
 }

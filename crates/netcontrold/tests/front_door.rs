@@ -472,7 +472,7 @@ async fn mdns_http_contract_authentication_permissions_queries_and_repair() {
 }
 
 #[tokio::test]
-async fn host_and_firewall_statistics_http_authentication_permissions_and_cors() {
+async fn host_firewall_and_performance_statistics_http_authentication_permissions_and_cors() {
     use netcontrold::http::Credential;
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(
@@ -507,6 +507,16 @@ async fn host_and_firewall_statistics_http_authentication_permissions_and_cors()
         ("GET", "/api/v1/statistics/firewall?unused=1", "reader", 400),
         ("POST", "/api/v1/statistics/firewall", "reader", 405),
         ("GET", "/api/v1/statistics/firewall", "reader", 200),
+        ("GET", "/api/v1/statistics/performance", "", 401),
+        ("GET", "/api/v1/statistics/performance", "writer", 403),
+        (
+            "GET",
+            "/api/v1/statistics/performance?unused=1",
+            "reader",
+            400,
+        ),
+        ("POST", "/api/v1/statistics/performance", "reader", 405),
+        ("GET", "/api/v1/statistics/performance", "reader", 200),
     ] {
         let response = app
             .clone()
@@ -530,11 +540,19 @@ async fn host_and_firewall_statistics_http_authentication_permissions_and_cors()
                 body["schema"],
                 if path.ends_with("firewall") {
                     "netcontrol-firewall-counters/v1"
+                } else if path.ends_with("performance") {
+                    "netcontrol-performance/v1"
                 } else {
                     "netcontrol-host-health/v1"
                 }
             );
-            assert_eq!(body["sample"]["status"], "simulated");
+            if path.ends_with("performance") {
+                assert_eq!(body["sample"]["status"], "simulated");
+                assert!(body["sections"]["cpu"]["data"].is_null());
+                assert_eq!(body["recommendations"], json!([]));
+            } else {
+                assert_eq!(body["sample"]["status"], "simulated");
+            }
         } else {
             assert!(body["error"].is_string());
         }
@@ -1499,6 +1517,13 @@ async fn scoped_credentials_permissions_and_api_body_limit() {
     for (method, path, body, status) in [
         ("GET", "/api/v1/state", String::new(), 200),
         ("GET", "/api/v1/interfaces/discovered", String::new(), 200),
+        ("GET", "/api/v1/statistics/performance", String::new(), 200),
+        (
+            "GET",
+            "/api/v1/statistics/performance",
+            "{}".to_owned(),
+            400,
+        ),
         ("GET", "/api/v1/interface-capabilities", String::new(), 200),
         (
             "GET",

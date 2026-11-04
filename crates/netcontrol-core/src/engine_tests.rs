@@ -4577,3 +4577,141 @@ fn shutdown_is_idempotent_and_stops_requests() {
         503
     );
 }
+#[test]
+fn performance_rps_permissions_persistence_confirmation_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut config = Config::empty();
+    config.interfaces.push(
+        serde_json::from_value(json!({
+            "name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]
+        }))
+        .unwrap(),
+    );
+    let reply = submit(&mut engine, config.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    config.kernel.rps.insert("eno1/rx-0".into(), "c".into());
+    for denied in ["interfaces.write", "kernel.host.write"] {
+        let permissions: Vec<_> = all()
+            .into_iter()
+            .filter(|permission| permission != denied)
+            .collect();
+        let reply = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "operator",
+            &permissions,
+            &serde_json::to_vec(&json!({"base_revision":engine.state.revision,
+                "confirm_timeout_seconds":30,"config":config}))
+            .unwrap(),
+        );
+        assert_eq!(reply.status, 403, "{}", reply.body);
+        assert!(reply.body["error"].as_str().unwrap().contains(denied));
+    }
+
+    let revision = engine.state.revision;
+    let reply = submit(&mut engine, config.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    let id = reply.body["id"].as_str().unwrap();
+    let observed = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(observed.body["observed"]["rps"]["eno1/rx-0"], "c");
+    assert_eq!(observed.body["captured_original"]["rps"]["eno1/rx-0"], "0");
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.state.revision, revision);
+    assert!(engine.state.desired.kernel.rps.is_empty());
+    let observed = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(observed.body["observed"]["rps"]["eno1/rx-0"], "0");
+    let reply = submit(&mut engine, config.clone());
+    assert_eq!(reply.status, 202);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let backend = Simulator::with_config(config.clone()).unwrap();
+    let mut engine = Engine::open(&fixture.path(), Box::new(backend)).unwrap();
+    assert_eq!(engine.state.desired.kernel.rps, config.kernel.rps);
+    let state_before = fs::read(fixture.path()).unwrap();
+    for (method, query, body, permissions, status) in [
+        ("GET", "", "", vec!["state.read".into()], 200),
+        ("GET", "extra=1", "", vec!["state.read".into()], 400),
+        ("GET", "", "{}", vec!["state.read".into()], 400),
+        ("GET", "", "", vec![], 403),
+        ("POST", "", "", all(), 405),
+    ] {
+        let reply = engine.request(
+            method,
+            "/api/v1/statistics/performance",
+            query,
+            "operator",
+            &permissions,
+            body.as_bytes(),
+        );
+        assert_eq!(reply.status, status, "{}", reply.body);
+        if status == 200 {
+            assert_eq!(reply.body["sample"]["status"], "simulated");
+            assert!(reply.body["sections"]["cpu"]["data"].is_null());
+            assert_eq!(reply.body["recommendations"], json!([]));
+        }
+    }
+    assert_eq!(fs::read(fixture.path()).unwrap(), state_before);
+}
+
+#[test]
+fn performance_rps_pending_restart_timeout_restores_committed_masks() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut initial: Config = serde_json::from_value(json!({
+        "interfaces":[{"name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],
+        "kernel":{"rps":{"eno1/rx-0":"2"}}
+    })).unwrap();
+    let reply = submit(&mut engine, initial.clone());
+    assert_eq!(reply.status, 202);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let revision = engine.state.revision;
+    initial.kernel.rps.insert("eno1/rx-0".into(), "c".into());
+    let reply = submit(&mut engine, initial.clone());
+    assert_eq!(reply.status, 202);
+    let id = reply.body["id"].as_str().unwrap().to_owned();
+    let sample = engine.request(
+        "GET",
+        "/api/v1/statistics/performance",
+        "",
+        "operator",
+        &all(),
+        &[],
+    );
+    assert_eq!(sample.status, 200, "{}", sample.body);
+    assert_eq!(sample.body["transaction_id"], id);
+    assert_eq!(sample.body["config_revision"], json!(revision));
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(initial).unwrap()),
+    )
+    .unwrap();
+    engine.now = Some(engine.active().unwrap().confirmation_deadline);
+    engine.tick().unwrap();
+    assert_eq!(engine.state.desired.kernel.rps["eno1/rx-0"], "2");
+    assert_eq!(engine.state.revision, revision);
+    let observed = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(observed.body["observed"]["rps"]["eno1/rx-0"], "2");
+    assert!(engine.active().is_none());
+}

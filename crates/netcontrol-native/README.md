@@ -53,6 +53,44 @@ without the C/header toolchain: TLS requests then fail explicitly and
 `Native::open` always fails because nftables is essential. It is **not** a
 functional networking build or a permissive firewall fallback.
 
+## Performance diagnostics and RPS
+
+The passive `GET /api/v1/statistics/performance` collector is host-mode-only.
+It reads CPU/IRQ/softnet sources and live interface/physical-parent queue
+evidence, without scanning ethtool capabilities, writing tuning or sending
+traffic. CPU/IRQ deltas are process-local observations, not a persisted benchmark
+or a guarantee that forwarded packets are CPU-limited. Lab namespaces are
+rejected explicitly because their networking cannot be joined safely to mounted
+host sysfs. Containers must expose the intended host namespace, procfs and sysfs;
+cgroup/process CPU visibility is not the scope of all kernel networking work.
+
+`kernel.rps` maps `INTERFACE/rx-N` to canonical lowercase Linux hexadecimal CPU
+masks. Only managed physical Ethernet interfaces are eligible; set the physical
+parent, not each VLAN. Use host mode with `allow_host_tunables`, the existing
+exclusive host-tunables lock and writable sysfs. Every change also needs
+`transactions.write`, `interfaces.write` and `kernel.host.write`.
+Opening a control is not proof it will accept a write: exact readback is required.
+CPU IDs must be online at preflight. There is no automatic CPU-hotplug retuning,
+IRQ-affinity management or interference coordination with irqbalance/tuning tools.
+Operators must remove conflicting external RPS management.
+
+Original masks and interface identities are captured in native kernel ownership
+and durable operation intents before mutation. Failed operations restore the
+captured masks through existing recovery; incomplete recovery retains its intent
+and explicit error. Pending confirmation, explicit rollback, deadline rollback,
+restart and reboot follow the existing transaction lifecycle. Removing a setting
+restores its original mask and releases that queue's RPS ownership. MAC and
+same-boot interface-index guards reject replacement; reboot reconciliation binds
+the current verified identity without replacing saved masks. Missing interfaces,
+RX queues, read permissions, write permissions or offline selected CPUs are
+explicit errors, never successful no-ops or automatic defaults.
+
+This adds no datapath bypass: nftables, connection tracking, accounting and
+services retain their existing paths. RFS/RSS/XPS, NIC offload switches, qdisc
+shaping, XDP/AF_XDP and DPDK are not configured. See the
+[frontend contract](../../FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning)
+for sampling, recommendations and before/after acceptance.
+
 ## Firewall deny logging
 
 The owned namespace-pinned NFLOG receiver reserves group 100 and runs inside
@@ -352,6 +390,35 @@ daemon through the normal upgrade path. Repeated `IFLA_INET6_CONF` size warnings
 are distinct from this fatal comparison; inspect the final startup error if the
 failure persists. Appliance-specific configuration/kernel differences still need
 diagnosis rather than an automatic overwrite.
+
+### Physical-interface labels
+
+Managed `kind:"ethernet"` links keep their real names and receive one descriptive
+Linux alias through the existing rtnetlink backend. A display name such as
+`Office uplink` and `role:"wan"` produces `Office uplink [WAN]`; without a display
+name the alias is `WAN`, `LAN` or `UNASSIGNED`. Linux does not support multiple
+descriptive aliases. This does not add alternative interface names or create a
+`WAN@eno1` relationship; all addresses, DHCP, routing, firewall and configuration
+references continue using the real name.
+
+Inspect with `ip -d link show dev eno1` or `ip address show dev eno1`.
+Change `interfaces[].metadata.display_name` and/or `role` through the usual
+confirmed configuration transaction, not by renaming the NIC. Descriptions do
+not affect labels. The kernel's 255-byte limit may shorten a Unicode display-name
+prefix at a whole-character boundary, preserving the role suffix; the complete
+saved name and existing validation are unchanged.
+
+Labels are synchronized after native apply and startup repair, even on down
+interfaces. Unmanaged links and configured virtual links are untouched.
+Metadata-only changes do not restart networking or protocol workers, rewrite
+native ownership, or cause network drift. Cosmetic aliases are deliberately
+separate from the native operational projection and its strict startup guard.
+Original aliases and identity-checked update snapshots are persisted in
+`interface-aliases.json` and transient `interface-alias-intent.json` within the
+native state directory. Unmanagement restores original labels; failed or
+interrupted updates recover pre-update labels. Recovery errors remain explicit
+with the intent retained. Preserve these files with the rest of native state;
+do not remove them to bypass an identity/recovery error.
 
 Top-level `dhcp_clients` and `dns` maps participate in core transactions and
 interface authorization. DHCP addresses and routes are separate live lease
