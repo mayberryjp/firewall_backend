@@ -99,6 +99,13 @@ pub fn public_key(root: &Path, reference: &str) -> Result<String> {
     Ok(private_key(root, reference)?.get_public().to_base64())
 }
 
+pub(super) fn device_public_key(name: &str) -> Result<String> {
+    Device::get(&name.parse()?, Backend::Kernel)?
+        .public_key
+        .map(|key| key.to_base64())
+        .context("RPS requires a configured kernel WireGuard device public key")
+}
+
 fn private_key(root: &Path, reference: &str) -> Result<Key> {
     ensure!(
         crate::safe_name(reference, 64),

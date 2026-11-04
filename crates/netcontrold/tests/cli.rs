@@ -1016,6 +1016,30 @@ fn performance_rps_cli_stages_confirms_and_restores() {
 }
 
 #[test]
+fn wireguard_rps_cli_uses_existing_confirmed_workflow() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.ok(&mut cli, r#"set /interfaces [{"name":"wg0","kind":"wireguard","role":"wan","mtu":1420,"up":true,"addresses":[],"wireguard":{"key_ref":"wg-key","listen_port":51820,"peers":[]}}]"#);
+    f.ok(&mut cli, "kernel rps wg0/rx-0 2");
+    f.ok(&mut cli, "commit check");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/kernel/tunables")["observed"]["rps"]["wg0/rx-0"],
+        "2"
+    );
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "no kernel rps wg0/rx-0");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert_eq!(
+        f.request("/api/v1/kernel/tunables")["observed"]["rps"]["wg0/rx-0"],
+        "0"
+    );
+}
+
+#[test]
 fn offload_and_rfs_cli_use_the_confirmed_candidate_workflow() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

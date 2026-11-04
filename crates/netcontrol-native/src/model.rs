@@ -91,6 +91,8 @@ pub struct RpsIdentity {
     pub index: u32,
     pub mac: String,
     pub boot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard_public_key: Option<String>,
 }
 
 impl Kernel {
@@ -302,10 +304,9 @@ impl Network {
         for key in self.kernel.rps.keys() {
             let (name, _) = netcontrol_core::rps_target(key)?;
             ensure!(
-                self.interfaces
-                    .iter()
-                    .any(|link| link.name == name && link.kind == "ethernet"),
-                "RPS requires a managed physical Ethernet interface"
+                self.interfaces.iter().any(|link| link.name == name
+                    && matches!(link.kind.as_str(), "ethernet" | "wireguard")),
+                "RPS requires a managed physical Ethernet or WireGuard interface"
             );
         }
         let mut names = BTreeSet::new();
@@ -518,6 +519,7 @@ mod tests {
             index: 2,
             mac: "02:00:00:00:00:01".into(),
             boot: "boot-a".into(),
+            wireguard_public_key: None,
         };
         let mut baseline = Kernel {
             rps: [("eno1/rx-0".into(), "0".into())].into(),

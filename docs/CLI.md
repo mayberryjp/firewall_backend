@@ -185,15 +185,18 @@ kernel offload INTERFACE FEATURE enable|disable
 no kernel offload INTERFACE [FEATURE]
 ```
 
-`show statistics performance` reads passive CPU/IRQ/softnet and physical RX-queue
+`show statistics performance` reads passive CPU/IRQ/softnet and physical/WireGuard RX-queue
 evidence (`state.read`). `kernel rps` stages a canonical lowercase hexadecimal
 CPU mask, for example `c` selects CPUs 2 and 3; this is a synthetic example,
 not an appliance recommendation. Mask `0` explicitly disables RPS; `no kernel
 rps` restores the queue's captured original mask on apply. Changes require
 `transactions.write`, `interfaces.write`, `kernel.host.write` and native host mode,
 which automatically acquires tuning ownership without an extra launch flag.
-Use a managed physical Ethernet parent, not a
-VLAN/tunnel. `commit check` validates configuration, not live queue/CPU/write
+Use a managed physical Ethernet parent or kernel WireGuard interface, not a
+VLAN or other tunnel. For example, `kernel rps wg0/rx-0 2` selects CPU 1
+(synthetic, not a recommendation). WireGuard creation and tuning can share a
+candidate; the live kernel must expose a writable RX queue. RFS and NIC offload
+targets remain physical-only. `commit check` validates configuration, not live queue/CPU/write
 availability. Apply still requires `commit confirmed` and explicit `confirm`
 after independent connectivity/performance checks. No IRQ or other tuning is
 changed. See the [contract](../FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning).

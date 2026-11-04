@@ -1910,6 +1910,31 @@ fn rps_requires_canonical_masks_and_managed_ethernet_parents() {
 }
 
 #[test]
+fn wireguard_supports_rps_but_not_rfs_or_nic_offloads() {
+    let mut config: Config = serde_json::from_value(json!({
+        "interfaces":[{"name":"wg0","kind":"wireguard","role":"wan","mtu":1420,"up":true,
+            "addresses":[],"wireguard":{"key_ref":"wg-key","listen_port":51820,"peers":[]}}],
+        "kernel":{"rps":{"wg0/rx-0":"2"}}
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    config.kernel.rfs = Some(crate::RfsConfig {
+        sock_flow_entries: 1024,
+        queues: [("wg0/rx-0".into(), 1024)].into(),
+    });
+    assert!(config.validate().unwrap_err().to_string().contains("RFS"));
+    config.kernel.rfs = None;
+    config.kernel.offloads = [("wg0".into(), [("rx-checksum".into(), true)].into())].into();
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("offload")
+    );
+}
+
+#[test]
 fn rfs_and_offloads_require_explicit_physical_targets_and_valid_dependencies() {
     let value = serde_json::json!({
         "interfaces":[{"name":"eno1","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]}],

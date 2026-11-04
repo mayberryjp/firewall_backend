@@ -45,12 +45,28 @@ fn child(directory: &File, name: &str, write: bool, is_directory: bool) -> Resul
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn validate_values(values: &BTreeMap<String, String>) -> Result<()> {
+pub(super) fn validate_values(values: &BTreeMap<String, String>) -> Result<()> {
     ensure!(values.len() <= 128, "RPS transaction queue limit exceeded");
     for (key, value) in values {
         validate_rps(&[(key.clone(), value.clone())].into())?;
     }
     Ok(())
+}
+
+pub(super) fn wireguard_keys(network: &crate::model::Network) -> Result<BTreeMap<String, String>> {
+    network
+        .interfaces
+        .iter()
+        .filter(|link| link.kind == "wireguard")
+        .map(|link| {
+            let reference = link
+                .wireguard
+                .as_ref()
+                .and_then(|value| value["key_ref"].as_str())
+                .context("WireGuard RPS requires a key reference")?;
+            Ok((link.name.clone(), reference.to_owned()))
+        })
+        .collect()
 }
 
 impl Io {
@@ -64,7 +80,7 @@ impl Io {
         }
     }
 
-    fn interface(&self, name: &str) -> Result<File> {
+    fn directory(&self, name: &str) -> Result<File> {
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
@@ -77,25 +93,76 @@ impl Io {
                     && stat.f_type as u64 == libc::SYSFS_MAGIC as u64,
                 "RPS controls must reside on sysfs"
             );
-            ensure!(
-                fs::symlink_metadata(self.net.join(name).join("device"))?
-                    .file_type()
-                    .is_symlink(),
-                "RPS tuning requires a physical Ethernet device"
-            );
         }
         Ok(directory)
     }
 
-    fn identity(&self, directory: &File) -> Result<RpsIdentity> {
+    fn physical(&self, name: &str) -> Result<bool> {
+        match fs::symlink_metadata(self.net.join(name).join("device")) {
+            Ok(metadata) => Ok(metadata.file_type().is_symlink()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn interface(&self, name: &str) -> Result<File> {
+        let directory = self.directory(name)?;
+        ensure!(
+            !self.sysfs || self.physical(name)?,
+            "RFS/physical queue inspection requires a physical Ethernet device"
+        );
+        Ok(directory)
+    }
+
+    fn rps_interface(&self, name: &str) -> Result<File> {
+        let directory = self.directory(name)?;
+        if self.sysfs && !self.physical(name)? {
+            super::wireguard::device_public_key(name).context(
+                "RPS requires physical Ethernet or a configured kernel WireGuard device",
+            )?;
+        }
+        Ok(directory)
+    }
+
+    fn identity_values(&self, directory: &File) -> Result<RpsIdentity> {
         let index = text(child(directory, "ifindex", false, false)?)?.parse()?;
         let mac = text(child(directory, "address", false, false)?)?;
         let boot = text(File::open(&self.boot)?)?;
         ensure!(
-            index > 0 && !mac.is_empty() && !boot.is_empty(),
+            index > 0 && !boot.is_empty(),
             "invalid RPS interface identity"
         );
-        Ok(RpsIdentity { index, mac, boot })
+        Ok(RpsIdentity {
+            index,
+            mac,
+            boot,
+            wireguard_public_key: None,
+        })
+    }
+
+    fn identity(&self, directory: &File) -> Result<RpsIdentity> {
+        let identity = self.identity_values(directory)?;
+        ensure!(
+            !identity.mac.is_empty(),
+            "physical interface MAC unavailable"
+        );
+        Ok(identity)
+    }
+
+    fn rps_identity(&self, name: &str, directory: &File) -> Result<RpsIdentity> {
+        let mut identity = self.identity_values(directory)?;
+        if self.sysfs && !self.physical(name)? {
+            ensure!(
+                identity.mac.is_empty(),
+                "WireGuard RPS identity unexpectedly has a MAC"
+            );
+            identity.wireguard_public_key = Some(super::wireguard::device_public_key(name)?);
+        }
+        ensure!(
+            !identity.mac.is_empty() || identity.wireguard_public_key.is_some(),
+            "RPS interface identity unavailable"
+        );
+        Ok(identity)
     }
 
     fn queue(&self, directory: &File, queue: &str, write: bool) -> Result<File> {
@@ -117,6 +184,7 @@ impl Io {
     fn check_identity(actual: &RpsIdentity, expected: &RpsIdentity) -> Result<()> {
         crate::ensure_unchanged(
             actual.mac == expected.mac
+                && actual.wireguard_public_key == expected.wireguard_public_key
                 && (actual.boot != expected.boot || actual.index == expected.index),
             "RPS interface identity changed",
         )
@@ -129,8 +197,8 @@ impl Io {
         writable: bool,
     ) -> Result<(String, RpsIdentity)> {
         let (name, queue) = rps_target(key)?;
-        let directory = self.interface(name)?;
-        let identity = self.identity(&directory)?;
+        let directory = self.rps_interface(name)?;
+        let identity = self.rps_identity(name, &directory)?;
         if let Some(expected) = expected {
             Self::check_identity(&identity, expected)?;
         }
@@ -140,7 +208,10 @@ impl Io {
         if writable {
             self.queue(&directory, queue, true)?;
         }
-        Self::check_identity(&self.identity(&self.interface(name)?)?, &identity)?;
+        Self::check_identity(
+            &self.rps_identity(name, &self.rps_interface(name)?)?,
+            &identity,
+        )?;
         Ok((mask, identity))
     }
 
@@ -168,6 +239,16 @@ impl Io {
         values: &BTreeMap<String, String>,
         expected: &BTreeMap<String, RpsIdentity>,
     ) -> Result<()> {
+        self.preflight_masks(values)?;
+        for key in values.keys() {
+            let (name, _) = rps_target(key)?;
+            self.one(key, expected.get(name), true)
+                .with_context(|| format!("preflight RPS {key}"))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn preflight_masks(&self, values: &BTreeMap<String, String>) -> Result<()> {
         validate_values(values)?;
         if values.is_empty() {
             return Ok(());
@@ -179,9 +260,6 @@ impl Io {
                 parse_cpu_mask(mask)?.is_subset(&online),
                 "RPS {key} selects offline CPUs"
             );
-            let (name, _) = rps_target(key)?;
-            self.one(key, expected.get(name), true)
-                .with_context(|| format!("preflight RPS {key}"))?;
         }
         Ok(())
     }
@@ -198,8 +276,8 @@ impl Io {
             if &current == value {
                 continue;
             }
-            let directory = self.interface(name)?;
-            Self::check_identity(&self.identity(&directory)?, &identity)?;
+            let directory = self.rps_interface(name)?;
+            Self::check_identity(&self.rps_identity(name, &directory)?, &identity)?;
             self.queue(&directory, queue, true)?
                 .write_all(format!("{value}\n").as_bytes())
                 .with_context(|| format!("write RPS {key}"))?;
@@ -363,9 +441,9 @@ impl Io {
         Ok(())
     }
 
-    pub(super) fn queues(&self, name: &str) -> Result<Vec<(String, String, u32)>> {
-        let directory = self.interface(name)?;
-        let identity = self.identity(&directory)?;
+    pub(super) fn rps_queues(&self, name: &str) -> Result<Vec<(String, String)>> {
+        let directory = self.rps_interface(name)?;
+        let identity = self.rps_identity(name, &directory)?;
         let mut result = Vec::new();
         for (index, entry) in fs::read_dir(self.net.join(name).join("queues"))?.enumerate() {
             ensure!(index < 8192, "too many interface queues");
@@ -379,11 +457,22 @@ impl Io {
             }
             ensure!(result.len() < 4096, "too many RX queues");
             let (mask, _) = self.one(&format!("{name}/{queue}"), Some(&identity), false)?;
-            let (flows, _) = self.rfs_one(&format!("{name}/{queue}"), Some(&identity), false)?;
-            result.push((queue, mask, flows));
+            result.push((queue, mask));
         }
         result.sort();
         Ok(result)
+    }
+
+    pub(super) fn queues(&self, name: &str) -> Result<Vec<(String, String, u32)>> {
+        let identity = self.identity(&self.interface(name)?)?;
+        self.rps_queues(name)?
+            .into_iter()
+            .map(|(queue, mask)| {
+                let (flows, _) =
+                    self.rfs_one(&format!("{name}/{queue}"), Some(&identity), false)?;
+                Ok((queue, mask, flows))
+            })
+            .collect()
     }
 
     pub(super) fn irqs(&self, name: &str) -> Result<Vec<u32>> {
@@ -451,6 +540,26 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn wireguard_identity_requires_public_key_and_same_boot_index() {
+        let expected = RpsIdentity {
+            index: 4,
+            mac: String::new(),
+            boot: "boot-a".into(),
+            wireguard_public_key: Some("fixture-public-key".into()),
+        };
+        assert!(Io::check_identity(&expected, &expected).is_ok());
+        let mut actual = expected.clone();
+        actual.index += 1;
+        assert!(Io::check_identity(&actual, &expected).is_err());
+        actual.boot = "boot-b".into();
+        assert!(Io::check_identity(&actual, &expected).is_ok());
+        actual.wireguard_public_key = Some("different-public-key".into());
+        assert!(Io::check_identity(&actual, &expected).is_err());
+        actual.wireguard_public_key = None;
+        assert!(Io::check_identity(&actual, &expected).is_err());
     }
 
     #[test]

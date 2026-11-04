@@ -75,8 +75,8 @@ snapshots nor change configuration. Compare successive samples under the same
 representative load alongside existing interface rates, queue drops and gateway
 latency; a recommendation is a trial candidate, never proof of a speed increase.
 
-Explicit `kernel.rps` entries map physical managed Ethernet RX queues to canonical
-Linux CPU masks, for example `{"eno1/rx-0":"c"}` selects CPUs 2 and 3.
+Explicit `kernel.rps` entries map managed physical Ethernet or WireGuard RX queues
+to canonical Linux CPU masks, for example `{"eno1/rx-0":"c"}` selects CPUs 2 and 3.
 This is a synthetic illustration, not a recommended mask for another appliance.
 Use complete confirmed configuration transactions with `transactions.write`,
 `kernel.host.write` and `interfaces.write`. Native host mode enables tuning
@@ -85,6 +85,12 @@ extra launch flag or permission refresh is required. No IRQ, offload, RSS, RFS o
 settings are changed automatically. Zero disables RPS; removing an entry restores
 its captured original mask. Native durable intents cover apply failures and
 interrupted recovery, and confirmation timeout restores the prior configuration.
+WireGuard accepts the same setting, for example `{"wg0/rx-0":"2"}` (CPU 1),
+when its kernel RX queue exposes writable RPS controls. Creation and tuning can
+share a transaction; rekey, deletion, recreation and reboot preserve safe ownership.
+This steers post-decryption RX processing, not WireGuard crypto workers. No
+WireGuard IRQ-based mask recommendations are generated; RFS/offloads remain
+physical-Ethernet-only.
 
 SSH supports `show statistics performance`, `kernel rps INTERFACE/rx-N MASK`
 and `no kernel rps INTERFACE/rx-N` in the normal candidate/confirmed workflow.

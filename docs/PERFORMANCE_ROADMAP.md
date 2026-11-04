@@ -24,17 +24,20 @@ inventory; additional controls are primarily for safe tuning and diagnosis.
 ### Existing backend
 
 - Passive `GET /api/v1/statistics/performance`: CPU, IRQ, softnet, topology,
-  physical RX queues and conservative RPS trial evidence.
-- Explicit `kernel.rps` masks with permissions, host opt-in, confirmation,
+  physical/WireGuard RX queues and physical-only conservative RPS trial evidence.
+- Explicit physical/WireGuard `kernel.rps` masks with permissions, automatic host-mode ownership, confirmation,
   readback, original-setting capture and durable rollback/recovery.
-- SSH inspection and candidate editing; no automatic tuning.
+- SSH inspection and candidate editing; no automatic tuning. WireGuard creation,
+  rekey, deletion, rollback/reboot recreation and replacement guards are covered;
+  crypto-worker steering, WireGuard RFS/offloads and automatic trials are not.
 
 Implementation results and limitations:
 [journal](journal/2026-11-04.md#performance-diagnostics-and-transactional-rps).
 Current contract:
 [performance diagnostics and RPS](../FRONTEND_SPEC.md#performance-diagnostics-and-rps-tuning).
 Frontend work:
-[handoff 2026-11-04-03](frontend-handoffs/2026-11-04.md#2026-11-04-03-performance-diagnostics-and-transactional-rps),
+[handoff 2026-11-04-03](frontend-handoffs/2026-11-04.md#2026-11-04-03-performance-diagnostics-and-transactional-rps)
+and [WireGuard extension](frontend-handoffs/2026-11-04.md#2026-11-04-07-wireguard-rps),
 **Pending frontend review**.
 
 ### Remaining acceptance
@@ -42,7 +45,8 @@ Frontend work:
 - [ ] Integrate frontend types, full-package preservation, diagnostics and
   explicit tuning/confirmation UX; do not assume the handoff was delivered.
 - [ ] Through an approved deployment, verify real physical NIC queue/CPU
-  evidence, permissions and host opt-in.
+  evidence, permissions and host-mode ownership; test real WireGuard traffic
+  and measure post-decryption processing before enabling its RPS masks.
 - [ ] Establish repeatable baseline traffic and acceptance criteria before
   tuning: throughput, CPU distribution, drops/backlog, latency and loss.
 - [ ] Run one explicitly reviewed RPS trial; preserve independent management

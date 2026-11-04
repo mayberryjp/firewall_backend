@@ -34,6 +34,16 @@
 
 ### Added
 
+- Managed WireGuard RX queues now support explicit `kernel.rps` through the
+  existing confirmed API/CLI workflow. Verified creation, rekey, deletion,
+  rollback/reboot recreation and public-key/index ownership guards protect
+  original masks and reject external replacement. Performance diagnostics expose
+  WireGuard RPS masks without physical IRQ/RFS evidence or automatic trials;
+  RFS and NIC offloads remain physical-only. Nothing is enabled automatically.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Required frontend eligibility/diagnostic updates:
+  [handoff 2026-11-04-07](docs/frontend-handoffs/2026-11-04.md#2026-11-04-07-wireguard-rps).
+
 - Transactional physical-NIC checksum, scatter/gather, TSO/GSO, GRO and VLAN
   offload controls plus explicit RFS global/per-queue budgets. Exact active and
   requested feature snapshots preserve latent wishes, detect driver side effects

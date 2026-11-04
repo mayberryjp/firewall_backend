@@ -569,11 +569,9 @@ impl Native {
         for key in network.kernel.rps.keys() {
             let (name, _) = netcontrol_core::rps_target(key)?;
             ensure!(
-                network
-                    .interfaces
-                    .iter()
-                    .any(|link| link.name == name && link.kind == "ethernet"),
-                "RPS requires a managed physical Ethernet interface"
+                network.interfaces.iter().any(|link| link.name == name
+                    && matches!(link.kind.as_str(), "ethernet" | "wireguard")),
+                "RPS requires a managed physical Ethernet or WireGuard interface"
             );
         }
         firewall::validate(&network.firewall)?;
@@ -611,7 +609,13 @@ impl Native {
                 "masquerade egress must be managed or adopted"
             );
         }
-        self.preflight_kernel(&network.kernel)?;
+        rps::Io::system().preflight_masks(&network.kernel.rps)?;
+        let wireguard = rps::wireguard_keys(&network)?;
+        let mut eager = network.kernel.clone();
+        eager.rps.retain(|key, _| {
+            netcontrol_core::rps_target(key).is_ok_and(|(name, _)| !wireguard.contains_key(name))
+        });
+        self.preflight_kernel(&eager)?;
         let enabled = network.ipv6_enabled;
         session(self.namespace.clone(), move |_, _| ipv6::preflight(enabled))?;
         let parents = self.parents.clone();
@@ -631,7 +635,7 @@ impl Native {
         &self,
         before: &Value,
         after: &Value,
-        kernel: Kernel,
+        mut kernel: Kernel,
         ownership: &mut Ownership,
     ) -> Result<()> {
         self.check_scope()?;
@@ -645,6 +649,8 @@ impl Native {
             .map_err(|_| anyhow!("DHCP state poisoned"))?;
         dhcp_client::effective(&mut before, &leases)?;
         dhcp_client::effective(&mut after, &leases)?;
+        let before_wireguard = rps::wireguard_keys(&before)?;
+        let after_wireguard = rps::wireguard_keys(&after)?;
         let parents = self.parents.clone();
         let keys = self.wireguard_dns.control.clone();
         let namespace_values = kernel.namespace.clone();
@@ -691,13 +697,13 @@ impl Native {
                 .host_namespace
                 .clone()
                 .context("host tunable opt-in required")?;
-            let values = kernel.host;
+            let values = kernel.host.clone();
             host_session(host, move |_, _| {
                 sysctl::write_scope(&values, "host")?;
                 sysctl::verify_scope(&values, "host")
             })?;
         }
-        rps::Io::system().write(&kernel.rps, &kernel.rps_identity)?;
+        self.write_network_rps(&before_wireguard, &after_wireguard, &mut kernel, ownership)?;
         rps::Io::system().write_rfs(&kernel.rfs, &kernel.rfs_identity)?;
         offloads::Io::system().write_requested(
             &kernel.offloads,
@@ -710,15 +716,72 @@ impl Native {
         Ok(())
     }
 
+    fn write_network_rps(
+        &self,
+        before: &BTreeMap<String, String>,
+        after: &BTreeMap<String, String>,
+        kernel: &mut Kernel,
+        ownership: &mut Ownership,
+    ) -> Result<()> {
+        let io = rps::Io::system();
+        rps::validate_values(&kernel.rps)?;
+        for name in before.keys().filter(|name| !after.contains_key(*name)) {
+            kernel.rps.retain(|key, _| {
+                netcontrol_core::rps_target(key).is_ok_and(|(interface, _)| interface != name)
+            });
+            kernel.rps_identity.remove(name);
+        }
+        for (name, reference) in after {
+            if before.get(name) == Some(reference) {
+                continue;
+            }
+            let targets = kernel
+                .rps
+                .iter()
+                .filter(|(key, _)| {
+                    netcontrol_core::rps_target(key).is_ok_and(|(interface, _)| interface == name)
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let (original, identities) = io.read(&targets, &BTreeMap::new())?;
+            if original.is_empty() {
+                continue;
+            }
+            let public_key = wireguard::public_key(&self.options.keys, reference)?;
+            ensure!(
+                identities
+                    .get(name)
+                    .and_then(|identity| identity.wireguard_public_key.as_deref())
+                    == Some(public_key.as_str()),
+                "new/rekeyed WireGuard RPS identity does not match configured device"
+            );
+            ownership.kernel_baseline.capture_originals(&Kernel {
+                rps: original,
+                rps_identity: identities.clone(),
+                ..Default::default()
+            });
+            kernel.rps_identity.extend(identities);
+        }
+        io.write(&kernel.rps, &kernel.rps_identity)
+    }
+
     fn capture_kernel(&self, before: &Value, after: &Value) -> Result<Kernel> {
         let before = Network::parse(before)?;
         let after = Network::parse(after)?;
+        let before_wireguard = rps::wireguard_keys(&before)?;
+        let after_wireguard = rps::wireguard_keys(&after)?;
         let mut keys = before.kernel;
         keys.overlay(&after.kernel);
         // Include restored-but-retained baseline keys so drift cannot be bypassed by
         // removing a key from the desired configuration and changing it externally.
         let baseline = self.ownership()?.kernel_baseline;
         keys.capture_originals(&baseline);
+        rps::validate_values(&keys.rps)?;
+        keys.rps.retain(|key, _| {
+            netcontrol_core::rps_target(key).is_ok_and(|(name, _)| {
+                !after_wireguard.contains_key(name) || before_wireguard.contains_key(name)
+            })
+        });
         let (features, requested, identities) =
             offloads::Io::system().complete_state(&keys.offloads, &keys.offload_identity)?;
         keys.offloads = features;
@@ -837,6 +900,15 @@ impl Native {
                             }
                             Err(error) => errors.push(format!("NIC IRQs: {error:#}")),
                         }
+                    } else if parent.kind == "wireguard" {
+                        match io.rps_queues(&parent.name) {
+                            Ok(values) => {
+                                queue_count += values.len();
+                                ensure!(queue_count <= 4096, "performance RX queue limit exceeded");
+                                queues = json!(values.into_iter().map(|(name,mask)| json!({"name":name,"rps_cpus":mask,"rps_flow_cnt":null})).collect::<Vec<_>>());
+                            }
+                            Err(error) => errors.push(format!("WireGuard RX queues: {error:#}")),
+                        }
                     }
                     rows.push(json!({
                         "name":parent.name,"index":parent.index,"mac":parent.mac,
@@ -864,12 +936,8 @@ impl Native {
         let mut snapshot = self.performance.snapshot()?;
         let mut interfaces = interfaces;
         for row in &mut interfaces {
-            row["managed"] = json!(
-                config
-                    .interfaces
-                    .iter()
-                    .any(|link| link.name == row["name"] && link.kind == "ethernet")
-            );
+            row["managed"] = json!(config.interfaces.iter().any(|link| link.name == row["name"]
+                && matches!(link.kind.as_str(), "ethernet" | "wireguard")));
         }
         if interfaces.iter().any(|row| {
             row["errors"]

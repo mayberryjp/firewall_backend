@@ -1149,10 +1149,9 @@ impl Config {
         for key in self.kernel.rps.keys() {
             let (name, _) = crate::rps_target(key)?;
             ensure!(
-                self.interfaces
-                    .iter()
-                    .any(|link| link.name == name && link.kind == "ethernet"),
-                "RPS requires a managed physical Ethernet interface; configure the parent, not a VLAN or tunnel"
+                self.interfaces.iter().any(|link| link.name == name
+                    && matches!(link.kind.as_str(), "ethernet" | "wireguard")),
+                "RPS requires a managed physical Ethernet or WireGuard interface; VLAN and other virtual links are unsupported"
             );
         }
         let rfs_queues = self.kernel.rfs.iter().flat_map(|rfs| rfs.queues.iter());

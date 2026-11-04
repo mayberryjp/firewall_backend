@@ -15,6 +15,256 @@ impl Drop for StateDirectory {
     }
 }
 
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated mount/network namespaces and nft/WireGuard/RPS support"]
+fn native_wireguard_rps_lifecycle_recovery_and_replacement() -> Result<()> {
+    ensure!(
+        std::env::var("NETCONTROL_INTEGRATION").as_deref() == Ok("1"),
+        "set NETCONTROL_INTEGRATION=1; fixture never mutates the invoking network or mounts"
+    );
+    if std::env::var("NETCONTROL_WG_RPS_CHILD").as_deref() != Ok("1") {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "linux::host_integration::native_wireguard_rps_lifecycle_recovery_and_replacement",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("NETCONTROL_WG_RPS_CHILD", "1")
+            .status()?;
+        ensure!(
+            status.success(),
+            "isolated WireGuard RPS child failed: {status}"
+        );
+        return Ok(());
+    }
+    ensure!(
+        unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWNS) } == 0,
+        "unshare network/mount namespaces: {}",
+        std::io::Error::last_os_error()
+    );
+    ensure!(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        } == 0,
+        "make child mounts private: {}",
+        std::io::Error::last_os_error()
+    );
+    ensure!(
+        unsafe {
+            libc::mount(
+                c"sysfs".as_ptr(),
+                c"/sys".as_ptr(),
+                c"sysfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                std::ptr::null(),
+            )
+        } == 0,
+        "mount child network sysfs: {}",
+        std::io::Error::last_os_error()
+    );
+    let namespace = Arc::new(File::open("/proc/thread-self/ns/net")?);
+    let directory = StateDirectory(std::env::current_dir()?.join(format!(
+        ".native-wg-rps-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    )));
+    fs::DirBuilder::new().mode(0o700).create(&directory.0)?;
+    let options = NativeOptions {
+        namespace: String::new(),
+        keys: directory.0.join("keys"),
+        services_state: directory.0.join("services"),
+        adopted_parents: vec![],
+        allow_host_tunables: false,
+        allow_host_services: false,
+        gateway_monitoring: false,
+    };
+    let first_key = wireguard::create_key(&options.keys, "first-key")?;
+    let second_key = wireguard::create_key(&options.keys, "second-key")?;
+    let online = netcontrol_core::parse_cpu_list(
+        fs::read_to_string("/sys/devices/system/cpu/online")?.trim(),
+    )?;
+    let cpu = *online.first().context("no online CPU")?;
+    let mask = netcontrol_core::cpu_mask(&[cpu].into());
+    let mut desired: Config = serde_json::from_value(json!({
+        "interfaces":[{"name":"wg0","kind":"wireguard","role":"wan","mtu":1420,"up":true,
+            "addresses":[],"wireguard":{"key_ref":"first-key","listen_port":51820,"peers":[]}}],
+        "kernel":{"rps":{"wg0/rx-0":mask}}
+    }))?;
+    desired.normalize();
+    desired.validate()?;
+    let empty = Config::empty();
+    let mut native = Native::open(options.clone())?;
+    native.repair(&empty)?;
+    let read_mask = || -> Result<String> {
+        Ok(rps::Io::system()
+            .read(&desired.kernel.rps, &BTreeMap::new())?
+            .0["wg0/rx-0"]
+            .clone())
+    };
+    let mut unsupported = desired.clone();
+    unsupported.kernel.rps = [("wg0/rx-4095".into(), mask.clone())].into();
+    assert!(native.apply(&empty, &unsupported).is_err());
+    assert!(!Path::new("/sys/class/net/wg0").exists());
+    assert!(!native.state.join("intent.json").exists());
+    native.observe(&empty)?;
+
+    native.apply(&empty, &desired)?;
+    assert_eq!(read_mask()?, mask);
+    assert!(rps::Io::system().queues("wg0").is_err());
+    assert!(
+        rps::Io::system()
+            .read(&[("lo/rx-0".into(), mask.clone())].into(), &BTreeMap::new())
+            .is_err()
+    );
+    let ownership = native.ownership()?;
+    let original = ownership.kernel_baseline.rps["wg0/rx-0"].clone();
+    let identity = ownership.kernel_baseline.rps_identity["wg0"].clone();
+    assert_eq!(
+        identity.wireguard_public_key.as_deref(),
+        Some(first_key.as_str())
+    );
+    assert!(identity.mac.is_empty());
+    let sample = native.statistics(&desired, "/api/v1/statistics/performance", "")?;
+    let row = sample["interfaces"]
+        .as_array()
+        .context("interface rows")?
+        .iter()
+        .find(|row| row["name"] == "wg0")
+        .context("WireGuard diagnostic row")?;
+    assert_eq!(row["managed"], true);
+    assert_eq!(row["physical"], false);
+    assert_eq!(row["rx_queues"][0]["rps_cpus"], mask);
+    assert!(row["rx_queues"][0]["rps_flow_cnt"].is_null() && row["irqs"].is_null());
+    assert!(
+        sample["recommendations"]
+            .as_array()
+            .context("recommendations")?
+            .is_empty()
+    );
+    let mut clear = desired.clone();
+    clear.kernel.rps.clear();
+    native.apply(&desired, &clear)?;
+    assert_eq!(read_mask()?, original);
+    assert!(native.ownership()?.kernel_baseline.rps.is_empty());
+    native.apply(&clear, &desired)?;
+    let mut disabled = desired.clone();
+    disabled.kernel.rps.insert("wg0/rx-0".into(), "0".into());
+    native.apply(&desired, &disabled)?;
+    assert_eq!(read_mask()?, "0");
+    native.apply(&disabled, &desired)?;
+
+    let mut rekeyed = desired.clone();
+    rekeyed.interfaces[0]
+        .wireguard
+        .as_mut()
+        .context("WireGuard settings")?
+        .key_ref = "second-key".into();
+    native.apply(&desired, &rekeyed)?;
+    assert_eq!(
+        native.ownership()?.kernel_baseline.rps_identity["wg0"]
+            .wireguard_public_key
+            .as_deref(),
+        Some(second_key.as_str())
+    );
+    assert_eq!(
+        native.ownership()?.kernel_baseline.rps["wg0/rx-0"],
+        original
+    );
+    native.apply(&rekeyed, &desired)?;
+    native.observe(&desired)?;
+    native.apply(&desired, &empty)?;
+    assert!(!Path::new("/sys/class/net/wg0").exists());
+    assert!(native.ownership()?.kernel_baseline.rps_identity.is_empty());
+    native.apply(&empty, &desired)?;
+    assert_ne!(
+        native.ownership()?.kernel_baseline.rps_identity["wg0"].index,
+        identity.index
+    );
+
+    // Interrupt a deletion after kernel convergence but before ownership is saved.
+    let before = desired.operational_value()?;
+    let after = empty.operational_value()?;
+    let previous = native.ownership()?;
+    let kernel_before = native.capture_kernel(&before, &after)?;
+    write_json(
+        &native.state.join("intent.json"),
+        &Intent {
+            scope: native.identity.clone(),
+            before: before.clone(),
+            after: after.clone(),
+            kernel_before,
+            ownership_before: previous.clone(),
+            ethernet_before: BTreeMap::new(),
+            ethernet_originals: BTreeMap::new(),
+            ipv6_before: native.capture_ipv6(&before)?,
+        },
+    )?;
+    let mut applying = previous.clone();
+    native.network_apply(&before, &after, previous.kernel_baseline, &mut applying)?;
+    drop(native);
+    let mut native = Native::open(options.clone())?;
+    native.observe(&desired)?;
+    assert_eq!(read_mask()?, mask);
+    assert!(!native.state.join("intent.json").exists());
+
+    let delete = |namespace: Arc<File>| -> Result<()> {
+        session(namespace, |rt, handle| {
+            rt.block_on(async {
+                let link = networking::links(handle)
+                    .await?
+                    .into_iter()
+                    .find(|link| networking::name(link) == "wg0")
+                    .context("WireGuard link")?;
+                handle.link().del(link.header.index).execute().await?;
+                Ok(())
+            })
+        })
+    };
+    delete(namespace.clone())?;
+    let mut ownership = native.ownership()?;
+    ownership.boot = "synthetic-previous-boot".into();
+    native.save_ownership(&ownership)?;
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.repair(&desired)?;
+    native.observe(&desired)?;
+    assert_eq!(read_mask()?, mask);
+    assert_eq!(
+        native.ownership()?.kernel_baseline.rps["wg0/rx-0"],
+        original
+    );
+
+    // Even an externally recreated device using the same key cannot inherit ownership.
+    delete(namespace.clone())?;
+    let keys = native.wireguard_dns.control.clone();
+    let a = Network::parse(&empty.operational_value()?)?;
+    let b = Network::parse(&before)?;
+    session(namespace, move |rt, handle| {
+        rt.block_on(networking::reconcile(
+            handle,
+            &a,
+            &b,
+            &BTreeMap::new(),
+            &keys,
+            &BTreeMap::new(),
+        ))
+    })?;
+    rps::Io::system().write(&desired.kernel.rps, &BTreeMap::new())?;
+    assert!(native.observe(&desired).is_err());
+    assert!(native.apply(&desired, &disabled).is_err());
+    assert_eq!(read_mask()?, mask);
+    assert!(!native.state.join("intent.json").exists());
+    Ok(())
+}
+
 fn row(native: &mut Native, name: &str) -> Result<Value> {
     native
         .discover_interfaces()?

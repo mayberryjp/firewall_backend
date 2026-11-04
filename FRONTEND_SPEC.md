@@ -1487,18 +1487,19 @@ layouts retain counts with `cpu_id:null`, `row_index` and no deltas/rates;
 
 Collection is on demand, with no background worker or persisted benchmark
 history. CPU/IRQ collection is bounded to 32 MiB/sample, 4096 CPUs/IRQs and
-65536 IRQ-CPU rows. Interface collection is bounded to 8192 links, 4096 physical
+65536 IRQ-CPU rows. Interface collection is bounded to 8192 links, 4096 physical/WireGuard
 RX queues, 65536 NIC-IRQ associations, and checks its five-second budget between
 operations. Source files are bounded; these are not hard preemptive I/O deadlines.
 
 `interfaces[]` has `name`, numeric `index`, `mac`, native `kind`, `up`,
 `physical`, `managed`, nullable VLAN `parent_index`/`parent`, nullable
 `rx_queues:[{name,rps_cpus,rps_flow_cnt}]`, nullable numeric `irqs[]` and `errors:string[]`.
-`rps_flow_cnt` is the current nonnegative integer RFS queue table entry count,
+`rps_flow_cnt` is the current nonnegative integer RFS queue table entry count (null for WireGuard),
 not a packet counter. Unreadable queue controls produce explicit interface errors.
-Queue masks are observed canonical hexadecimal strings. Nonphysical links
-retain null physical queue/IRQ evidence. `managed` means a configured Ethernet
-record; unmanaged/down links remain visible. VLAN parent references can be
+Queue masks are observed canonical hexadecimal strings. Kernel WireGuard links
+expose their RX RPS masks, with null `rps_flow_cnt` and null physical `irqs`.
+Other nonphysical links retain null queue/IRQ evidence. `managed` means a configured
+Ethernet or WireGuard record; unmanaged/down links remain visible. VLAN parent references can be
 followed to the physical NIC; veth peer indices are not mislabeled as parents.
 NIC IRQ association comes from device sysfs, not action-name guessing.
 
@@ -1538,14 +1539,21 @@ Synthetic fragment only, not a complete transaction or recommended CPU choice:
 {"kernel":{"rps":{"eno1/rx-0":"c"}}}
 ```
 
-`c` selects CPUs 2 and 3. Keys use an existing managed physical Ethernet
+`c` selects CPUs 2 and 3. Keys use a managed physical Ethernet or kernel WireGuard
 interface and canonical `rx-N` queue index 0..4095, maximum 64 settings.
 Masks are lowercase comma-separated hexadecimal 32-bit words, highest word
 unpadded, subsequent words exactly eight digits; CPU IDs 0..8191.
 No `0x`, whitespace, uppercase or redundant leading zeros. `0` disables RPS.
-Every selected CPU must be online at native apply preflight. VLANs, tunnels,
+Every selected CPU must be online at native apply preflight. VLANs, other tunnels,
 dummy/veth software links and unsupported/missing queues cannot be tuned.
-The physical-device sysfs check is native preflight, not just core validation.
+WireGuard creation and RPS may share one candidate, for example
+`{"kernel":{"rps":{"wg0/rx-0":"2"}}}` (synthetic CPU-1 fragment, not a
+recommendation or full transaction). Physical-device or kernel WireGuard identity,
+actual RX controls and write/readback support are verified natively. New WireGuard
+queues are checked after link creation; a missing/unwritable queue fails the
+transaction and triggers rollback. WireGuard RPS steers post-decryption RX
+processing; it does not select crypto worker CPUs. IRQ-based recommendations
+remain physical-only; RFS and NIC offloads remain physical-Ethernet-only.
 
 Use the full `POST /api/v1/transactions` candidate and current `base_revision`,
 10..300-second confirmation timeout and explicit confirm/rollback. Changes,
@@ -1557,7 +1565,7 @@ write permissions are still checked. Do not copy native `rps_identity` observati
 into editable configuration. No new permission, RPS write endpoint or GET tuning.
 
 Known JSON type/null errors are `400`; invalid masks/keys, limits and unmanaged
-or non-Ethernet references are `422`; authentication `401`/`403`, stale/busy
+or ineligible interface references are `422`; authentication `401`/`403`, stale/busy
 transaction `409`, native apply/readback/recovery errors use existing `500`
 transaction behavior. Source availability errors on diagnostic reads are `503`
 or explicit `200` partial evidence as above. Submit success is provisional
@@ -1566,14 +1574,23 @@ never automatically retry mutation.
 
 `GET /api/v1/kernel/tunables` and existing runtime reads expose `rps` in
 desired/configured/effective/observed/captured-original maps. Native maps may
-also expose daemon-owned `rps_identity:{INTERFACE:{index,mac,boot}}`. Normal
+also expose daemon-owned `rps_identity:{INTERFACE:{index,mac,boot,wireguard_public_key?}}`.
+Physical identities omit the public key; WireGuard has an empty `mac` and its
+kernel public key. No private key is exposed or stored in tuning identity. Normal
 state/revision reads preserve desired masks. Capture original values/identities
 durably before writes, verify exact readback, and restore through native intents
 on apply failure/interrupted recovery. Failed recovery retains its intent and
 error. Remove an entry to restore its original mask and release queue ownership;
 set `0` to explicitly own a disabled setting. Confirmation timeout/restart
 rollback restores the previous configuration; reboot reapplies verified saved
-settings. Same-boot index and MAC checks reject replacement. Missing devices,
+settings. Same-boot index plus physical MAC or WireGuard public-key checks reject
+arbitrary replacement, even a same-key WireGuard replacement. Controlled creation,
+rekey and rollback/reboot recreation verify the configured kernel public key
+before rebinding identity, preserving owned original masks. A new device's intent
+records deletion on rollback; its initial mask is captured after creation and
+saved with successful ownership. Deleting WireGuard drops its nonexistent queue
+from writes and releases ownership; rollback recreates the device and previous
+requested mask. Missing devices outside controlled recreation,
 changed CPU availability or unreadable controls fail explicitly; no automatic
 hotplug repair, permissive fallback or external tuning coordination.
 
@@ -5718,7 +5735,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
 | GET | `/interface-capabilities` | Persisted `InterfaceCapabilitySnapshot \| null`; `state.read`, no implicit scan |
 | GET | `/interface-capabilities/refresh` | No body/query -> `200 InterfaceCapabilitySnapshot`; `state.read` + `interfaces.write`, explicit passive scan and durable save; never auto-run/prefetch/poll |
-| GET | `/statistics/performance` | No body/query -> live host CPU/IRQ/softnet, physical RX queues and conservative RPS trial evidence; `state.read`, no tuning or persisted scan |
+| GET | `/statistics/performance` | No body/query -> live host CPU/IRQ/softnet, physical/WireGuard RX queues and physical-only RPS trial evidence; `state.read`, no tuning or persisted scan |
 | GET | `/kernel/tunables` | Desired/configured/effective/observed/original kernel maps, including explicit RPS masks and native read-only identity evidence |
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |

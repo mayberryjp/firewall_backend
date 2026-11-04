@@ -4672,6 +4672,62 @@ fn performance_rps_permissions_persistence_confirmation_and_rollback() {
 }
 
 #[test]
+fn wireguard_rps_transactions_authorize_persist_and_restore_deleted_interfaces() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let desired: Config = serde_json::from_value(json!({
+        "interfaces":[{"name":"wg0","kind":"wireguard","role":"wan","mtu":1420,"up":true,
+            "addresses":[],"wireguard":{"key_ref":"wg-key","listen_port":51820,"peers":[]}}],
+        "kernel":{"rps":{"wg0/rx-0":"2"}}
+    }))
+    .unwrap();
+    for denied in ["interfaces.write", "kernel.host.write"] {
+        let permissions: Vec<_> = all()
+            .into_iter()
+            .filter(|permission| permission != denied)
+            .collect();
+        let reply = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "operator",
+            &permissions,
+            &serde_json::to_vec(&json!({"base_revision":engine.state.revision,
+                "confirm_timeout_seconds":30,"config":desired}))
+            .unwrap(),
+        );
+        assert_eq!(reply.status, 403, "{}", reply.body);
+        assert!(reply.body["error"].as_str().unwrap().contains(denied));
+    }
+    let reply = submit(&mut engine, desired.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let deleted = submit(&mut engine, Config::empty());
+    assert_eq!(deleted.status, 202, "{}", deleted.body);
+    let id = deleted.body["id"].as_str().unwrap();
+    let rolled_back = request(
+        &mut engine,
+        "POST",
+        &format!("/api/v1/transactions/{id}/rollback"),
+        Value::Null,
+    );
+    assert_eq!(rolled_back.status, 200, "{}", rolled_back.body);
+    assert_eq!(engine.state.desired.kernel.rps, desired.kernel.rps);
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null).body["observed"]["rps"]
+            ["wg0/rx-0"],
+        "2"
+    );
+    drop(engine);
+    let backend = Simulator::with_config(desired.clone()).unwrap();
+    let engine = Engine::open(&fixture.path(), Box::new(backend)).unwrap();
+    assert_eq!(engine.state.desired.kernel.rps, desired.kernel.rps);
+}
+
+#[test]
 fn performance_rps_pending_restart_timeout_restores_committed_masks() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

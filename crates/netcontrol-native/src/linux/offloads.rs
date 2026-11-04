@@ -711,7 +711,12 @@ impl Driver for System {
             index == live_index && mac == live_mac,
             "offload sysfs/network namespace identity mismatch",
         )?;
-        Ok(RpsIdentity { index, mac, boot })
+        Ok(RpsIdentity {
+            index,
+            mac,
+            boot,
+            wireguard_public_key: None,
+        })
     }
 
     fn snapshot(&mut self, name: &str) -> Result<Snapshot> {
@@ -808,6 +813,7 @@ mod tests {
             index: 7,
             mac: "02:00:00:00:00:01".into(),
             boot: "test-boot".into(),
+            wireguard_public_key: None,
         }
     }
 
@@ -1262,6 +1268,7 @@ mod tests {
                             index,
                             mac,
                             boot: "isolated-veth-fixture".into(),
+                            wireguard_public_key: None,
                         })
                     }
                     fn snapshot(&mut self, name: &str) -> Result<Snapshot> {

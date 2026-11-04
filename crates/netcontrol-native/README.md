@@ -59,7 +59,7 @@ functional networking build or a permissive firewall fallback.
 ## Performance diagnostics and RPS
 
 The passive `GET /api/v1/statistics/performance` collector is host-mode-only.
-It reads CPU/IRQ/softnet sources and live interface/physical-parent queue
+It reads CPU/IRQ/softnet sources and live physical/WireGuard RX queue
 evidence, without scanning ethtool capabilities, writing tuning or sending
 traffic. CPU/IRQ deltas are process-local observations, not a persisted benchmark
 or a guarantee that forwarded packets are CPU-limited. Lab namespaces are
@@ -68,8 +68,9 @@ host sysfs. Containers must expose the intended host namespace, procfs and sysfs
 cgroup/process CPU visibility is not the scope of all kernel networking work.
 
 `kernel.rps` maps `INTERFACE/rx-N` to canonical lowercase Linux hexadecimal CPU
-masks. Only managed physical Ethernet interfaces are eligible; set the physical
-parent, not each VLAN. Host mode automatically holds the exclusive
+masks. Managed physical Ethernet and kernel WireGuard interfaces are eligible;
+use the physical parent for VLANs. Other virtual links remain unsupported.
+Host mode automatically holds the exclusive
 host-tunables lock; writable sysfs is still required. Every change also needs
 `transactions.write`, `interfaces.write` and `kernel.host.write`.
 Opening a control is not proof it will accept a write: exact readback is required.
@@ -82,11 +83,23 @@ and durable operation intents before mutation. Failed operations restore the
 captured masks through existing recovery; incomplete recovery retains its intent
 and explicit error. Pending confirmation, explicit rollback, deadline rollback,
 restart and reboot follow the existing transaction lifecycle. Removing a setting
-restores its original mask and releases that queue's RPS ownership. MAC and
-same-boot interface-index guards reject replacement; reboot reconciliation binds
+restores its original mask and releases that queue's RPS ownership. Physical MAC,
+WireGuard public-key and same-boot interface-index guards reject replacement; reboot reconciliation binds
 the current verified identity without replacing saved masks. Missing interfaces,
 RX queues, read permissions, write permissions or offline selected CPUs are
 explicit errors, never successful no-ops or automatic defaults.
+
+A new WireGuard device has no queue to capture before link creation: its durable
+intent records rollback by deleting the newly created device. After verified
+creation, capture its initial mask before writing; successful ownership saves
+that original. Existing devices are captured before mutation. Controlled creation,
+rekey and recovery rebind only after kernel WireGuard/public-key verification,
+retaining owned originals. Deleted devices have no queue to restore; rollback can
+recreate and rebind them. Arbitrary same-boot replacement is rejected even with
+the same public key. Missing controls after creation cause rollback, not success.
+WireGuard diagnostics expose RPS masks but null physical IRQ/RFS-count evidence;
+recommendations remain physical-only. This does not tune crypto workers or enable
+RFS/NIC offloads on WireGuard.
 
 This adds no datapath bypass: nftables, connection tracking, accounting and
 services retain their existing paths. RFS and NIC offloads are separate explicit
