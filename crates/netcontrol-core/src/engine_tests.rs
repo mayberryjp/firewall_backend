@@ -2387,7 +2387,7 @@ fn capabilities_refresh_is_explicit_authorized_persisted_and_separate_from_confi
         ("GET", path, "", "", all(), "", 401),
         ("GET", path, "", "reader", vec![], "", 403),
         (
-            "POST",
+            "GET",
             refresh,
             "",
             "reader",
@@ -2395,13 +2395,24 @@ fn capabilities_refresh_is_explicit_authorized_persisted_and_separate_from_confi
             "",
             403,
         ),
+        ("GET", refresh, "", "", all(), "", 401),
+        (
+            "GET",
+            refresh,
+            "",
+            "operator",
+            vec!["interfaces.write".into()],
+            "",
+            403,
+        ),
         ("POST", path, "", "operator", all(), "", 405),
-        ("GET", refresh, "", "operator", all(), "", 405),
+        ("POST", refresh, "", "operator", all(), "", 405),
+        ("HEAD", refresh, "", "operator", all(), "", 405),
         ("DELETE", path, "", "operator", all(), "", 405),
         ("GET", path, "unexpected=1", "operator", all(), "", 400),
         ("GET", path, "", "operator", all(), "{}", 400),
-        ("POST", refresh, "unexpected=1", "operator", all(), "", 400),
-        ("POST", refresh, "", "operator", all(), "{}", 400),
+        ("GET", refresh, "unexpected=1", "operator", all(), "", 400),
+        ("GET", refresh, "", "operator", all(), "{}", 400),
     ] {
         assert_eq!(
             engine
@@ -2412,7 +2423,7 @@ fn capabilities_refresh_is_explicit_authorized_persisted_and_separate_from_confi
     }
     assert_eq!(faults.lock().unwrap().capability_calls, 0);
     faults.lock().unwrap().fail_observe = true;
-    let reply = engine.request("POST", refresh, "", "operator", &all(), &[]);
+    let reply = engine.request("GET", refresh, "", "operator", &all(), &[]);
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(reply.body["inventory"]["status"], "partial");
     assert_eq!(
@@ -2423,6 +2434,11 @@ fn capabilities_refresh_is_explicit_authorized_persisted_and_separate_from_confi
     assert_eq!(engine.state.revision, revision);
     assert_eq!(faults.lock().unwrap().apply_count, 0);
     assert_eq!(faults.lock().unwrap().capability_calls, 1);
+    let reply = engine.request("GET", refresh, "", "operator", &all(), &[]);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(faults.lock().unwrap().capability_calls, 2);
+    assert_eq!(engine.state.desired, desired);
+    assert_eq!(engine.state.revision, revision);
     let saved = reply.body;
     assert_eq!(
         engine
@@ -2431,7 +2447,7 @@ fn capabilities_refresh_is_explicit_authorized_persisted_and_separate_from_confi
         saved
     );
     faults.lock().unwrap().discovery_error = true;
-    let failed = engine.request("POST", refresh, "", "operator", &all(), &[]);
+    let failed = engine.request("GET", refresh, "", "operator", &all(), &[]);
     assert_eq!(failed.status, 503);
     assert!(
         failed.body["error"]
@@ -2449,7 +2465,7 @@ fn capabilities_refresh_is_explicit_authorized_persisted_and_separate_from_confi
     engine.store.fail_after.set(Some(0));
     assert_eq!(
         engine
-            .request("POST", refresh, "", "operator", &all(), &[])
+            .request("GET", refresh, "", "operator", &all(), &[])
             .status,
         500
     );
@@ -2491,7 +2507,7 @@ fn capabilities_survive_transaction_rollback_and_respect_maintenance() {
         }),
     );
     assert_eq!(tx.status, 202, "{}", tx.body);
-    let refreshed = engine.request("POST", refresh, "", "operator", &all(), &[]);
+    let refreshed = engine.request("GET", refresh, "", "operator", &all(), &[]);
     assert_eq!(refreshed.status, 200);
     assert_eq!(refreshed.body["inventory"]["source"], "simulator");
     let resource = engine.request(
@@ -2524,7 +2540,28 @@ fn capabilities_survive_transaction_rollback_and_respect_maintenance() {
     engine.set_upgrade_maintenance(true).unwrap();
     assert_eq!(
         engine
-            .request("POST", refresh, "", "operator", &all(), &[])
+            .request("GET", refresh, "", "operator", &all(), &[])
+            .status,
+        409
+    );
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/interface-capabilities",
+                "",
+                "reader",
+                &all(),
+                &[]
+            )
+            .status,
+        200
+    );
+    engine.set_upgrade_maintenance(false).unwrap();
+    engine.begin_restart().unwrap();
+    assert_eq!(
+        engine
+            .request("GET", refresh, "", "operator", &all(), &[])
             .status,
         409
     );

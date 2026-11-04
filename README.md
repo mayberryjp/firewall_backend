@@ -53,12 +53,14 @@ force a new schema to load.
 ## Interface capability snapshots
 
 Explicit NIC capability inventory is available separately:
-`POST /api/v1/interface-capabilities/refresh` (`state.read` and
+`GET /api/v1/interface-capabilities/refresh` (`state.read` and
 `interfaces.write`, no body/query) reads all links once and durably saves the
 snapshot. `GET /api/v1/interface-capabilities` (`state.read`) returns it, or
 null before the first refresh, without rescanning. Driver/firmware and PCI
 identity, supported/advertised speed-duplex modes, queues, steering, XDP and
 offload evidence are daemon-owned observations, not editable configuration.
+Refresh is an explicit scan-and-save GET for GET-only API explorers, not a
+read-only resource: never prefetch, automatically retry, cache or poll it.
 Unknown/partial results are explicit; no tuning or device rebinding occurs.
 DPDK readiness requires future PMD-specific validation. See the
 [design](docs/INTERFACE_CAPABILITIES.md) and

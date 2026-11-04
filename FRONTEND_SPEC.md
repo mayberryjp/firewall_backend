@@ -3695,16 +3695,36 @@ Renames must similarly surface dependencies. Up does not imply carrier/readiness
 
 `GET /api/v1/interface-capabilities` requires API-key authentication and
 `state.read`. It returns `InterfaceCapabilitySnapshot | null`; null means no
-refresh has been performed. GET never probes hardware or runs state observation.
-`POST /api/v1/interface-capabilities/refresh` requires `state.read` plus
+refresh has been performed. This cached-read path never probes hardware or runs
+state observation.
+`GET /api/v1/interface-capabilities/refresh` requires `state.read` plus
 `interfaces.write`, performs one synchronous passive scan of all links in the
 backend namespace, and returns the atomically persisted snapshot with 200.
 Both paths accept no body (including `{}`) or query parameters (400); wrong
 methods return 405, authentication/permissions return 401/403. Fatal scan errors
 return 503, persistence errors 500; either preserves the last saved snapshot.
-Upgrade/restart guards can return 409 on POST. Source failures within a completed
+Upgrade/restart guards can return 409 on refresh despite its GET method.
+Source failures within a completed
 scan return 200 with `inventory.status: "partial"` and explicit `errors`.
 Partial snapshots replace prior data; do not merge old evidence into new rows.
+
+**API Explorer integration (required):** the user reports both routes are missing
+from the frontend explorer. Register both full paths as separate GET entries:
+"Read saved interface capabilities" and "Refresh interface capabilities".
+The refresh method changed from POST to GET to support the explorer's GET-only
+execution; POST now returns 405, without an alias. Keep existing API-key handling.
+The read entry needs `state.read`; refresh additionally needs `interfaces.write`.
+Accept no body or query parameters for either entry.
+
+Refresh is intentionally scan-and-save, not a normal read-only GET. Mark its
+side effect in the explorer and require explicit user execution. Never include
+it in automatic polling, prefetch, automatic retries or "run all GETs".
+Responses use `Cache-Control: no-store`; disable client/proxy response caching
+and send the actual request on each explicit refresh. Avoid overlapping scans.
+Render a never-refreshed read as null, successful/partial snapshots with original
+timestamp/scope and errors, and permission/409/500/503 failures without claiming
+the old snapshot was refreshed. A successful refresh returns the same
+`InterfaceCapabilitySnapshot` type as a non-null cached read.
 
 The snapshot is daemon-owned journal state, not a `Config` field. Never include
 it in transactions or expose an inventory editor. Refresh does not advance
@@ -3740,6 +3760,8 @@ namespace-local. Simulator rows have `source: "simulator"`,
 unknown performance support. Containers observe their namespace, not external
 host NICs. See the [design](docs/INTERFACE_CAPABILITIES.md) and required
 [frontend handoff](docs/frontend-handoffs/2026-10-31.md#2026-10-31-01-interface-capability-inventory).
+The GET-only refresh method and missing explorer registrations are tracked in
+[handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ##### Live interface selection
 
@@ -5358,7 +5380,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/interfaces` | Observed `Interface[]` |
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
 | GET | `/interface-capabilities` | Persisted `InterfaceCapabilitySnapshot \| null`; `state.read`, no implicit scan |
-| POST | `/interface-capabilities/refresh` | No body/query -> `200 InterfaceCapabilitySnapshot`; `state.read` + `interfaces.write`, passive scan and durable save |
+| GET | `/interface-capabilities/refresh` | No body/query -> `200 InterfaceCapabilitySnapshot`; `state.read` + `interfaces.write`, explicit passive scan and durable save; never auto-run/prefetch/poll |
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |
 | POST | `/diagnostics/dns-lookup` | Timed configured- or explicit-resolver diagnostic result `200`; `diagnostics.run` |

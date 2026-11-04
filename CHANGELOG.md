@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+
+- Interface capability refresh now uses
+  `GET /api/v1/interface-capabilities/refresh`; POST is rejected with 405.
+  Permissions, explicit passive scanning, durable save, no-body/query validation
+  and upgrade/restart guards are unchanged. This scan-and-save GET must not be
+  cached, prefetched, automatically retried or polled.
+  Release impact: breaking method change, Unreleased; next automatic calendar
+  version. Required frontend client/API Explorer registrations for both cached
+  read and refresh:
+  [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
+
 ### Fixed
 
 - Exclude daemon-managed software version and release-check metadata from native
@@ -34,7 +46,7 @@
   [handoff 2026-11-01-01](docs/frontend-handoffs/2026-11-01.md#2026-11-01-01-mdns-and-udp-relay-entry-usage-counters).
 
 - Explicit passive NIC capability inventory:
-  `POST /api/v1/interface-capabilities/refresh` reads all namespace-local links
+  `GET /api/v1/interface-capabilities/refresh` reads all namespace-local links
   once and atomically persists daemon-owned observations;
   `GET /api/v1/interface-capabilities` retrieves them without rescanning.
   Driver/firmware/PCI identity, supported/advertised speed-duplex modes, queues,

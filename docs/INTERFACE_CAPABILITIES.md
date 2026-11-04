@@ -13,10 +13,15 @@ attach BPF programs, bind AF_XDP queues or change ethtool/sysctl/IRQ settings.
 
 - `GET /api/v1/interface-capabilities`: API key and `state.read`. Read the last
   persisted snapshot; return JSON `null` before the first refresh. Never scan
-  implicitly on GET or startup.
-- `POST /api/v1/interface-capabilities/refresh`: API key, `state.read` and
+  implicitly on this cached-read path or startup.
+- `GET /api/v1/interface-capabilities/refresh`: API key, `state.read` and
   `interfaces.write`. Perform one synchronous inventory and atomically persist
   it before returning 200. No body or query parameters.
+- Refresh is deliberately a scan-and-save GET for GET-only API explorers, not
+  an ordinary read. Only explicit user execution may trigger it: no automatic
+  polling, prefetch, retry, caching or bulk "run all GETs". Responses have
+  `Cache-Control: no-store`; repeated explicit GETs each scan and save again.
+  POST is unsupported (405); there is no alternate write-method alias.
 - Both paths reject bodies/query parameters with 400 and unsupported methods
   with 405. Normal authentication errors are 401/403. Fatal discovery errors
   return 503; persistence errors return 500 and retain the prior snapshot.

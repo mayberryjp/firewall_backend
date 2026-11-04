@@ -555,10 +555,11 @@ impl Engine {
         if actor.trim().is_empty() {
             return Err(ApiError::new(401, "valid API key required"));
         }
-        if self.restarting && method != "GET" {
+        let writes_state = method != "GET" || path == "/api/v1/interface-capabilities/refresh";
+        if self.restarting && writes_state {
             return Err(ApiError::new(409, "daemon restart is pending"));
         }
-        if self.maintenance && method != "GET" {
+        if self.maintenance && writes_state {
             return Err(ApiError::new(
                 409,
                 "configuration writes are blocked during software upgrade",
@@ -569,7 +570,7 @@ impl Engine {
         {
             require(permissions, "state.read")?;
             let refresh = path.ends_with("/refresh");
-            if method != if refresh { "POST" } else { "GET" } {
+            if method != "GET" {
                 return Err(ApiError::new(405, "method not allowed"));
             }
             if refresh {

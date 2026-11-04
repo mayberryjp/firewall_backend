@@ -142,21 +142,21 @@ async fn capabilities_http_refresh_and_persisted_read_contract() {
         ("GET", "/api/v1/interface-capabilities", "", "invalid", 401),
         ("GET", "/api/v1/interface-capabilities", "", "reader", 200),
         (
-            "POST",
+            "GET",
             "/api/v1/interface-capabilities/refresh",
             "",
             "reader",
             403,
         ),
         (
-            "POST",
+            "GET",
             "/api/v1/interface-capabilities/refresh?unexpected=1",
             "",
             "operator",
             400,
         ),
         (
-            "POST",
+            "GET",
             "/api/v1/interface-capabilities/refresh",
             "{}",
             "operator",
@@ -164,6 +164,13 @@ async fn capabilities_http_refresh_and_persisted_read_contract() {
         ),
         (
             "POST",
+            "/api/v1/interface-capabilities/refresh",
+            "",
+            "operator",
+            405,
+        ),
+        (
+            "GET",
             "/api/v1/interface-capabilities/refresh",
             "",
             "operator",
@@ -184,9 +191,10 @@ async fn capabilities_http_refresh_and_persisted_read_contract() {
             .await
             .unwrap();
         assert_eq!(response.status().as_u16(), expected);
+        assert_eq!(response.headers()["cache-control"], "no-store");
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
-        if expected == 200 && method == "POST" {
+        if expected == 200 && path.ends_with("/refresh") {
             assert_eq!(value["inventory"]["source"], "simulator");
             assert_eq!(value["inventory"]["status"], "simulated");
             assert!(value["collected_at"].as_str().is_some());
@@ -1506,7 +1514,7 @@ async fn scoped_credentials_permissions_and_api_body_limit() {
         ),
         ("POST", "/api/v1/interface-capabilities", String::new(), 405),
         (
-            "POST",
+            "GET",
             "/api/v1/interface-capabilities/refresh",
             String::new(),
             403,
