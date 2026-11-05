@@ -90,6 +90,14 @@ struct Options {
     ssh_host_key: Option<PathBuf>,
     #[arg(
         long,
+        value_name = "PATH",
+        help = "Root-only Linux local control socket; host device mode defaults to /run/netcontrol/control.sock"
+    )]
+    control_socket: Option<PathBuf>,
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["auth_file", "provision_wan", "factory_reset", "configure_updates", "upgrade_worker", "upgrade_recover", "create_wireguard_key", "wireguard_public_key"], help = "Interactively create a device API key through the running daemon's local control socket and exit (Linux root only)")]
+    create_api_key: Option<String>,
+    #[arg(
+        long,
         env = "NETCONTROL_UPGRADE_CONFIG",
         help = "Root-owned private JSON configuration enabling GitHub HTTPS Ubuntu self-upgrades"
     )]
@@ -160,6 +168,28 @@ fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
     }
 }
 async fn run(options: Options) -> Result<()> {
+    if let Some(name) = &options.create_api_key {
+        let path = options
+            .control_socket
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(netcontrold::local_control::DEFAULT_SOCKET));
+        return netcontrold::local_control::create_key(path, name).await;
+    }
+    if options.control_socket.is_some() && options.auth_file.is_some() {
+        bail!("local control socket is unavailable with --auth-file");
+    }
+    #[cfg(not(target_os = "linux"))]
+    if options.control_socket.is_some() {
+        bail!("local control socket is supported only on Linux");
+    }
+    #[cfg(target_os = "linux")]
+    let control_path = options.control_socket.clone().or_else(|| {
+        (options.backend == "linux"
+            && options.namespace.is_empty()
+            && options.auth_file.is_none()
+            && options.provision_wan.is_none())
+        .then(|| PathBuf::from(netcontrold::local_control::DEFAULT_SOCKET))
+    });
     if options.create_wireguard_key.is_some() || options.wireguard_public_key.is_some() {
         let public = match (&options.create_wireguard_key, &options.wireguard_public_key) {
             (Some(name), _) => netcontrol_native::create_wireguard_key(&options.keys, name)?,
@@ -430,6 +460,11 @@ async fn run(options: Options) -> Result<()> {
         (system_mode == netcontrold::host_system::Mode::Native && watchdog.enabled())
             .then_some(restart_tx),
     )?;
+    #[cfg(target_os = "linux")]
+    let control_listener = control_path
+        .as_deref()
+        .map(netcontrold::local_control::Listener::bind)
+        .transpose()?;
     let (system_stop, system_receiver) = tokio::sync::watch::channel(false);
     let system_control = controls["system"].clone();
     let system_task = tokio::spawn(async move {
@@ -477,6 +512,14 @@ async fn run(options: Options) -> Result<()> {
     });
     let handle = axum_server::Handle::new();
     let (ssh_stop_tx, ssh_stop_rx) = tokio::sync::watch::channel(false);
+    #[cfg(target_os = "linux")]
+    let mut control_task = control_listener.map(|listener| {
+        let app = app.clone();
+        let stop = ssh_stop_rx.clone();
+        tokio::spawn(listener.serve(app, stop))
+    });
+    #[cfg(not(target_os = "linux"))]
+    let mut control_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
     let mut ssh_task = ssh.map(|(listener, path)| {
         let app = app.clone();
         tokio::spawn(
@@ -580,27 +623,45 @@ async fn run(options: Options) -> Result<()> {
     };
     tokio::pin!(served);
     let mut ssh_finished = None;
-    let served = if let Some(task) = ssh_task.as_mut() {
-        tokio::select! {
-            result = &mut served => result,
-            result = task => {
-                ssh_finished = Some(result);
-                handle.graceful_shutdown(Some(Duration::from_secs(10)));
-                served.await
+    let mut control_finished = None;
+    let mut listener_unexpected = false;
+    let served = tokio::select! {
+        result = &mut served => result,
+        result = async {
+            match ssh_task.as_mut() {
+                Some(task) => task.await,
+                None => std::future::pending().await,
             }
+        } => {
+            ssh_finished = Some(result);
+            listener_unexpected = !*ssh_stop_tx.borrow();
+            let _ = ssh_stop_tx.send(true);
+            handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            served.await
         }
-    } else {
-        served.await
+        result = async {
+            match control_task.as_mut() {
+                Some(task) => task.await,
+                None => std::future::pending().await,
+            }
+        } => {
+            control_finished = Some(result);
+            listener_unexpected = !*ssh_stop_tx.borrow();
+            let _ = ssh_stop_tx.send(true);
+            handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            served.await
+        }
     };
     readiness.abort();
     if let Err(error) = watchdog.stopping() {
         tracing::warn!(%error, "systemd stopping notification failed");
     }
-    let stopping = *ssh_stop_tx.borrow();
     let _ = ssh_stop_tx.send(true);
     let ssh_result = if let Some(result) = ssh_finished {
         match result {
-            Ok(Ok(())) if !stopping => Err(anyhow::anyhow!("SSH listener stopped unexpectedly")),
+            Ok(Ok(())) if listener_unexpected => {
+                Err(anyhow::anyhow!("SSH listener stopped unexpectedly"))
+            }
             Ok(result) => result,
             Err(error) => Err(error.into()),
         }
@@ -614,6 +675,19 @@ async fn run(options: Options) -> Result<()> {
                 Err(anyhow::anyhow!("SSH server shutdown timed out"))
             }
         }
+    } else {
+        Ok(())
+    };
+    let control_result = if let Some(result) = control_finished {
+        match result {
+            Ok(Ok(())) if listener_unexpected => Err(anyhow::anyhow!(
+                "local control listener stopped unexpectedly"
+            )),
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        }
+    } else if let Some(task) = control_task {
+        task.await.context("local control shutdown task failed")?
     } else {
         Ok(())
     };
@@ -643,6 +717,7 @@ async fn run(options: Options) -> Result<()> {
     shutdown_result.context("durable engine shutdown failed")?;
     tick_result??;
     ssh_result.context("configuration SSH server failed")?;
+    control_result.context("local control server failed")?;
     if *restart_requested.borrow() {
         bail!("daemon restart requested; supervised service will restart");
     }
@@ -664,6 +739,48 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_key_command_is_explicit_and_rejects_other_identity_modes() {
+        let options = Options::try_parse_from([
+            "netcontrold",
+            "--create-api-key",
+            "console",
+            "--control-socket",
+            "/run/netcontrol/custom.sock",
+        ])
+        .unwrap();
+        assert_eq!(options.create_api_key.as_deref(), Some("console"));
+        assert_eq!(
+            options.control_socket,
+            Some(PathBuf::from("/run/netcontrol/custom.sock"))
+        );
+        for arguments in [
+            vec![
+                "netcontrold",
+                "--create-api-key",
+                "console",
+                "--auth-file",
+                "auth.json",
+            ],
+            vec![
+                "netcontrold",
+                "--create-api-key",
+                "console",
+                "--create-wireguard-key",
+                "wg0",
+            ],
+            vec![
+                "netcontrold",
+                "--create-api-key",
+                "console",
+                "--configure-updates",
+                "updates.json",
+            ],
+        ] {
+            assert!(Options::try_parse_from(arguments).is_err());
+        }
+    }
 
     #[test]
     fn release_checks_default_on_and_upgrade_bootstrap_is_an_explicit_operation() {

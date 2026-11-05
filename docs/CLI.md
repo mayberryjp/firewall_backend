@@ -46,7 +46,8 @@ with no group/other permissions; new keys use mode 0600. On Windows, operators
 must enforce private ACLs on the key and its parent directory; the daemon does
 not independently verify Windows ACL privacy.
 
-Complete normal website onboarding, create and save an **API key**, and then:
+Create and save an **API key** using normal website onboarding or the local
+console command below, and then:
 
 ```sh
 ssh -p 2222 apikey@192.0.2.10
@@ -63,6 +64,55 @@ SSH encrypts its own connection even if the HTTP listener uses HTTP. It does not
 make HTTP key creation secure or restrict an all-interface listener to LAN.
 Operators still provide reachable addressing and management access controls.
 Enabling SSH does not provision interfaces or forwarding.
+
+### Browser-free local key creation
+
+With the updated daemon running, use a trusted Linux root console:
+
+```sh
+sudo netcontrold --create-api-key console
+ssh -p 2222 apikey@127.0.0.1
+```
+
+On a fresh device, the first command prompts for a device username and a
+12..72-byte password twice, without echoing the password. It atomically saves
+the account, finishes onboarding and creates a full-permission API key. Save
+the displayed key immediately and use it at the SSH password prompt. The device
+account password remains for website login; it is not an SSH password.
+
+If an account already exists, its username/password and existing keys/sessions
+are preserved, and no account prompt is shown. The command also finishes pending
+onboarding: existing pending device keys become usable. Key names must be unique,
+nonempty, trimmed, without control characters, and at most 80 bytes; the normal
+100-key limit applies. Failed validation changes nothing; uncertain persistence
+fails closed and requires daemon restart. Use the normal website key list and
+revocation controls for the new key.
+
+This is local root authorization, not a default password or an unauthenticated
+HTTP/SSH route. The daemon keeps its credential-store lock; no restart or direct
+state-file editing is needed. Plaintext passwords/keys are not persisted or
+logged by the daemon. Output requires a terminal: do not redirect it or use
+session recording, terminal logging or shell tracing while creating a key.
+Lost output cannot be recovered; inspect/revoke that named key before creating
+another. Do not blindly retry a timed-out request.
+
+Linux host device mode automatically binds `/run/netcontrol/control.sock`,
+independently of HTTP and SSH listeners. Its directory is root-owned mode 0700
+and socket mode 0600; both peers must have root UID. The directory's parent must
+also be root-owned and not writable by others. The daemon rejects foreign files,
+symlinks, insecure paths and active sockets; a verified stale socket after a
+crash is replaced. Shutdown finishes accepted identity writes and removes only
+its owned socket. Bind failures are startup errors, not silent disablement.
+
+For an explicit socket path, supply `--control-socket /run/netcontrol/custom.sock`
+to both the daemon and key command. A manual root simulator/lab launch needs this
+explicit flag; native host device mode uses the default automatically. Live local
+key creation is Linux-only and unavailable with `--auth-file`, whose externally
+managed scoped credentials must not be modified through this command.
+The feature requires a daemon built with this support; an older running daemon
+has no socket. It does not enable SSH when SSH is disabled, assign network
+addresses, or add firewall permits. Use the existing candidate/confirmed
+configuration commands after login to set LAN addresses and VLANs.
 
 ## Candidate, apply, and confirmation
 

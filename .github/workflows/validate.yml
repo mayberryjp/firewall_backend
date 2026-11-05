@@ -69,6 +69,13 @@ jobs:
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             cargo +stable test -p netcontrol-native -p netcontrol-services --locked -- --ignored --test-threads=1
+      - name: Test root-only live CLI identity administration
+        run: |
+          cargo +stable test -p netcontrold --test local_control --locked --no-run
+          sudo env "PATH=$PATH" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            cargo +stable test -p netcontrold --test local_control --locked -- --ignored --test-threads=1
 
   package:
     name: Signed native package (Ubuntu x86-64)

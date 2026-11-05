@@ -1317,3 +1317,12 @@ service-runtime and packaging contracts as well as changed management exposure.
 No release baseline is assigned; Cargo `0.0.0` is development metadata, not an
 approved release. Privileged Linux and physical Alpine acceptance remain pending;
 cross-compilation does not establish native correctness.
+- Root-only live Linux CLI API-key creation via a protected local Unix socket:
+  `netcontrold --create-api-key NAME`. Fresh devices prompt for an account
+  username and hidden password, then atomically finish onboarding and save a
+  full-permission key displayed once. Existing accounts/passwords are preserved;
+  pending onboarding is completed. Normal HTTP/SSH authorization, revocation and
+  the identity schema remain unchanged; no shared default password is added.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Optional frontend operator-help update:
+  [handoff 2026-11-06-01](docs/frontend-handoffs/2026-11-06.md#2026-11-06-01-browser-free-local-api-key-setup).

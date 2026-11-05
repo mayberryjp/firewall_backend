@@ -1610,6 +1610,19 @@ configuration SSH server by default using
 daemon process, system shell, SFTP server or supervised `sshd`.
 `upgrade.sh --build-only` does not change this configuration.
 
+An updated running Linux host device daemon also provides root-console key
+creation without a browser or restart:
+`sudo netcontrold --create-api-key console`. It prompts for a username and hidden
+password on an unclaimed device, finishes onboarding and displays the new API key
+once. Existing accounts/passwords are retained. Use that key with
+`ssh -p 2222 apikey@127.0.0.1`; the default IPv4 wildcard SSH listener includes
+localhost. The root-only `/run/netcontrol/control.sock` is independent of network
+listeners and must have a root-owned mode-0700 directory and mode-0600 socket.
+Bind/security failures stop startup. Custom `--control-socket PATH` must match on
+daemon and client; no local key creation is available with `--auth-file`.
+See [setup and error handling](CLI.md#browser-free-local-key-creation).
+Do not record the terminal or redirect the displayed key.
+
 For manual/OpenRC deployments, add `--ssh-listen 0.0.0.0:2222` to
 `netcontrold_args` to enable the daemon's native SSH interpreter; add
 `--ssh-host-key /var/lib/netcontrol/ssh-host-key`

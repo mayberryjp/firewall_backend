@@ -901,6 +901,16 @@ add firewall exceptions, and wildcard binding must not expose management to WAN.
 See [deployment overrides](docs/BUILD_AND_INSTALL.md#optional-configuration-ssh-server)
 for a custom address or explicit disable.
 
+For browser-free setup on the running Linux host daemon, use a root console:
+`sudo netcontrold --create-api-key console`, then
+`ssh -p 2222 apikey@127.0.0.1`. A fresh device prompts for a username and hidden
+account password; the command saves the account/key and finishes onboarding
+atomically. Existing account passwords are preserved. Save the API key displayed
+once and use it as the SSH password. This uses a root-only local Unix socket,
+not a shared default password; it requires the updated running daemon and a
+terminal. See [local key setup](docs/CLI.md#browser-free-local-key-creation)
+for pending-onboarding effects, socket requirements and failure handling.
+
 Use `enable`, `configure terminal`, interface/global configuration commands,
 `compare`, and `commit check`. `commit confirmed 60` applies the private
 candidate through the same transaction engine as HTTP; verify connectivity,

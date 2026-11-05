@@ -180,6 +180,107 @@ fn failed_claim_is_not_visible_and_pending_setup_resumes_after_restart() {
     assert!(store.authenticate(&key).is_some());
 }
 
+#[test]
+fn local_setup_is_atomic_durable_and_uses_normal_key_revocation() {
+    let dir = Directory::new();
+    let mut store = Store::open(&dir.path()).unwrap();
+    let before = fs::read(dir.path()).unwrap();
+    assert_eq!(
+        status(store.create_local_key("console", None).err().unwrap()),
+        409
+    );
+    for (username, password) in [("", "a unique test password"), ("admin", "short")] {
+        assert_eq!(
+            status(
+                store
+                    .create_local_key("console", Some((username, password)))
+                    .err()
+                    .unwrap()
+            ),
+            400
+        );
+    }
+    assert_eq!(fs::read(dir.path()).unwrap(), before);
+    let (key, token) = store
+        .create_local_key("console", Some(("operator", "a unique test password")))
+        .unwrap();
+    assert_eq!(store.status(), (true, true, "operator"));
+    assert_eq!(store.authenticate(&token).unwrap().id, key.id);
+    let bytes = fs::read_to_string(dir.path()).unwrap();
+    assert!(!bytes.contains(&token));
+    assert!(!bytes.contains("a unique test password"));
+    assert_eq!(
+        status(
+            store
+                .create_local_key("second", Some(("other", "another test password")))
+                .err()
+                .unwrap()
+        ),
+        409
+    );
+    drop(store);
+    let mut store = Store::open(&dir.path()).unwrap();
+    assert!(store.authenticate(&token).is_some());
+    let session = store.login("operator", "a unique test password").unwrap();
+    store.delete_key(&session, &key.id).unwrap();
+    assert!(store.authenticate(&token).is_none());
+}
+
+#[test]
+fn local_key_preserves_existing_account_and_finishes_pending_onboarding() {
+    let dir = Directory::new();
+    let mut store = Store::open(&dir.path()).unwrap();
+    let session = store.setup("operator", "a unique test password").unwrap();
+    let (_, pending) = store.create_key(&session, "web").unwrap();
+    assert!(store.authenticate(&pending).is_none());
+    let before = fs::read(dir.path()).unwrap();
+    assert_eq!(
+        status(store.create_local_key("web", None).err().unwrap()),
+        400
+    );
+    assert_eq!(fs::read(dir.path()).unwrap(), before);
+    assert!(!store.status().1);
+    let (_, token) = store.create_local_key("console", None).unwrap();
+    assert_eq!(store.status(), (true, true, "operator"));
+    store.session(&session).unwrap();
+    assert!(store.authenticate(&token).is_some());
+    assert!(store.authenticate(&pending).is_some());
+    assert!(store.login("operator", "a unique test password").is_ok());
+    for i in 2..100 {
+        store.create_local_key(&format!("local-{i}"), None).unwrap();
+    }
+    assert_eq!(
+        status(store.create_local_key("overflow", None).err().unwrap()),
+        400
+    );
+}
+
+#[test]
+fn local_setup_persistence_failure_is_fail_closed_without_partial_account() {
+    let dir = Directory::new();
+    let mut store = Store::open(&dir.path()).unwrap();
+    let before = fs::read(dir.path()).unwrap();
+    fs::remove_file(dir.path()).unwrap();
+    fs::create_dir(dir.path()).unwrap();
+    assert!(
+        store
+            .create_local_key("console", Some(("operator", "a unique test password")))
+            .is_err()
+    );
+    assert_eq!(store.status(), (false, false, ""));
+    assert!(store.check_health().is_err());
+    fs::remove_dir(dir.path()).unwrap();
+    fs::write(dir.path(), before).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    drop(store);
+    let store = Store::open(&dir.path()).unwrap();
+    assert_eq!(store.status(), (false, false, ""));
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_world_readable_symlink_and_hardlink_databases() {

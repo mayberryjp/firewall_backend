@@ -452,6 +452,55 @@ impl Store {
     }
     pub fn create_key(&mut self, token: &str, name: &str) -> Result<(Key, String)> {
         self.session(token)?;
+        let (stored, value) = self.new_key(name)?;
+        let key = stored.key.clone();
+        self.update(|data| {
+            data.keys.insert(key.id.clone(), stored);
+            Ok(())
+        })?;
+        Ok((key, value))
+    }
+    pub fn create_local_key(
+        &mut self,
+        name: &str,
+        account: Option<(&str, &str)>,
+    ) -> Result<(Key, String)> {
+        self.check_health()?;
+        let account = match (self.data.account.is_some(), account) {
+            (false, Some((username, password))) => {
+                if !valid_name(username, 64) || !(12..=72).contains(&password.len()) {
+                    return reject(400, "invalid username or password");
+                }
+                let salt = SaltString::generate(&mut OsRng);
+                let password_hash = Argon2::default()
+                    .hash_password(password.as_bytes(), &salt)
+                    .map_err(|_| anyhow::anyhow!("password hashing failed"))?
+                    .to_string();
+                Some(Account {
+                    username: username.to_owned(),
+                    password_hash,
+                    complete: true,
+                })
+            }
+            (false, None) => return reject(409, "device account setup required"),
+            (true, Some(_)) => {
+                return reject(409, "device account already exists; retry without setup");
+            }
+            (true, None) => None,
+        };
+        let (stored, value) = self.new_key(name)?;
+        let key = stored.key.clone();
+        self.update(|data| {
+            if let Some(account) = account {
+                data.account = Some(account);
+            }
+            data.account.as_mut().context("missing account")?.complete = true;
+            data.keys.insert(key.id.clone(), stored);
+            Ok(())
+        })?;
+        Ok((key, value))
+    }
+    fn new_key(&self, name: &str) -> Result<(StoredKey, String)> {
         if !valid_name(name, 80) {
             return reject(400, "invalid username, password, or key name");
         }
@@ -470,21 +519,17 @@ impl Store {
         let value = secret("nc_")?;
         let id = secret("")?;
         let key = Key {
-            id: id.clone(),
+            id,
             name: name.to_owned(),
             masked: format!("nc_...{}", &value[value.len() - 4..]),
             created_at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)?,
         };
         let stored = StoredKey {
-            key: key.clone(),
+            key,
             token_sha256: digest(&value),
         };
-        self.update(|data| {
-            data.keys.insert(id, stored);
-            Ok(())
-        })?;
-        Ok((key, value))
+        Ok((stored, value))
     }
     pub fn delete_key(&mut self, token: &str, id: &str) -> Result<()> {
         self.session(token)?;

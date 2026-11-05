@@ -1104,6 +1104,27 @@ is `apikey` and its password is the existing API key, with the same permissions,
 device setup gate, immediate managed-key revocation and fail-closed identity
 health. SSH never makes account passwords authorize networking operations.
 
+Linux host device mode additionally supports browser-free onboarding via the
+root-console command `netcontrold --create-api-key NAME`. It communicates only
+through a protected local Unix socket (default `/run/netcontrol/control.sock`),
+not an HTTP endpoint. On an unclaimed device it interactively obtains the device
+username/password and atomically saves a completed account plus a full-permission
+key. For an existing account it preserves username/password/keys/sessions, adds
+the key and completes pending onboarding; existing pending keys become active.
+The key is displayed once on a terminal and thereafter uses normal HTTP/SSH
+authorization and website listing/revocation. No shared default password,
+account-password SSH authentication, identity schema change or scoped-key
+modification is introduced.
+
+Existing `GET /auth/status` can therefore observe configured identity after local
+setup, without this browser having a session; render the existing login stage,
+not an assumed setup stage. `POST /auth/login`, `GET /auth/keys` and
+`DELETE /auth/keys/{id}` retain their current device-session rules and schemas.
+No client changes are required; optional onboarding/operator help can explain
+the root-console command. Updated daemon deployment is required for the socket.
+Non-Linux and `--auth-file` deployments do not support this local operation.
+See [console setup](docs/CLI.md#browser-free-local-key-creation).
+
 Each shell stages a private candidate against a captured committed revision.
 `commit confirmed 10..300` submits a complete package to the existing engine;
 confirmation, rollback, deadlines, revision history and recovery are shared with

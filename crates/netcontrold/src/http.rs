@@ -89,7 +89,7 @@ pub enum Authentication {
 pub struct App {
     pub engine: Arc<Mutex<Engine>>,
     pub health: Arc<crate::health::Monitor>,
-    auth: Authentication,
+    pub(crate) auth: Authentication,
     tls: bool,
     attempts: Mutex<(Instant, usize)>,
     updates: Option<crate::updates::Manager>,

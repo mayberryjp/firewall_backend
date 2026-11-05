@@ -102,6 +102,16 @@ identical to API transactions. Neither disconnect nor normal session exit
 confirms an applied transaction. No system shell, SFTP or forwarding is exposed.
 The [CLI guide](../../docs/CLI.md) defines commands and operator setup.
 
+Linux host device mode also enables `/run/netcontrol/control.sock` for root-only
+live identity administration. `sudo netcontrold --create-api-key NAME` prompts
+for an initial account username/hidden password when needed, atomically completes
+onboarding and saves an immediately usable full-permission key, displayed once
+on a terminal. Existing accounts/passwords are preserved; pending keys become
+usable when onboarding completes. HTTP/SSH authorization and the saved identity
+schema remain unchanged. Explicit `--control-socket PATH` supports custom root
+deployments; non-Linux and scoped `--auth-file` mode cannot use it.
+See [browser-free setup](../../docs/CLI.md#browser-free-local-key-creation).
+
 ## Native discovery CLI
 
 Configuration mode accepts `mdns JSON` (typed replacement) and `no mdns`
