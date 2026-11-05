@@ -110,14 +110,15 @@ pub(super) fn normalized_set(payload: &[u8]) -> Result<Vec<u8>> {
     for (kind, value) in &attrs {
         match kind & 0x3fff {
             19 => {
-                // NFTA_SET_TYPE is the kernel-selected implementation symbol,
-                // informational only, not a userspace set-policy attribute.
+                // Kernel %ps text can include a module suffix and is truncated
+                // to 39 bytes; it is informational, not set-policy identity.
                 let implementation = c_string(value)?;
                 ensure!(
-                    implementation.len() <= 39
+                    !implementation.is_empty()
+                        && implementation.len() <= 39
                         && implementation
                             .bytes()
-                            .all(|byte| { byte.is_ascii_alphanumeric() || byte == b'_' }),
+                            .all(|byte| byte.is_ascii_graphic() || byte == b' '),
                     "invalid kernel set implementation metadata"
                 );
             }
@@ -641,6 +642,18 @@ mod tests {
         }
         let expected = normalized_set(&set_payload(&request)).unwrap();
         assert_eq!(expected, normalized_set(&set_payload(&kernel)).unwrap());
+        let truncated = format!("{} [nf_tables\0", "nft_".repeat(7));
+        assert_eq!(truncated.len(), 40);
+        for implementation in [
+            b"nft_rhash_fast_ops\0".as_slice(),
+            b"nft_rhash_fast_ops [nf_tables]\0",
+            b"nft_rhash_fast_ops.llvm.1 [nf_tables]\0",
+            truncated.as_bytes(),
+        ] {
+            let mut observed = fields.clone();
+            observed.push((19, implementation.to_vec()));
+            assert_eq!(expected, normalized_set(&set_payload(&observed)).unwrap());
+        }
         for field in [2, 3, 4, 5, 11, 13] {
             let mut changed = fields.clone();
             changed
@@ -662,9 +675,20 @@ mod tests {
         let mut foreign_count = fields.clone();
         foreign_count.push((20, 2u32.to_be_bytes().to_vec()));
         assert!(normalized_set(&set_payload(&foreign_count)).is_err());
-        let mut invalid_type = fields.clone();
-        invalid_type.push((19, b"not-terminated".to_vec()));
-        assert!(normalized_set(&set_payload(&invalid_type)).is_err());
+        for implementation in [
+            b"not-terminated".to_vec(),
+            b"\0".to_vec(),
+            b"nft_rhash\0extra\0".to_vec(),
+            b"nft_rhash\n[nf_tables]\0".to_vec(),
+            b"nft_rhash\t[nf_tables]\0".to_vec(),
+            b"nft_rhash\x7f\0".to_vec(),
+            b"nft_rhash\xff\0".to_vec(),
+            format!("{}\0", "x".repeat(40)).into_bytes(),
+        ] {
+            let mut invalid_type = fields.clone();
+            invalid_type.push((19, implementation));
+            assert!(normalized_set(&set_payload(&invalid_type)).is_err());
+        }
     }
 
     #[test]

@@ -16,6 +16,13 @@
 
 ### Fixed
 
+- Accept bounded module-qualified kernel symbol text in path-test nftables
+  lease metadata, preventing false firewall-cleanup failures on modular kernels
+  such as Ubuntu CI. Keep lease identity, policy, timeout, element and
+  unknown-attribute drift checks strict.
+  Release impact: runtime fix, Unreleased; next automatic calendar version.
+  No frontend contract or client changes.
+
 - Serialize privileged CI integration tests so isolated Ethernet and WireGuard
   host-mode fixtures do not contend for the shared host-tunables lock. Keep all
   test coverage, production locking and release validation gates unchanged.
