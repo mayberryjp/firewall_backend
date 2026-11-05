@@ -48,6 +48,15 @@ impl Fixture {
                     token_sha256: netcontrold::identity::digest("synthetic-operator"),
                     permissions: vec!["system.restart".into(), "diagnostics.run".into()],
                 },
+                Credential {
+                    name: "path-operator".into(),
+                    token_sha256: netcontrold::identity::digest("synthetic-path-operator"),
+                    permissions: vec![
+                        "diagnostics.run".into(),
+                        "interfaces.write".into(),
+                        "firewall.write".into(),
+                    ],
+                },
             ]),
             false,
         );
@@ -76,6 +85,43 @@ impl Fixture {
         let bytes = to_bytes(reply.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
     }
+}
+
+#[tokio::test]
+async fn path_test_http_auth_and_unsupported_backend_are_explicit() {
+    let fixture = Fixture::new();
+    let path = "/api/v1/diagnostics/path-tests";
+    let body = json!({"interface":"lan0","source_address":"192.0.2.1","peer_address":"192.0.2.2",
+        "maximum_mtu":9000,"pairing_secret":"synthetic-pairing-secret-1234567890"});
+    assert_eq!(fixture.request("POST", path, body.clone(), "").await.0, 401);
+    assert_eq!(
+        fixture
+            .request("POST", path, body.clone(), "synthetic-reader")
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        fixture
+            .request("POST", path, body.clone(), "synthetic-operator")
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        fixture
+            .request("POST", path, json!({}), "synthetic-path-operator")
+            .await
+            .0,
+        400
+    );
+    assert_eq!(
+        fixture
+            .request("POST", path, body, "synthetic-path-operator")
+            .await
+            .0,
+        503
+    );
 }
 
 #[tokio::test]

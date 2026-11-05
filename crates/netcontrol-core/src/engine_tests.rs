@@ -1646,6 +1646,10 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    path_active: bool,
+    path_starts: usize,
+    path_cleanup_failure: bool,
+    path_shutdowns: usize,
     bgp_response: Option<Value>,
     connection_flushes: usize,
     connection_targets: Vec<Option<(u32, crate::ConnectionTarget)>>,
@@ -1675,6 +1679,39 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn path_test_active(&self) -> bool {
+        self.0.lock().unwrap().path_active
+    }
+    fn start_path_test(&mut self, _: &Config, _: crate::PathTestRequest) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        ensure!(!faults.path_active, "path test already active");
+        faults.path_active = true;
+        faults.path_starts += 1;
+        Ok(json!({"id":"11111111111111111111111111111111","state":"armed","active":true}))
+    }
+    fn path_test_status(&mut self) -> Result<Value> {
+        let faults = self.0.lock().unwrap();
+        Ok(json!({"id":"11111111111111111111111111111111",
+            "state":if faults.path_active {"armed"} else {"idle"}, "active":faults.path_active}))
+    }
+    fn cancel_path_test(&mut self, _: &str) -> Result<Value> {
+        {
+            let mut faults = self.0.lock().unwrap();
+            ensure!(!faults.path_cleanup_failure, "injected restoration failure");
+            faults.path_active = false;
+        }
+        self.path_test_status()
+    }
+    fn shutdown_path_test(&mut self) -> Result<()> {
+        let mut faults = self.0.lock().unwrap();
+        faults.path_shutdowns += 1;
+        ensure!(
+            !faults.path_cleanup_failure,
+            "injected shutdown restoration failure"
+        );
+        faults.path_active = false;
+        Ok(())
+    }
     fn configure_reporting_identity(&mut self, system: &SystemConfig) -> Result<()> {
         self.0
             .lock()
@@ -4576,6 +4613,114 @@ fn shutdown_is_idempotent_and_stops_requests() {
         request(&mut e, "GET", "/api/v1/state", Value::Null).status,
         503
     );
+}
+
+#[test]
+fn path_tests_authorize_block_mutations_and_preserve_secret_free_configuration() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let before = fs::read(fixture.path()).unwrap();
+    let path = "/api/v1/diagnostics/path-tests";
+    let body = json!({"interface":"lan0","source_address":"192.0.2.1","peer_address":"192.0.2.2",
+        "maximum_mtu":9000,"pairing_secret":"synthetic-pairing-secret-1234567890"});
+    let bytes = serde_json::to_vec(&body).unwrap();
+    for denied in ["diagnostics.run", "interfaces.write", "firewall.write"] {
+        let permissions: Vec<_> = all().into_iter().filter(|value| value != denied).collect();
+        let reply = engine.request("POST", path, "", "operator", &permissions, &bytes);
+        assert_eq!(reply.status, 403, "{}", reply.body);
+    }
+    assert_eq!(
+        engine.request("POST", path, "", "", &all(), &bytes).status,
+        401
+    );
+    assert_eq!(
+        engine
+            .request("POST", path, "x=1", "operator", &all(), &bytes)
+            .status,
+        400
+    );
+    assert_eq!(
+        engine
+            .request("PUT", path, "", "operator", &all(), &bytes)
+            .status,
+        405
+    );
+    let mut invalid = body.clone();
+    invalid["maximum_mtu"] = json!(65536);
+    assert_eq!(request(&mut engine, "POST", path, invalid).status, 422);
+    let mut invalid = body.clone();
+    invalid["unknown"] = json!(true);
+    assert_eq!(request(&mut engine, "POST", path, invalid).status, 400);
+    assert_eq!(faults.lock().unwrap().path_starts, 0);
+    let started = request(&mut engine, "POST", path, body);
+    assert_eq!(started.status, 202, "{}", started.body);
+    assert!(engine.configuration_busy());
+    assert!(engine.set_upgrade_maintenance(true).is_err());
+    assert!(engine.begin_restart().is_err());
+    assert_eq!(submit(&mut engine, Config::empty()).status, 409);
+    assert_eq!(engine.restart_process("link-diagnostics").status, 409);
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/interface-capabilities/refresh",
+                "",
+                "operator",
+                &all(),
+                &[]
+            )
+            .status,
+        409
+    );
+    let status = engine.request("GET", path, "", "reader", &["state.read".into()], &[]);
+    assert_eq!(status.status, 200);
+    assert_eq!(status.body["active"], true);
+    assert!(!status.body.to_string().contains("pairing"));
+    let cancel = "/api/v1/diagnostics/path-tests/11111111111111111111111111111111/cancel";
+    assert_eq!(
+        engine
+            .request("POST", cancel, "", "reader", &["state.read".into()], &[])
+            .status,
+        403
+    );
+    assert_eq!(
+        engine
+            .request("POST", cancel, "", "operator", &all(), b"{}")
+            .status,
+        400
+    );
+    let missing = cancel.replace(
+        "11111111111111111111111111111111",
+        "22222222222222222222222222222222",
+    );
+    assert_eq!(
+        engine
+            .request("POST", &missing, "", "operator", &all(), &[])
+            .status,
+        404
+    );
+    faults.lock().unwrap().path_cleanup_failure = true;
+    assert_eq!(
+        engine
+            .request("POST", cancel, "", "operator", &all(), &[])
+            .status,
+        503
+    );
+    assert!(engine.configuration_busy());
+    assert!(engine.shutdown().is_err());
+    assert!(engine.configuration_busy());
+    faults.lock().unwrap().path_cleanup_failure = false;
+    assert_eq!(
+        engine
+            .request("POST", cancel, "", "operator", &all(), &[])
+            .status,
+        200
+    );
+    assert!(!engine.configuration_busy());
+    assert_eq!(fs::read(fixture.path()).unwrap(), before);
+    engine.shutdown().unwrap();
+    assert_eq!(faults.lock().unwrap().path_shutdowns, 2);
 }
 #[test]
 fn performance_rps_permissions_persistence_confirmation_and_rollback() {

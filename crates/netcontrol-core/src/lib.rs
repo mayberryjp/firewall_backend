@@ -2,8 +2,13 @@
 mod bgp;
 mod deny_log;
 mod diagnostics;
+mod path_test;
 pub use bgp::{BGPConfig, BGPNeighbor};
 pub use deny_log::{DenyLogQuery, DenyRecord};
+pub use path_test::{
+    PATH_TEST_ARM_SECONDS, PATH_TEST_LIFETIME_SECONDS, PATH_TEST_PORT, PATH_TEST_RUN_SECONDS,
+    PathTestParent, PathTestRequest,
+};
 mod dynamic_dns;
 pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;
@@ -52,6 +57,21 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    fn path_test_active(&self) -> bool {
+        false
+    }
+    fn start_path_test(&mut self, _config: &Config, _request: PathTestRequest) -> Result<Value> {
+        anyhow::bail!("active path tests require the native Linux backend")
+    }
+    fn path_test_status(&mut self) -> Result<Value> {
+        anyhow::bail!("active path tests require the native Linux backend")
+    }
+    fn cancel_path_test(&mut self, _id: &str) -> Result<Value> {
+        anyhow::bail!("active path tests require the native Linux backend")
+    }
+    fn shutdown_path_test(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn deny_log(&mut self, _query: &DenyLogQuery) -> Result<Value> {
         anyhow::bail!("firewall deny logging requires the native Linux backend")
     }

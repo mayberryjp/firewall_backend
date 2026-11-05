@@ -632,7 +632,10 @@ the per-interface DHCP retry action (`interfaces.write`), MQTT password upload
 (`mqtt.write`) and software upgrade submission (`system.upgrade`).
 Operational restart requires `system.restart`; an on-demand DNS lookup requires
 `diagnostics.run`, not `transactions.write` or `state.read`. These permissions
-do not grant configuration editing. Device-account
+do not grant configuration editing. Paired path-test start/cancel requires
+`diagnostics.run`, `interfaces.write` and `firewall.write` together because it
+temporarily changes live MTUs and permits test traffic. It does not edit saved
+configuration or use `transactions.write`. Device-account
 API keys have all permissions,
 including upgrade authority when the operator explicitly enables self-upgrade;
 scoped credential files must grant `system.upgrade` explicitly.
@@ -767,6 +770,239 @@ accounting databases and desired configuration are preserved. DHCP retry may
 reacquire a lease and affect connectivity; syslog may miss deliveries while
 restarting. Monitor restarts reset sampling baselines. Show these effects before
 confirmation and poll the existing target/platform status afterward.
+
+#### Paired path MTU/MSS tests
+
+These are deliberate, short-lived, two-firewall diagnostics, not continuous
+monitoring, automatic tuning, an iperf subprocess or a VPN-only feature.
+The backend runs tests; the frontend must implement the two-sided start/cancel
+workflow. Start on both firewalls within the arming window, with inverse source/
+peer addresses and the same random one-time secret and port. No management API
+key is exchanged between firewalls.
+
+| Method/path | Permission | Result |
+| --- | --- | --- |
+| `POST /api/v1/diagnostics/path-tests` | `diagnostics.run` + `interfaces.write` + `firewall.write` | `202` accepted session |
+| `GET /api/v1/diagnostics/path-tests` | `state.read` | `200` current/last session status; no body/query |
+| `POST /api/v1/diagnostics/path-tests/{id}/cancel` | Same three start grants | `200` cancellation/restoration status; no body/query |
+
+Start is a strict, nonnull JSON object. Synthetic example only; do not reuse its
+pairing secret:
+
+```json
+{
+  "interface": "vlan100",
+  "source_address": "192.0.2.1",
+  "peer_address": "192.0.2.2",
+  "port": 49872,
+  "maximum_mtu": 9000,
+  "parents": [{"interface": "eno1", "maximum_mtu": 9100}],
+  "pairing_secret": "synthetic-pairing-secret-1234567890"
+}
+```
+
+- `interface`: valid live IP-capable interface, not a kind whitelist. Physical
+  Ethernet, VLAN, WireGuard and other tunnels are eligible subject to actual
+  kernel/address/routing/ownership checks; no silent egress fallback.
+- `source_address`, `peer_address`: distinct unicast IP literals of the same
+  family, excluding unspecified, multicast, loopback and limited broadcast.
+  IPv6 link-local addresses are explicitly unsupported; use unique-local or
+  globally scoped IPv6. Source must belong to the selected interface.
+- `port`: integer 1024..65535, default 49872, used for both UDP and TCP. Match it
+  on both ends; there is no public persistent diagnostic listener.
+- `maximum_mtu`: required integer 1280..65535 bytes, the explicit temporary
+  selected-interface ceiling, not a proposed saved configuration value.
+  Native preparation rejects unsupported values or lowering a live MTU.
+- `parents`: optional array, default empty, maximum eight distinct explicitly
+  approved ancestor interfaces, each with valid `interface` and
+  `maximum_mtu:1280..65535`. The selected interface cannot repeat here.
+  Do not infer consent for other interfaces, automatically raise all uplinks or
+  silently guess an ambiguous tunnel underlay.
+- `pairing_secret`: required write-only 32..128 non-space printable ASCII
+  bytes (`!` through `~`). Generate
+  at least 32 cryptographically random bytes and encode as hexadecimal on the
+  client; copy to the other firewall over a trusted channel. Timing alone is
+  not authentication. Never persist in drafts/history/browser storage, log it,
+  put it in a URL or copy it into ordinary firewall configuration.
+  Submit over HTTPS or a trusted management channel. Authentication does not
+  imply encryption of synthetic diagnostic traffic.
+
+One session per firewall, at most 30 seconds arming and 30 seconds measuring,
+with a 90-second overall lifetime budget. Temporary MTU changes affect unrelated
+traffic on the same interface/parents: show an explicit disruption warning and
+the exact approvals before submitting. State the expected peer/interface/port
+and selected maxima on both forms. Do not retry start automatically.
+
+The orchestrator records owned originals before changing live state. Firewall
+permissions are temporary, peer/interface/port-scoped, not a blanket policy
+disable; kernel expiry limits exposure if the process dies. Restore originals
+on normal completion, cancellation or failure, and recover interrupted MTU
+changes on daemon startup. A killed daemon cannot execute MTU restoration until
+it runs again; do not promise independent kernel expiry of an MTU. Failed
+restoration remains an explicit error and blocks conflicting mutations.
+Do not overwrite a foreign interface replacement or external state changes.
+Kernel permit expiry/removal does not revoke already established conntrack
+acceptance. The orchestrator closes test sockets but does not flush unrelated
+connections. While cleanup has failed, it retains its socket reservations and
+durable intent; process death releases those reservations, so restart/recovery
+is still required. Do not describe permit expiry as complete session teardown.
+Startup recovery precedes normal native reconciliation; if owned state cannot
+be safely restored, startup fails explicitly rather than adopting foreign
+changes. Status/cancellation remain available for cleanup failures in a
+running daemon, not a promise of API availability after failed startup.
+
+Preparation currently refuses any configured DHCP client or enabled BGP: their
+asynchronous address/MTU/route writers prevent stable ownership. Dynamic
+WireGuard DNS endpoints also prevent testing their selected/ancestor path or
+an unresolved tunnel underlay; demonstrably unrelated dynamic tunnels do not
+block a nonencapsulating selected path. Numeric-endpoint tunnels remain
+eligible. IPv6 tests require IPv6 enabled in committed configuration. Both the
+UDP and TCP source ports must be free; sockets are reserved before any MTU or
+firewall changes. These preparation refusals are explicit `503`, not successful
+empty measurements; do not suggest disabling live services automatically.
+
+While a test/restoration owns the lease, configuration writes, capability
+refresh/save, secret uploads, upgrades, restarts and other mutating actions are
+blocked; read-only status and cancellation remain available. No software or
+configuration revision is created for a test. No result automatically changes
+MTU, TCP MSS or persistent firewall rules.
+Firewall-counter and observe/repair reads that cannot safely interpret
+temporary rules are explicitly unavailable during the lease. Keep polling
+the dedicated status endpoint rather than treating those errors as zero
+counters or vanished saved rules.
+
+##### Status and progress
+
+Start, status and cancellation return the native status object
+`schema:"netcontrol-path-test-status-v1"`:
+
+| Field | Type and meaning |
+| --- | --- |
+| `id` | 32 lowercase hexadecimal characters, or null before a session; use this ID, not protocol `session_id`, for cancellation |
+| `state` | `idle`, `preparing`, `running`, `restoring`, `completed`, `cancelled`, `failed`, `cleanup_failed`, or `interrupted` |
+| `active` | Boolean ownership/busy flag; wait for false before enabling conflicting writes, regardless of measurement outcome |
+| `error` | String or null; preserve and display cleanup errors |
+| `restoration` | `not_required`, `pending`, `restored`, or `kernel_reset` (recovery after a changed boot) |
+| `deadline_unix_ms` | Optional integer UTC Unix milliseconds, present on a newly started session; not a promise of independent MTU restoration |
+| `permit_lease_seconds` | Integer 90 |
+| `mtu_restores_on_daemon_recovery` | Boolean true |
+| `conntrack_cleanup` | String `not_performed` |
+| `warnings` | String array; display operational limitations |
+| `mtu_changes` | Array of interface snapshot/observation rows described below |
+| `progress` | Progress object or null; cleared while restoring |
+| `result` | Completed measurement object or null; completion of measurements does not imply successful restoration |
+
+`mtu_changes[]` includes selected/approved links and unapproved ancestry
+context, not just changed links. Each row has `interface:string`, `index:integer`,
+`kind:string`, `address:integer[]` (raw link-address bytes, possibly empty),
+`parent:integer|null` (ifindex), `approved:boolean`, `original_mtu:integer`,
+`maximum_mtu:integer`, `observed_mtu:integer|null`, `identity_matches:boolean`
+and `restored:boolean`. MTUs are bytes. Do not require MAC addresses or
+interpret context rows as operator approvals.
+
+`progress.schema` is `netcontrol-path-test-progress-v1`. Its `phase` is:
+
+- `armed`, with `arm_timeout_seconds:30`;
+- `paired`, with integer byte caps `local_cap_bytes`, `peer_cap_bytes`,
+  `peer_send_cap_bytes`, `local_receive_cap_bytes`, `tested_cap_bytes`;
+- `udp_complete`, with `udp.outbound` and `udp.inbound` evidence below;
+- `completed`, with no additional required fields.
+
+The outer state remains `running` during arming/pairing. Progress may be
+skipped between polls; do not require observing every phase. Idle has null
+`id`, `error`, `progress`, `result`, an empty `mtu_changes` array, false
+`active` and `restoration:"not_required"`. Cancellation requests stopping;
+its `200` response does not imply synchronous restoration.
+
+##### Measurement result
+
+`result.schema` is `netcontrol-path-test-v1`, with `status:"completed"`,
+`interface`, `source_address`, `peer_address` (strings), `port` (integer),
+`role:"initiator"|"responder"`, `session_id` (protocol identity string),
+`elapsed_ms` (number), `limitations:string[]`,
+`peer_report_received:boolean` and `local_report_acknowledged:boolean`.
+Authenticated final peer reports may be absent without invalidating local
+receive evidence; render missing sender evidence as unavailable.
+
+`limits` distinguishes requested/interface/route/peer ceilings from path
+evidence. Integer byte fields are `requested_maximum_mtu_bytes`,
+`interface_mtu_bytes`, `initial_route_mtu_bytes`, `local_cap_bytes`,
+`peer_cap_bytes`, `local_receive_cap_bytes`, `peer_send_cap_bytes`,
+`inbound_tested_cap_bytes`, `tested_cap_bytes`, `ip_udp_overhead_bytes`.
+`final_cached_route_mtu_bytes` is integer or null;
+`ipv6_minimum_mtu_bytes` is 1280 for IPv6, otherwise null.
+`path_mtu_bytes` is deliberately null: finite sampling does not establish a
+conclusive path MTU. Integer bounds also include `maximum_probes_per_size`,
+`candidate_limit`, `measurement_limit_seconds`, `arm_limit_seconds` and
+`lifetime_limit_seconds`. At most 12 packet-size candidates are sampled;
+there is no byte-exact boundary search.
+
+`udp.outbound` and `udp.inbound` each contain:
+
+- `largest_verified_ip_size_bytes:integer|null`, `delivery_evidence:string`,
+  `rtt_origin:"local"|"peer"`, and `sizes:object[]`.
+- Each size row has `ip_size_bytes:integer`, `delivered:integer`,
+  `attempted`, `sent`, `ack_timeouts`, `emsgsize`, `send_errors`
+  (integers or null), `loss_fraction:number|null` (0..1),
+  `mean_rtt_ms:number|null`, and
+  `status:"verified"|"local_or_route_limit"|"unknown"`.
+- Outbound delivery requires a small authenticated received-size ACK, not an
+  equally large echo. Inbound delivery counts authenticated local receives.
+  Inbound sender counters and peer RTT are null until an authenticated peer
+  report arrives; inbound `ack_timeouts` remains null. Final inbound
+  `peer_sender_report` is that report object or null; progress snapshots omit
+  this final-report field.
+
+`udp.receive_path_errors` is an object of bounded integer counters keyed by
+observed error (`emsgsize`, `connection_refused`, `connection_reset`,
+`host_unreachable`, `network_unreachable`, `administratively_prohibited`);
+absent keys mean none observed.
+
+`tcp` contains `outbound_trials:object[]`, `inbound_trials:object[]`,
+`peer_sender_trials:object[]|null`, `trial_byte_limit:4194304`,
+`rate_limit_bytes_per_second:8388608` and `mss_observation:string`.
+At most three fresh socket trials run per direction. All trial rows include
+integer `trial`, `requested_mss_bytes` and string `status`:
+
+- Outbound `status` is `measured` or `inconclusive`. Fields
+  `effective_mss_bytes`, `peer_effective_mss_bytes`, `delivered_bytes`,
+  `retransmits` are integers or null; `elapsed_ms`,
+  `goodput_bits_per_second`, `kernel_rtt_ms`, `connect_ms`,
+  `authentication_rtt_ms` are numbers or null. `delivery_evidence` is a string
+  describing the authenticated byte-count/SHA256 receipt, or null without
+  evidence. `error:string|null` preserves an inconclusive trial's failure
+  reason; measured trials have null errors.
+- Inbound `status` is `received`; integer `effective_mss_bytes`,
+  `delivered_bytes`, numeric `elapsed_ms`, `goodput_bits_per_second`,
+  `kernel_rtt_ms`, null `retransmits`, nullable integer
+  `sender_retransmits`/`sender_effective_mss_bytes` and string
+  `delivery_evidence` distinguish local receive observations from final
+  peer-sender evidence.
+
+`measured_candidates` contains
+`largest_verified_outbound_ip_size_bytes:integer|null`,
+`best_outbound_mss_trial:object|null` (the measured outbound row with highest
+observed goodput), and `automatic_configuration:false`. This short,
+rate-limited comparison is not an unrestricted speed test or a recommendation
+to apply the highest observed candidate automatically.
+
+Render authenticated bidirectional UDP packet-size evidence and TCP MSS trials,
+not an unqualified "ideal MTU." Distinguish total IP packet size from TCP payload
+MSS, local/peer/interface/route caps from verified path limits, loss/timeouts from
+proof that a size is too large, and requested from observed TCP MSS. Inner
+delivery does not prove absence of outer tunnel fragmentation. Brief tests,
+ECMP, routing changes, congestion and CPU load limit conclusions.
+The test connections terminate on the two firewalls; they do not prove
+forwarded-LAN workload performance. MSS trials change only their own sockets,
+not the firewall's persistent TCP MSS clamping policy.
+
+Wrong JSON/types/nulls/unknown fields/body/query/ID shape: `400`; invalid request
+values: `422`; authentication: `401`/`403`; conflicting test/transaction/
+maintenance: `409`; unknown cancellation ID: `404`; unsupported method: `405`;
+unavailable native backend or preparation/control failure: `503`. The simulator
+does not fabricate successful measurements. Accepted-session failures are
+reported in status; preserve restoration errors and poll until the lease is
+released before offering new mutations.
 
 #### Timed DNS lookup
 
@@ -5740,6 +5976,9 @@ Paths below are relative to `/api/v1`.
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |
 | POST | `/diagnostics/dns-lookup` | Timed configured- or explicit-resolver diagnostic result `200`; `diagnostics.run` |
+| POST | `/diagnostics/path-tests` | Arm paired short-lived MTU/MSS test, `202`; `diagnostics.run` + `interfaces.write` + `firewall.write`; temporary MTU/peer-specific firewall lease |
+| GET | `/diagnostics/path-tests` | Current/last session and restoration status, `200`; `state.read`, no body/query |
+| POST | `/diagnostics/path-tests/{id}/cancel` | Cancel and restore owned temporary state, `200`; same three start permissions, no body/query |
 | POST | `/interfaces/{name}/dhcp/retry` | No body or `{}` -> `202 {interface, status: "retrying"}`; `interfaces.write`, runtime only |
 | GET | `/vlans` | Observed VLAN `Interface[]` |
 | GET | `/wireguard` | Observed WireGuard `Interface[]` |

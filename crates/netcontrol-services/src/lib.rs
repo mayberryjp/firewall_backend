@@ -13,6 +13,7 @@ mod integration;
 mod linux;
 mod mdns;
 mod ntp;
+pub mod path_test;
 mod resolve;
 pub use resolve::resolve as resolve_addresses;
 mod syslog;

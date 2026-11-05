@@ -325,6 +325,27 @@ helper is used. See the
 [complete action contract](FRONTEND_SPEC.md#operational-restart-and-dns-diagnostics)
 for targets, limits, statuses, timing and side effects.
 
+Paired MTU/MSS diagnostics use explicit
+`POST /api/v1/diagnostics/path-tests` on both firewalls: select any suitable
+live IP interface, its source address, exact peer IP, a common test port and
+a random one-time pairing secret. Supply the selected interface's temporary
+maximum MTU and explicitly approve any parent MTU increases. This can disrupt
+other traffic; nothing is inferred or saved as a new configuration.
+Start/cancel needs `diagnostics.run`, `interfaces.write` and `firewall.write`.
+Read progress/results with `GET /api/v1/diagnostics/path-tests` (`state.read`);
+cancel with `POST /api/v1/diagnostics/path-tests/{id}/cancel`.
+Arming/measurements are bounded; scoped temporary firewall permissions expire
+and owned MTUs/rules are restored afterward. Interrupted MTU changes recover
+on daemon startup; restoration failures remain explicit and block mutations.
+Compare verified packet sizes and measured MSS trials, not a promise of an
+ideal MTU or proof of no outer tunnel fragmentation. No iperf/external worker,
+automatic tuning or API-key exchange. Preparation currently refuses configured
+DHCP clients, enabled BGP and dynamic WireGuard DNS on an unresolved/affected
+path; it does not stop these services automatically. Kernel permit expiry does
+not revoke established conntrack acceptance, and a killed daemon must restart
+to restore MTUs. See the
+[paired-test contract](FRONTEND_SPEC.md#paired-path-mtumss-tests).
+
 Basic native IPv4 BGP runs inside the daemon: configure `bgp` in a full
 transaction with local ASN/router ID, interface-bound neighbors and keepalive/
 hold timers. It advertises connected prefixes from all configured up interfaces,

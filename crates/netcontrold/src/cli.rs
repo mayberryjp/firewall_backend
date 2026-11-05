@@ -19,6 +19,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   show interfaces discovered          Read-only inventory, including unmanaged host NICs
   show transactions / transaction ID / revisions / revision yyyy.mm.dd.iteration
     show statistics [host|interfaces|protocols|gateways|link-diagnostics|performance|vnstat]
+    show diagnostics path-test
   commit check                        Normalize and validate; no networking changes
   commit confirmed SECONDS [TEXT]     Apply full candidate; 10..300 seconds to confirm
   confirm [ID] / rollback [ID]         Explicit transaction action; last local ID if omitted
@@ -518,6 +519,7 @@ impl CliSession {
             ));
         }
         let path = match words {
+            ["diagnostics", "path-test"] => "/api/v1/diagnostics/path-tests".to_owned(),
             ["state"] => "/api/v1/state".to_owned(),
             ["runtime"] => "/api/v1/runtime".to_owned(),
             ["mdns"] => "/api/v1/services/mdns".to_owned(),

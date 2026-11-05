@@ -354,7 +354,7 @@ pub fn counter_layout(firewall: &Value) -> Result<BTreeMap<(String, String), usi
     }
     add("forward", "/firewall/policy");
     let input = compile_input(firewall)?;
-    if !input.is_empty() || firewall["allow_all_icmp"] == true {
+    {
         for plan in input {
             add("input", &plan.counter_key);
         }
@@ -371,8 +371,8 @@ pub fn counter_layout(firewall: &Value) -> Result<BTreeMap<(String, String), usi
         for chain in ["forward", "input", "output"] {
             add(chain, "/firewall/allow_all_icmp");
         }
-        add("output", "generated/output/policy");
     }
+    add("output", "generated/output/policy");
     for (index, _) in array(&firewall["nat"], "masquerade")?.iter().enumerate() {
         add("postrouting", &format!("/firewall/nat/masquerade/{index}"));
     }
@@ -409,6 +409,34 @@ mod tests {
         assert!(compile_input(&firewall).is_err());
         assert!(compile_input(&json!({})).unwrap().is_empty());
     }
+    #[test]
+    fn input_related_feedback_is_accepted_before_drops_without_peer_outer_source_filter() {
+        let firewall = json!({
+            "policy":"drop","allow_all_icmp":false,"rules":[],
+            "nat":{"masquerade":[]},
+            "input":{"policy":"drop","interfaces":[{"interface":"test0","rules":[
+                {"protocol":"icmp","action":"drop"},
+                {"protocol":"icmpv6","action":"drop"}
+            ]}]}
+        });
+        let plans = compile_input(&firewall).unwrap();
+        let related = plans
+            .iter()
+            .position(|plan| plan.established_related)
+            .unwrap();
+        let first_drop = plans.iter().position(|plan| plan.action == "drop").unwrap();
+        assert!(related < first_drop);
+        assert_eq!(plans[related].action, "accept");
+        assert!(plans[related].source.is_empty());
+        assert!(plans[related].destination.is_empty());
+        assert!(plans[related].protocol.is_empty());
+        assert_eq!(plans[related].port, 0);
+        assert_eq!(
+            plans[related].counter_key,
+            "generated/input/established_related"
+        );
+    }
+
     #[test]
     fn icmp_filters_expand_only_compatible_families_in_all_scopes() {
         let mut firewall = json!({"policy":"drop","allow_all_icmp":false,"rules":[],"nat":{"masquerade":[]},
@@ -575,7 +603,9 @@ mod tests {
             counter_layout(&f).unwrap(),
             BTreeMap::from([
                 (("forward".into(), "/firewall/rules/0".into()), 1),
-                (("forward".into(), "/firewall/policy".into()), 1)
+                (("forward".into(), "/firewall/policy".into()), 1),
+                (("input".into(), "generated/input/policy".into()), 1),
+                (("output".into(), "generated/output/policy".into()), 1),
             ])
         );
     }

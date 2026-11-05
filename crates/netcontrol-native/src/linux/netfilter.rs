@@ -4,16 +4,151 @@ use crate::netlink_decode::{attributes, c_string};
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
+
+thread_local! {
+    static DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+pub(super) fn with_budget<T>(
+    duration: std::time::Duration,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let previous = DEADLINE.replace(Some(std::time::Instant::now() + duration));
+    struct Reset(Option<std::time::Instant>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DEADLINE.set(self.0);
+        }
+    }
+    let _reset = Reset(previous);
+    operation()
+}
 
 pub fn empty_fingerprint() -> String {
     hex::encode(Sha256::digest([]))
 }
 
 pub fn fingerprint() -> Result<String> {
+    fingerprint_excluding(&[], None)
+}
+
+pub(super) fn normalized_rule(payload: &[u8]) -> Result<Vec<u8>> {
+    ensure!(payload.len() >= 4, "short rule");
+    let mut record = Vec::new();
+    for (kind, value) in attributes(&payload[4..])? {
+        let base = kind & 0x3fff;
+        if matches!(base, 3 | 6 | 8 | 9 | 10 | 11) {
+            continue;
+        }
+        let value = if base == 4 {
+            canonical_expressions(&crate::firewall_counters::normalize_expressions(&value)?)?
+        } else {
+            value
+        };
+        record.push((base, value));
+    }
+    record.sort();
+    Ok(serde_json::to_vec(&record)?)
+}
+
+fn canonical_attributes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut result = Vec::new();
+    for (kind, value) in attributes(bytes)? {
+        result.push((kind & 0x3fff, value));
+    }
+    result.sort();
+    Ok(serde_json::to_vec(&result)?)
+}
+
+fn canonical_expressions(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut expressions = Vec::new();
+    for (kind, expression) in attributes(bytes)? {
+        ensure!(kind & 0x3fff == 1, "invalid expression list");
+        let fields = attributes(&expression)?;
+        ensure!(fields.len() == 2, "unexpected expression fields");
+        let name = fields
+            .iter()
+            .find(|(kind, _)| kind & 0x3fff == 1)
+            .context("expression name missing")?;
+        let data = fields
+            .iter()
+            .find(|(kind, _)| kind & 0x3fff == 2)
+            .context("expression data missing")?;
+        let mut values = Vec::new();
+        for (kind, value) in attributes(&data.1)? {
+            let base = kind & 0x3fff;
+            let nested =
+                (name.1 == b"cmp\0" && base == 3) || (name.1 == b"immediate\0" && base == 2);
+            let value = if nested {
+                let mut data = attributes(&value)?;
+                for (kind, value) in &mut data {
+                    if *kind & 0x3fff == 2 {
+                        *value = canonical_attributes(value)?;
+                    }
+                    *kind &= 0x3fff;
+                }
+                data.sort();
+                serde_json::to_vec(&data)?
+            } else {
+                value
+            };
+            values.push((base, value));
+        }
+        values.sort();
+        expressions.push((name.1.clone(), values));
+    }
+    Ok(serde_json::to_vec(&expressions)?)
+}
+
+pub(super) fn normalized_set(payload: &[u8]) -> Result<Vec<u8>> {
+    ensure!(payload.len() >= 4, "short set");
+    let mut attrs = attributes(&payload[4..])?;
+    for (kind, value) in &attrs {
+        match kind & 0x3fff {
+            19 => {
+                // NFTA_SET_TYPE is the kernel-selected implementation symbol,
+                // informational only, not a userspace set-policy attribute.
+                let implementation = c_string(value)?;
+                ensure!(
+                    implementation.len() <= 39
+                        && implementation
+                            .bytes()
+                            .all(|byte| { byte.is_ascii_alphanumeric() || byte == b'_' }),
+                    "invalid kernel set implementation metadata"
+                );
+            }
+            20 => {
+                // NFTA_SET_COUNT includes elements waiting for timeout GC. Its
+                // only owned values are zero or our one explicitly checked key.
+                ensure!(
+                    value.len() == 4 && u32::from_be_bytes(value.as_slice().try_into()?) <= 1,
+                    "foreign element count in owned path-test lease"
+                );
+            }
+            _ => {}
+        }
+    }
+    attrs.retain(|(kind, value)| {
+        !matches!(kind & 0x3fff, 10 | 14 | 16 | 19 | 20)
+            && !(kind & 0x3fff == 9 && value.is_empty())
+    });
+    for (kind, _) in &mut attrs {
+        *kind &= 0x3fff;
+    }
+    attrs.sort();
+    Ok(serde_json::to_vec(&attrs)?)
+}
+
+pub(super) fn fingerprint_excluding(
+    owned_rules: &[Vec<u8>],
+    lease: Option<&[u8]>,
+) -> Result<String> {
     let mut records = Vec::new();
+    let mut seen_owned = std::collections::BTreeSet::new();
     let mut rule_chains: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
     let tables = dump(1, false)?;
     let exists = tables
@@ -53,6 +188,63 @@ pub fn fingerprint() -> Result<String> {
             if c_string(&table.1)? != "netcontrol" {
                 continue;
             }
+            if message == 10 {
+                if let Some(expected) = lease {
+                    if normalized_set(&payload)? == normalized_set(expected)? {
+                        super::path_test::validate_lease_elements()?;
+                        continue;
+                    }
+                    let expected_attrs = attributes(&expected[4..])?;
+                    let owned_identity = [2, 13].iter().all(|identity| {
+                        attrs
+                            .iter()
+                            .find(|(kind, _)| kind & 0x3fff == *identity)
+                            .map(|(_, value)| value)
+                            == expected_attrs
+                                .iter()
+                                .find(|(kind, _)| kind & 0x3fff == *identity)
+                                .map(|(_, value)| value)
+                    });
+                    if owned_identity {
+                        let observed: Vec<(u16, Vec<u8>)> =
+                            serde_json::from_slice(&normalized_set(&payload)?)?;
+                        let expected: Vec<(u16, Vec<u8>)> =
+                            serde_json::from_slice(&normalized_set(expected)?)?;
+                        let changes: Vec<_> = observed
+                            .iter()
+                            .filter(|field| !expected.contains(field))
+                            .map(|(kind, value)| {
+                                let expected =
+                                    expected.iter().find(|(expected, _)| expected == kind);
+                                if matches!(*kind, 3..=12) && value.len() <= 32 {
+                                    format!(
+                                        "{kind}: observed={}, expected={}",
+                                        hex::encode(value),
+                                        expected
+                                            .map(|(_, value)| hex::encode(value))
+                                            .unwrap_or_else(|| "absent".into())
+                                    )
+                                } else {
+                                    format!(
+                                        "{kind}: observed length {}, expected length {:?}",
+                                        value.len(),
+                                        expected.map(|(_, value)| value.len())
+                                    )
+                                }
+                            })
+                            .collect();
+                        let missing: Vec<_> = expected
+                            .iter()
+                            .filter(|field| !observed.contains(field))
+                            .map(|(kind, _)| *kind)
+                            .collect();
+                        bail!(
+                            "owned path-test lease set metadata differs from durable intent: {}; expected-only fields: {missing:?}",
+                            changes.join("; ")
+                        );
+                    }
+                }
+            }
             crate::ensure_unchanged(
                 matches!(message, 1 | 4 | 7),
                 "owned nftables table contains unsupported sets/objects/flowtables",
@@ -81,6 +273,16 @@ pub fn fingerprint() -> Result<String> {
                 record.extend(value);
             }
             if message == 7 {
+                if !owned_rules.is_empty() {
+                    let normalized = normalized_rule(&payload)?;
+                    if owned_rules.contains(&normalized) {
+                        ensure!(
+                            seen_owned.insert(normalized),
+                            "duplicate owned path-test rule"
+                        );
+                        continue;
+                    }
+                }
                 let chain = attrs
                     .iter()
                     .find(|(kind, _)| kind & 0x3fff == 2)
@@ -135,7 +337,12 @@ pub fn delete_connections(target: Option<(u32, &netcontrol_core::ConnectionTarge
     Ok(())
 }
 
-fn dump_messages(subsystem: u16, message: u16, family: u8, attrs: &[u8]) -> Result<Vec<Vec<u8>>> {
+pub(super) fn dump_messages(
+    subsystem: u16,
+    message: u16,
+    family: u8,
+    attrs: &[u8],
+) -> Result<Vec<Vec<u8>>> {
     exchange(subsystem, message, family, attrs, false)
 }
 
@@ -275,7 +482,10 @@ fn exchange_request(
     );
     let mut result = Vec::new();
     let mut total = 0usize;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let default_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = DEADLINE
+        .get()
+        .map_or(default_deadline, |deadline| deadline.min(default_deadline));
     loop {
         let remaining = deadline
             .checked_duration_since(std::time::Instant::now())
@@ -393,6 +603,69 @@ fn exchange_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_payload(fields: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut bytes = vec![1, 0, 0, 0];
+        for (kind, value) in fields {
+            let length = value.len() + 4;
+            bytes.extend((length as u16).to_ne_bytes());
+            bytes.extend(kind.to_ne_bytes());
+            bytes.extend(value);
+            bytes.resize((bytes.len() + 3) & !3, 0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn lease_set_normalization_preserves_identity_and_ignores_only_kernel_bookkeeping() {
+        let fields = vec![
+            (1, b"netcontrol\0".to_vec()),
+            (2, b"netcontrol_path_test_lease\0".to_vec()),
+            (3, 16u32.to_be_bytes().to_vec()),
+            (4, 0u32.to_be_bytes().to_vec()),
+            (5, 4u32.to_be_bytes().to_vec()),
+            (11, 90000u64.to_be_bytes().to_vec()),
+            (13, b"netcontrol-path-test:synthetic".to_vec()),
+        ];
+        let mut request = fields.clone();
+        request.push((10, 1u32.to_be_bytes().to_vec()));
+        let mut kernel = fields.clone();
+        kernel.push((9, Vec::new()));
+        kernel.push((14, Vec::new()));
+        kernel.push((16, 7u64.to_be_bytes().to_vec()));
+        kernel.push((19, b"nft_rhash_fast_ops\0".to_vec()));
+        kernel.push((20, 1u32.to_be_bytes().to_vec()));
+        kernel.reverse();
+        for (kind, _) in &mut kernel {
+            *kind |= 0x4000;
+        }
+        let expected = normalized_set(&set_payload(&request)).unwrap();
+        assert_eq!(expected, normalized_set(&set_payload(&kernel)).unwrap());
+        for field in [2, 3, 4, 5, 11, 13] {
+            let mut changed = fields.clone();
+            changed
+                .iter_mut()
+                .find(|(kind, _)| *kind == field)
+                .unwrap()
+                .1
+                .push(1);
+            assert_ne!(expected, normalized_set(&set_payload(&changed)).unwrap());
+        }
+        let mut unknown = fields.clone();
+        unknown.push((21, Vec::new()));
+        assert_ne!(expected, normalized_set(&set_payload(&unknown)).unwrap());
+        for count in [0u32, 1] {
+            let mut observed = fields.clone();
+            observed.push((20, count.to_be_bytes().to_vec()));
+            assert_eq!(expected, normalized_set(&set_payload(&observed)).unwrap());
+        }
+        let mut foreign_count = fields.clone();
+        foreign_count.push((20, 2u32.to_be_bytes().to_vec()));
+        assert!(normalized_set(&set_payload(&foreign_count)).is_err());
+        let mut invalid_type = fields.clone();
+        invalid_type.push((19, b"not-terminated".to_vec()));
+        assert!(normalized_set(&set_payload(&invalid_type)).is_err());
+    }
 
     #[test]
     fn conntrack_delete_requires_exact_ack_and_preserves_not_found() {

@@ -185,6 +185,12 @@ kernel offload INTERFACE FEATURE enable|disable
 no kernel offload INTERFACE [FEATURE]
 ```
 
+`show diagnostics path-test` reads the current/last short-lived paired MTU/MSS
+session (`state.read`). Start/cancel is API-managed, not a CLI credential command;
+pairing secrets are never accepted as saved configuration or printed by status.
+Simulator/unsupported backends report an explicit error, not invented results.
+See the [paired-test contract](../FRONTEND_SPEC.md#paired-path-mtumss-tests).
+
 `show statistics performance` reads passive CPU/IRQ/softnet and physical/WireGuard RX-queue
 evidence (`state.read`). `kernel rps` stages a canonical lowercase hexadecimal
 CPU mask, for example `c` selects CPUs 2 and 3; this is a synthetic example,

@@ -16,6 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 rand.workspace = true
+sha2 = "0.11"
+hmac = "0.13"
+subtle = "2"
+zeroize = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

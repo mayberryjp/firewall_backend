@@ -522,6 +522,7 @@ impl Engine {
     /// Leaves pending confirmations durable for deadline-aware restart recovery.
     pub fn shutdown(&mut self) -> Result<()> {
         if !self.closed {
+            self.backend.shutdown_path_test()?;
             self.tick()?;
             self.store.save(&self.state)?;
             self.closed = true;
@@ -530,8 +531,9 @@ impl Engine {
     }
     pub fn set_upgrade_maintenance(&mut self, enabled: bool) -> Result<()> {
         ensure!(
-            !enabled || (!self.closed && self.active().is_none()),
-            "upgrade requires a healthy engine with no active transaction"
+            !enabled
+                || (!self.closed && self.active().is_none() && !self.backend.path_test_active()),
+            "upgrade requires a healthy engine with no active transaction or path test"
         );
         self.maintenance = enabled;
         Ok(())
@@ -566,6 +568,15 @@ impl Engine {
             return Err(ApiError::new(401, "valid API key required"));
         }
         let writes_state = method != "GET" || path == "/api/v1/interface-capabilities/refresh";
+        let path_test_cancel = path
+            .strip_prefix("/api/v1/diagnostics/path-tests/")
+            .and_then(|value| value.strip_suffix("/cancel"));
+        if self.backend.path_test_active() && writes_state && path_test_cancel.is_none() {
+            return Err(ApiError::new(
+                409,
+                "a path test or its restoration is active",
+            ));
+        }
         if self.restarting && writes_state {
             return Err(ApiError::new(409, "daemon restart is pending"));
         }
@@ -574,6 +585,74 @@ impl Engine {
                 409,
                 "configuration writes are blocked during software upgrade",
             ));
+        }
+        if path == "/api/v1/diagnostics/path-tests" || path_test_cancel.is_some() {
+            if !query.is_empty() {
+                return Err(ApiError::new(400, "path tests accept no query parameters"));
+            }
+            if path_test_cancel.is_none() && method == "GET" {
+                require(permissions, "state.read")?;
+                if !body.is_empty() {
+                    return Err(ApiError::new(400, "path-test status accepts no body"));
+                }
+                return self
+                    .backend
+                    .path_test_status()
+                    .map(|status| Reply::value(200, status))
+                    .map_err(service_error);
+            }
+            if method != "POST" {
+                return Err(ApiError::new(405, "path-test actions require POST"));
+            }
+            for permission in ["diagnostics.run", "interfaces.write", "firewall.write"] {
+                require(permissions, permission)?;
+            }
+            if let Some(id) = path_test_cancel {
+                if id.len() != 32
+                    || !id
+                        .bytes()
+                        .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+                {
+                    return Err(ApiError::new(
+                        400,
+                        "path-test ID must be 32 lowercase hexadecimal characters",
+                    ));
+                }
+                if !body.is_empty() {
+                    return Err(ApiError::new(400, "path-test cancellation accepts no body"));
+                }
+                let current = self.backend.path_test_status().map_err(service_error)?;
+                if current["id"].as_str() != Some(id) {
+                    return Err(ApiError::new(404, "path test not found"));
+                }
+                return self
+                    .backend
+                    .cancel_path_test(id)
+                    .map(|status| Reply::value(200, status))
+                    .map_err(service_error);
+            }
+            if self.configuration_busy() {
+                return Err(ApiError::new(
+                    409,
+                    "configuration transaction, upgrade, restart or path test is active",
+                ));
+            }
+            if body.len() > 1 << 20 {
+                return Err(ApiError::new(
+                    400,
+                    "path-test request exceeds 1048576 bytes",
+                ));
+            }
+            let request: crate::PathTestRequest = serde_json::from_slice(body)
+                .map_err(|_| ApiError::new(400, "expected strict path-test JSON with interface, source_address, peer_address, maximum_mtu, pairing_secret and optional port/parents"))?;
+            request
+                .validate()
+                .map_err(|error| ApiError::new(422, error))?;
+            return self
+                .backend
+                .start_path_test(&self.state.desired, request)
+                .map(|status| Reply::value(202, status))
+                .map_err(service_error);
         }
         if path == "/api/v1/interface-capabilities"
             || path == "/api/v1/interface-capabilities/refresh"
@@ -1039,7 +1118,10 @@ impl Engine {
     }
 
     pub fn configuration_busy(&self) -> bool {
-        self.restarting || self.maintenance || self.active().is_some()
+        self.restarting
+            || self.maintenance
+            || self.active().is_some()
+            || self.backend.path_test_active()
     }
 
     pub fn begin_restart(&mut self) -> Result<()> {
@@ -1173,6 +1255,12 @@ impl Engine {
         restored: Option<Version>,
         factory_reset: bool,
     ) -> ApiResult<Transaction> {
+        if self.backend.path_test_active() {
+            return Err(ApiError::new(
+                409,
+                "a path test or its restoration is active",
+            ));
+        }
         r.config.normalize();
         r.config.software = self.state.desired.software.clone();
         r.description = r.description.trim().into();

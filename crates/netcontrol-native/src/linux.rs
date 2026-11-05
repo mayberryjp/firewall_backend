@@ -60,6 +60,7 @@ mod link_monitor;
 mod netfilter;
 mod networking;
 mod offloads;
+mod path_test;
 mod rps;
 mod rps_recommendations;
 mod sysctl;
@@ -77,6 +78,7 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 }
 
 pub struct Native {
+    path_test: path_test::Manager,
     performance: crate::performance::Monitor,
     bgp: bgp::Manager,
     link_monitor: link_monitor::Monitor,
@@ -340,6 +342,11 @@ impl Native {
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
         let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
+            path_test: path_test::Manager::new(
+                namespace.clone(),
+                state.clone(),
+                boot.trim().into(),
+            ),
             performance: Default::default(),
             wireguard_dns: wireguard_dns::Manager::new(
                 namespace.clone(),
@@ -363,6 +370,7 @@ impl Native {
             _host_lock: host_lock,
             boot: boot.trim().into(),
         };
+        native.path_test.recover()?;
         let ownership = native.ownership()?;
         ensure!(
             ownership.scope.is_empty() || ownership.scope == native.identity,
@@ -1161,6 +1169,50 @@ impl Native {
 }
 
 impl Backend for Native {
+    fn path_test_active(&self) -> bool {
+        self.path_test.active()
+    }
+
+    fn start_path_test(
+        &mut self,
+        config: &Config,
+        request: netcontrol_core::PathTestRequest,
+    ) -> Result<Value> {
+        self.check_scope()?;
+        self.path_test.ensure_idle()?;
+        ensure!(
+            config.ipv6_enabled || request.source_address.is_ipv4(),
+            "IPv6 path tests require IPv6 enabled in the committed configuration"
+        );
+        ensure!(
+            !self.state.join("intent.json").try_exists()?,
+            "native recovery is pending"
+        );
+        self.verify(&config.operational_value()?)?;
+        // These workers change the chosen path asynchronously. Never stop unrelated
+        // services or pretend that a changing route is a verified test path.
+        path_test::validate_dhcp_path(config, &request)?;
+        ensure!(
+            !config.bgp.enabled,
+            "path tests require a stable path: BGP is active"
+        );
+        let value = config.operational_value()?;
+        path_test::validate_dynamic_dns_path(self.namespace.clone(), &request, &value)?;
+        self.path_test
+            .start(request, self.ownership()?.firewall_fingerprint)
+    }
+
+    fn path_test_status(&mut self) -> Result<Value> {
+        self.path_test.status()
+    }
+
+    fn cancel_path_test(&mut self, id: &str) -> Result<Value> {
+        self.path_test.cancel(id)
+    }
+
+    fn shutdown_path_test(&mut self) -> Result<()> {
+        self.path_test.shutdown()
+    }
     fn deny_log(&mut self, query: &netcontrol_core::DenyLogQuery) -> Result<Value> {
         self.check_scope()?;
         self.deny_log.snapshot(query)
@@ -1227,6 +1279,7 @@ impl Backend for Native {
         }))
     }
     fn restart_process(&mut self, config: &Config, target: &str) -> Result<Value> {
+        self.path_test.ensure_idle()?;
         self.check_scope()?;
         let value = config.operational_value()?;
         if let Some(interface) = target.strip_prefix("dhcp-client:") {
@@ -1247,6 +1300,7 @@ impl Backend for Native {
         self.services.restart_worker(target)
     }
     fn initial_configuration(&mut self) -> Result<Config> {
+        self.path_test.ensure_idle()?;
         if !self.options.namespace.is_empty() {
             return Ok(Config::empty());
         }
@@ -1374,6 +1428,7 @@ impl Backend for Native {
     }
 
     fn observe(&mut self, expected: &Config) -> Result<Config> {
+        self.path_test.ensure_idle()?;
         let config = expected.operational_value()?;
         self.verify(&config)?;
         self.verify_services(&config)?;
@@ -1381,6 +1436,7 @@ impl Backend for Native {
     }
 
     fn observe_for_repair(&mut self, expected: &Config) -> Result<Config> {
+        self.path_test.ensure_idle()?;
         self.verify(&expected.operational_value()?)?;
         Ok(expected.clone())
     }
@@ -1389,10 +1445,12 @@ impl Backend for Native {
         &mut self,
         system: &netcontrol_core::SystemConfig,
     ) -> Result<()> {
+        self.path_test.ensure_idle()?;
         self.services.configure_reporting_identity(system)
     }
 
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()> {
+        self.path_test.ensure_idle()?;
         let alias_config = after;
         (|| -> Result<()> {
             self.recover()?;
@@ -1519,6 +1577,7 @@ impl Backend for Native {
     }
 
     fn retry_dhcp(&mut self, config: &Config, interface: &str) -> Result<()> {
+        self.path_test.ensure_idle()?;
         self.check_scope()?;
         let value = config.operational_value()?;
         let ownership = self.ownership()?;
@@ -1540,6 +1599,7 @@ impl Backend for Native {
     }
 
     fn factory_reset(&mut self, before: &Config, after: &Config) -> Result<()> {
+        self.path_test.ensure_idle()?;
         ensure!(
             self.options.namespace.is_empty(),
             "factory reset requires host mode"
@@ -1606,6 +1666,7 @@ impl Backend for Native {
                     .collect::<Result<Vec<_>>>()?
             ))
         })?;
+        value["path_test"] = self.path_test.status()?;
         Ok(value)
     }
 
@@ -1613,6 +1674,7 @@ impl Backend for Native {
         &mut self,
         target: Option<(u32, &netcontrol_core::ConnectionTarget)>,
     ) -> Result<Value> {
+        self.path_test.ensure_idle()?;
         self.check_scope()?;
         let target = target.map(|(id, target)| (id, target.clone()));
         let single = target.is_some();
@@ -1657,6 +1719,9 @@ impl Backend for Native {
         }
         self.check_scope()?;
         if path == "/api/v1/statistics/firewall" {
+            self.path_test.ensure_idle().context(
+                "firewall counters are temporarily unavailable during owned path-test leases",
+            )?;
             let started_at = time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)?;
             let ownership = self.ownership()?;
@@ -1730,6 +1795,7 @@ impl Backend for Native {
     }
 
     fn repair(&mut self, config: &Config) -> Result<Value> {
+        self.path_test.ensure_idle()?;
         self.recover()?;
         let value = config.operational_value()?;
         let originals = self.ownership()?.ethernet_originals;
@@ -1823,6 +1889,9 @@ impl Backend for Native {
 
 impl Drop for Native {
     fn drop(&mut self) {
+        if let Err(error) = self.path_test.shutdown() {
+            eprintln!("path-test cleanup failed; recovery intent retained: {error:#}");
+        }
         if let Err(error) = self.wireguard_dns.shutdown() {
             eprintln!("WireGuard DNS shutdown failed: {error:#}");
         }

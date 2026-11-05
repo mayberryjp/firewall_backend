@@ -149,6 +149,7 @@ impl Native {
     }
 
     pub(super) fn reconcile_interface_aliases(&self, config: &Config) -> Result<()> {
+        self.path_test.ensure_idle()?;
         self.check_scope()?;
         self.recover_interface_aliases()?;
         let state_path = self.state.join("interface-aliases.json");

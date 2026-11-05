@@ -1,12 +1,12 @@
 use super::*;
 use std::{ffi::CString, os::unix::fs::DirBuilderExt};
 
-struct Fixture {
+pub(super) struct Fixture {
     root: PathBuf,
     namespace: PathBuf,
 }
 impl Fixture {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         ensure!(
             std::env::var("NETCONTROL_INTEGRATION").as_deref() == Ok("1"),
             "set NETCONTROL_INTEGRATION=1 for privileged native integration tests"
@@ -53,7 +53,7 @@ impl Fixture {
         }
         Ok(Self { root, namespace })
     }
-    fn options(&self) -> NativeOptions {
+    pub(super) fn options(&self) -> NativeOptions {
         NativeOptions {
             namespace: self.namespace.to_string_lossy().into_owned(),
             keys: self.root.join("keys"),

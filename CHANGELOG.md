@@ -39,6 +39,18 @@
 
 ### Added
 
+- Paired, short-lived path MTU/MSS diagnostics with explicit interface/source/
+  peer selection, one-time-secret authentication and bounded bidirectional
+  measurements. Temporary selected/approved-parent MTU changes and scoped
+  firewall leases use original-state restoration and interrupted recovery;
+  conflicting mutations are blocked until cleanup succeeds. New API start/
+  status/cancel actions and read-only SSH status do not save tuning or exchange
+  management API keys. Results are evidence, not an absolute ideal MTU or proof
+  of no outer tunnel fragmentation.
+  Release impact: additive, Unreleased; next automatic calendar version.
+  Required frontend two-firewall controls and restoration/error UX:
+  [handoff 2026-11-05-01](docs/frontend-handoffs/2026-11-05.md#2026-11-05-01-paired-path-mtumss-diagnostics).
+
 - Managed WireGuard RX queues now support explicit `kernel.rps` through the
   existing confirmed API/CLI workflow. Verified creation, rekey, deletion,
   rollback/reboot recreation and public-key/index ownership guards protect

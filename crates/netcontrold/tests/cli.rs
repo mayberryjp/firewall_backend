@@ -1040,6 +1040,16 @@ fn wireguard_rps_cli_uses_existing_confirmed_workflow() {
 }
 
 #[test]
+fn path_test_cli_does_not_invent_simulator_measurements() {
+    let fixture = Fixture::new(PERMISSIONS);
+    fixture.fail(
+        &mut CliSession::new(),
+        "show diagnostics path-test",
+        "native Linux",
+    );
+}
+
+#[test]
 fn offload_and_rfs_cli_use_the_confirmed_candidate_workflow() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

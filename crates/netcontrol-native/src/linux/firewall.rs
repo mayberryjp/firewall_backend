@@ -212,17 +212,21 @@ pub fn apply(value: &Value) -> Result<()> {
         .add_to_batch(&mut batch);
     if value["allow_all_icmp"] == true {
         icmp(&forward, generation)?.add_to_batch(&mut batch);
+    }
+    {
         let output = Chain::new(&table)
             .with_name("output")
             .with_type(ChainType::Filter)
             .with_hook(Hook::new(HookClass::Out, 0))
             .with_policy(ChainPolicy::Accept)
             .add_to_batch(&mut batch);
-        icmp(&output, generation)?.add_to_batch(&mut batch);
+        if value["allow_all_icmp"] == true {
+            icmp(&output, generation)?.add_to_batch(&mut batch);
+        }
         default_rule(&output, "generated/output/policy", "accept", "", generation)?
             .add_to_batch(&mut batch);
     }
-    if !input_plans.is_empty() || value["allow_all_icmp"] == true {
+    {
         let input = Chain::new(&table)
             .with_name("input")
             .with_type(ChainType::Filter)
