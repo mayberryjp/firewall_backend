@@ -29,6 +29,13 @@ jobs:
           persist-credentials: false
       - run: python3 -B -m unittest discover -s .github/scripts -v
       - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - name: Cache Rust checks dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ubuntu-24.04-checks
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
       - run: cargo +stable fmt --all -- --check
@@ -56,6 +63,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
+      - name: Cache native integration dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ubuntu-24.04-native
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
       - name: Prepare kernel modules
         run: |
@@ -79,12 +93,12 @@ jobs:
 
   package:
     name: Signed native package (Ubuntu x86-64)
-    needs: [checks, native]
     runs-on: ubuntu-24.04
     env:
       TARGET: x86_64-unknown-linux-musl
       ARCH: x86_64
       COMMIT: ${{ inputs.commit }}
+      RUSTFLAGS: "-C linker=rust-lld -C link-self-contained=yes"
     outputs:
       version: ${{ steps.assets.outputs.version }}
     timeout-minutes: 40
@@ -95,10 +109,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --target "$TARGET"
+      - name: Cache musl package dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ubuntu-24.04-musl
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y musl-tools libclang-dev linux-libc-dev
       - name: Build static native binaries
-        env:
-          RUSTFLAGS: "-C linker=rust-lld -C link-self-contained=yes"
         run: |
           export "CC_${TARGET//-/_}=musl-gcc"
           export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/$ARCH-linux-musl -I/usr/include -I/usr/include/$ARCH-linux-gnu"
@@ -142,7 +161,7 @@ jobs:
           "target/$TARGET/release/netcontrol-package" build-update \
             --daemon "target/$TARGET/release/netcontrold" \
             --version "$version" --output-dir ubuntu-update-assets
-      - name: Retain validated release assets
+      - name: Retain built release assets for gated publication
         if: inputs.publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

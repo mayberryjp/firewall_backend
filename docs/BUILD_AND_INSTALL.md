@@ -1769,15 +1769,31 @@ The [reusable validation workflow](../.github/workflows/validate.yml) checks
 release-automation tests, Rust formatting, tests, clippy, and
 builds on Ubuntu 24.04 x86-64, and runs privileged Linux integration separately
 on the same runner platform. Windows and ARM64 jobs are not run. Successful
-checks gate each commit's `x86_64-unknown-linux-musl` package build on Ubuntu; the
-static daemon is also used by the Ubuntu amd64 prebuilt installer. Package
+checks gate publication, not compilation: each commit's
+`x86_64-unknown-linux-musl` package build runs alongside both validation jobs.
+Publication still requires all three jobs to succeed. The static daemon is
+also used by the Ubuntu amd64 prebuilt installer. Package
 format support for other architectures does not imply CI coverage.
+
+Each job restores its own pinned Rust cache: checks, privileged integration and
+musl packaging do not share build outputs. Cache keys include the Rust toolchain,
+Cargo dependency inputs and relevant Rust environment; musl linker flags are
+job-level environment so the cache sees them. Only default-branch runs save
+caches, including reusable dependency artifacts from failed runs. Workspace
+crates are not cached, so Git-derived software identity is rebuilt for the
+selected commit. PRs/other branches can restore available caches but do not
+save them. The first run or a toolchain/dependency change can still be cold.
+No formatting, tests, Clippy, release build, package verification or serial
+privileged-test gates are removed. APT setup remains unchanged.
+
 Artifacts contain the package, standalone installer, public key, commit/target
 build information, and SHA-256 checksums.
 The amd64 job also prepares `netcontrol-ubuntu-amd64-<commit>` with the static
 daemon, systemd unit and strict binary-mode SHA-256 manifest. It uses the same
-opt-in upload gate and 14-day retention. The Ubuntu bootstrap selects that
-artifact by successful workflow run ID rather than installing OpenRC payloads.
+opt-in upload gate and 14-day retention. Build artifacts can be retained before
+the other checks finish; their presence does not establish a successful run or
+approve a release. The Ubuntu bootstrap downloads the latest stable release's
+binary/manifest rather than requiring a workflow run ID or OpenRC payload.
 
 CI generates a temporary signing key and retains only its public key. This
 verifies consistency but is not a stable publisher identity: trust only

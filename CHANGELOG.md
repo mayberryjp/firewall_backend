@@ -4,6 +4,12 @@
 
 ### Changed
 
+- CI restores separate Rust dependency/build caches for checks, privileged
+  integration and musl packaging, and builds packages alongside validation.
+  Stable publication still requires all three jobs to succeed; no checks are
+  removed and privileged tests remain serialized.
+  Release impact: CI-only optimization; no runtime/API contract or frontend action.
+
 - Fresh Ubuntu installs prompt for the LAN interface and IPv4 address, including
   eligible existing VLANs. Unattended installs require `--lan` and
   `--lan-address`; unsafe or ambiguous VLAN topology fails explicitly.
