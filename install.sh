@@ -259,41 +259,139 @@ provision_appliance() {
 }
 
 download_prebuilt() {
-    local run_id=$1 destination=$2 commit
-    gh auth status || {
-        printf 'Authenticate GitHub CLI as the installing user first (sudo gh auth login when installing as root). Actions read access is required.\n' >&2
+    local destination=$1 version base
+    release_download 'https://api.github.com/repos/mayberryjp/firewall_backend/releases/latest' \
+        "$destination/release.json" 1048576 || return 1
+    version=$(python3 - "$destination/release.json" <<'PY'
+import datetime
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    release = json.load(source)
+if not isinstance(release, dict):
+    sys.exit("Invalid GitHub release response")
+tag = release.get("tag_name")
+if (release.get("draft") is not False or release.get("prerelease") is not False
+        or not isinstance(tag, str)
+        or not re.fullmatch(r"v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]{0,9}", tag)):
+    sys.exit("Expected a published stable calendar-version release")
+version = tag[1:]
+year, month, day, iteration = map(int, version.split("."))
+datetime.date(year, month, day)
+if iteration > 4294967295:
+    sys.exit("Release iteration exceeds the supported range")
+assets = release.get("assets")
+if not isinstance(assets, list):
+    sys.exit("Release is missing its Ubuntu assets")
+base = f"https://github.com/mayberryjp/firewall_backend/releases/download/{tag}/"
+for name in ("netcontrol-ubuntu-amd64.json", "netcontrold-ubuntu-amd64"):
+    matches = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == name]
+    if len(matches) != 1 or matches[0].get("browser_download_url") != base + name:
+        sys.exit(f"Release is missing a unique trusted Ubuntu asset: {name}")
+print(version)
+PY
+    ) || { printf 'Cannot select a valid stable Ubuntu release.\n' >&2; return 1; }
+    base="https://github.com/mayberryjp/firewall_backend/releases/download/v$version"
+    release_download "$base/netcontrol-ubuntu-amd64.json" "$destination/manifest.json" 4096 || return 1
+    release_download "$base/netcontrold-ubuntu-amd64" "$destination/netcontrold" 268435456 || return 1
+    python3 - "$destination" "$version" <<'PY' || return 1
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+def unique_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate manifest field: {key}")
+        result[key] = value
+    return result
+
+directory = pathlib.Path(sys.argv[1])
+manifest_path = directory / "manifest.json"
+binary_path = directory / "netcontrold"
+for path in (manifest_path, binary_path):
+    if path.is_symlink() or not path.is_file():
+        sys.exit("Release downloads must be regular files")
+if manifest_path.stat().st_size > 4096:
+    sys.exit("Release manifest exceeds 4096 bytes")
+manifest = json.loads(manifest_path.read_bytes(), object_pairs_hook=unique_fields)
+if (not isinstance(manifest, dict)
+        or set(manifest) != {"schema", "version", "target", "size", "sha256"}
+        or type(manifest["schema"]) is not int or manifest["schema"] != 1
+        or manifest["version"] != sys.argv[2]
+        or manifest["target"] != "ubuntu-amd64-systemd"
+        or type(manifest["size"]) is not int or not 64 <= manifest["size"] <= 268435456
+        or not isinstance(manifest["sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])):
+    sys.exit("Invalid Ubuntu release manifest or release version mismatch")
+with binary_path.open("rb") as binary:
+    digest = hashlib.sha256()
+    header = binary.read(64)
+    digest.update(header)
+    for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+        digest.update(chunk)
+if binary_path.stat().st_size != manifest["size"] or digest.hexdigest() != manifest["sha256"]:
+    sys.exit("Release binary size or SHA-256 mismatch")
+if header[:6] != b"\x7fELF\x02\x01" or header[18:20] != b"\x3e\x00":
+    sys.exit("Release binary must be an amd64 Linux ELF executable")
+PY
+    release_download \
+        "https://raw.githubusercontent.com/mayberryjp/firewall_backend/v$version/packaging/native/netcontrold.service" \
+        "$destination/netcontrold.service" 65536 || return 1
+    [[ -f $destination/netcontrold.service && -s $destination/netcontrold.service && ! -L $destination/netcontrold.service ]] || {
+        printf 'Release systemd unit is empty or not a regular download.\n' >&2
         return 1
     }
-    commit=$(gh api "repos/mayberryjp/firewall_backend/actions/runs/$run_id" --jq 'select(.conclusion == "success" and .path == ".github/workflows/build.yml" and .event == "workflow_dispatch" and .head_repository.full_name == "mayberryjp/firewall_backend") | .head_sha') || return 1
-    if [[ ! $commit =~ ^[0-9a-f]{40}$ ]]; then
-        printf 'Expected a successful manually dispatched build workflow from the owning repository.\n' >&2
-        return 1
-    fi
-    gh run download "$run_id" --repo mayberryjp/firewall_backend --name "netcontrol-ubuntu-amd64-$commit" --dir "$destination" || return 1
-    (
-        cd "$destination"
-        local file
-        for file in netcontrold netcontrold.service SHA256SUMS; do
-            [[ -f $file && ! -L $file ]] || return 1
-        done
-        [[ $(wc -l < SHA256SUMS) -eq 2 ]] || return 1
-        grep -Eq '^[0-9a-f]{64} \*netcontrold$' SHA256SUMS || return 1
-        grep -Eq '^[0-9a-f]{64} \*netcontrold\.service$' SHA256SUMS || return 1
-        sha256sum --check --strict SHA256SUMS
-    ) || return 1
-    printf 'Verified prebuilt artifacts from source commit %s (workflow run %s).\n' "$commit" "$run_id"
+    printf '%s\n' "$version" > "$destination/release-version" || return 1
+    printf 'Verified stable Ubuntu release v%s (binary size, SHA-256 and amd64 ELF).\n' "$version"
 }
 
+release_download() {
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
+        --silent --show-error --connect-timeout 15 --max-time 300 \
+        --max-filesize "$3" --output "$2" "$1" || {
+        printf 'Release download failed: %s. Check internet/DNS access and stable release availability.\n' "$1" >&2
+        return 1
+    }
+}
+
+check_prebuilt() (
+    set -euo pipefail
+    cd "$1" || exit 1
+    chmod 0755 netcontrold || exit 1
+    local actual_version expected_version help
+    expected_version=$(< release-version)
+    actual_version=$(./netcontrold --version) || exit 1
+    if [[ $actual_version != "netcontrold $expected_version" ]]; then
+        printf 'Downloaded daemon version does not match the selected release.\n' >&2
+        exit 1
+    fi
+    help=$(./netcontrold --help) || exit 1
+    if ! grep -q -- --provision-wan <<< "$help" ||
+       ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
+       ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help" ||
+       ! grep -q NETCONTROL_SSH_LISTEN <<< "$help" ||
+       ! grep -q NETCONTROL_UPGRADE_CONFIG <<< "$help" ||
+       ! grep -q -- --configure-updates <<< "$help"; then
+        printf 'Release lacks current appliance provisioning/service/SSH environment support. No older-contract fallback is provided.\n' >&2
+        exit 1
+    fi
+)
+
 main() {
-    local run_id='' wan='' lan='' lan_address=192.168.0.1/24 path ports
+    local wan='' lan='' lan_address=192.168.0.1/24 path ports
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash install.sh --run-id SUCCESSFUL_BUILD_RUN_ID [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24]\nDefaults: first physical Ethernet port (natural name order) is DHCP WAN, second is LAN; LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Saved configuration controls which workers run. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
+        printf 'Usage: bash install.sh [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24]\nDownloads the latest stable Ubuntu amd64 release over verified HTTPS; no CI run ID or GitHub login is needed.\nDefaults: first physical Ethernet port (natural name order) is DHCP WAN, second is LAN; LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Saved configuration controls which workers run. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
         return
     fi
     while [[ $# -gt 0 ]]; do
         [[ $# -ge 2 ]] || { printf 'Missing option value; use --help.\n' >&2; return 1; }
         case $1 in
-            --run-id) [[ -z $run_id ]] || return 1; run_id=$2 ;;
             --wan) [[ -z $wan ]] || return 1; wan=$2 ;;
             --lan) [[ -z $lan ]] || return 1; lan=$2 ;;
             --lan-address) lan_address=$2 ;;
@@ -301,10 +399,10 @@ main() {
         esac
         shift 2
     done
-        if [[ ! $run_id =~ ^[0-9]+$ || ( -n $wan && ! $wan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
+    if [[ ( -n $wan && ! $wan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
             ( -n $lan && ! $lan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
           ! $lan_address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-        printf 'Specify a run ID, an IPv4 LAN prefix and optionally both --wan/--lan; use --help.\n' >&2
+        printf 'Specify an IPv4 LAN prefix and optionally both --wan/--lan; use --help.\n' >&2
         return 1
     fi
     if [[ $(uname -s) != Linux || ! -r /etc/os-release ]]; then
@@ -335,28 +433,18 @@ main() {
     systemctl is-active --quiet systemd-networkd.service || return 1
     systemctl is-active --quiet systemd-resolved.service || return 1
     apt-get update
-    apt-get install --no-install-recommends -y ca-certificates gh procps kmod curl
+    apt-get install --no-install-recommends -y ca-certificates python3 procps kmod curl
     if pgrep -x netcontrold >/dev/null; then
         printf 'Stop the running netcontrold before installing; networking will not be stopped automatically.\n' >&2
         return 1
     fi
-    local work cleanup help
+    local work cleanup
     work=$(mktemp -d)
     printf -v cleanup 'rm -rf -- %q' "$work"
     trap "$cleanup" EXIT
-    download_prebuilt "$run_id" "$work"
+    download_prebuilt "$work" || return 1
+    check_prebuilt "$work" || return 1
     cd "$work"
-    chmod 0755 netcontrold
-    help=$(./netcontrold --help) || return 1
-    if ! grep -q -- --provision-wan <<< "$help" ||
-       ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
-       ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help" ||
-       ! grep -q NETCONTROL_SSH_LISTEN <<< "$help" ||
-       ! grep -q NETCONTROL_UPGRADE_CONFIG <<< "$help" ||
-       ! grep -q -- --configure-updates <<< "$help"; then
-        printf 'Artifact lacks current appliance provisioning/service/SSH environment support. Build the reviewed current source; no older-contract fallback is provided.\n' >&2
-        return 1
-    fi
     check_systemd_unit
     configure_conntrack || return 1
     configure_link_diagnostics || return 1

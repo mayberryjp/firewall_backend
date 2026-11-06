@@ -21,9 +21,11 @@ Windows is a development/test target, not a native firewall or installation
 target. Linux kernel tests require Linux and the appropriate privileges;
 portable tests do not establish native networking readiness.
 
-There is no approved release version. Cargo's `0.0.0` workspace value is
-unassigned development metadata, not a release baseline. Artifacts are
-identified by target, source commit, and content SHA-256.
+Public software versions are commit-derived canonical `yyyy.mm.dd.iteration`
+versions. Cargo's `0.0.0` workspace value is internal package metadata, not the
+firewall software version. Stable GitHub Releases provide the Ubuntu binary
+and JSON manifest used by fresh installation and self-upgrade; signed `.ncpkg`
+packages remain a separate distribution format.
 
 ## Build
 
@@ -739,44 +741,49 @@ and [original recovery design](journal/2026-10-24.md#signed-ubuntu-self-upgrade)
 ## Ubuntu prebuilt installation (amd64)
 
 The repository provides [install.sh](../install.sh) for an internet-connected
-Ubuntu amd64 systemd host. It installs prebuilt static musl binaries from a
-successful, manually dispatched GitHub Actions build, not source code. No
+Ubuntu amd64 systemd host. It installs the prebuilt static musl binary from the
+latest published stable GitHub Release, not source code or temporary CI artifacts. No
 Rust, Cargo, compiler, libclang or build headers are installed on the appliance.
 
-There is no approved release or public release-download channel. After reviewing
-distribution licensing, an authorized operator must run the existing Build and
-test workflow with `upload_packages: true` on reviewed source containing these
-changes. The installer needs that successful run's numeric ID. Uploads remain
-disabled by default, including push/PR builds. No workflow is dispatched and no
-artifact is published automatically by changing this code.
-
-GitHub Actions artifacts require authentication even for public repositories.
-Install/authenticate GitHub CLI for the account performing installation:
+No CI run ID, GitHub CLI/login, artifact upload or workflow dispatch is required.
+From a local console, ensure Ubuntu has internet addressing, a default gateway
+and working DNS. If `curl` or trusted CA certificates are missing, install them:
 
 ```sh
-sudo apt-get update && sudo apt-get install --no-install-recommends -y gh curl ca-certificates
-sudo gh auth login
+sudo apt-get update && sudo apt-get install --no-install-recommends -y curl ca-certificates
 ```
 
-Use an account with access to the repository's Actions artifacts. Never embed
-tokens in download URLs or shell history. Download and inspect the installer
-before running it as root. Once these changes are pushed and an approved build
-has uploaded its artifacts, run from any directory, replacing `123456789` with
-the actual successful workflow run ID:
+Download and inspect the installer before running it as root:
 
 ```sh
-curl -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh && sudo bash /tmp/netcontrol-install.sh --run-id 123456789
+curl --proto '=https' --tlsv1.2 -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh
+# Inspect /tmp/netcontrol-install.sh, then:
+sudo bash /tmp/netcontrol-install.sh
 ```
 
 Downloading fully before execution prevents running a partial response. For a
 pinned installer replace `main` in its URL with the reviewed source commit.
-Public raw access is required for that command; private repositories require
-an authenticated download without credentials embedded in the URL.
+The command downloads the script currently on GitHub, not unpushed local edits.
+Public HTTPS access to the repository, release API, assets and tagged source is
+required; this public-release installer has no private-repository login flow.
 
-The installer installs only `ca-certificates`, `gh`, `procps`, `kmod` and `curl` through APT,
-checks the successful workflow's repository/path/event/commit, downloads
-`netcontrol-ubuntu-amd64-<commit>`, verifies SHA-256 for the exact daemon and
-unit files and installs `/usr/local/sbin/netcontrold`. Only `--run-id` is required.
+The installer installs `ca-certificates`, `python3`, `procps`, `kmod` and `curl`
+through APT. Python is used only for installer metadata/binary validation, not
+as a runtime networking service. It resolves GitHub's latest stable release
+once, rejecting drafts/prereleases, invalid calendar tags and missing, duplicate
+or foreign asset URLs. All subsequent downloads are pinned to that version:
+
+- `netcontrol-ubuntu-amd64.json` and `netcontrold-ubuntu-amd64` from the release.
+  The manifest must match schema 1, the selected version and
+  `ubuntu-amd64-systemd`, with exactly the current fields. Manifest size is at
+  most 4096 bytes; binary size is 64 bytes..256 MiB. Duplicate fields, invalid
+  types, wrong size/SHA-256 and non-amd64 ELF binaries are rejected.
+- `packaging/native/netcontrold.service` from the same immutable release tag's
+  source over HTTPS, not from moving `main` or a different release.
+
+Only after verification is the binary executed to check its compiled version
+and required provisioning/service options. It is installed at
+`/usr/local/sbin/netcontrold`. No installation arguments are required.
 The first physical Ethernet interface in natural name order is WAN and the
 second is LAN (`eno1`, `eno2`, ...; `eno2` precedes `eno10`). Loopback, virtual
 and Wi-Fi interfaces are excluded. At least two physical Ethernet ports are
@@ -788,12 +795,15 @@ inside an RFC1918 subnet with prefix length 8..30, entirely within private
 space and not overlapping another interface or active DHCP lease. There is no
 source-build fallback or `--ref` option. No checkout is needed.
 Checksums detect corruption; authenticity relies on the reviewed source and
-authenticated GitHub workflow/artifact channel, not an independently trusted
+verified HTTPS to the trusted GitHub repository/account, not an independently trusted
 publisher signature. This is not a signed `.ncpkg` installation.
-Artifacts expire after 14 days; missing/expired artifacts or failed/unapproved
-workflow kinds cause an error rather than installing a different build.
-The workflow's manual upload input is an operator approval gate, not proof that
-licensing has been resolved. No release version is inferred from a run ID.
+An absent release, missing assets/tagged service source, GitHub rate limiting,
+download/TLS failures or invalid contents cause explicit errors, never a fallback
+to a CI artifact or source build. HTTPS redirects are restricted to HTTPS;
+downloads have size limits and connection/overall timeouts. CI artifact expiry
+does not govern installation. The removed `--run-id` option is rejected.
+Existing automated publication checks and distribution licensing obligations
+remain unchanged; the installer does not publish or dispatch builds.
 An already running daemon causes an explicit stop-and-retry error; the script
 does not stop it for you. It installs the systemd unit and private directories
 described below, provisions the appliance and starts/enables it. Existing
@@ -803,7 +813,7 @@ packages from prior source installs are not automatically removed.
 The host must be running systemd, not merely have `systemctl` installed.
 Before provisioning, it applies the persistent
 [conntrack host prerequisites](#conntrack-host-prerequisites). The downloaded
-installer remains self-contained; no checkout or extra helper download is needed.
+installer remains self-contained; no checkout or extra helper script is needed.
 
 ### Initial appliance provisioning
 

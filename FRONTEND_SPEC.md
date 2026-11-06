@@ -412,6 +412,18 @@ write outcome, pending confirmation, unavailable/stale state, modeled drift.
 
 Custom signed native package/OpenRC installation and automatic build artifacts are documented in
 the [build and installation specification](docs/BUILD_AND_INSTALL.md).
+Ubuntu fresh installation downloads the latest published stable GitHub Release
+without a CI run ID, GitHub login or manual build. It selects a single canonical
+calendar version, verifies the Ubuntu manifest, binary size/SHA-256, amd64 ELF
+header and compiled version, and fetches the systemd unit from the same immutable
+tag's source over verified HTTPS. Missing/invalid releases, rate limiting or
+download failures stop installation; there is no CI-artifact/source fallback.
+The installer uses Python 3 for metadata verification only; protocol services
+remain in-process Rust. The Ubuntu assets are unsigned; trust rests on HTTPS and
+the GitHub repository/account, not an independent publisher signature.
+Optional installation/help text should use `sudo bash install.sh` with optional
+paired `--wan`/`--lan` and `--lan-address`, not the removed `--run-id` option.
+No HTTP endpoint, authentication permission or saved configuration schema changes.
 Alpine packages and the bare daemon default to HTTP on `0.0.0.0:8080`.
 Ubuntu's fresh appliance installer selects the first physical Ethernet NIC in
 natural name order as WAN and the second as LAN (Wi-Fi/virtual NICs excluded).
@@ -1162,9 +1174,9 @@ or `NETCONTROL_UPGRADE_CONFIG`; standard install/upgrade scripts now bootstrap
 that configuration and service environment automatically, preserving valid
 operator settings and existing startup arguments.
 It supports only Ubuntu amd64/systemd, Linux host appliance mode. It is not an
-OS update, `.ncpkg` installation, factory reset or source build. Release assets
-must be explicitly published; no approved release/version baseline or channel
-is implied. SHA-256 detects corruption against the same-source manifest, not
+OS update, `.ncpkg` installation, factory reset or source build. It consumes
+published stable Ubuntu release assets from the configured repository; validation
+or local builds alone do not prove publication. SHA-256 detects corruption against the same-source manifest, not
 publisher authenticity: compromise of the trusted GitHub repository/account can
 provide an accepted replacement. Separate signed `.ncpkg` packages are unchanged.
 See [operator setup and artifact contract](docs/BUILD_AND_INSTALL.md#ubuntu-self-upgrade).

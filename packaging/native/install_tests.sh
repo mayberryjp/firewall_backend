@@ -6,7 +6,6 @@ source ./install.sh
 temporary=$(mktemp -d)
 printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
-fixture_commit=0123456789abcdef0123456789abcdef01234567
 scenario=valid
 
 for conntrack_scenario in success repeat module_failure write_failure read_failure verify_failure checksum_failure persist_failure symlink_sysctl symlink_modules; do
@@ -348,40 +347,150 @@ mv "$ports_fixture/eno1" "$temporary/one-port/"
 if select_appliance_ports '' '' "$temporary/one-port"; then exit 1; fi
 printf 'Automatic Ethernet port selection and override validation passed.\n'
 
-gh() {
-    case $1 in
-        auth) [[ $scenario != unauthenticated ]] ;;
-        api)
-            [[ $scenario != api_failure ]] || return 1
-            [[ $scenario != unsuccessful ]] || return 0
-            printf '%s\n' "$fixture_commit"
-            ;;
-        run)
-            [[ $scenario != missing_artifact ]] || return 1
-            [[ $* == *"netcontrol-ubuntu-amd64-$fixture_commit"* ]] || return 1
-            local destination=${!#}
-            printf 'synthetic executable fixture\n' > "$destination/netcontrold"
-            cp packaging/native/netcontrold.service "$destination/netcontrold.service"
-            (cd "$destination" && sha256sum --binary netcontrold netcontrold.service > SHA256SUMS)
-            case $scenario in
-                tampered_binary) printf 'tampered\n' >> "$destination/netcontrold" ;;
-                tampered_unit) printf 'tampered\n' >> "$destination/netcontrold.service" ;;
-                incomplete_manifest) head -n 1 "$destination/SHA256SUMS" > "$destination/reduced"; mv "$destination/reduced" "$destination/SHA256SUMS" ;;
-            esac
-            ;;
-        *) return 1 ;;
+curl() {
+    local url=${!#} output='' limit=''
+    [[ $* == *"--proto =https --proto-redir =https --tlsv1.2 --fail --location"* ]] || return 1
+    while [[ $# -gt 1 ]]; do
+        case $1 in
+            --output) output=$2; shift 2 ;;
+            --max-filesize) limit=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    printf '%s\n' "$url" >> "$fixture/downloads"
+    case $url in
+        https://api.github.com/repos/mayberryjp/firewall_backend/releases/latest)
+            [[ $limit == 1048576 && $scenario != api_failure && $scenario != no_release ]] || return 1
+            cp "$fixture/release.json" "$output" ;;
+        https://github.com/mayberryjp/firewall_backend/releases/download/v2026.11.05.2/netcontrol-ubuntu-amd64.json)
+            [[ $limit == 4096 && $scenario != missing_manifest ]] || return 1
+            cp "$fixture/manifest.json" "$output" ;;
+        https://github.com/mayberryjp/firewall_backend/releases/download/v2026.11.05.2/netcontrold-ubuntu-amd64)
+            [[ $limit == 268435456 && $scenario != missing_binary ]] || return 1
+            cp "$fixture/binary" "$output"
+            if [[ $scenario == tampered_binary ]]; then printf x >> "$output"; fi ;;
+        https://raw.githubusercontent.com/mayberryjp/firewall_backend/v2026.11.05.2/packaging/native/netcontrold.service)
+            [[ $limit == 65536 && $scenario != missing_unit ]] || return 1
+            if [[ $scenario == empty_unit ]]; then : > "$output"
+            else cp packaging/native/netcontrold.service "$output"; fi ;;
+        *) printf 'Unexpected release URL: %s\n' "$url" >&2; return 1 ;;
     esac
 }
 
-for scenario in valid unauthenticated api_failure unsuccessful missing_artifact tampered_binary tampered_unit incomplete_manifest; do
+for scenario in valid api_failure no_release draft prerelease bad_tag invalid_date oversized_iteration \
+    missing_asset duplicate_asset foreign_url malformed_metadata missing_manifest missing_binary \
+    malformed_manifest duplicate_field unknown_field schema_bool wrong_schema wrong_version wrong_target \
+    size_bool short_binary oversized_binary wrong_size bad_digest digest_mismatch tampered_binary \
+    wrong_elf wrong_arch oversized_manifest missing_unit empty_unit; do
+    fixture="$temporary/release-$scenario"
+    mkdir "$fixture"
+    python3 - "$fixture" "$scenario" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+directory = pathlib.Path(sys.argv[1])
+scenario = sys.argv[2]
+binary = bytearray(64)
+binary[:6] = b"\x7fELF\x02\x01"
+binary[18:20] = b"\x3e\x00"
+if scenario == "wrong_elf":
+    binary[0] = 0
+if scenario == "wrong_arch":
+    binary[18] = 183
+manifest = {"schema": 1, "version": "2026.11.05.2", "target": "ubuntu-amd64-systemd",
+            "size": len(binary), "sha256": hashlib.sha256(binary).hexdigest()}
+invalid = {
+    "unknown_field": ("extra", True), "schema_bool": ("schema", True),
+    "wrong_schema": ("schema", 2), "wrong_version": ("version", "2026.11.05.1"),
+    "wrong_target": ("target", "other"), "size_bool": ("size", True),
+    "short_binary": ("size", 63), "oversized_binary": ("size", 268435457),
+    "wrong_size": ("size", 65), "bad_digest": ("sha256", "Z" * 64),
+    "digest_mismatch": ("sha256", "0" * 64),
+}
+if scenario in invalid:
+    key, value = invalid[scenario]
+    manifest[key] = value
+manifest_text = json.dumps(manifest)
+if scenario == "duplicate_field":
+    manifest_text = '{"schema":1,' + manifest_text[1:]
+elif scenario == "malformed_manifest":
+    manifest_text = "{"
+elif scenario == "oversized_manifest":
+    manifest_text += " " * 4096
+base = "https://github.com/mayberryjp/firewall_backend/releases/download/v2026.11.05.2/"
+release = {"tag_name": "v2026.11.05.2", "draft": False, "prerelease": False,
+           "assets": [{"name": name, "browser_download_url": base + name}
+                      for name in ("netcontrol-ubuntu-amd64.json", "netcontrold-ubuntu-amd64")]}
+if scenario in ("draft", "prerelease"):
+    release[scenario] = True
+elif scenario == "bad_tag":
+    release["tag_name"] = "../bad"
+elif scenario == "invalid_date":
+    release["tag_name"] = "v2026.02.30.1"
+elif scenario == "oversized_iteration":
+    release["tag_name"] = "v2026.11.05.4294967296"
+elif scenario == "missing_asset":
+    release["assets"].pop()
+elif scenario == "duplicate_asset":
+    release["assets"].append(release["assets"][0])
+elif scenario == "foreign_url":
+    release["assets"][0]["browser_download_url"] = "https://example.invalid/asset"
+(directory / "release.json").write_text("{" if scenario == "malformed_metadata" else json.dumps(release))
+(directory / "manifest.json").write_text(manifest_text)
+(directory / "binary").write_bytes(binary)
+PY
     destination="$temporary/$scenario"
     mkdir "$destination"
-    if download_prebuilt 123 "$destination"; then
+    if download_prebuilt "$destination"; then
         [[ $scenario == valid ]] || { printf 'Unexpected success: %s\n' "$scenario" >&2; exit 1; }
+        [[ $(< "$destination/release-version") == 2026.11.05.2 ]]
+        cmp "$destination/netcontrold.service" packaging/native/netcontrold.service
+        [[ $(wc -l < "$fixture/downloads") -eq 4 ]]
     else
-        [[ $scenario != valid ]] || { printf 'Valid artifact rejected\n' >&2; exit 1; }
+        [[ $scenario != valid ]] || { printf 'Valid release rejected\n' >&2; exit 1; }
+        [[ ! -e $destination/release-version ]]
+        if [[ $scenario != missing_unit && $scenario != empty_unit ]]; then
+            ! grep -q raw.githubusercontent.com "$fixture/downloads"
+        fi
     fi
 done
+unset -f curl
+for scenario in valid wrong_version version_failure help_failure missing_option; do
+    destination="$temporary/prebuilt-$scenario"
+    mkdir "$destination"
+    printf '2026.11.05.2\n' > "$destination/release-version"
+    cat > "$destination/netcontrold" <<'SH'
+#!/usr/bin/env bash
+case $1 in
+    --version)
+        [[ $prebuilt_scenario != version_failure ]] || exit 1
+        if [[ $prebuilt_scenario == wrong_version ]]; then printf 'netcontrold 2026.11.05.1\n'
+        else printf 'netcontrold 2026.11.05.2\n'; fi ;;
+    --help)
+        [[ $prebuilt_scenario != help_failure ]] || exit 1
+        printf '%s\n' --provision-wan NETCONTROL_ALLOW_HOST_SERVICES NETCONTROL_GATEWAY_MONITORING NETCONTROL_SSH_LISTEN NETCONTROL_UPGRADE_CONFIG
+        if [[ $prebuilt_scenario != missing_option ]]; then printf '%s\n' --configure-updates; fi ;;
+    *) exit 1 ;;
+esac
+SH
+    export prebuilt_scenario=$scenario
+    if check_prebuilt "$destination"; then
+        [[ $scenario == valid ]] || exit 1
+    else
+        [[ $scenario != valid ]] || exit 1
+    fi
+done
+unset prebuilt_scenario
+(
+    [[ $(main --help) != *--run-id* ]]
+    if main --run-id 123; then exit 1; fi
+    uname() { printf 'unsupported-test-platform\n'; }
+    if output=$(main 2>&1); then exit 1; fi
+    [[ $output == *'requires Ubuntu Linux amd64'* ]]
+)
+printf 'Stable release download, verification, compiled version/options, pinned unit, failure and no-run-ID CLI tests passed.\n'
 
 (
 trace=''

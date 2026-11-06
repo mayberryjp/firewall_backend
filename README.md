@@ -806,17 +806,22 @@ using historical examples.
 ## Install on Ubuntu
 
 An Ubuntu amd64 [prebuilt installer](install.sh) downloads verified binaries
-from a successful manually dispatched GitHub Actions run. No Rust/compiler
-installation is needed on the firewall. GitHub authentication and an approved
-artifact-producing workflow run are required; there is no public release yet.
+from the latest published stable GitHub Release. No Rust/compiler installation,
+GitHub login, CI run ID or manual workflow dispatch is needed on the firewall.
 See the [download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-prebuilt-installation-amd64).
 It automatically provisions a fresh appliance:
 
 ```sh
-sudo bash install.sh --run-id 123456789
+curl --proto '=https' --tlsv1.2 -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh
+# Inspect the downloaded script before running it as root.
+sudo bash /tmp/netcontrol-install.sh
 ```
 
-Use the actual approved workflow run ID. The first physical Ethernet interface
+The installer selects one stable version, verifies its manifest, binary size,
+SHA-256, amd64 ELF header and compiled version, and fetches its systemd unit from
+the same release tag. Downloads use verified HTTPS; Ubuntu release assets are
+unsigned, unlike `.ncpkg` packages. Missing or invalid releases fail explicitly.
+The first physical Ethernet interface
 in natural name order (`eno1`, `eno2`, ...; Wi-Fi/virtual links excluded) is WAN;
 the second is LAN. Override with both `--wan` and `--lan` when needed. LAN
 defaults to `192.168.0.1/24` (`--lan-address` overrides it); WAN is configured
@@ -830,8 +835,9 @@ LAN clients currently need static addresses and the appliance as their gateway;
 no LAN DHCP or DNS server is installed. IPv6 forwarding is not enabled.
 Use console access during provisioning. See the
 [service commands](docs/BUILD_AND_INSTALL.md#ubuntu-systemd-service). The GitHub
-download command requires the installer to be pushed and the reviewed artifacts
-to be built and uploaded first.
+download command uses the installer currently published on `main`; local script
+edits are not available there until an authorized push. Initial internet
+addressing, gateway and DNS must work before downloading/installing.
 
 ## Install on Alpine
 

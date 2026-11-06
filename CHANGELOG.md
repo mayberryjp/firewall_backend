@@ -16,6 +16,15 @@
 
 ### Fixed
 
+- Ubuntu fresh installation now downloads and verifies the latest stable GitHub
+  Release instead of requiring a CI run ID, temporary Actions artifacts,
+  GitHub login or a manually dispatched build. Binary manifest, size, SHA-256,
+  architecture and compiled version are checked; the service unit is pinned to
+  the same release tag. Invalid/missing downloads fail explicitly.
+  Release impact: installer fix with breaking removal of `--run-id`, Unreleased;
+  next automatic calendar version. Optional frontend installation-help update:
+  [handoff 2026-11-06-02](docs/frontend-handoffs/2026-11-06.md#2026-11-06-02-stable-release-installation-without-ci-run-ids).
+
 - Accept bounded module-qualified kernel symbol text in path-test nftables
   lease metadata, preventing false firewall-cleanup failures on modular kernels
   such as Ubuntu CI. Keep lease identity, policy, timeout, element and
