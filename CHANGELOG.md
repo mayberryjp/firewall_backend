@@ -16,6 +16,15 @@
 
 ### Fixed
 
+- Allow fresh-install retries after initial network capture fails before saving
+  a journal. Retain and reuse only a verified inactive, private, empty state lock
+  when both saved state and appliance environment are absent; active/unsafe
+  locks and existing appliance state still fail explicitly. No lock/state
+  deletion or production-lock bypass.
+  Release impact: installer fix, Unreleased; next automatic calendar version.
+  Optional operator-help clarification in
+  [handoff 2026-11-06-02](docs/frontend-handoffs/2026-11-06.md#2026-11-06-02-stable-release-installation-without-ci-run-ids).
+
 - Ubuntu fresh installation now downloads and verifies the latest stable GitHub
   Release instead of requiring a CI run ID, temporary Actions artifacts,
   GitHub login or a manually dispatched build. Binary manifest, size, SHA-256,

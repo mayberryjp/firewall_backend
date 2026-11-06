@@ -424,6 +424,12 @@ the GitHub repository/account, not an independent publisher signature.
 Optional installation/help text should use `sudo bash install.sh` with optional
 paired `--wan`/`--lan` and `--lan-address`, not the removed `--run-id` option.
 No HTTP endpoint, authentication permission or saved configuration schema changes.
+An initial capture failure can leave an empty journal lock without a saved
+journal. Fresh-install retries retain and reuse only a verified root-owned,
+mode-0600, empty, singly linked regular lock that is currently unlocked, and
+only while both journal and appliance environment are absent. Existing state,
+environment and active/unsafe locks still block installation; no files are
+deleted to force setup. See the installation guide for operator recovery.
 Alpine packages and the bare daemon default to HTTP on `0.0.0.0:8080`.
 Ubuntu's fresh appliance installer selects the first physical Ethernet NIC in
 natural name order as WAN and the second as LAN (Wi-Fi/virtual NICs excluded).

@@ -8,6 +8,49 @@ printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
 scenario=valid
 
+for fresh_scenario in clean unused_lock active_lock nonempty_lock private_mode directory_lock symlink_lock dangling_lock hardlink_lock saved_state empty_state environment state_symlink environment_symlink; do
+    fresh_directory="$temporary/fresh-$fresh_scenario"
+    mkdir "$fresh_directory"
+    fresh_state="$fresh_directory/state.json"
+    fresh_environment="$fresh_directory/appliance.env"
+    fresh_lock="$fresh_state.lock"
+    if [[ $fresh_scenario != clean ]]; then
+        : > "$fresh_lock"
+        chmod 0600 "$fresh_lock"
+    fi
+    case $fresh_scenario in
+        active_lock) exec {fresh_fd}<>"$fresh_lock"; flock --exclusive "$fresh_fd" ;;
+        nonempty_lock) printf 'foreign data\n' > "$fresh_lock" ;;
+        private_mode) chmod 0644 "$fresh_lock" ;;
+        directory_lock) rm "$fresh_lock"; mkdir "$fresh_lock" ;;
+        symlink_lock) mv "$fresh_lock" "$fresh_directory/target"; ln -s target "$fresh_lock" ;;
+        dangling_lock) rm "$fresh_lock"; ln -s missing "$fresh_lock" ;;
+        hardlink_lock) ln "$fresh_lock" "$fresh_directory/other" ;;
+        saved_state) printf 'saved configuration\n' > "$fresh_state" ;;
+        empty_state) : > "$fresh_state" ;;
+        environment) printf 'NETCONTROL_LISTEN=192.0.2.1:8080\n' > "$fresh_environment" ;;
+        state_symlink) ln -s missing "$fresh_state" ;;
+        environment_symlink) ln -s missing "$fresh_environment" ;;
+    esac
+    if [[ $fresh_scenario != clean ]]; then
+        fresh_identity=$(stat -c '%d:%i:%s:%a:%h' -- "$fresh_lock")
+    fi
+    if check_fresh_installation "$fresh_state" "$fresh_environment"; then
+        [[ $fresh_scenario == clean || $fresh_scenario == unused_lock ]] || exit 1
+    else
+        [[ $fresh_scenario != clean && $fresh_scenario != unused_lock ]] || exit 1
+    fi
+    if [[ $fresh_scenario != clean ]]; then
+        [[ $(stat -c '%d:%i:%s:%a:%h' -- "$fresh_lock") == "$fresh_identity" ]]
+    fi
+    if [[ $fresh_scenario == active_lock ]]; then
+        flock --unlock "$fresh_fd"
+        exec {fresh_fd}>&-
+        check_fresh_installation "$fresh_state" "$fresh_environment"
+    fi
+done
+printf 'Fresh installation retry, active/unsafe lock refusal and saved-state protection tests passed.\n'
+
 for conntrack_scenario in success repeat module_failure write_failure read_failure verify_failure checksum_failure persist_failure symlink_sysctl symlink_modules; do
     conntrack_directory="$temporary/conntrack-$conntrack_scenario"
     mkdir -p "$conntrack_directory/sysctl.d" "$conntrack_directory/modules-load.d"

@@ -807,8 +807,17 @@ remain unchanged; the installer does not publish or dispatch builds.
 An already running daemon causes an explicit stop-and-retry error; the script
 does not stop it for you. It installs the systemd unit and private directories
 described below, provisions the appliance and starts/enables it. Existing
-appliance journals, journal locks and appliance environment files cause explicit
-refusal; they are never removed to force a reinstall. Existing compiler/toolchain
+appliance journals and appliance environment files cause explicit refusal; they
+are never removed to force a reinstall. A failed initial capture can leave only
+`/var/lib/netcontrol/native-state.json.lock`, before any journal was saved.
+When both the journal and appliance environment are absent, the installer may
+reuse that lock file only if it is root-owned, mode 0600, empty, regular, not
+symlinked, singly linked and currently unlocked. It checks the existing lock
+with `flock` (Ubuntu's `util-linux`); missing tooling or a failed lock check
+stops installation. The file is never removed or replaced, and the daemon still
+acquires its own exclusive lock before reading/initializing state. An active,
+unsafe or nonempty lock remains an explicit error. Do not delete state, lock
+files or native recovery evidence to force retries. Existing compiler/toolchain
 packages from prior source installs are not automatically removed.
 The host must be running systemd, not merely have `systemctl` installed.
 Before provisioning, it applies the persistent

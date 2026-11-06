@@ -383,8 +383,34 @@ check_prebuilt() (
     fi
 )
 
+check_fresh_installation() {
+    local state=$1 environment=$2 lock="$1.lock" path
+    for path in "$state" "$environment"; do
+        [[ ! -e $path && ! -L $path ]] || {
+            printf 'Fresh appliance installation required; refusing existing %s. Do not delete appliance state to reinstall.\n' "$path" >&2
+            return 1
+        }
+    done
+    if [[ -e $lock || -L $lock ]]; then
+        [[ -f $lock && ! -L $lock ]] &&
+            [[ $(stat -c '%u:%a:%h:%s' -- "$lock") == "$EUID:600:1:0" ]] || {
+            printf 'Refusing unsafe or nonempty state lock %s; expected an installer-owned mode-0600 empty regular file with one link.\n' "$lock" >&2
+            return 1
+        }
+        command -v flock >/dev/null || {
+            printf 'The flock command (util-linux) is required to check an existing state lock safely.\n' >&2
+            return 1
+        }
+        flock --nonblock --exclusive -- "$lock" true || {
+            printf 'State lock %s is held by another process or cannot be checked; stop the owning process before retrying.\n' "$lock" >&2
+            return 1
+        }
+        printf 'Reusing inactive state lock %s; no saved appliance configuration exists. The lock file is retained.\n' "$lock"
+    fi
+}
+
 main() {
-    local wan='' lan='' lan_address=192.168.0.1/24 path ports
+    local wan='' lan='' lan_address=192.168.0.1/24 ports
     if [[ ${1:-} == --help ]]; then
         printf 'Usage: bash install.sh [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24]\nDownloads the latest stable Ubuntu amd64 release over verified HTTPS; no CI run ID or GitHub login is needed.\nDefaults: first physical Ethernet port (natural name order) is DHCP WAN, second is LAN; LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Saved configuration controls which workers run. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
         return
@@ -424,9 +450,7 @@ main() {
         return 1
     fi
 
-    for path in /var/lib/netcontrol/native-state.json /var/lib/netcontrol/native-state.json.lock /etc/netcontrol/appliance.env; do
-        [[ ! -e $path && ! -L $path ]] || { printf 'Fresh appliance installation required; refusing existing %s. Do not delete appliance state to reinstall.\n' "$path" >&2; return 1; }
-    done
+    check_fresh_installation /var/lib/netcontrol/native-state.json /etc/netcontrol/appliance.env || return 1
     ports=$(select_appliance_ports "$wan" "$lan") || return 1
     read -r wan lan <<< "$ports"
     printf 'Selected WAN: %s (DHCP); LAN: %s (%s).\n' "$wan" "$lan" "$lan_address"
