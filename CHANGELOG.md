@@ -4,6 +4,15 @@
 
 ### Changed
 
+- MQTT telemetry uses per-sensor retained discovery and bounded metric/structured
+  state topics instead of monolithic discovery/state messages. Aggregate samples
+  can exceed 1 MiB without dropping sensors; every publication remains bounded.
+  Preserve stable identity, precision, partial-source expiry, QoS acknowledgment
+  and durable per-entity removal. Oversized indivisible units report byte counts.
+  Release impact: breaking MQTT topic/payload contract, Unreleased; next automatic
+  calendar version. Required consumer/ACL and retained-discovery deployment work:
+  [handoff 2026-11-06-06](docs/frontend-handoffs/2026-11-06.md#2026-11-06-06-bounded-mqtt-topic-publications).
+
 - CI restores separate Rust dependency/build caches for checks, privileged
   integration and musl packaging, and builds packages alongside validation.
   Stable publication still requires all three jobs to succeed; no checks are
@@ -27,6 +36,15 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Size the native netfilter socket for complete atomic firewall updates instead
+  of sending large Sando/imported rulesets through the default-size buffer and
+  failing with `EMSGSIZE`. Share the checked sender across ordinary firewall,
+  destination-rewrite and rollback removal paths; request only the final success
+  acknowledgement while preserving kernel error checks. No global buffer sysctl,
+  partial rule application, API/schema or validation-limit changes.
+  Release impact: runtime fix, Unreleased; next automatic calendar version.
+  No frontend action.
 
 - DHCPv4 relay accepts server Offers, ACKs and NAKs with zero BOOTP hops instead
   of requiring the forwarded request's hop count to be echoed. Reply hops are

@@ -6,6 +6,15 @@ It never invokes `ip`, `nft`, `wg`, Go, a shell, or a service executable.
 `wireguard-control` is always explicitly selected with `Backend::Kernel`; its
 optional userspace-program backend is never selected.
 
+Firewall updates, including large imported rulesets and destination rewrites,
+remain one atomic netfilter transaction. The sender sizes its private socket
+buffer for the complete datagram, using `SO_SNDBUFFORCE` with the already-required
+`CAP_NET_ADMIN` if the ordinary buffer is clamped by `net.core.wmem_max`.
+No host sysctl change or non-atomic rule chunking is used. Only the final operation
+requests a success acknowledgement; errors from every operation remain checked.
+Buffer allocation, permission and kernel failures remain explicit apply errors
+with the ordinary transaction recovery/rollback behavior.
+
 ## Operator requirements
 
 - Linux with network namespace, dummy, VLAN, WireGuard, connection-tracking,

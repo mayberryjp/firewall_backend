@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -189,6 +189,13 @@ pub struct Manager {
 }
 
 type Publication = (String, Vec<u8>, bool);
+const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+const MAX_ENTITIES: usize = 4096;
+
+struct TelemetryPublications {
+    discovery: BTreeMap<String, Vec<u8>>,
+    state: Vec<Publication>,
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct Failure {
@@ -515,7 +522,7 @@ impl Manager {
         let mut options = MqttOptions::new(format!("netcontrol_{}", self.device_id), host, port);
         options.set_keep_alive(Duration::from_secs(30));
         options.set_clean_session(true);
-        options.set_max_packet_size(1 << 20, (1 << 20) + 4096);
+        options.set_max_packet_size(MAX_PAYLOAD_BYTES, MAX_PAYLOAD_BYTES + 4096);
         options.set_last_will(LastWill::new(
             format!("netcontrol/{}/availability", self.device_id),
             "offline",
@@ -747,7 +754,6 @@ impl Manager {
             }
         });
         let base = format!("netcontrol/{}", self.device_id);
-        let discovery_topic = format!("homeassistant/device/netcontrol_{}/config", self.device_id);
         let mut queue = VecDeque::<Publication>::new();
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut connected = false;
@@ -756,6 +762,7 @@ impl Manager {
         let mut batch_has_state = false;
         let mut manifest = None::<BTreeSet<String>>;
         let mut previous_discovery = None::<Value>;
+        let mut previous_publications = BTreeMap::<String, Vec<u8>>::new();
         let mut force_discovery = true;
         let mut next_sample = Instant::now();
         let mut collecting =
@@ -800,12 +807,15 @@ impl Manager {
                                     discovery["components"][key] = component.clone();
                                 }
                             }
-                            if validate_telemetry(&discovery, &state).is_err() {
-                                self.state(true, "error", Some("MQTT entity or payload limit exceeded"));
-                                queue.push_back((format!("{base}/availability"), b"offline".to_vec(), true));
-                                continue;
-                            }
-                            if force_discovery || previous_discovery.as_ref() != Some(&discovery) {
+                            let publications = match telemetry_publications(&self.device_id, &discovery, &state) {
+                                Ok(publications) => publications,
+                                Err(error) => {
+                                    self.state(true, "error", Some(&error.to_string()));
+                                    queue.push_back((format!("{base}/availability"), b"offline".to_vec(), true));
+                                    continue;
+                                }
+                            };
+                            if force_discovery || previous_publications != publications.discovery {
                                 let secrets = self.secrets.lock().map_err(|_| anyhow::anyhow!("MQTT store unavailable"))?;
                                 let before = secrets.components().context(Failure::new(
                                     "discovery_manifest", "MQTT discovery manifest could not be read or validated"
@@ -813,31 +823,17 @@ impl Manager {
                                 let after: BTreeSet<_> = discovery["components"].as_object().unwrap().keys().cloned().collect();
                                 // Entities of a section that could not be enumerated now are kept, not removed.
                                 let kept: BTreeSet<_> = before.iter().filter(|key| retained.iter().any(|kind| key.starts_with(&format!("{kind}_")))).cloned().collect();
-                                let mut removal = discovery.clone();
-                                let mut removed = false;
-                                for key in before.difference(&after).filter(|key| !kept.contains(*key)) {
-                                    removal["components"][key] = json!({"platform":"sensor"});
-                                    removed = true;
-                                }
-                                let removal_payload = serde_json::to_vec(&removal)?;
-                                if removal_payload.len() > 1 << 20 {
-                                    self.state(true, "error", Some("MQTT discovery removal payload limit exceeded"));
-                                    queue.push_back((format!("{base}/availability"), b"offline".to_vec(), true));
-                                    continue;
-                                }
                                 secrets.save_components(&before.union(&after).cloned().collect()).context(Failure::new(
                                     "discovery_manifest", "MQTT discovery manifest could not be saved"
                                 ))?;
-                                if removed {
-                                    queue.push_back((discovery_topic.clone(), removal_payload, true));
-                                }
-                                queue.push_back((discovery_topic.clone(), serde_json::to_vec(&discovery)?, true));
+                                queue.extend(discovery_updates(&self.device_id, &before, &kept, &previous_publications, &publications.discovery, force_discovery));
                                 manifest = Some(after.union(&kept).cloned().collect());
+                                previous_publications = publications.discovery;
                                 previous_discovery = Some(discovery);
                                 force_discovery = false;
                             }
+                            queue.extend(publications.state);
                             queue.push_back((format!("{base}/availability"), b"online".to_vec(), true));
-                            queue.push_back((format!("{base}/state"), serde_json::to_vec(&state)?, false));
                             batch_has_state = true;
                         }
                         Err(error) => {
@@ -940,17 +936,182 @@ fn validate_telemetry(discovery: &Value, state: &Value) -> Result<()> {
     let components = discovery["components"]
         .as_object()
         .context("MQTT components missing")?;
-    ensure!(components.len() <= 4096, "MQTT entity limit exceeded");
+    ensure!(
+        components.len() <= MAX_ENTITIES,
+        "MQTT entity limit exceeded: entities={}, maximum={MAX_ENTITIES}",
+        components.len()
+    );
     ensure!(
         components.keys().all(|key| valid_component(key)),
         "invalid MQTT discovery component ID"
     );
-    ensure!(
-        serde_json::to_vec(discovery)?.len() <= 1 << 20
-            && serde_json::to_vec(state)?.len() <= 1 << 20,
-        "MQTT payload limit exceeded"
-    );
+    if let Some(metrics) = state.get("metrics") {
+        let metrics = metrics.as_object().context("MQTT metrics missing")?;
+        ensure!(
+            metrics.keys().all(|key| components.contains_key(key)),
+            "MQTT metric has no discovery component"
+        );
+    }
     Ok(())
+}
+
+fn sensor_discovery_topic(device_id: &str, key: &str) -> String {
+    format!("homeassistant/sensor/netcontrol_{device_id}/{key}/config")
+}
+
+fn discovery_updates(
+    device_id: &str,
+    before: &BTreeSet<String>,
+    kept: &BTreeSet<String>,
+    previous: &BTreeMap<String, Vec<u8>>,
+    current: &BTreeMap<String, Vec<u8>>,
+    force: bool,
+) -> Vec<Publication> {
+    let mut publications = Vec::new();
+    for key in before
+        .iter()
+        .filter(|key| !current.contains_key(*key) && !kept.contains(*key))
+    {
+        publications.push((sensor_discovery_topic(device_id, key), Vec::new(), true));
+    }
+    for (key, payload) in current {
+        if force || previous.get(key) != Some(payload) {
+            publications.push((
+                sensor_discovery_topic(device_id, key),
+                payload.clone(),
+                true,
+            ));
+        }
+    }
+    publications
+}
+
+fn metric_state_topic(device_id: &str, key: &str) -> String {
+    format!(
+        "netcontrol/{device_id}/state/metrics/{:02x}",
+        Sha256::digest(key.as_bytes())[0]
+    )
+}
+
+fn metric_publications(
+    device_id: &str,
+    timestamp: &Value,
+    metrics: &Map<String, Value>,
+) -> Result<(BTreeMap<String, String>, Vec<Publication>)> {
+    let mut buckets = BTreeMap::<String, Map<String, Value>>::new();
+    for (key, value) in metrics {
+        buckets
+            .entry(hex::encode(&Sha256::digest(key.as_bytes())[..1]))
+            .or_default()
+            .insert(key.clone(), value.clone());
+    }
+    let mut pending: VecDeque<_> = buckets.into_iter().collect();
+    let mut topics = BTreeMap::new();
+    let mut publications = Vec::new();
+    while let Some((prefix, metrics)) = pending.pop_front() {
+        let payload = json!({"collected_at_unix":timestamp,"metrics":metrics});
+        let bytes = serde_json::to_vec(&payload)?;
+        if bytes.len() > MAX_PAYLOAD_BYTES && metrics.len() > 1 && prefix.len() < 64 {
+            let mut smaller = BTreeMap::<String, Map<String, Value>>::new();
+            for (key, value) in metrics {
+                let digest = hex::encode(Sha256::digest(key.as_bytes()));
+                smaller
+                    .entry(digest[..prefix.len() + 1].into())
+                    .or_default()
+                    .insert(key, value);
+            }
+            pending.extend(smaller);
+        } else {
+            ensure!(
+                bytes.len() <= MAX_PAYLOAD_BYTES,
+                "MQTT metric shard payload limit exceeded: serialized_bytes={}, maximum={MAX_PAYLOAD_BYTES}",
+                bytes.len()
+            );
+            let topic = format!("netcontrol/{device_id}/state/metrics/{prefix}");
+            for key in metrics.keys() {
+                topics.insert(key.clone(), topic.clone());
+            }
+            publications.push((topic, bytes, false));
+        }
+    }
+    Ok((topics, publications))
+}
+
+fn bounded_payload(value: &Value, kind: &str) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(value)?;
+    ensure!(
+        payload.len() <= MAX_PAYLOAD_BYTES,
+        "MQTT {kind} payload limit exceeded: serialized_bytes={}, maximum={MAX_PAYLOAD_BYTES}",
+        payload.len()
+    );
+    Ok(payload)
+}
+
+fn telemetry_publications(
+    device_id: &str,
+    discovery: &Value,
+    state: &Value,
+) -> Result<TelemetryPublications> {
+    validate_telemetry(discovery, state)?;
+    let timestamp = state
+        .get("collected_at_unix")
+        .filter(|value| value.is_u64())
+        .context("MQTT sample timestamp missing")?;
+    let components = discovery["components"]
+        .as_object()
+        .context("MQTT components missing")?;
+    let metrics = state["metrics"]
+        .as_object()
+        .context("MQTT metrics missing")?;
+    let (topics, mut publications) = metric_publications(device_id, timestamp, metrics)?;
+    let mut discovery_publications = BTreeMap::new();
+    for (key, component) in components {
+        let mut component = component.clone();
+        let fields = component
+            .as_object_mut()
+            .context("MQTT discovery component must be an object")?;
+        fields.remove("platform");
+        for field in ["device", "origin", "availability_topic", "qos"] {
+            fields.insert(
+                field.into(),
+                discovery
+                    .get(field)
+                    .context("MQTT discovery metadata missing")?
+                    .clone(),
+            );
+        }
+        fields.insert(
+            "state_topic".into(),
+            json!(
+                topics
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| metric_state_topic(device_id, key))
+            ),
+        );
+        discovery_publications.insert(
+            key.clone(),
+            bounded_payload(&component, "sensor discovery")?,
+        );
+    }
+    for (field, value) in state.as_object().context("MQTT state must be an object")? {
+        if matches!(field.as_str(), "metrics" | "collected_at_unix") {
+            continue;
+        }
+        ensure!(valid_component(field), "MQTT invalid state section");
+        publications.push((
+            format!("netcontrol/{device_id}/state/{field}"),
+            bounded_payload(
+                &json!({"collected_at_unix":timestamp,field:value}),
+                "state section",
+            )?,
+            false,
+        ));
+    }
+    Ok(TelemetryPublications {
+        discovery: discovery_publications,
+        state: publications,
+    })
 }
 
 fn telemetry(
@@ -1200,7 +1361,7 @@ fn telemetry(
         Some("measurement"),
     );
     let discovery = json!({"device":{"identifiers":[format!("netcontrol_{device_id}")],"name":format!("Netcontrol {}", &device_id[..8]),"manufacturer":"Netcontrol","model":"Firewall"},
-        "origin":{"name":"netcontrold"},"components":components,"state_topic":format!("{base}/state"),
+        "origin":{"name":"netcontrold"},"components":components,
         "availability_topic":format!("{base}/availability"),"qos":1});
     let state = json!({"collected_at_unix":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"metrics":metrics,
         "bgp":statistics.get("bgp").cloned().unwrap_or_else(||json!({"state":"unavailable","error":"BGP statistics unavailable","neighbors":[]})),
@@ -1517,15 +1678,292 @@ mod tests {
         let overhead = serde_json::to_vec(&json!({"data":""})).unwrap().len();
         let state = json!({"data":"a".repeat((1 << 20) - overhead)});
         assert_eq!(serde_json::to_vec(&state).unwrap().len(), 1 << 20);
-        assert!(validate_telemetry(&json!({"components":{}}), &state).is_ok());
+        assert!(bounded_payload(&state, "state section").is_ok());
         let too_large = json!({"data":"a".repeat((1 << 20) - overhead + 1)});
-        assert!(validate_telemetry(&json!({"components":{}}), &too_large).is_err());
+        let error = bounded_payload(&too_large, "state section")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("serialized_bytes=1048577"), "{error}");
+        assert!(error.contains("maximum=1048576"), "{error}");
+        assert!(!error.contains(&"a".repeat(32)), "{error}");
+    }
+
+    fn telemetry_fixture(count: usize) -> (Value, Value) {
+        let mut discovery = json!({
+            "device":{"identifiers":["netcontrol_fixture"],"name":"Firewall"},
+            "origin":{"name":"netcontrold"},"availability_topic":"netcontrol/fixture/availability",
+            "qos":1,"components":{}
+        });
+        let mut state = json!({"collected_at_unix":42,"metrics":{},
+            "process_health":{"status":"healthy"},"active_alerts":[],
+            "statistics_available":true,"telemetry_sources":{"network":true}});
+        for index in 0..count {
+            let key = format!("metric_{index:04}");
+            discovery["components"][&key] = json!({
+                "platform":"sensor","unique_id":format!("netcontrol_fixture_{key}"),
+                "name":format!("Sensor {index} {}", "x".repeat(256)),
+                "expire_after":90,
+                "value_template":format!("{{{{ value_json.metrics.get('{key}', 'unknown') }}}}")
+            });
+            state["metrics"][key] = json!("y".repeat(512));
+        }
+        (discovery, state)
+    }
+
+    #[test]
+    fn mqtt_splits_oversized_discovery_and_state_without_losing_entities_or_values() {
+        let (discovery, mut state) = telemetry_fixture(MAX_ENTITIES);
+        state["metrics"]["metric_0000"] = json!("18446744073709551615");
+        state["metrics"]["metric_0001"] = Value::Null;
+        state["metrics"]["metric_0002"] = json!(1.5);
+        state["metrics"]["metric_0003"] = json!(false);
+        assert!(serde_json::to_vec(&discovery).unwrap().len() > MAX_PAYLOAD_BYTES);
+        assert!(serde_json::to_vec(&state).unwrap().len() > MAX_PAYLOAD_BYTES);
+        let publications = telemetry_publications("fixture", &discovery, &state).unwrap();
+        assert_eq!(publications.discovery.len(), MAX_ENTITIES);
+        let mut reconstructed_metrics = Map::new();
+        let mut sections = Map::new();
+        for (topic, bytes, retained) in &publications.state {
+            assert!(!retained);
+            assert!(bytes.len() <= MAX_PAYLOAD_BYTES);
+            let payload: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(payload["collected_at_unix"], 42);
+            if topic.contains("/state/metrics/") {
+                for (key, value) in payload["metrics"].as_object().unwrap() {
+                    assert!(
+                        reconstructed_metrics
+                            .insert(key.clone(), value.clone())
+                            .is_none()
+                    );
+                }
+            } else {
+                let field = topic.rsplit('/').next().unwrap();
+                sections.insert(field.into(), payload[field].clone());
+            }
+        }
+        assert_eq!(Value::Object(reconstructed_metrics), state["metrics"]);
+        for (field, value) in state.as_object().unwrap() {
+            if !matches!(field.as_str(), "metrics" | "collected_at_unix") {
+                assert_eq!(&sections[field], value);
+            }
+        }
+        for (key, bytes) in &publications.discovery {
+            assert!(bytes.len() <= MAX_PAYLOAD_BYTES);
+            let component: Value = serde_json::from_slice(bytes).unwrap();
+            assert!(component.get("platform").is_none());
+            assert_eq!(component["device"], discovery["device"]);
+            assert_eq!(
+                component["unique_id"],
+                discovery["components"][key]["unique_id"]
+            );
+            assert_eq!(component["expire_after"], 90);
+            assert_eq!(
+                component["availability_topic"],
+                discovery["availability_topic"]
+            );
+            let topic = component["state_topic"].as_str().unwrap();
+            let (_, state, _) = publications
+                .state
+                .iter()
+                .find(|(name, _, _)| name == topic)
+                .unwrap();
+            let state: Value = serde_json::from_slice(state).unwrap();
+            assert!(state["metrics"].get(key).is_some());
+        }
+    }
+
+    #[test]
+    fn mqtt_partition_topics_are_stable_and_oversized_units_fail_explicitly() {
+        let (mut discovery, mut state) = telemetry_fixture(2);
+        let before = telemetry_publications("fixture", &discovery, &state).unwrap();
+        discovery["components"]["additional"] = discovery["components"]["metric_0000"].clone();
+        state["metrics"]["additional"] = json!(null);
+        let after = telemetry_publications("fixture", &discovery, &state).unwrap();
+        for (key, payload) in &before.discovery {
+            assert_eq!(after.discovery.get(key), Some(payload));
+        }
+        let topic = metric_state_topic("fixture", "additional");
+        let (_, payload, _) = after
+            .state
+            .iter()
+            .find(|(name, _, _)| name == &topic)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(payload).unwrap()["metrics"]["additional"],
+            Value::Null
+        );
+        discovery["components"]["metric_0000"]["name"] = json!("x".repeat(MAX_PAYLOAD_BYTES));
+        let error = telemetry_publications("fixture", &discovery, &state)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
-            validate_telemetry(
-                &json!({"components":{},"data":"a".repeat(1 << 20)}),
-                &json!({})
+            error.contains("MQTT sensor discovery payload limit exceeded"),
+            "{error}"
+        );
+        discovery["components"]["metric_0000"]["name"] = json!("Sensor");
+        state["metrics"]["metric_0000"] = json!("x".repeat(MAX_PAYLOAD_BYTES));
+        let error = telemetry_publications("fixture", &discovery, &state)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("MQTT metric shard payload limit exceeded"),
+            "{error}"
+        );
+        state["metrics"]["metric_0000"] = json!(1);
+        state["active_alerts"] = json!(["x".repeat(MAX_PAYLOAD_BYTES)]);
+        let error = telemetry_publications("fixture", &discovery, &state)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("MQTT state section payload limit exceeded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn mqtt_retained_partial_source_keeps_discovery_but_does_not_invent_values() {
+        let (discovery, mut state) = telemetry_fixture(1);
+        let key = "metric_0000";
+        state["metrics"].as_object_mut().unwrap().remove(key);
+        let publications = telemetry_publications("fixture", &discovery, &state).unwrap();
+        assert!(publications.discovery.contains_key(key));
+        assert!(
+            !publications
+                .state
+                .iter()
+                .any(|(topic, _, _)| topic == &metric_state_topic("fixture", key))
+        );
+        assert_eq!(
+            sensor_discovery_topic("fixture", key),
+            "homeassistant/sensor/netcontrol_fixture/metric_0000/config"
+        );
+    }
+
+    #[test]
+    fn mqtt_subdivides_oversized_metric_buckets_and_updates_discovery_topics() {
+        let mut keys = BTreeMap::<u8, String>::new();
+        let (first, second) = (0..10000)
+            .find_map(|index| {
+                let key = format!("metric_{index}");
+                let digest = Sha256::digest(key.as_bytes());
+                if let Some(first) = keys.get(&digest[0]) {
+                    if Sha256::digest(first.as_bytes())[1] >> 4 != digest[1] >> 4 {
+                        return Some((first.clone(), key));
+                    }
+                } else {
+                    keys.insert(digest[0], key);
+                }
+                None
+            })
+            .unwrap();
+        let (mut discovery, mut state) = telemetry_fixture(0);
+        for key in [&first, &second] {
+            discovery["components"][key] = json!({"platform":"sensor","unique_id":key});
+            state["metrics"][key] = json!("x".repeat(600_000));
+        }
+        let split = telemetry_publications("fixture", &discovery, &state).unwrap();
+        let mut topics = BTreeSet::new();
+        for key in [&first, &second] {
+            let component: Value = serde_json::from_slice(&split.discovery[key]).unwrap();
+            let topic = component["state_topic"].as_str().unwrap();
+            assert_eq!(topic.rsplit('/').next().unwrap().len(), 3);
+            let (_, payload, _) = split
+                .state
+                .iter()
+                .find(|(name, _, _)| name == topic)
+                .unwrap();
+            assert!(payload.len() <= MAX_PAYLOAD_BYTES);
+            assert_eq!(
+                serde_json::from_slice::<Value>(payload).unwrap()["metrics"][key],
+                state["metrics"][key]
+            );
+            topics.insert(topic.to_owned());
+        }
+        assert_eq!(topics.len(), 2);
+        state["metrics"][&first] = json!(1);
+        state["metrics"][&second] = json!(2);
+        let joined = telemetry_publications("fixture", &discovery, &state).unwrap();
+        let changed = discovery_updates(
+            "fixture",
+            &split.discovery.keys().cloned().collect(),
+            &BTreeSet::new(),
+            &split.discovery,
+            &joined.discovery,
+            false,
+        );
+        assert_eq!(changed.len(), 2);
+        for (_, bytes, retain) in changed {
+            assert!(retain);
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                value["state_topic"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn mqtt_discovery_cleanup_is_bounded_retained_and_safe_to_repeat_after_restart() {
+        let previous = BTreeMap::from([
+            ("removed".into(), b"old".to_vec()),
+            ("kept".into(), b"same".to_vec()),
+            ("unavailable".into(), b"unknown".to_vec()),
+        ]);
+        let current = BTreeMap::from([("kept".into(), b"same".to_vec())]);
+        let before: BTreeSet<_> = previous.keys().cloned().collect();
+        let retained = BTreeSet::from(["unavailable".into()]);
+        let updates = discovery_updates("fixture", &before, &retained, &previous, &current, false);
+        assert_eq!(
+            updates,
+            vec![(
+                sensor_discovery_topic("fixture", "removed"),
+                Vec::new(),
+                true
+            )]
+        );
+        let restarted = discovery_updates(
+            "fixture",
+            &before,
+            &retained,
+            &BTreeMap::new(),
+            &current,
+            true,
+        );
+        assert_eq!(restarted.len(), 2);
+        assert_eq!(restarted[0], updates[0]);
+        assert_eq!(
+            restarted[1],
+            (
+                sensor_discovery_topic("fixture", "kept"),
+                b"same".to_vec(),
+                true
             )
-            .is_err()
+        );
+        let all: BTreeSet<_> = (0..MAX_ENTITIES)
+            .map(|index| format!("metric_{index}"))
+            .collect();
+        let removals = discovery_updates(
+            "fixture",
+            &all,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+        );
+        assert_eq!(removals.len(), MAX_ENTITIES);
+        assert!(
+            removals
+                .iter()
+                .all(|(_, payload, retain)| payload.is_empty() && *retain)
         );
     }
 
@@ -2156,7 +2594,8 @@ mod tests {
                             .write(&mut output)?;
                         }
                         Packet::Publish(publication) => {
-                            let state = publication.topic.ends_with("/state");
+                            let state = publication.topic.ends_with("/availability")
+                                && publication.payload == "online";
                             messages
                                 .send((
                                     connection,
@@ -2256,10 +2695,11 @@ mod tests {
                 let (messages, mut receive) = tokio::sync::mpsc::channel(64);
                 let broker = tokio::spawn(broker_fixture(listener, messages));
                 let mut connections = Vec::new();
-                let mut host_discovered = false;
+                let mut host_discovered = BTreeSet::new();
+                let mut sample = json!({"metrics":{}});
                 let mut health_interval = tokio::time::interval(Duration::from_secs(5));
                 tokio::time::timeout(Duration::from_secs(65), async {
-                    while connections.len() < 4 {
+                    while connections.len() < 3 {
                         let (connection, topic, payload) = tokio::select! {
                             message = receive.recv() => message.context("MQTT broker fixture stopped")?,
                             _ = health_interval.tick() => {
@@ -2269,24 +2709,38 @@ mod tests {
                         };
                         if topic.ends_with("/config") {
                             let value: Value = serde_json::from_slice(&payload)?;
-                            let components = &value["components"];
-                            host_discovered |= components.get("memory_used_bytes").is_some() && components.get("load_1m").is_some();
+                            ensure!(value["state_topic"].as_str().is_some_and(|topic| topic.contains("/state/metrics/")), "sensor state shard missing");
+                            let key = topic.rsplit('/').nth(1).context("sensor discovery key missing")?;
+                            if matches!(key, "memory_used_bytes" | "load_1m") {
+                                host_discovered.insert(key.to_owned());
+                            }
                         }
-                        if topic.ends_with("/state") {
+                        if topic.contains("/state/") {
                             let value: Value = serde_json::from_slice(&payload)?;
-                            ensure!(value["metrics"]["revision"] == serde_json::json!(test_revision(1)), "unconfirmed or wrong revision published");
-                            ensure!(value["process_health"]["status"] == "unhealthy" && value["active_alerts"][0]["retrying"] == true, "health/alerts were not published");
-                            ensure!(value["metrics"].get("memory_used_bytes").is_some_and(Value::is_null), "host sensor missing or fabricated by the simulator");
-                            ensure!(value["metrics"][metric_key("software", "release", "check_state")] == "disabled", "release summary missing from broker payload");
-                            ensure!(value["metrics"].get(metric_key("firewall", "accounting", "dropped_packets")).is_some_and(Value::is_null), "unmeasured firewall drops missing or fabricated");
-                            connections.push(connection);
+                            if let Some(metrics) = value["metrics"].as_object() {
+                                sample["metrics"].as_object_mut().unwrap().extend(metrics.clone());
+                            } else {
+                                let field = topic.rsplit('/').next().context("state section missing")?;
+                                sample[field] = value[field].clone();
+                            }
+                        }
+                        if topic.ends_with("/availability") && payload == b"online" {
+                            ensure!(sample["metrics"]["revision"] == serde_json::json!(test_revision(1)), "unconfirmed or wrong revision published");
+                            ensure!(sample["process_health"]["status"] == "unhealthy" && sample["active_alerts"][0]["retrying"] == true, "health/alerts were not published");
+                            ensure!(sample["metrics"].get("memory_used_bytes").is_some_and(Value::is_null), "host sensor missing or fabricated by the simulator");
+                            ensure!(sample["metrics"][metric_key("software", "release", "check_state")] == "disabled", "release summary missing from broker payload");
+                            ensure!(sample["metrics"].get(metric_key("firewall", "accounting", "dropped_packets")).is_some_and(Value::is_null), "unmeasured firewall drops missing or fabricated");
+                            if connection != 2 {
+                                connections.push(connection);
+                            }
+                            sample = json!({"metrics":{}});
                             manager.health.observe(Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})), &[], false);
                         }
                     }
                     Ok::<(), anyhow::Error>(())
                 }).await.with_context(|| format!("MQTT sample sequence incomplete: status={}, connections={connections:?}, broker_finished={}", manager.status().unwrap(), broker.is_finished()))??;
-                ensure!(host_discovered, "host sensors missing from discovery");
-                ensure!(connections == [1, 1, 2, 3], "MQTT connection was not persistent or failed to reconnect after disconnect/acknowledgement timeout");
+                ensure!(host_discovered.len() == 2, "host sensors missing from discovery");
+                ensure!(connections == [1, 1, 3], "MQTT connection was not persistent or failed to reconnect after disconnect/acknowledgement timeout");
                 let diagnostics = manager.status()?;
                 ensure!(diagnostics["connection_attempts"] == 3 && diagnostics["reconnect_count"] == 2, "MQTT reconnect diagnostics did not track actual sessions: {diagnostics}");
                 ensure!(diagnostics["last_failure"]["category"] == "publication_ack_timeout", "MQTT acknowledgment timeout reason was lost after reconnect: {diagnostics}");

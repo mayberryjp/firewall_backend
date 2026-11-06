@@ -382,7 +382,109 @@ fn exchange(
 }
 
 pub(super) fn send_batch(request: &[u8], last_sequence: u32) -> Result<()> {
-    exchange_request(request, 10, true, Some(last_sequence))?;
+    let mut request = request.to_vec();
+    prepare_batch(&mut request, last_sequence)?;
+    exchange_request(&request, 10, true, Some(last_sequence))?;
+    Ok(())
+}
+
+fn prepare_batch(request: &mut [u8], last_sequence: u32) -> Result<()> {
+    let end_sequence = last_sequence
+        .checked_add(1)
+        .filter(|_| last_sequence > 0)
+        .context("invalid nftables batch sequence")?;
+    let mut frames = request;
+    let mut expected = 0u64;
+    while !frames.is_empty() {
+        ensure!(frames.len() >= 20, "short nftables batch frame");
+        let length = u32::from_ne_bytes(frames[..4].try_into()?) as usize;
+        let aligned = (length + 3) & !3;
+        ensure!(
+            length >= 20 && aligned <= frames.len(),
+            "invalid nftables batch frame"
+        );
+        let sequence = u32::from_ne_bytes(frames[8..12].try_into()?);
+        let kind = u16::from_ne_bytes(frames[4..6].try_into()?);
+        ensure!(
+            u64::from(sequence) == expected
+                && sequence <= end_sequence
+                && if sequence == 0 {
+                    kind == libc::NFNL_MSG_BATCH_BEGIN as u16
+                } else if sequence == end_sequence {
+                    kind == libc::NFNL_MSG_BATCH_END as u16
+                } else {
+                    kind >> 8 == 10
+                },
+            "invalid nftables batch ordering"
+        );
+        // Errors are returned even without NLM_F_ACK. One final success ACK
+        // avoids overflowing the receive queue before an atomic batch completes.
+        let mut flags = u16::from_ne_bytes(frames[6..8].try_into()?) & !4;
+        if sequence == last_sequence {
+            flags |= 4;
+        }
+        frames[6..8].copy_from_slice(&flags.to_ne_bytes());
+        expected += 1;
+        frames = &mut frames[aligned..];
+    }
+    ensure!(
+        expected == u64::from(end_sequence) + 1,
+        "incomplete nftables batch"
+    );
+    Ok(())
+}
+
+fn reserve_batch_send_buffer(fd: &OwnedFd, length: usize) -> Result<()> {
+    // Netlink requires the entire transaction in one datagram and leaves
+    // 32 bytes of socket-buffer headroom. Never split the atomic transaction.
+    let required = length
+        .checked_add(32)
+        .and_then(|length| libc::c_int::try_from(length).ok())
+        .context("nftables transaction exceeds socket buffer size range")?;
+    let set = |option| -> Result<()> {
+        ensure!(
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    &required as *const _ as *const _,
+                    std::mem::size_of_val(&required) as u32,
+                )
+            } == 0,
+            "reserve {length}-byte atomic nftables send buffer: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    };
+    let capacity = || -> Result<libc::c_int> {
+        let mut capacity: libc::c_int = 0;
+        let mut size = std::mem::size_of_val(&capacity) as libc::socklen_t;
+        ensure!(
+            unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &mut capacity as *mut _ as *mut _,
+                    &mut size,
+                )
+            } == 0,
+            "read nftables send buffer capacity: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(capacity)
+    };
+    set(libc::SO_SNDBUF)?;
+    if capacity()? < required {
+        // SO_SNDBUF is silently clamped by wmem_max. NET_ADMIN is already
+        // required for firewall mutation; FORCE changes only this socket.
+        set(libc::SO_SNDBUFFORCE)?;
+    }
+    ensure!(
+        capacity()? >= required,
+        "kernel send buffer cannot hold {length}-byte atomic nftables transaction"
+    );
     Ok(())
 }
 
@@ -435,8 +537,8 @@ fn exchange_request(
         std::io::Error::last_os_error()
     );
     if batch_sequence.is_some() {
-        // A whole atomic batch is processed before its ACKs can be drained.
-        // Reserve bounded queue space for per-rule ACK socket-buffer overhead.
+        reserve_batch_send_buffer(&fd, request.len())?;
+        // Leave room for error responses; successful batches need only one ACK.
         let capacity: libc::c_int = 4 * 1024 * 1024;
         ensure!(
             unsafe {
@@ -479,7 +581,9 @@ fn exchange_request(
                 std::mem::size_of_val(&address) as u32,
             )
         } == request.len() as isize,
-        "send netfilter dump"
+        "send {}-byte netfilter request: {}",
+        request.len(),
+        std::io::Error::last_os_error()
     );
     let mut result = Vec::new();
     let mut total = 0usize;
@@ -604,6 +708,84 @@ fn exchange_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_batch_requests_only_the_final_success_ack() -> Result<()> {
+        let table = rustables::Table::new(rustables::ProtocolFamily::Inet).with_name("netcontrol");
+        let mut batch = rustables::Batch::new();
+        batch.add(&table, rustables::MsgType::Add);
+        batch.add(&table, rustables::MsgType::Del);
+        batch.add(&table, rustables::MsgType::Add);
+        let original = batch.finalize();
+        let mut request = original.clone();
+        prepare_batch(&mut request, 3)?;
+        let mut offset = 0;
+        for sequence in 0..=4 {
+            let length = u32::from_ne_bytes(request[offset..offset + 4].try_into()?) as usize;
+            let mut expected = original[offset..offset + length].to_vec();
+            let flags = u16::from_ne_bytes(expected[6..8].try_into()?);
+            let flags = (flags & !4) | if sequence == 3 { 4 } else { 0 };
+            expected[6..8].copy_from_slice(&flags.to_ne_bytes());
+            assert_eq!(request[offset..offset + length], expected);
+            offset += (length + 3) & !3;
+        }
+        assert_eq!(offset, request.len());
+        for length in [0, 19, original.len() - 1, original.len() - 20] {
+            assert!(prepare_batch(&mut original[..length].to_vec(), 3).is_err());
+        }
+        for last in [0, 2, 4, u32::MAX] {
+            assert!(prepare_batch(&mut original.clone(), last).is_err());
+        }
+        for (offset, value) in [(0, 19u32), (8, 1u32), (28, 0u32)] {
+            let mut invalid = original.clone();
+            invalid[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+            assert!(prepare_batch(&mut invalid, 3).is_err());
+        }
+        let mut invalid = original;
+        invalid[4..6].copy_from_slice(&0x0a00u16.to_ne_bytes());
+        assert!(prepare_batch(&mut invalid, 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires NETCONTROL_INTEGRATION=1 and CAP_NET_ADMIN"]
+    fn atomic_batch_send_buffer_exceeds_the_normal_socket_limit() -> Result<()> {
+        ensure!(
+            std::env::var("NETCONTROL_INTEGRATION").as_deref() == Ok("1"),
+            "set NETCONTROL_INTEGRATION=1 for privileged native integration tests"
+        );
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_NETFILTER,
+            )
+        };
+        ensure!(raw >= 0, "open test netfilter socket");
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let maximum: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_max")?
+            .trim()
+            .parse()?;
+        let length = maximum.checked_mul(2).context("socket limit overflow")? + 4096;
+        reserve_batch_send_buffer(&fd, length)?;
+        let mut capacity: libc::c_int = 0;
+        let mut size = std::mem::size_of_val(&capacity) as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &mut capacity as *mut _ as *mut _,
+                    &mut size,
+                )
+            },
+            0
+        );
+        assert!(capacity as usize >= length + 32);
+        assert!(reserve_batch_send_buffer(&fd, usize::MAX).is_err());
+        Ok(())
+    }
 
     fn set_payload(fields: &[(u16, Vec<u8>)]) -> Vec<u8> {
         let mut bytes = vec![1, 0, 0, 0];

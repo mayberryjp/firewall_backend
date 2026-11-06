@@ -2928,13 +2928,49 @@ Publisher and deployment contract:
   `mqtts` requires system trust and valid
   certificate/hostname; no insecure bypass. Explicit `mqtt` is plaintext. Upload
   passwords over protected HTTPS or a trusted management channel.
-- Device discovery at `homeassistant/device/netcontrol_<device_id>/config`;
-  samples at `netcontrol/<device_id>/state`; availability at
+- Per-sensor discovery at
+  `homeassistant/sensor/netcontrol_<device_id>/<component_id>/config`;
+  metric samples at `netcontrol/<device_id>/state/metrics/<hash-prefix>`;
+  structured samples at `netcontrol/<device_id>/state/<section>`; availability at
   `netcontrol/<device_id>/availability`. QoS 1; discovery/availability retained,
   samples nonretained. Broker ACLs must allow these publications and subscription
   to `homeassistant/status`. Birth `online` refreshes discovery/sample within
   five seconds when idle. LWT is retained `offline`; graceful stop/disable attempts
   offline/disconnect within three seconds. Broken sockets rely on broker LWT.
+- Each sensor discovery is a complete standard MQTT sensor configuration, with
+  the existing stable `unique_id`, templates, units/classes/expiry and shared
+  device/origin/availability metadata. It declares its exact `state_topic`.
+  There is no `components` envelope in these per-sensor messages. Only changed
+  discovery is sent between samples; reconnect and Home Assistant birth resend
+  all currently enumerable sensors. Removed sensors get an empty retained
+  payload on their discovery topic. Failed enumerations retain prior discovery
+  rather than deleting entities; absent measurements remain unknown/expire.
+- Metrics are assigned by the lowercase SHA-256 hex digest of the component ID,
+  initially using its first two hex characters. Oversized groups recursively
+  extend that prefix one character until each payload fits. The state topic can
+  therefore change when a bucket splits/joins; discovery is updated before the
+  affected sample. Consumers must follow discovery, not hardcode a hash prefix.
+  Metric messages have `{"collected_at_unix":1793942400,"metrics":{"uptime":60}}`
+  shape, with only the assigned subset of metrics. The timestamp here is synthetic.
+- Structured state sections are `bgp`, `link_diagnostics`, `process_health`,
+  `active_alerts`, `statistics_available` and `telemetry_sources`. Each has
+  `{"collected_at_unix":1793942400,"<section>":<original value>}` shape, preserving
+  the section's types/nullability/content. No aggregate `/state` message is sent.
+  All messages from one sample share its collection timestamp. Assemble sections
+  and metrics by timestamp; delivery is QoS 1, non-atomic and may duplicate.
+  Do not treat an individual shard as a full snapshot or delete metrics absent
+  from that shard. Availability `online` is queued after all state messages.
+  `last_published_at_unix` advances only after the whole batch is acknowledged.
+- **Breaking deployment requirement:** update broker ACLs for
+  `homeassistant/sensor/netcontrol_<device_id>/+/config` and
+  `netcontrol/<device_id>/state/#`, preserving availability and birth access.
+  Broker administrators must clear the former retained
+  `homeassistant/device/netcontrol_<device_id>/config` with an empty retained
+  publication before enabling the new publisher. No dual old/new topics,
+  automatic broker-state conversion or schema migration. Keep the private store,
+  device ID and secret references. Home Assistant rediscovery and entity-registry
+  continuity must be verified; unique IDs alone do not prove customization
+  preservation across discovery methods.
 - Stable name-hashed sensor IDs and durable component-removal manifest.
   Component IDs preserve case and contain 1..128 ASCII letters/digits/underscores;
   reads and writes apply the same validation, with at most 8192 manifest entries
@@ -3011,7 +3047,7 @@ Publisher and deployment contract:
   are kept (unknown, expiring). Names are `<name> flow dropped packets` etc. Cap:
   64 instances. `running` is local worker health, not collector delivery; see
   [docs/NETFLOW_IPFIX_SPEC.md](docs/NETFLOW_IPFIX_SPEC.md) section 5.
-- Additional bounded monitoring families use the same discovery/state topics,
+- Additional bounded monitoring families use these discovery/state topic families,
   QoS, expiry and credentials. IDs are `<kind>_<sha256(identity)>_<field>`:
   - **Kernel protocols** (`protocol`, identity `<source>/<group>`): all numeric
     SNMP/netstat/SNMP6 counters, including IPv4/IPv6, TCP/TCP extensions, UDP and
@@ -3091,8 +3127,8 @@ Publisher and deployment contract:
     256 appliance-service rows, 256 DHCP relay/client identities, 128 BGP
     neighbors, 128 traffic-history interfaces and 128 WireGuard peers total.
     Existing host/NetFlow caps and the overall payload/entity limits also apply.
-- MQTT state payloads additionally carry the exact shared `process_health` object
-  and `active_alerts` array. Home Assistant sensor metrics/discovery add
+- MQTT section payloads carry the exact shared `process_health` object
+  and `active_alerts` array on their respective topics. Home Assistant sensor metrics/discovery add
   `process_health` (`healthy|unhealthy|unknown`) and numeric `active_alert_count`.
   Alerts do not change MQTT transport availability: a connected publisher can
   publish unhealthy or unknown platform state. Broker disconnection still uses
@@ -3114,9 +3150,13 @@ Publisher and deployment contract:
 - Samples expire after three publication intervals. Active configuration/maintenance
   and unrecoverable collection failures pause samples with offline availability;
   the next successful sample restores availability. No offline backlog or command topics. Limits:
-  4096 entities and 1 MiB per discovery/state payload; excess fails collection.
-  Limits include health/source additions and merged retained discovery; oversized
-  removal payloads are rejected before publishing/updating the durable manifest.
+  4096 entities and 1 MiB per published discovery/state payload. Aggregate samples
+  may exceed 1 MiB and are split without dropping entities/values. Entity limits
+  include health/source additions and merged retained discovery. If one sensor
+  configuration, one metric value/envelope or one structured section cannot fit,
+  collection fails explicitly with payload class, serialized byte count and limit,
+  not payload contents; no partial sample is enqueued. Retained discovery removals
+  are individual empty messages, never an oversized aggregate removal payload.
   Raw connections, deny records, route tables, Sando inventory, secrets and vnStat
   history records are not added. No MQTT controls or automatic upgrades/sync
   triggers are introduced.
@@ -4099,6 +4139,13 @@ appropriate. Import-only metadata is excluded from native operational
 configuration, so it does not restart workers or itself change firewall rules.
 The standard full-package safety checks remain. SSH generic `set`/`load candidate`
 and show/commit workflows carry the same typed settings and permissions.
+
+Large valid imported rulesets use the same atomic native firewall transaction,
+with a per-socket send buffer sized for the complete update. They are not split
+into partially applied imports. No import schema, validation limit, permission,
+HTTP status or confirmation behavior changes. Resource/kernel failures still
+surface as ordinary backend apply errors; a reported restoration of the previous
+configuration is not a successful import and must not advance the saved report.
 
 #### Rule-source labels and Sando replacement
 

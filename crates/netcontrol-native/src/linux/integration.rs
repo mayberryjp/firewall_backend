@@ -3585,6 +3585,95 @@ fn native_preserves_unmanaged_links_and_adopted_parent() -> Result<()> {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_large_import_is_atomic_across_apply_restart_and_rollback() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let options = fixture.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let mut desired = empty.clone();
+    desired.firewall.rules = serde_json::from_value(Value::Array(
+        (0..4096)
+            .map(|index| {
+                json!({
+                    "source": format!("198.18.{}.{}/32", index / 256, index % 256),
+                    "action": "accept",
+                    "origin": "import",
+                    "import_source": "sando"
+                })
+            })
+            .collect(),
+    ))?;
+    desired.validate()?;
+    native.apply(&empty, &desired)?;
+    native.observe(&desired)?;
+    let path = "/api/v1/statistics/firewall";
+    let counters = native.statistics(&desired, path, "")?;
+    assert_eq!(
+        firewall_counter(&counters, "forward:/firewall/rules/4095")?["expanded_rules"],
+        1
+    );
+    let fingerprint = session(native.namespace.clone(), |_, _| netfilter::fingerprint())?;
+    let ownership = fs::read(native.state.join("ownership.json"))?;
+    session(native.namespace.clone(), move |_, _| {
+        use rustables::{Batch, Chain, MsgType, ProtocolFamily, Rule, Table};
+        let table = Table::new(ProtocolFamily::Inet).with_name("netcontrol");
+        let mut batch = Batch::new();
+        batch.add(&table, MsgType::Add);
+        batch.add(&table, MsgType::Del);
+        batch.add(&table, MsgType::Add);
+        let chain = Chain::new(&table)
+            .with_name("forward")
+            .add_to_batch(&mut batch);
+        let missing = Chain::new(&table).with_name("missing");
+        for index in 0..4096 {
+            let target = if index == 2048 { &missing } else { &chain };
+            Rule::new(target)?
+                .with_userdata(vec![b'x'; 200])
+                .accept()
+                .add_to_batch(&mut batch);
+        }
+        let bytes = batch.finalize();
+        let default: usize = fs::read_to_string("/proc/sys/net/core/wmem_default")?
+            .trim()
+            .parse()?;
+        ensure!(
+            bytes.len() > default,
+            "regression batch must exceed the default send buffer"
+        );
+        let error = netfilter::send_batch(&bytes, 4100).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(netfilter::fingerprint()?, fingerprint);
+        Ok(())
+    })?;
+    assert_eq!(fs::read(native.state.join("ownership.json"))?, ownership);
+    native.observe(&desired)?;
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.observe_for_repair(&desired)?;
+    assert_eq!(
+        native.statistics(&desired, path, "")?["generation"],
+        counters["generation"]
+    );
+    native.repair(&desired)?;
+    native.observe(&desired)?;
+    assert_ne!(
+        native.statistics(&desired, path, "")?["generation"],
+        counters["generation"]
+    );
+    native.apply(&desired, &empty)?;
+    native.observe(&empty)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
 fn native_firewall_external_mutation_is_detected() -> Result<()> {
     let fixture = Fixture::new()?;
     let mut native = Native::open(fixture.options())?;

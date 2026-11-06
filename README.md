@@ -613,9 +613,26 @@ Prefer `mqtts://` (port 8883), with a system-trusted certificate and matching
 hostname. Explicit `mqtt://` (1883) sends credentials/data without TLS. Endpoint
 URLs must not contain credentials, paths other than `/`, query or fragment.
 Broker ACLs must allow retained discovery publication at
-`homeassistant/device/netcontrol_<device_id>/config`, publication under
-`netcontrol/<device_id>/`, and subscription to `homeassistant/status`. Discovery
+`homeassistant/sensor/netcontrol_<device_id>/+/config`, publication under
+`netcontrol/<device_id>/#`, and subscription to `homeassistant/status`. Discovery
 and availability are retained; samples are not. QoS 1 can duplicate messages.
+
+Discovery is one bounded retained message per sensor. Metrics use bounded
+`netcontrol/<device_id>/state/metrics/<hash-prefix>` shards; each sensor's
+discovery declares its exact state topic. Structured sections (health, alerts,
+BGP, link diagnostics and source status) use separate
+`netcontrol/<device_id>/state/<section>` topics. All sample messages include
+the same `collected_at_unix`; consumers must assemble them, not expect one
+complete snapshot at `/state`. Every payload remains at most 1 MiB.
+
+This replaces the monolithic MQTT topic contract. Before enabling the new
+publisher against an existing discovery installation, the broker administrator
+must remove the retained `homeassistant/device/netcontrol_<device_id>/config`
+message (publish an empty retained payload) and update ACLs/subscriptions.
+No old/new dual publication or automatic retained-topic conversion is provided.
+Device identity, entity unique IDs, saved configuration and secrets are retained.
+Home Assistant entity-registry/customization continuity requires deployment
+acceptance; it is not guaranteed by preserving unique IDs alone.
 
 Back up `<state>.mqtt` together with the journal (default
 `/var/lib/netcontrol/native-state.json.mqtt`). Its daemon-owned private files hold

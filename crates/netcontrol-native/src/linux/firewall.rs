@@ -178,7 +178,7 @@ pub fn remove_owned(expected: &str) -> Result<()> {
     let table = Table::new(ProtocolFamily::Inet).with_name(TABLE);
     let mut batch = Batch::new();
     batch.add(&table, MsgType::Del);
-    batch.send()?;
+    super::netfilter::send_batch(&batch.finalize(), 1)?;
     crate::ensure_unchanged(
         super::netfilter::fingerprint()? == super::netfilter::empty_fingerprint(),
         "firewall bootstrap rollback did not remove owned table",
@@ -325,10 +325,6 @@ pub fn apply(value: &Value) -> Result<()> {
                 .add_to_batch(&mut batch);
         }
     }
-    if rewrites.is_empty() {
-        batch.send()?;
-    } else {
-        super::destination_rewrite::send(batch, &rewrites, generation)?;
-    }
+    super::destination_rewrite::send(batch, &rewrites, generation)?;
     Ok(())
 }
