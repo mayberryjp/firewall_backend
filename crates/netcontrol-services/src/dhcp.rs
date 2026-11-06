@@ -91,9 +91,10 @@ pub(crate) fn request(packet: &[u8], relay: Ipv4Addr) -> Result<Vec<u8>> {
     Ok(wire)
 }
 pub(crate) fn response(packet: &[u8], relay: Ipv4Addr) -> Result<(Ipv4Addr, bool)> {
+    // Hops limits apply to forwarded requests, not BOOTREPLY (RFC 2131 table 3).
     ensure!(
-        valid(packet) && packet[0] == 2 && packet[3] == 1 && ip(packet, 24) == relay,
-        "invalid relay reply op/hops/giaddr"
+        valid(packet) && packet[0] == 2 && ip(packet, 24) == relay,
+        "invalid relay reply op/giaddr"
     );
     let kind = message_type(packet);
     ensure!(
@@ -472,6 +473,48 @@ mod tests {
             "192.0.2.5".parse::<Ipv4Addr>().unwrap()
         );
         assert!(response(&p, "192.0.2.2".parse().unwrap()).is_err());
+    }
+    #[test]
+    fn server_replies_do_not_require_request_hops_to_be_echoed() {
+        let relay = "10.4.20.1".parse().unwrap();
+        let mut discover = packet();
+        discover[4..8].copy_from_slice(&0x031f90b5u32.to_be_bytes());
+        discover[10] = 0x80;
+        discover[28..34].copy_from_slice(&[0x02, 0x00, 0x0a, 0x04, 0x14, 0x2e]);
+        let forwarded = request(&discover, relay).unwrap();
+        assert_eq!(forwarded[3], 1);
+        for kind in [2, 5, 6] {
+            for hops in [0, 1, 16, 255] {
+                let mut reply = forwarded.clone();
+                reply[0] = 2;
+                reply[3] = hops;
+                reply[242] = kind;
+                if kind != 6 {
+                    reply[16..20].copy_from_slice(&[10, 4, 20, 46]);
+                }
+                assert_eq!(key(&reply), key(&discover));
+                assert_eq!(
+                    response(&reply, relay).unwrap(),
+                    (Ipv4Addr::BROADCAST, true),
+                    "message type {kind}, hops {hops}"
+                );
+                reply[10] = 0;
+                if kind != 6 {
+                    assert_eq!(
+                        response(&reply, relay).unwrap(),
+                        ("10.4.20.46".parse().unwrap(), false)
+                    );
+                }
+                reply[24..28].copy_from_slice(&[10, 4, 50, 1]);
+                assert!(response(&reply, relay).is_err());
+                reply[24..28].copy_from_slice(&relay.octets());
+                reply[0] = 1;
+                assert!(response(&reply, relay).is_err());
+            }
+        }
+        let mut chained = discover;
+        chained[3] = 1;
+        assert!(request(&chained, relay).is_err());
     }
     #[test]
     fn layer2_unicast_ip_udp_checksum_and_subnet() {

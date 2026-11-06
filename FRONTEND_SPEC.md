@@ -4818,6 +4818,11 @@ is the relay address (`giaddr`). Show it in the editor/review when more than one
 IPv4 address is present; do not infer a different subnet. Enabled interfaces must
 use distinct relay addresses. IPv6 DHCP is not implemented.
 
+Server Offers, ACKs and NAKs with zero BOOTP hops are valid (RFC 2131 table 3).
+Relay reply processing does not require the server to echo request hops.
+Transaction/client identity, configured upstream, relay-address and on-link
+checks remain required; downstream relay chaining remains unsupported.
+
 Linux uses an in-process Rust DHCPv4 relay, not a DNS or DHCP address server.
 Simulator status is `simulated`, never actual packet forwarding. Unsupported
 configurations must fail explicitly during preflight. Operators supply capabilities,

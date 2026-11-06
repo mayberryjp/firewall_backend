@@ -28,6 +28,14 @@
 
 ### Fixed
 
+- DHCPv4 relay accepts server Offers, ACKs and NAKs with zero BOOTP hops instead
+  of requiring the forwarded request's hop count to be echoed. Reply hops are
+  not a routing/authentication check; retain transaction/client, trusted-server,
+  relay-address and on-link checks, and reject downstream relay chaining.
+  Release impact: protocol fix, Unreleased; next automatic calendar version.
+  Optional troubleshooting update:
+  [handoff 2026-11-06-05](docs/frontend-handoffs/2026-11-06.md#2026-11-06-05-dhcp-relay-server-reply-hops).
+
 - Restore committed DHCP runtime before verifying a pending VLAN adoption on
   daemon startup. A valid saved WAN lease no longer appears as an unexpected
   static address merely because in-memory lease state starts empty. Preserve

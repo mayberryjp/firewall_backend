@@ -137,7 +137,7 @@ drift and durable transaction recovery safeguards remain enforced.
 * **DHCPv4:** one exclusive UDP/67 socket with receive/send `IP_PKTINFO`,
   supported on explicitly managed up Ethernet, dummy or VLAN interfaces;
   per-interface giaddr, up to 64 upstreams per interface, no downstream relay chaining,
-  Ethernet/DHCP header/options/hops validation, transaction ID plus client-MAC
+  Ethernet/DHCP header/options and request-hops validation, transaction ID plus client-MAC
   correlation, trusted upstream/source-port checks, and bounded transaction
   tracking (65,536 entries; 120 seconds). Configured client addresses must be
   on-link unicast, not subnet broadcast/network/relay addresses. Broadcast and
@@ -145,6 +145,9 @@ drift and durable transaction recovery safeguards remain enforced.
   AF_PACKET with the client's Ethernet address and valid IPv4/UDP checksums.
   Requests require UDP/68, replies UDP/67. Requires privileged bind and raw
   packet permission. DHCPv6, chained relays, and option-82 insertion are absent.
+  Server reply hops are ignored: RFC 2131 table 3 specifies zero for Offers,
+  ACKs and NAKs, not an echo of the relay's incremented request hop count.
+  Reply identity, upstream and giaddr checks still apply.
 * **NTP:** host UDP poll client, one resolved endpoint per configured server,
   sixty-four-second polling and three-second response deadlines. Validates
   server mode, v3/v4, leap, stratum, originate/receive/transmit timestamps,
