@@ -464,6 +464,12 @@ they do not require a networkd D-Bus service merely to reopen native ownership.
 Links with runtime state must pass the existing D-Bus relinquishment check.
 Initial capture restrictions and supported manager requirements are unchanged.
 
+Pending VLAN adoption restores the committed DHCP clients and their valid saved
+leases before baseline verification. A fresh daemon's empty in-memory lease map
+must not make an already-leased WAN address look like drift. This uses the
+existing durable lease/intent recovery and does not import arbitrary live
+addresses or relax configuration verification.
+
 Ordinary startup reads the core journal without initial inheritance. If an
 already-owned host interface differs from the saved desired configuration,
 startup reconciles it to that saved configuration after identity and ownership

@@ -192,6 +192,12 @@ finishes the ownership baseline: rerun `--configure-lan` afterward to perform
 the provisional LAN move, then verify and confirm it normally. Do not edit the
 journal or remove the VLAN to clear pending recovery.
 
+Recovery initializes committed DHCP clients and valid saved leases before
+checking the existing configuration. A WAN address-drift startup failure with
+a valid saved lease can therefore require a backend update, not removal of the
+WAN address. If startup fails before the local control socket is created, LAN
+commands cannot connect; inspect the daemon's startup error first.
+
 ## Candidate, apply, and confirmation
 
 BGP uses `bgp JSON` / `no bgp` to replace/reset the private candidate's BGP

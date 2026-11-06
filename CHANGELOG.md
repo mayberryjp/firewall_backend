@@ -28,6 +28,14 @@
 
 ### Fixed
 
+- Restore committed DHCP runtime before verifying a pending VLAN adoption on
+  daemon startup. A valid saved WAN lease no longer appears as an unexpected
+  static address merely because in-memory lease state starts empty. Preserve
+  strict address/route checks and durable adoption recovery.
+  Release impact: runtime fix, Unreleased; next automatic calendar version.
+  Optional operator-help update:
+  [handoff 2026-11-06-04](docs/frontend-handoffs/2026-11-06.md#dhcp-backed-startup-recovery-correction).
+
 - Physical-interface inheritance and explicit VLAN ownership recovery now share
   active takeover: relinquish networkd management and reapply captured settings
   instead of requiring mutable live settings

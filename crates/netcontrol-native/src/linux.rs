@@ -1288,6 +1288,9 @@ impl Backend for Native {
                 "VLAN adoption ownership changed"
             );
         }
+        self.dhcp
+            .configure(&before_value)
+            .context("restore committed DHCP runtime before VLAN adoption verification")?;
         self.verify(&before_value)?;
         let result = (|| -> Result<()> {
             // An interrupted rollback can release networkd before restoring ownership.json.

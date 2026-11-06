@@ -4465,6 +4465,11 @@ including those without an initial-inheritance receipt, then reconciles saved
 desired configuration rather than restoring bootstrap addressing. This does
 not add an endpoint, discover/claim unrelated links or remove initial capture
 restrictions.
+Before verifying this baseline, restart recovery initializes committed DHCP
+clients and restores valid durable leases, including pending lease intents.
+An empty in-memory lease map must not classify a valid leased WAN address as
+an unexpected static address. This changes neither the saved configuration nor
+address/route validation; arbitrary live addresses are not imported.
 External changes to those mutable settings during handover are overwritten on
 the selected VLAN, not treated as a requirement for manual reconciliation.
 Verification compares address configuration rather than raw kernel creation/

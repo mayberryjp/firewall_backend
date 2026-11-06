@@ -333,23 +333,27 @@ fn foreign_routes(namespace: Arc<File>) -> Result<usize> {
     })
 }
 
-#[test]
-#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
-fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Result<()> {
+fn isolate_host_fixture(test_name: &str) -> Result<bool> {
     ensure!(
         std::env::var("NETCONTROL_INTEGRATION").as_deref() == Ok("1"),
         "set NETCONTROL_INTEGRATION=1; privileged tests never mutate the invoking namespace"
     );
-    if std::env::var("NETCONTROL_HOST_FIXTURE_CHILD").as_deref() != Ok("1") {
+    if std::env::var("NETCONTROL_HOST_FIXTURE_CHILD").as_deref() != Ok(test_name) {
         let status = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "linux::host_integration::native_current_namespace_ethernet_apply_rollback_recovery_and_reboot",
-                "--ignored", "--nocapture", "--test-threads=1"])
-            .env("NETCONTROL_HOST_FIXTURE_CHILD", "1").status()?;
+            .args([
+                "--exact",
+                test_name,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("NETCONTROL_HOST_FIXTURE_CHILD", test_name)
+            .status()?;
         ensure!(
             status.success(),
             "isolated host-mode child fixture failed: {status}"
         );
-        return Ok(());
+        return Ok(false);
     }
     ensure!(
         unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWNS) } == 0,
@@ -391,6 +395,215 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     }
     for path in ["/run", "/etc/systemd"] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(true)
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn native_vlan_adoption_recovery_restores_committed_dhcp_before_verification() -> Result<()> {
+    use sha2::Digest;
+
+    if !isolate_host_fixture(
+        "linux::host_integration::native_vlan_adoption_recovery_restores_committed_dhcp_before_verification",
+    )? {
+        return Ok(());
+    }
+    let namespace = Arc::new(File::open("/proc/thread-self/ns/net")?);
+    session(namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .veth("wan0".into(), "lan0".into())
+                .execute()
+                .await?;
+            for link in networking::links(handle).await? {
+                if matches!(networking::name(&link).as_str(), "wan0" | "lan0") {
+                    handle.link().set(link.header.index).up().execute().await?;
+                }
+            }
+            Ok(())
+        })
+    })?;
+    let directory = StateDirectory(std::env::current_dir()?.join(format!(
+        ".native-vlan-dhcp-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    )));
+    fs::DirBuilder::new().mode(0o700).create(&directory.0)?;
+    let options = NativeOptions {
+        namespace: String::new(),
+        keys: directory.0.join("keys"),
+        services_state: directory.0.join("services"),
+        adopted_parents: vec![],
+        allow_host_tunables: false,
+        allow_host_services: false,
+        gateway_monitoring: false,
+    };
+    let before: Config = serde_json::from_value(json!({
+        "interfaces":[
+            {"name":"wan0","kind":"ethernet","role":"wan","mtu":1500,"up":true,"addresses":[]},
+            {"name":"lan0","kind":"ethernet","role":"lan","mtu":1500,"up":true,"addresses":["192.168.0.1/24"]}
+        ],
+        "dhcp_clients":{"wan0":{}}
+    }))?;
+    before.validate()?;
+    let mut native = Native::open(options.clone())?;
+    native.repair(&Config::empty())?;
+    // Keep real DHCP/kernel recovery, without depending on a host resolved D-Bus service.
+    native.dhcp = dhcp_client::Manager::new(namespace.clone(), native.state.clone(), false);
+    let lease: dhcp_client::Lease = serde_json::from_value(json!({
+        "client":{}, "address":"192.0.2.10/24", "server":"192.0.2.1",
+        "acquired_at":dhcp_client::now()?, "lifetime":3600,
+        "renewal":1800, "rebinding":3150,
+        "routes":[
+            {"destination":"192.0.2.0/24","interface":"wan0","table":254,"metric":0},
+            {"destination":"0.0.0.0/0","gateway":"192.0.2.1","interface":"wan0","table":254,"metric":100}
+        ], "dns":[], "domain":"", "mtu":null
+    }))?;
+    let lease_path = native.state.join("dhcp-wan0.json");
+    write_json(&lease_path, &lease)?;
+    let saved_lease = fs::read(&lease_path)?;
+    let mut links_only = before.clone();
+    links_only.dhcp_clients.clear();
+    native.apply(&Config::empty(), &links_only)?;
+    native.dhcp.configure(&before.operational_value()?)?;
+    let mut ownership = native.ownership()?;
+    ownership.committed_config = Some(before.operational_value()?);
+    native.save_ownership(&ownership)?;
+    native.verify(&before.operational_value()?)?;
+    let request = netcontrol_core::AdoptVlanRequest {
+        name: "vlan50".into(),
+        parent: "lan0".into(),
+        id: 50,
+    };
+    let wanted = request.clone();
+    let snapshot = session(namespace.clone(), move |rt, handle| {
+        rt.block_on(async {
+            let parent = networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|link| networking::name(link) == wanted.parent)
+                .context("LAN parent missing")?
+                .header
+                .index;
+            handle
+                .link()
+                .add()
+                .vlan(wanted.name.clone(), parent, wanted.id)
+                .execute()
+                .await?;
+            let vlan = networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|link| networking::name(link) == wanted.name)
+                .context("VLAN missing")?
+                .header
+                .index;
+            handle.link().set(vlan).up().execute().await?;
+            handle
+                .address()
+                .add(vlan, "10.4.50.1".parse()?, 24)
+                .execute()
+                .await?;
+            networking::capture_vlan_snapshot(handle, &wanted).await
+        })
+    })?;
+    let mut after = before.clone();
+    after.interfaces.push(serde_json::from_value(json!({
+        "name":"vlan50","kind":"vlan","role":"unassigned","mtu":1500,"up":true,
+        "addresses":["10.4.50.1/24"],"vlan":{"parent":"lan0","id":50}
+    }))?);
+    after.normalize();
+    after.validate()?;
+    let previous = native.ownership()?;
+    let source = directory.0.join("vlan50.network");
+    fs::write(&source, "[Network]\nIPv6AcceptRA=no\n")?;
+    let source_digest = hex::encode(sha2::Sha256::digest(serde_json::to_vec(
+        &json!({"network":{"ipv6acceptra":"no"}}),
+    )?));
+    let imported = netcontrol_core::VlanAdoption {
+        config: after.clone(),
+        receipt: json!({"request":request,"capture":{
+            "scope":native.identity,"config":after,
+            "originals":{"vlan50":snapshot},"leases":{},"routes":[],
+            "ownership_before":previous,"complete":false,
+            "networkd_source":{"path":source,"sha256":source_digest}
+        }}),
+    };
+    drop(native);
+    for already_owned in [false, true] {
+        let mut native = Native::open(options.clone())?;
+        native.dhcp = dhcp_client::Manager::new(namespace.clone(), native.state.clone(), false);
+        assert!(native.dhcp.state.lock().unwrap().leases.is_empty());
+        let cold_error = native.verify(&before.operational_value()?).unwrap_err();
+        assert!(
+            format!("{cold_error:#}").contains("interface wan0 address drift"),
+            "{cold_error:#}"
+        );
+        if already_owned {
+            let mut ownership = previous.clone();
+            ownership.managed_interfaces.insert("vlan50".into());
+            ownership
+                .vlan_originals
+                .insert("vlan50".into(), snapshot.clone());
+            ownership.committed_config = Some(imported.config.operational_value()?);
+            native.save_ownership(&ownership)?;
+        }
+        let ownership_before = fs::read(native.state.join("ownership.json"))?;
+        let error = native.finish_vlan_adoption(&before, &imported).unwrap_err();
+        // The isolated fixture deliberately has no networkd/resolved bus. Reach that
+        // boundary, rather than rejecting the WAN's restored lease as address drift.
+        assert!(
+            format!("{error:#}").contains("VLAN networkd recovery failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            native.dhcp.state.lock().unwrap().leases["wan0"].address,
+            lease.address
+        );
+        native.verify(&before.operational_value()?)?;
+        assert_eq!(fs::read(&lease_path)?, saved_lease);
+        assert_eq!(
+            fs::read(native.state.join("ownership.json"))?,
+            ownership_before
+        );
+        let extra = session(namespace.clone(), |rt, handle| {
+            rt.block_on(async {
+                let wan = networking::links(handle)
+                    .await?
+                    .into_iter()
+                    .find(|link| networking::name(link) == "wan0")
+                    .context("WAN missing")?
+                    .header
+                    .index;
+                let mut add = handle.address().add(wan, "198.51.100.10".parse()?, 24);
+                let message = add.message_mut().clone();
+                add.execute().await?;
+                Ok(message)
+            })
+        })?;
+        let error = native.finish_vlan_adoption(&before, &imported).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("interface wan0 address drift"),
+            "{error:#}"
+        );
+        session(namespace.clone(), move |rt, handle| {
+            rt.block_on(handle.address().del(extra).execute())?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Result<()> {
+    if !isolate_host_fixture(
+        "linux::host_integration::native_current_namespace_ethernet_apply_rollback_recovery_and_reboot",
+    )? {
+        return Ok(());
     }
     let namespace = Arc::new(File::open("/proc/thread-self/ns/net")?);
     session(namespace.clone(), |rt, handle| {
