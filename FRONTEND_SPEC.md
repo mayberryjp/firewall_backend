@@ -2928,49 +2928,50 @@ Publisher and deployment contract:
   `mqtts` requires system trust and valid
   certificate/hostname; no insecure bypass. Explicit `mqtt` is plaintext. Upload
   passwords over protected HTTPS or a trusted management channel.
-- Per-sensor discovery at
-  `homeassistant/sensor/netcontrol_<device_id>/<component_id>/config`;
-  metric samples at `netcontrol/<device_id>/state/metrics/<hash-prefix>`;
-  structured samples at `netcontrol/<device_id>/state/<section>`; availability at
+- Device discovery at
+  `homeassistant/device/netcontrol_<device_id>/config`;
+  complete samples at `netcontrol/<device_id>/state`; availability at
   `netcontrol/<device_id>/availability`. QoS 1; discovery/availability retained,
   samples nonretained. Broker ACLs must allow these publications and subscription
   to `homeassistant/status`. Birth `online` refreshes discovery/sample within
   five seconds when idle. LWT is retained `offline`; graceful stop/disable attempts
   offline/disconnect within three seconds. Broken sockets rely on broker LWT.
-- Each sensor discovery is a complete standard MQTT sensor configuration, with
-  the existing stable `unique_id`, templates, units/classes/expiry and shared
-  device/origin/availability metadata. It declares its exact `state_topic`.
-  There is no `components` envelope in these per-sensor messages. Only changed
-  discovery is sent between samples; reconnect and Home Assistant birth resend
-  all currently enumerable sensors. Removed sensors get an empty retained
-  payload on their discovery topic. Failed enumerations retain prior discovery
-  rather than deleting entities; absent measurements remain unknown/expire.
-- Metrics are assigned by the lowercase SHA-256 hex digest of the component ID,
-  initially using its first two hex characters. Oversized groups recursively
-  extend that prefix one character until each payload fits. The state topic can
-  therefore change when a bucket splits/joins; discovery is updated before the
-  affected sample. Consumers must follow discovery, not hardcode a hash prefix.
-  Metric messages have `{"collected_at_unix":1793942400,"metrics":{"uptime":60}}`
-  shape, with only the assigned subset of metrics. The timestamp here is synthetic.
-- Structured state sections are `bgp`, `link_diagnostics`, `process_health`,
-  `active_alerts`, `statistics_available` and `telemetry_sources`. Each has
-  `{"collected_at_unix":1793942400,"<section>":<original value>}` shape, preserving
-  the section's types/nullability/content. No aggregate `/state` message is sent.
-  All messages from one sample share its collection timestamp. Assemble sections
-  and metrics by timestamp; delivery is QoS 1, non-atomic and may duplicate.
-  Do not treat an individual shard as a full snapshot or delete metrics absent
-  from that shard. Availability `online` is queued after all state messages.
+- Discovery contains shared device/origin/availability metadata, `qos: 1`,
+  `state_topic: "netcontrol/<device_id>/state"` and a `components` mapping.
+  Each component keeps `platform: "sensor"`, its stable `unique_id`, template,
+  units/classes and expiry. Only changed discovery is sent between samples;
+  reconnect and Home Assistant birth resend it. Removal publishes a bounded
+  device-discovery update containing platform-only entries for removed components,
+  followed by the current complete discovery without those entries. The durable
+  manifest finalizes only after batch acknowledgments; interrupted removals can
+  repeat. Failed enumerations retain prior discovery, not invented measurements.
+- Every sample is one complete JSON object containing `collected_at_unix`
+  (Unix seconds), all `metrics`, and structured `bgp`, `link_diagnostics`,
+  `process_health`, `active_alerts`, `statistics_available` and `telemetry_sources`.
+  Their types, exact counter strings, nullability and content are unchanged.
+  No shard assembly is needed; no `/state/metrics/*` or `/state/<section>` is
+  published. Delivery is QoS 1 and can duplicate. One message carries the full
+  sample, but source reads still are not an atomic kernel snapshot.
+  Availability `online` is queued after the state message.
   `last_published_at_unix` advances only after the whole batch is acknowledged.
 - **Breaking deployment requirement:** update broker ACLs for
-  `homeassistant/sensor/netcontrol_<device_id>/+/config` and
-  `netcontrol/<device_id>/state/#`, preserving availability and birth access.
-  Broker administrators must clear the former retained
-  `homeassistant/device/netcontrol_<device_id>/config` with an empty retained
-  publication before enabling the new publisher. No dual old/new topics,
+  `homeassistant/device/netcontrol_<device_id>/config` and
+  `netcontrol/<device_id>/state`, preserving availability and birth access.
+  Stop/disable the publisher and have the broker administrator clear each former
+  retained `homeassistant/sensor/netcontrol_<device_id>/<component_id>/config`
+  with an empty retained publication on that exact topic before enabling device
+  discovery; do not publish to wildcards or clear the new device-discovery topic.
+  No dual old/new topics,
   automatic broker-state conversion or schema migration. Keep the private store,
   device ID and secret references. Home Assistant rediscovery and entity-registry
   continuity must be verified; unique IDs alone do not prove customization
   preservation across discovery methods.
+  Brokers must allow 33,554,432-byte payloads and MQTT packet overhead
+  (at least 33,558,528 bytes for a configured packet cap). For Mosquitto, review
+  `message_size_limit` and `max_packet_size`; also review broker/subscriber memory
+  budgets. Only the daemon outbound packet cap increases; inbound stays 1 MiB.
+  Broker acknowledgments alone do not prove Home Assistant ingestion. See
+  [handoff 2026-11-06-07](docs/frontend-handoffs/2026-11-06.md#2026-11-06-07-consolidated-mqtt-with-32-mib-payloads).
 - Stable name-hashed sensor IDs and durable component-removal manifest.
   Component IDs preserve case and contain 1..128 ASCII letters/digits/underscores;
   reads and writes apply the same validation, with at most 8192 manifest entries
@@ -3127,8 +3128,8 @@ Publisher and deployment contract:
     256 appliance-service rows, 256 DHCP relay/client identities, 128 BGP
     neighbors, 128 traffic-history interfaces and 128 WireGuard peers total.
     Existing host/NetFlow caps and the overall payload/entity limits also apply.
-- MQTT section payloads carry the exact shared `process_health` object
-  and `active_alerts` array on their respective topics. Home Assistant sensor metrics/discovery add
+- The complete MQTT state payload carries the exact shared `process_health` object
+  and `active_alerts` array. Home Assistant sensor metrics/discovery add
   `process_health` (`healthy|unhealthy|unknown`) and numeric `active_alert_count`.
   Alerts do not change MQTT transport availability: a connected publisher can
   publish unhealthy or unknown platform state. Broker disconnection still uses
@@ -3150,13 +3151,13 @@ Publisher and deployment contract:
 - Samples expire after three publication intervals. Active configuration/maintenance
   and unrecoverable collection failures pause samples with offline availability;
   the next successful sample restores availability. No offline backlog or command topics. Limits:
-  4096 entities and 1 MiB per published discovery/state payload. Aggregate samples
-  may exceed 1 MiB and are split without dropping entities/values. Entity limits
-  include health/source additions and merged retained discovery. If one sensor
-  configuration, one metric value/envelope or one structured section cannot fit,
-  collection fails explicitly with payload class, serialized byte count and limit,
-  not payload contents; no partial sample is enqueued. Retained discovery removals
-  are individual empty messages, never an oversized aggregate removal payload.
+  4096 entities and 32 MiB (33,554,432 serialized UTF-8 bytes) per published
+  discovery/state payload. Entity limits include health/source additions and
+  merged retained discovery. If a complete discovery, complete state or discovery
+  removal exceeds the cap, collection fails explicitly with payload class,
+  serialized byte count and limit, not payload contents; no partial sample is
+  enqueued and no values are truncated. Source failures/nulls and expiry can still
+  cause unknown/unavailable entities; consolidation does not hide them.
   Raw connections, deny records, route tables, Sando inventory, secrets and vnStat
   history records are not added. No MQTT controls or automatic upgrades/sync
   triggers are introduced.
@@ -4873,8 +4874,34 @@ checks remain required; downstream relay chaining remains unsupported.
 Linux uses an in-process Rust DHCPv4 relay, not a DNS or DHCP address server.
 Simulator status is `simulated`, never actual packet forwarding. Unsupported
 configurations must fail explicitly during preflight. Operators supply capabilities,
-namespace access, routes, server return paths, and UDP 67/68 firewall
-permissions. Do not imply automatic routing/NAT/firewall changes.
+namespace access, routes, server return paths, DHCP scopes and any permissions
+on external firewalls. Native input permissions for the relay itself are
+automatic; no manual input rule is required:
+
+- Client: IPv4 UDP source port 68, destination port 67, ingress equal to the
+  relay-enabled interface, destination either `255.255.255.255` or its exact
+  selected relay address. The worker retains source/on-link/header validation.
+- Server: IPv4 UDP source/destination port 67, source equal to one of that
+  interface's configured servers and destination equal to its exact selected
+  relay address. Return traffic can enter any interface; upstream/transaction
+  validation remains in the worker.
+
+These are system-owned derived accepts before configured input rules, including
+explicit input drops. Enabling relay deliberately authorizes only this traffic;
+disable relay to withdraw these exceptions. They apply in the normal network
+transaction and are regenerated for server/address changes, startup repair,
+rollback and interrupted-intent recovery. They are not inserted into saved
+`firewall.input.interfaces`, interface responses, drafts or exported packages.
+Existing manual permissions remain user-owned, and established/related conntrack
+acceptance is unchanged; disabling relay does not flush conntrack or remove
+manual DHCP permits. No automatic routing/NAT/forwarding changes, IPv6 permissions,
+TCP/UDP management access or DHCPv4 client port-68 input exception is added.
+
+`GET /api/v1/statistics/firewall` exposes generated client/server input rows
+with `config_path:null`, system origin and null import source, described under
+[rule counters](#firewall-rule-match-counters). Use them with worker status
+and traces to distinguish arrival, input admission, relay activity and delivery;
+an accepted packet does not prove a lease was supplied by the server.
 
 Use interface write permissions and full-package transaction workflows;
 confirmation, rollback, restart, and revision restoration preserve settings.
@@ -5459,7 +5486,10 @@ This is a synthetic shortened example, not measured traffic. Native returns
 all instrumented logical rows, including measured zeros, ordered by chain/key.
 `sample.scope` is opaque; timestamps are UTC RFC3339 and bracket collection,
 not an atomic global measurement instant. `ruleset_id` is the lowercase SHA-256
-of the applied operational firewall, matching deny-log ruleset identity.
+of the applied operational firewall and compiled input plan, including
+interface-derived DHCP relay permissions, matching deny-log ruleset identity.
+Treat it as opaque; changing relay settings can change this ID even when saved
+firewall JSON is unchanged.
 `generation` is a lowercase SHA-256 token incorporating a fresh ruleset-installation
 UUID and physical chain/handle set; treat it as opaque, not a software/config version.
 `config_revision` is the currently committed canonical calendar revision.
@@ -5496,7 +5526,14 @@ in host-policy mode, `generated/input/loopback` and
 `generated/input/established_related` with configured input,
 `generated/input/policy` for the ICMP-only generated input chain, and
 `generated/output/policy` for the ICMP output chain. Their IDs still contain
-the generated key. Chains/rules absent from the compiled firewall have no rows.
+the generated key. Enabled DHCP relays additionally expose
+`generated/input/dhcp_relay/<interface>/clients` (two physical rules: limited
+broadcast and selected relay address) and
+`generated/input/dhcp_relay/<interface>/servers` (one physical rule per configured
+server). These accepts precede configured input rules and are present even without
+an explicit input configuration. They have system origin and null import source.
+Interface names are managed kernel names, not array indexes; refresh the rows
+when relay configuration changes. Chains/rules absent from the compiled firewall have no rows.
 Empty rule lists still have their instrumented terminal default.
 
 All physical address, destination-host, family and port expansions for one

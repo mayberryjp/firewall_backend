@@ -265,25 +265,8 @@ pub(crate) fn contains(prefix: &str, ip: IpAddr) -> bool {
 }
 impl Interface {
     pub(crate) fn relay_address(&self) -> Result<Ipv4Addr> {
-        let mut addresses = self.addresses.clone();
-        addresses.sort();
-        for a in addresses {
-            let Some((text, bits)) = a.split_once('/') else {
-                bail!("invalid interface prefix {a}")
-            };
-            let ip: IpAddr = text.parse()?;
-            let n: u32 = bits.parse()?;
-            ensure!(
-                n <= if ip.is_ipv4() { 32 } else { 128 },
-                "invalid prefix length"
-            );
-            if let IpAddr::V4(v) = ip {
-                if unicast(ip, false) {
-                    return Ok(v);
-                }
-            }
-        }
-        bail!("relay {} requires a unicast IPv4 address", self.name)
+        netcontrol_core::dhcp_relay_address(&self.addresses)
+            .with_context(|| format!("relay {}", self.name))
     }
 }
 impl Config {

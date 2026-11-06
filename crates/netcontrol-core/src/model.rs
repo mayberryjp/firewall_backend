@@ -307,6 +307,21 @@ pub struct DHCPRelayConfig {
     pub servers: Vec<String>,
 }
 
+pub fn dhcp_relay_address(addresses: &[String]) -> Result<std::net::Ipv4Addr> {
+    let mut addresses: Vec<_> = addresses.iter().collect();
+    addresses.sort();
+    for prefix in addresses {
+        let (ip, _) = canonical_prefix(prefix, false)?;
+        if let IpAddr::V4(address) = ip
+            && global_unicast(ip)
+            && address.octets()[0] != 0
+        {
+            return Ok(address);
+        }
+    }
+    bail!("DHCP relay requires a unicast IPv4 address")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DHCPClientConfig {
@@ -1286,14 +1301,7 @@ impl Config {
                         && !l.dhcp_relay.servers.is_empty(),
                     "enabled DHCP relay requires up Ethernet/dummy/VLAN and servers"
                 );
-                let addr = l
-                    .addresses
-                    .iter()
-                    .filter_map(|s| canonical_prefix(s, false).ok())
-                    .map(|p| p.0)
-                    .filter(|a| a.is_ipv4())
-                    .min()
-                    .ok_or_else(|| anyhow::anyhow!("DHCP relay requires IPv4 address"))?;
+                let addr = dhcp_relay_address(&l.addresses)?;
                 ensure!(
                     relay_addresses.insert(addr),
                     "DHCP relays require distinct relay addresses"

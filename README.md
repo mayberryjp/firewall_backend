@@ -157,6 +157,23 @@ See the [contract](FRONTEND_SPEC.md#dns-peer-endpoints) and synthetic
 [BGP-over-WireGuard example](examples/bgp.json); replace its name, addresses
 and public key, and provision the private key/underlay before applying.
 
+## DHCP relay firewall admission
+
+Enabling per-interface DHCPv4 relay automatically installs system-owned native
+input permits: UDP 68 to 67 on that interface, addressed to the limited broadcast
+or selected relay IPv4 address, and UDP 67 to 67 from its configured servers to
+that relay address. No separate manual input rule is needed. The service permits
+precede configured input drops; disabling/removing relay removes only these
+derived permits, not manual rules or existing conntrack state.
+
+The same transaction applies addresses, relay settings and firewall permissions;
+startup repair and rollback regenerate them. No forwarding/NAT, routes or
+management-port access is enabled. Operators still provide reachable servers,
+return routes, DHCP scopes and permissions on other firewalls. Inspect generated
+`input:generated/input/dhcp_relay/<interface>/clients` and `/servers` rows at
+`GET /api/v1/statistics/firewall`, alongside worker status and packet captures.
+See the [relay contract](FRONTEND_SPEC.md#621-per-interface-dhcpv4-relay).
+
 ## Bulk firewall clearing
 
 `DELETE /api/v1/firewall/hosts-and-rules` removes all configured firewall hosts,
@@ -613,26 +630,36 @@ Prefer `mqtts://` (port 8883), with a system-trusted certificate and matching
 hostname. Explicit `mqtt://` (1883) sends credentials/data without TLS. Endpoint
 URLs must not contain credentials, paths other than `/`, query or fragment.
 Broker ACLs must allow retained discovery publication at
-`homeassistant/sensor/netcontrol_<device_id>/+/config`, publication under
+`homeassistant/device/netcontrol_<device_id>/config`, publication under
 `netcontrol/<device_id>/#`, and subscription to `homeassistant/status`. Discovery
 and availability are retained; samples are not. QoS 1 can duplicate messages.
 
-Discovery is one bounded retained message per sensor. Metrics use bounded
-`netcontrol/<device_id>/state/metrics/<hash-prefix>` shards; each sensor's
-discovery declares its exact state topic. Structured sections (health, alerts,
-BGP, link diagnostics and source status) use separate
-`netcontrol/<device_id>/state/<section>` topics. All sample messages include
-the same `collected_at_unix`; consumers must assemble them, not expect one
-complete snapshot at `/state`. Every payload remains at most 1 MiB.
+Discovery is one retained Home Assistant device message with all sensor
+`components` and a shared `state_topic`. Each sample is one complete JSON message
+at `netcontrol/<device_id>/state`: `collected_at_unix`, all `metrics`, health,
+alerts, BGP, link diagnostics and source status. No metric shards or separate
+section topics are published. Each discovery/state payload allows up to **32 MiB
+(33,554,432 serialized UTF-8 bytes)**; the entity limit remains 4096. Oversized
+samples fail explicitly without truncation or partial enqueue.
 
-This replaces the monolithic MQTT topic contract. Before enabling the new
-publisher against an existing discovery installation, the broker administrator
-must remove the retained `homeassistant/device/netcontrol_<device_id>/config`
-message (publish an empty retained payload) and update ACLs/subscriptions.
-No old/new dual publication or automatic retained-topic conversion is provided.
+The broker must accept that payload size and MQTT packet overhead. If configured,
+raise broker payload limits to at least 33,554,432 bytes and packet limits to at
+least 33,558,528 bytes (32 MiB + 4096); for Mosquitto these are
+`message_size_limit` and `max_packet_size`. Review broker/subscriber memory budgets.
+The daemon increases its outbound limit, not broker configuration or the 1 MiB
+inbound limit. PUBACK proves broker acknowledgment, not Home Assistant ingestion.
+
+This supersedes the split-topic contract. Stop/disable the publisher before
+deployment, update ACLs/subscriptions and have the broker administrator clear each
+retained `homeassistant/sensor/netcontrol_<device_id>/<component_id>/config`
+message with an empty retained payload before enabling device discovery. Publish
+to each exact topic, not an MQTT wildcard. Do not clear the new device-discovery
+topic. No dual publication or automatic retained-topic conversion is provided.
 Device identity, entity unique IDs, saved configuration and secrets are retained.
 Home Assistant entity-registry/customization continuity requires deployment
 acceptance; it is not guaranteed by preserving unique IDs alone.
+Consolidation does not invent unavailable source measurements; null/missing
+metrics and expired samples still appear unknown/unavailable as appropriate.
 
 Back up `<state>.mqtt` together with the journal (default
 `/var/lib/netcontrol/native-state.json.mqtt`). Its daemon-owned private files hold

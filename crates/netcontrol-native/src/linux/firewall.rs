@@ -11,9 +11,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const TABLE: &str = "netcontrol";
-pub fn validate(value: &Value) -> Result<()> {
+pub fn validate(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
     crate::firewall_plan::compile(value)?;
-    crate::firewall_plan::compile_input(value)?;
+    crate::firewall_plan::compile_input(value, interfaces)?;
     Ok(())
 }
 
@@ -115,6 +115,13 @@ fn matching(
             rule.protocol(transport)
         };
     }
+    if plan.source_port != 0 {
+        anyhow::ensure!(
+            protocol == netcontrol_core::FilterProtocol::Udp,
+            "generated source-port match requires UDP"
+        );
+        rule = rule.sport(plan.source_port, Protocol::UDP);
+    }
     rule = rule.with_expr(Counter::default());
     Ok(if plan.action == "drop" {
         rule.with_expr(Log::new(Some(super::deny_log::GROUP), Some(prefix))?)
@@ -155,18 +162,29 @@ fn default_rule(
     )
 }
 
-pub fn counters(value: &Value, recorded: &Option<Value>, fingerprint: &str) -> Result<Value> {
+fn ruleset_id(value: &Value, interfaces: &[crate::model::Link]) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+        value,
+        crate::firewall_plan::compile_input(value, interfaces)?,
+    ))?)))
+}
+
+pub fn counters(
+    value: &Value,
+    interfaces: &[crate::model::Link],
+    recorded: &Option<Value>,
+    fingerprint: &str,
+) -> Result<Value> {
     verify(value, recorded, Some(fingerprint))?;
     let mut snapshot = crate::firewall_counters::snapshot(
         &super::netfilter::rules()?,
-        &crate::firewall_plan::counter_layout(value)?,
+        &crate::firewall_plan::counter_layout(value, interfaces)?,
     )?;
     crate::ensure_unchanged(
         super::netfilter::fingerprint()? == fingerprint,
         "firewall changed while reading rule counters",
     )?;
-    snapshot["ruleset_id"] =
-        serde_json::json!(hex::encode(Sha256::digest(serde_json::to_vec(value)?)));
+    snapshot["ruleset_id"] = serde_json::json!(ruleset_id(value, interfaces)?);
     Ok(snapshot)
 }
 
@@ -185,10 +203,10 @@ pub fn remove_owned(expected: &str) -> Result<()> {
     )
 }
 
-pub fn apply(value: &Value) -> Result<()> {
+pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
     let plans = crate::firewall_plan::compile(value)?;
-    let input_plans = crate::firewall_plan::compile_input(value)?;
-    let ruleset = hex::encode(Sha256::digest(serde_json::to_vec(value)?));
+    let input_plans = crate::firewall_plan::compile_input(value, interfaces)?;
+    let ruleset = ruleset_id(value, interfaces)?;
     let generation = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?;
     let generation = generation.trim();
     let table = Table::new(ProtocolFamily::Inet)

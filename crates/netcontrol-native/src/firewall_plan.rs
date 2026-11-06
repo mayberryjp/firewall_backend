@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Match {
     pub counter_key: String,
     pub source: String,
@@ -11,6 +11,7 @@ pub struct Match {
     pub egress: String,
     pub protocol: String,
     pub port: u16,
+    pub source_port: u16,
     pub action: String,
     pub established_related: bool,
 }
@@ -224,9 +225,56 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
     Ok(output)
 }
 
-pub fn compile_input(firewall: &Value) -> Result<Vec<Match>> {
+pub fn compile_input(firewall: &Value, interfaces: &[crate::model::Link]) -> Result<Vec<Match>> {
+    let mut relay_plans = Vec::new();
+    for interface in interfaces.iter().filter(|link| link.dhcp_relay.enabled) {
+        ensure!(
+            crate::safe_name(&interface.name, 15)
+                && interface.up
+                && matches!(interface.kind.as_str(), "ethernet" | "dummy" | "vlan")
+                && !interface.dhcp_relay.servers.is_empty(),
+            "enabled DHCP relay requires up Ethernet/dummy/VLAN and servers"
+        );
+        let relay = netcontrol_core::dhcp_relay_address(&interface.addresses)?;
+        let key = format!("generated/input/dhcp_relay/{}", interface.name);
+        for destination in [format!("{relay}/32"), "255.255.255.255/32".into()] {
+            relay_plans.push(Match {
+                counter_key: format!("{key}/clients"),
+                destination,
+                ingress: interface.name.clone(),
+                protocol: "udp".into(),
+                source_port: 68,
+                port: 67,
+                action: "accept".into(),
+                ..Match::default()
+            });
+        }
+        for server in &interface.dhcp_relay.servers {
+            let IpAddr::V4(address) = netcontrol_core::canonical_ip(server)? else {
+                bail!("DHCP relay server must be IPv4");
+            };
+            ensure!(
+                netcontrol_core::global_unicast(address.into()) && address.octets()[0] != 0,
+                "invalid DHCP relay server"
+            );
+            relay_plans.push(Match {
+                counter_key: format!("{key}/servers"),
+                source: host_prefix(server)?,
+                destination: format!("{relay}/32"),
+                protocol: "udp".into(),
+                source_port: 67,
+                port: 67,
+                action: "accept".into(),
+                ..Match::default()
+            });
+        }
+    }
+    ensure!(
+        relay_plans.len() <= 4096,
+        "input firewall expands beyond 4096 rules"
+    );
     let Some(input) = firewall.get("input").filter(|value| !value.is_null()) else {
-        return Ok(vec![]);
+        return Ok(relay_plans);
     };
     action(string(input, "policy"))?;
     for interface in array(input, "interfaces")? {
@@ -254,6 +302,7 @@ pub fn compile_input(firewall: &Value) -> Result<Vec<Match>> {
             )
         };
     }
+    plans.splice(1..1, relay_plans);
     plans.insert(
         0,
         Match {
@@ -262,6 +311,10 @@ pub fn compile_input(firewall: &Value) -> Result<Vec<Match>> {
             action: "accept".into(),
             ..Match::default()
         },
+    );
+    ensure!(
+        plans.len() <= 4096,
+        "input firewall expands beyond 4096 rules"
     );
     Ok(plans)
 }
@@ -329,6 +382,7 @@ fn expand(
                     egress: egress.into(),
                     protocol: protocol.into(),
                     port: *port,
+                    source_port: 0,
                     action: string(rule, "action").into(),
                     established_related: false,
                 });
@@ -342,7 +396,10 @@ fn expand(
     Ok(())
 }
 
-pub fn counter_layout(firewall: &Value) -> Result<BTreeMap<(String, String), usize>> {
+pub fn counter_layout(
+    firewall: &Value,
+    interfaces: &[crate::model::Link],
+) -> Result<BTreeMap<(String, String), usize>> {
     let mut layout = BTreeMap::new();
     let mut add = |chain: &str, key: &str| {
         *layout
@@ -353,7 +410,7 @@ pub fn counter_layout(firewall: &Value) -> Result<BTreeMap<(String, String), usi
         add("forward", &plan.counter_key);
     }
     add("forward", "/firewall/policy");
-    let input = compile_input(firewall)?;
+    let input = compile_input(firewall, interfaces)?;
     {
         for plan in input {
             add("input", &plan.counter_key);
@@ -389,13 +446,114 @@ pub fn counter_layout(firewall: &Value) -> Result<BTreeMap<(String, String), usi
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn relay_interfaces() -> Vec<crate::model::Link> {
+        serde_json::from_value(json!([{
+            "name":"vlan30","kind":"vlan","role":"lan","up":true,"mtu":1500,
+            "vlan":{"parent":"trunk0","id":30},
+            "addresses":["10.4.30.2/24","2001:db8::1/64","10.4.30.10/24"],
+            "dhcp_relay":{"enabled":true,"servers":["10.4.40.40","10.4.40.41"]}
+        }]))
+        .unwrap()
+    }
+
+    #[test]
+    fn relay_input_is_derived_scoped_before_user_drops_and_accounted() {
+        let interfaces = relay_interfaces();
+        let firewall = json!({
+            "policy":"drop","allow_all_icmp":false,"rules":[],"nat":{"masquerade":[]},
+            "input":{"policy":"drop","interfaces":[
+                {"interface":"vlan30","rules":[{"action":"drop"}]}
+            ]}
+        });
+        let plans = compile_input(&firewall, &interfaces).unwrap();
+        assert_eq!(plans.len(), 7);
+        assert_eq!(plans[0].ingress, "lo");
+        assert!(plans[1].established_related);
+        for (plan, destination) in plans[2..4]
+            .iter()
+            .zip(["10.4.30.10/32", "255.255.255.255/32"])
+        {
+            assert_eq!(plan.ingress, "vlan30");
+            assert_eq!(plan.destination, destination);
+            assert!(plan.source.is_empty());
+            assert_eq!((plan.source_port, plan.port), (68, 67));
+        }
+        for (plan, source) in plans[4..6].iter().zip(["10.4.40.40/32", "10.4.40.41/32"]) {
+            assert!(plan.ingress.is_empty());
+            assert_eq!(plan.source, source);
+            assert_eq!(plan.destination, "10.4.30.10/32");
+            assert_eq!((plan.source_port, plan.port), (67, 67));
+        }
+        for plan in &plans[2..6] {
+            assert_eq!(plan.protocol, "udp");
+            assert_eq!(plan.action, "accept");
+            assert!(!plan.established_related);
+            assert!(plan.egress.is_empty());
+        }
+        assert_eq!(plans[6].action, "drop");
+        let layout = counter_layout(&firewall, &interfaces).unwrap();
+        for kind in ["clients", "servers"] {
+            assert_eq!(
+                layout[&(
+                    "input".into(),
+                    format!("generated/input/dhcp_relay/vlan30/{kind}")
+                )],
+                2
+            );
+        }
+        assert_eq!(compile_input(&json!({}), &interfaces).unwrap(), plans[2..6]);
+        let mut disabled = interfaces.clone();
+        disabled[0].dhcp_relay.enabled = false;
+        assert_eq!(
+            compile_input(&firewall, &disabled).unwrap(),
+            compile_input(&firewall, &[]).unwrap()
+        );
+        assert!(
+            !counter_layout(&firewall, &disabled)
+                .unwrap()
+                .keys()
+                .any(|(_, key)| key.contains("dhcp_relay"))
+        );
+    }
+
+    #[test]
+    fn relay_input_changes_replace_addresses_servers_and_reject_invalid_or_excess_rules() {
+        let mut interfaces = relay_interfaces();
+        interfaces[0].name = "vlan60".into();
+        interfaces[0].addresses = vec!["10.4.60.1/24".into()];
+        interfaces[0].dhcp_relay.servers = vec!["10.4.40.42".into()];
+        let plans = compile_input(&json!({}), &interfaces).unwrap();
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].ingress, "vlan60");
+        assert_eq!(plans[0].destination, "10.4.60.1/32");
+        assert_eq!(plans[2].source, "10.4.40.42/32");
+        assert_eq!(plans[2].destination, "10.4.60.1/32");
+        for server in ["::1", "0.1.2.3", "255.255.255.255", "127.0.0.1"] {
+            interfaces[0].dhcp_relay.servers = vec![server.into()];
+            assert!(compile_input(&json!({}), &interfaces).is_err());
+        }
+        let firewall = json!({
+            "input":{"policy":"drop","interfaces":[
+                {"interface":"vlan30","rules":vec![json!({"action":"drop"}); 4092]}
+            ]}
+        });
+        assert!(compile_input(&firewall, &[]).is_ok());
+        assert!(
+            compile_input(&firewall, &relay_interfaces())
+                .unwrap_err()
+                .to_string()
+                .contains("4096")
+        );
+    }
+
     #[test]
     fn appliance_input_allows_loopback_replies_lan_and_dhcp_only() {
         let mut firewall = json!({"input": {"policy": "drop", "interfaces": [
             {"interface": "eno2", "rules": [{"action": "accept"}]},
             {"interface": "eno1", "rules": [{"destination": "0.0.0.0/0", "protocol": "udp", "destination_ports": [68], "action": "accept"}]}
         ]}});
-        let plans = compile_input(&firewall).unwrap();
+        let plans = compile_input(&firewall, &[]).unwrap();
         assert_eq!(plans.len(), 4);
         assert_eq!(plans[0].ingress, "lo");
         assert!(plans[1].established_related);
@@ -406,8 +564,8 @@ mod tests {
         assert_eq!(plans[3].port, 68);
         assert_eq!(plans[3].destination, "0.0.0.0/0");
         firewall["input"]["interfaces"][0]["rules"][0]["out_interface"] = json!("eno1");
-        assert!(compile_input(&firewall).is_err());
-        assert!(compile_input(&json!({})).unwrap().is_empty());
+        assert!(compile_input(&firewall, &[]).is_err());
+        assert!(compile_input(&json!({}), &[]).unwrap().is_empty());
     }
     #[test]
     fn input_related_feedback_is_accepted_before_drops_without_peer_outer_source_filter() {
@@ -419,7 +577,7 @@ mod tests {
                 {"protocol":"icmpv6","action":"drop"}
             ]}]}
         });
-        let plans = compile_input(&firewall).unwrap();
+        let plans = compile_input(&firewall, &[]).unwrap();
         let related = plans
             .iter()
             .position(|plan| plan.established_related)
@@ -470,10 +628,10 @@ mod tests {
             )
         );
         assert_eq!(plans[1].protocol, "icmpv6");
-        let input = compile_input(&firewall).unwrap();
+        let input = compile_input(&firewall, &[]).unwrap();
         assert_eq!(input[2].protocol, "icmp");
         assert_eq!(input[3].protocol, "icmpv6");
-        let layout = counter_layout(&firewall).unwrap();
+        let layout = counter_layout(&firewall, &[]).unwrap();
         assert_eq!(
             layout[&(
                 "forward".into(),
@@ -502,7 +660,8 @@ mod tests {
             (&"icmp".into(), &"icmpv6".into())
         );
         assert_eq!(
-            counter_layout(&firewall).unwrap()[&("forward".into(), "/firewall/rules/0".into())],
+            counter_layout(&firewall, &[]).unwrap()
+                [&("forward".into(), "/firewall/rules/0".into())],
             2
         );
         for rule in [
@@ -567,7 +726,7 @@ mod tests {
             "out_interface":"wan0","target_interface":"lan0","target_address":"192.0.2.53",
             "protocol":"udp","destination_port":53
         }]);
-        let layout = counter_layout(&f).unwrap();
+        let layout = counter_layout(&f, &[]).unwrap();
         for (chain, key, count) in [
             ("forward", "/firewall/policies/hosts/0/rules/0", 4),
             ("forward", "/firewall/policies/hosts/0/policy", 2),
@@ -600,7 +759,7 @@ mod tests {
         let f = json!({"policy":"drop","allow_all_icmp":false,"rules":[{"action":"drop"}],
             "nat":{"masquerade":[]}});
         assert_eq!(
-            counter_layout(&f).unwrap(),
+            counter_layout(&f, &[]).unwrap(),
             BTreeMap::from([
                 (("forward".into(), "/firewall/rules/0".into()), 1),
                 (("forward".into(), "/firewall/policy".into()), 1),

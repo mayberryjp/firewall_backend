@@ -889,7 +889,7 @@ mod tests {
             let base = json!({"policy":"accept","allow_all_icmp":false,"rules":[],"nat":{"masquerade":[]},"input":{"policy":"accept","interfaces":[]}});
             let install = |value: Value| {
                 session(router.clone(), move |_, _| {
-                    firewall::apply(&value)?;
+                    firewall::apply(&value, &[])?;
                     netfilter::fingerprint()
                 })
             };

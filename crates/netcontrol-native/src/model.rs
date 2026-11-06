@@ -37,7 +37,7 @@ pub struct Link {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard: Option<Value>,
     #[serde(default)]
-    pub dhcp_relay: Value,
+    pub dhcp_relay: netcontrol_core::DHCPRelayConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -784,7 +784,7 @@ mod tests {
         let round_trip: Link = serde_json::from_value(serde_json::to_value(link).unwrap()).unwrap();
         assert_eq!(round_trip, *link);
         assert_eq!(round_trip.role, "lan");
-        assert_eq!(round_trip.dhcp_relay["servers"][0], "198.51.100.10");
+        assert_eq!(round_trip.dhcp_relay.servers[0], "198.51.100.10");
         assert_eq!(network.ordered_links().unwrap()[0].name, "trunk0");
         let route: Route =
             serde_json::from_value(serde_json::to_value(&network.routes[0]).unwrap()).unwrap();

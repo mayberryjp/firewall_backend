@@ -148,6 +148,10 @@ drift and durable transaction recovery safeguards remain enforced.
   Server reply hops are ignored: RFC 2131 table 3 specifies zero for Offers,
   ACKs and NAKs, not an echo of the relay's incremented request hop count.
   Reply identity, upstream and giaddr checks still apply.
+  The native backend derives narrow client/server input permits from enabled
+  relay settings in its atomic firewall transaction; this worker does not mutate
+  firewall configuration. Core validation, native rules and the worker share
+  the same lexicographically selected relay-address helper.
 * **NTP:** host UDP poll client, one resolved endpoint per configured server,
   sixty-four-second polling and three-second response deadlines. Validates
   server mode, v3/v4, leap, stratum, originate/receive/transmit timestamps,

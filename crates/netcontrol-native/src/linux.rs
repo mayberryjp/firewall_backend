@@ -26,19 +26,24 @@ mod firewall;
 mod firewall {
     use anyhow::{Result, bail};
     use serde_json::Value;
-    pub fn validate(_: &Value) -> Result<()> {
+    pub fn validate(_: &Value, _: &[crate::model::Link]) -> Result<()> {
         bail!("native backend was built without nftables support")
     }
     pub fn verify(_: &Value, _: &Option<Value>, _: Option<&str>) -> Result<()> {
         bail!("native backend was built without nftables support")
     }
-    pub fn apply(_: &Value) -> Result<()> {
+    pub fn apply(_: &Value, _: &[crate::model::Link]) -> Result<()> {
         bail!("native backend was built without nftables support")
     }
     pub fn remove_owned(_: &str) -> Result<()> {
         bail!("native backend was built without nftables support")
     }
-    pub fn counters(_: &Value, _: &Option<Value>, _: &str) -> Result<Value> {
+    pub fn counters(
+        _: &Value,
+        _: &[crate::model::Link],
+        _: &Option<Value>,
+        _: &str,
+    ) -> Result<Value> {
         bail!("native backend was built without nftables support")
     }
 }
@@ -531,7 +536,7 @@ impl Native {
             .lock()
             .map_err(|_| anyhow!("DHCP state poisoned"))?;
         dhcp_client::effective(&mut network, &leases)?;
-        firewall::validate(&network.firewall)?;
+        firewall::validate(&network.firewall, &network.interfaces)?;
         let parents = self.parents.clone();
         let ownership = self.ownership()?;
         if ownership.committed_config.is_some() {
@@ -595,7 +600,7 @@ impl Native {
                 "RPS requires a managed physical Ethernet or WireGuard interface"
             );
         }
-        firewall::validate(&network.firewall)?;
+        firewall::validate(&network.firewall, &network.interfaces)?;
         let allowed_names: BTreeSet<_> = network
             .interfaces
             .iter()
@@ -700,7 +705,7 @@ impl Native {
                 ipv6::set(false)?;
             }
             sysctl::write_scope(&namespace_values, "namespace")?;
-            firewall::apply(&after.firewall)?;
+            firewall::apply(&after.firewall, &after.interfaces)?;
             let fingerprint = netfilter::fingerprint()?;
             // Verify the result rather than interpreting a netlink ACK as convergence.
             rt.block_on(networking::verify(handle, &after, &parents, &keys))?;
@@ -1911,9 +1916,14 @@ impl Backend for Native {
             let fingerprint = ownership
                 .firewall_fingerprint
                 .context("firewall counters unavailable; no owned firewall is installed")?;
-            let value = config.operational_value()?["firewall"].clone();
+            let network = Network::parse(&config.operational_value()?)?;
             let mut response = session(self.namespace.clone(), move |_, _| {
-                firewall::counters(&value, &ownership.firewall_config, &fingerprint)
+                firewall::counters(
+                    &network.firewall,
+                    &network.interfaces,
+                    &ownership.firewall_config,
+                    &fingerprint,
+                )
             })?;
             response["sample"] = json!({
                 "scope":self.identity, "started_at":started_at,
@@ -2023,7 +2033,7 @@ impl Backend for Native {
             ownership = self.ownership()?;
         }
         {
-            let firewall = Network::parse(&value)?.firewall;
+            let network = Network::parse(&value)?;
             let captured = self.capture_kernel(&value, &value)?;
             let intent = Intent {
                 scope: self.identity.clone(),
@@ -2042,17 +2052,17 @@ impl Backend for Native {
                         "initial firewall bootstrap failed; scoped recovery intent retained",
                     )?;
             } else {
-                let target = firewall.clone();
+                let target = network.clone();
                 ownership.firewall_fingerprint = Some(
                     session(self.namespace.clone(), move |_, _| {
-                        firewall::apply(&target)?;
+                        firewall::apply(&target.firewall, &target.interfaces)?;
                         netfilter::fingerprint()
                     })
                     .context("firewall compiler refresh failed; scoped recovery intent retained")?,
                 );
             }
             ownership.scope = self.identity.clone();
-            ownership.firewall_config = Some(firewall);
+            ownership.firewall_config = Some(network.firewall);
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))?;
         }

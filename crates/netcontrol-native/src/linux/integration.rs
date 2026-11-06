@@ -80,6 +80,415 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and nftables"]
+fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollback() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use std::{
+        net::UdpSocket,
+        os::fd::{FromRawFd, OwnedFd},
+        time::Duration,
+    };
+    let router = Fixture::new()?;
+    let client = Fixture::new()?;
+    let server = Fixture::new()?;
+    let router_ns = Arc::new(File::open(&router.namespace)?);
+    let client_ns = Arc::new(File::open(&client.namespace)?);
+    let server_ns = Arc::new(File::open(&server.namespace)?);
+    for (name, peer, target) in [
+        ("trunk0", "client0", client_ns.clone()),
+        ("srv0", "server0", server_ns.clone()),
+    ] {
+        session(router_ns.clone(), move |rt, handle| {
+            rt.block_on(async {
+                handle
+                    .link()
+                    .add()
+                    .veth(name.into(), peer.into())
+                    .execute()
+                    .await?;
+                let link = handle
+                    .link()
+                    .get()
+                    .match_name(peer.into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("DHCP peer missing")?;
+                handle
+                    .link()
+                    .set(link.header.index)
+                    .setns_by_fd(target.as_raw_fd())
+                    .execute()
+                    .await?;
+                Ok(())
+            })
+        })?;
+    }
+    session(client_ns.clone(), |rt, handle| {
+        rt.block_on(async {
+            let link = handle
+                .link()
+                .get()
+                .match_name("client0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("DHCP client trunk missing")?;
+            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .link()
+                .add()
+                .vlan("vlan30".into(), link.header.index, 30)
+                .execute()
+                .await?;
+            let vlan = handle
+                .link()
+                .get()
+                .match_name("vlan30".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("DHCP client VLAN missing")?;
+            handle
+                .address()
+                .add(vlan.header.index, "10.4.30.2".parse()?, 24)
+                .execute()
+                .await?;
+            handle.link().set(vlan.header.index).up().execute().await?;
+            Ok(())
+        })
+    })?;
+    session(server_ns.clone(), |rt, handle| {
+        rt.block_on(async {
+            let link = handle
+                .link()
+                .get()
+                .match_name("server0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("DHCP server link missing")?;
+            for address in ["10.4.40.40", "10.4.40.41", "10.4.40.42"] {
+                handle
+                    .address()
+                    .add(link.header.index, address.parse()?, 24)
+                    .execute()
+                    .await?;
+            }
+            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .route()
+                .add()
+                .v4()
+                .destination_prefix("10.4.30.0".parse()?, 24)
+                .gateway("10.4.40.1".parse()?)
+                .output_interface(link.header.index)
+                .execute()
+                .await?;
+            Ok(())
+        })
+    })?;
+    let socket = |namespace: Arc<File>, address: &'static str| {
+        session(namespace, move |_, _| {
+            let socket = UdpSocket::bind(address)?;
+            socket.set_broadcast(true)?;
+            socket.set_read_timeout(Some(Duration::from_millis(600)))?;
+            Ok(socket)
+        })
+    };
+    let upstream = socket(server_ns.clone(), "10.4.40.40:67")?;
+    let replacement = socket(server_ns.clone(), "10.4.40.41:67")?;
+    let outsider = socket(server_ns.clone(), "10.4.40.42:67")?;
+    let wrong_port = socket(server_ns.clone(), "10.4.40.40:68")?;
+    let downstream = socket(client_ns.clone(), "0.0.0.0:68")?;
+    let send_discover = |id: u32, broadcast: bool, source_port: u16, destination_port: u16| {
+        let mut packet = vec![0u8; 300];
+        packet[..4].copy_from_slice(&[1, 1, 6, 0]);
+        packet[4..8].copy_from_slice(&id.to_be_bytes());
+        packet[8..10].copy_from_slice(&561u16.to_be_bytes());
+        if broadcast {
+            packet[10] = 0x80;
+        }
+        packet[28..34].copy_from_slice(&[0x74, 0xfa, 0x29, 0x3e, 0x5d, 0x96]);
+        packet[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        packet[240..284].copy_from_slice(&[
+            53, 1, 1, 57, 2, 2, 64, 55, 8, 1, 3, 6, 12, 15, 28, 42, 43, 12, 9, b'o', b'f', b'f',
+            b'i', b'c', b'e', b'-', b'a', b'p', 60, 4, b'u', b'b', b'n', b't', 61, 7, 1, 0x74,
+            0xfa, 0x29, 0x3e, 0x5d, 0x96, 255,
+        ]);
+        let payload = packet.clone();
+        session(client_ns.clone(), move |rt, handle| {
+            let link = rt
+                .block_on(
+                    handle
+                        .link()
+                        .get()
+                        .match_name("vlan30".into())
+                        .execute()
+                        .try_next(),
+                )?
+                .context("DHCP client VLAN missing")?;
+            let descriptor = unsafe {
+                libc::socket(
+                    libc::AF_PACKET,
+                    libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                    (libc::ETH_P_IP as u16).to_be() as i32,
+                )
+            };
+            ensure!(
+                descriptor >= 0,
+                "DHCP injection socket: {}",
+                std::io::Error::last_os_error()
+            );
+            let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+            let mut wire = vec![0; 28 + payload.len()];
+            wire[0] = 0x45;
+            let length = u16::try_from(wire.len())?;
+            wire[2..4].copy_from_slice(&length.to_be_bytes());
+            wire[8] = 64;
+            wire[9] = 17;
+            wire[16..20].fill(255);
+            let mut checksum: u32 = wire[..20]
+                .chunks_exact(2)
+                .map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]])))
+                .sum();
+            while checksum > 65535 {
+                checksum = (checksum & 65535) + (checksum >> 16);
+            }
+            wire[10..12].copy_from_slice(&(!(checksum as u16)).to_be_bytes());
+            wire[20..22].copy_from_slice(&source_port.to_be_bytes());
+            wire[22..24].copy_from_slice(&destination_port.to_be_bytes());
+            wire[24..26].copy_from_slice(&u16::try_from(payload.len() + 8)?.to_be_bytes());
+            wire[28..].copy_from_slice(&payload);
+            let mut destination: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            destination.sll_family = libc::AF_PACKET as _;
+            destination.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+            destination.sll_ifindex = link.header.index as _;
+            destination.sll_halen = 6;
+            destination.sll_addr[..6].fill(255);
+            let sent = unsafe {
+                libc::sendto(
+                    descriptor.as_raw_fd(),
+                    wire.as_ptr().cast(),
+                    wire.len(),
+                    0,
+                    &destination as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&destination) as _,
+                )
+            };
+            ensure!(
+                sent == wire.len() as isize,
+                "DHCP frame injection: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(())
+        })?;
+        Ok::<_, anyhow::Error>(packet)
+    };
+    let assert_no_packet = |socket: &UdpSocket| -> Result<()> {
+        match socket.recv_from(&mut [0u8; 1500]) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(())
+            }
+            result => anyhow::bail!("unexpected DHCP receive result: {result:?}"),
+        }
+    };
+    let exchange = |id: u32, server: &UdpSocket, relay: &str| -> Result<()> {
+        let request = send_discover(id, true, 68, 67)?;
+        let mut wire = [0u8; 1500];
+        let (size, peer) = server
+            .recv_from(&mut wire)
+            .context("Discover was not relayed")?;
+        assert_eq!(peer, format!("{relay}:67").parse()?);
+        assert_eq!(size, request.len());
+        assert_eq!(&wire[4..8], &request[4..8]);
+        assert_eq!(wire[3], 1);
+        assert_eq!(
+            &wire[24..28],
+            &relay.parse::<std::net::Ipv4Addr>()?.octets()
+        );
+        wire[0] = 2;
+        wire[3] = 0;
+        wire[16..20].copy_from_slice(&[10, 4, 30, 100]);
+        wire[242] = 2;
+        server.send_to(&wire[..size], peer)?;
+        let (length, _) = downstream
+            .recv_from(&mut wire)
+            .context("Offer was not delivered")?;
+        assert_eq!(length, request.len());
+        assert_eq!(wire[0], 2);
+        assert_eq!(&wire[4..8], &request[4..8]);
+        assert_eq!(&wire[16..20], &[10, 4, 30, 100]);
+        Ok(())
+    };
+    let options = router.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let disabled = config(json!({
+        "ipv6_enabled":false,
+        "interfaces":[
+            {"name":"trunk0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":[]},
+            {"name":"vlan30","kind":"vlan","role":"lan","up":true,"mtu":1500,
+             "addresses":["10.4.30.1/24"],"vlan":{"parent":"trunk0","id":30},
+             "dhcp_relay":{"enabled":false,"servers":["10.4.40.40"]}},
+            {"name":"srv0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["10.4.40.1/24"]}
+        ],
+        "firewall":{"policy":"drop","allow_all_icmp":false,"rules":[],
+            "input":{"policy":"drop","interfaces":[]}}
+    }))?;
+    disabled.validate()?;
+    native.apply(&empty, &disabled)?;
+    send_discover(1, false, 68, 67)?;
+    assert_no_packet(&upstream)?;
+    let mut enabled = disabled.clone();
+    enabled.interfaces[1].dhcp_relay.enabled = true;
+    native.apply(&disabled, &enabled)?;
+    assert_eq!(native.observe(&enabled)?, enabled);
+    assert_eq!(enabled.firewall, disabled.firewall);
+
+    // Exercise the configured-server permit before any matching outbound flow exists.
+    upstream.send_to(b"configured server", "10.4.30.1:67")?;
+    // Reproduce the zero-source, flags=0 Discover before testing broadcast Offers.
+    send_discover(2, false, 68, 67)?;
+    let mut wire = [0u8; 1500];
+    let (_, peer) = upstream.recv_from(&mut wire)?;
+    assert_eq!(peer.to_string(), "10.4.30.1:67");
+    assert_eq!(wire[10], 0);
+
+    outsider.send_to(b"unconfigured server", "10.4.30.1:67")?;
+    wrong_port.send_to(b"wrong source port", "10.4.30.1:67")?;
+    upstream.send_to(b"wrong local address", "10.4.40.1:67")?;
+    upstream.send_to(b"wrong destination port", "10.4.30.1:68")?;
+    upstream.send_to(b"disabled ingress", "255.255.255.255:67")?;
+    send_discover(3, false, 69, 67)?;
+    send_discover(4, false, 68, 8080)?;
+    let path = "/api/v1/statistics/firewall";
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let snapshot = loop {
+        let snapshot = native.statistics(&enabled, path, "")?;
+        if firewall_counter(&snapshot, "input:/firewall/input/policy")?["packets"]
+            .as_str()
+            .context("missing input drops")?
+            .parse::<u64>()?
+            >= 7
+        {
+            break snapshot;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "missing negative-path drops: {snapshot}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        firewall_counter(&snapshot, "input:generated/input/dhcp_relay/vlan30/clients")?["packets"],
+        "1"
+    );
+    assert_eq!(
+        firewall_counter(&snapshot, "input:generated/input/dhcp_relay/vlan30/servers")?["packets"],
+        "1"
+    );
+    assert!(
+        firewall_counter(&snapshot, "input:/firewall/input/policy")?["packets"]
+            .as_str()
+            .context("missing input drops")?
+            .parse::<u64>()?
+            >= 7
+    );
+    exchange(5, &upstream, "10.4.30.1")?;
+    let mut renewal = wire[..300].to_vec();
+    renewal[3] = 0;
+    renewal[4..8].copy_from_slice(&50u32.to_be_bytes());
+    renewal[12..16].copy_from_slice(&[10, 4, 30, 2]);
+    renewal[24..28].fill(0);
+    renewal[242] = 3;
+    downstream.send_to(&renewal, "10.4.30.1:67")?;
+    let (length, _) = upstream.recv_from(&mut wire)?;
+    assert_eq!(length, 300);
+    assert_eq!(&wire[4..8], &50u32.to_be_bytes());
+    assert_eq!(&wire[12..16], &[10, 4, 30, 2]);
+
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.repair(&enabled)?;
+    assert_eq!(native.observe(&enabled)?, enabled);
+    assert_eq!(
+        native.statistics(&enabled, path, "")?["ruleset_id"],
+        snapshot["ruleset_id"]
+    );
+    exchange(6, &upstream, "10.4.30.1")?;
+    let mut changed = enabled.clone();
+    changed.interfaces[1].addresses = vec!["10.4.30.9/24".into()];
+    changed.interfaces[1].dhcp_relay.servers = vec!["10.4.40.41".into()];
+    native.apply(&enabled, &changed)?;
+    assert_ne!(
+        native.statistics(&changed, path, "")?["ruleset_id"],
+        snapshot["ruleset_id"]
+    );
+    upstream.send_to(b"removed server", "10.4.30.9:67")?;
+    exchange(7, &replacement, "10.4.30.9")?;
+    assert_ne!(
+        firewall_counter(
+            &native.statistics(&changed, path, "")?,
+            "input:/firewall/input/policy"
+        )?["packets"],
+        "0"
+    );
+    assert_no_packet(&upstream)?;
+    native.apply(&changed, &enabled)?;
+    exchange(8, &upstream, "10.4.30.1")?;
+    let before = enabled.operational_value()?;
+    let after = changed.operational_value()?;
+    let ownership = native.ownership()?;
+    let intent = Intent {
+        scope: native.identity.clone(),
+        before: before.clone(),
+        after: after.clone(),
+        kernel_before: native.capture_kernel(&before, &after)?,
+        ownership_before: ownership.clone(),
+        ethernet_before: BTreeMap::new(),
+        ethernet_originals: ownership.ethernet_originals.clone(),
+        ipv6_before: native.capture_ipv6(&before)?,
+    };
+    write_json(&native.state.join("intent.json"), &intent)?;
+    let mut provisional = ownership;
+    native.network_apply(&before, &after, Kernel::default(), &mut provisional)?;
+    drop(native);
+    let mut native = Native::open(router.options())?;
+    assert!(!native.state.join("intent.json").exists());
+    assert_eq!(native.observe(&enabled)?, enabled);
+    exchange(9, &upstream, "10.4.30.1")?;
+    let mut failing = changed.clone();
+    failing.ntp.enabled = true;
+    failing.ntp.servers = vec!["10.4.40.40".into()];
+    assert!(native.apply(&enabled, &failing).is_err());
+    assert_eq!(native.observe(&enabled)?, enabled);
+    exchange(10, &upstream, "10.4.30.1")?;
+    native.apply(&enabled, &disabled)?;
+    let stopped = native.statistics(&disabled, path, "")?;
+    assert!(
+        !stopped["rules"]
+            .as_array()
+            .context("missing counters")?
+            .iter()
+            .any(|row| row["id"]
+                .as_str()
+                .is_some_and(|id| id.contains("dhcp_relay")))
+    );
+    send_discover(11, false, 68, 67)?;
+    assert_no_packet(&upstream)?;
+    assert_eq!(native.observe(&disabled)?, disabled);
+    native.apply(&disabled, &empty)?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
 fn native_interface_ownership_restores_physical_and_vlan_without_touching_other_links() -> Result<()>
 {

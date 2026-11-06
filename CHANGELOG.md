@@ -4,14 +4,17 @@
 
 ### Changed
 
-- MQTT telemetry uses per-sensor retained discovery and bounded metric/structured
-  state topics instead of monolithic discovery/state messages. Aggregate samples
-  can exceed 1 MiB without dropping sensors; every publication remains bounded.
-  Preserve stable identity, precision, partial-source expiry, QoS acknowledgment
-  and durable per-entity removal. Oversized indivisible units report byte counts.
-  Release impact: breaking MQTT topic/payload contract, Unreleased; next automatic
-  calendar version. Required consumer/ACL and retained-discovery deployment work:
-  [handoff 2026-11-06-06](docs/frontend-handoffs/2026-11-06.md#2026-11-06-06-bounded-mqtt-topic-publications).
+- MQTT telemetry consolidates back to one retained Home Assistant device-discovery
+  message and one complete state message, replacing split sensor/metric/section
+  publications. Raise each payload cap from 1 MiB to the selected 32 MiB, with
+  outbound packet headroom; retain 4096 entities, exact values, partial-source
+  expiry, QoS acknowledgment and durable component removal. Oversized aggregate
+  payloads fail explicitly without partial enqueue. This supersedes the earlier
+  split-topic change; no live Home Assistant recovery is claimed.
+  Release impact: breaking MQTT topic/deployment contract, Unreleased; next
+  automatic calendar version. Required broker size/ACL, retained-topic cleanup
+  and consumer work:
+  [handoff 2026-11-06-07](docs/frontend-handoffs/2026-11-06.md#2026-11-06-07-consolidated-mqtt-with-32-mib-payloads).
 
 - CI restores separate Rust dependency/build caches for checks, privileged
   integration and musl packaging, and builds packages alongside validation.
@@ -36,6 +39,18 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Enabling DHCPv4 relay derives narrowly scoped client/server input permissions
+  in the native atomic firewall transaction, avoiding silent default-input drops
+  despite an enabled worker. Disable/removal, address/server edits, restart and
+  rollback regenerate permissions without appending manual rules or opening
+  forwarding/NAT/management access. Core validation, worker and rules share the
+  same relay-address selection; rule counters and ruleset identity include the
+  generated input exceptions. Release impact: runtime fix with additive generated
+  counter contract and intentional DHCP input-policy behavior change; Unreleased,
+  next automatic calendar version.
+  Required frontend/operator guidance:
+  [handoff 2026-11-06-08](docs/frontend-handoffs/2026-11-06.md#2026-11-06-08-automatic-dhcp-relay-input-permits).
 
 - Size the native netfilter socket for complete atomic firewall updates instead
   of sending large Sando/imported rulesets through the default-size buffer and

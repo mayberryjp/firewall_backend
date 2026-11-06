@@ -328,7 +328,7 @@ fn path_test_refuses_foreign_firewall_replacement_and_restores_owned_mtu() -> Re
     wait(&mut native, "running", 5)?;
     let value = config.operational_value()?["firewall"].clone();
     let foreign = session(native.namespace.clone(), move |_, _| {
-        firewall::apply(&value)?;
+        firewall::apply(&value, &[])?;
         netfilter::fingerprint()
     })?;
     native.cancel_path_test(&id)?;
@@ -457,7 +457,7 @@ fn path_test_kernel_lease_expires_without_worker_or_cleanup() -> Result<()> {
     let (_fixture, native, config) = setup()?;
     let firewall_value = config.operational_value()?["firewall"].clone();
     session(native.namespace.clone(), move |_, _| {
-        firewall::validate(&firewall_value)?;
+        firewall::validate(&firewall_value, &[])?;
         permits::check_enforcement()?;
         let before = netfilter::fingerprint()?;
         let (rules, lease) = permits::rules(

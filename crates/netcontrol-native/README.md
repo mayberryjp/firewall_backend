@@ -15,6 +15,22 @@ requests a success acknowledgement; errors from every operation remain checked.
 Buffer allocation, permission and kernel failures remain explicit apply errors
 with the ordinary transaction recovery/rollback behavior.
 
+## DHCP relay input permissions
+
+The input planner derives narrow IPv4 UDP permits from enabled managed relays,
+before configured input rules. Client traffic must enter its enabled interface
+on UDP 68 to 67 and target limited broadcast or the shared selected relay address.
+Server traffic must be UDP 67 to 67 from one of that relay's configured servers
+to its exact relay address; return ingress is not guessed from topology.
+The worker still validates packet format, transaction identity and on-link state.
+
+The native atomic firewall batch owns these rules, not editable firewall JSON.
+Apply, restart repair, disable/removal, address/server edits and intent recovery
+derive rules from their target interface configuration. Counter layout and
+ruleset identity include the derived permissions. Existing manual permissions and
+established/related conntrack behavior remain; no routing, forwarding, NAT or
+unrelated service admission is generated.
+
 ## Operator requirements
 
 - Linux with network namespace, dummy, VLAN, WireGuard, connection-tracking,

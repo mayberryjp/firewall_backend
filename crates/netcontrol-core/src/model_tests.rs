@@ -928,6 +928,7 @@ fn host_ethernet_and_main_table_routes_validate_without_relaxing_reserved_values
         invalid.routes[0].table = table;
         assert!(invalid.validate().is_err(), "route table {table}");
     }
+
     let mut invalid = config.clone();
     invalid.interfaces[0].kind = "bridge".into();
     assert!(invalid.validate().is_err());
@@ -937,6 +938,43 @@ fn host_ethernet_and_main_table_routes_validate_without_relaxing_reserved_values
         id: 10,
     });
     assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn dhcp_relay_address_selection_is_shared_lexical_and_unique() {
+    let addresses = vec![
+        "10.4.30.2/24".into(),
+        "2001:db8::1/64".into(),
+        "10.4.30.10/24".into(),
+    ];
+    assert_eq!(
+        dhcp_relay_address(&addresses).unwrap().to_string(),
+        "10.4.30.10"
+    );
+    for addresses in [
+        vec!["2001:db8::1/64".into()],
+        vec!["0.1.2.3/24".into()],
+        vec!["127.0.0.1/8".into()],
+        vec!["10.4.30.1/33".into()],
+    ] {
+        assert!(dhcp_relay_address(&addresses).is_err());
+    }
+    let config: Config = serde_json::from_value(json!({"interfaces":[
+        {"name":"relay0","kind":"dummy","role":"lan","up":true,"mtu":1500,
+         "addresses":addresses,
+         "dhcp_relay":{"enabled":true,"servers":["10.4.40.40"]}},
+        {"name":"relay1","kind":"dummy","role":"lan","up":true,"mtu":1500,
+         "addresses":["10.4.30.10/24"],
+         "dhcp_relay":{"enabled":true,"servers":["10.4.40.40"]}}
+    ]}))
+    .unwrap();
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("distinct relay addresses")
+    );
 }
 #[test]
 fn empty_and_icmp_defaults_are_explicit() {
