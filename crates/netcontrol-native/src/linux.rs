@@ -140,17 +140,12 @@ pub(super) fn validate_offline_state(ownership: &Value, receipt: Option<&Value>)
 }
 
 impl Ownership {
-    fn handover_originals(
-        &self,
-        host_mode: bool,
-        inherited: bool,
-    ) -> BTreeMap<String, EthernetSnapshot> {
+    fn handover_originals(&self, host_mode: bool) -> BTreeMap<String, EthernetSnapshot> {
         if !host_mode {
             return BTreeMap::new();
         }
         self.ethernet_originals
             .iter()
-            .filter(|_| inherited)
             .chain(
                 self.vlan_originals
                     .iter()
@@ -393,10 +388,7 @@ impl Native {
             "host tunable recovery requires host mode or allow_host_tunables for a lab namespace"
         );
         native.bgp.recover()?;
-        let originals = ownership.handover_originals(
-            host_mode,
-            host_mode && native.state.join("adoption.json").try_exists()?,
-        );
+        let originals = ownership.handover_originals(host_mode);
         if !originals.is_empty() {
             let snapshots = originals.clone();
             session(native.namespace.clone(), move |rt, handle| {
@@ -407,6 +399,19 @@ impl Native {
         }
         native.recover()?;
         Ok(native)
+    }
+
+    fn take_ownership(&self, originals: &BTreeMap<String, EthernetSnapshot>) -> Result<()> {
+        let snapshots = originals.clone();
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::check_ethernet(handle, &snapshots))
+        })?;
+        adoption::handover_interfaces(originals)?;
+        let snapshots = originals.clone();
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::restore_interfaces(handle, &snapshots))
+        })
+        .context("apply captured settings after interface ownership takeover")
     }
 
     fn check_scope(&self) -> Result<()> {
@@ -1271,51 +1276,30 @@ impl Backend for Native {
         let wanted = token.request.clone();
         let originals = receipt.originals.clone();
         session(self.namespace.clone(), move |rt, handle| {
-            let current = rt.block_on(networking::capture_vlan_snapshot(handle, &wanted))?;
             let expected = originals
                 .get(&wanted.name)
                 .context("VLAN snapshot missing")?;
-            crate::ensure_unchanged(
-                current.boot == expected.boot
-                    && current.index == expected.index
-                    && current.mac == expected.mac
-                    && current.mtu == expected.mtu
-                    && current.up == expected.up
-                    && current.addresses == expected.addresses,
-                "VLAN changed since durable capture",
-            )?;
-            Ok(())
+            rt.block_on(networking::check_vlan_identity(handle, &wanted, expected))
         })?;
         let already_owned = actual.committed_config.as_ref() == Some(&after_value);
-        if already_owned {
-            self.verify(&after_value)?;
-        } else {
+        if !already_owned {
             ensure!(
                 serde_json::to_value(&actual)? == serde_json::to_value(&previous)?,
                 "VLAN adoption ownership changed"
             );
-            self.verify(&before_value)?;
         }
+        self.verify(&before_value)?;
         let result = (|| -> Result<()> {
             // An interrupted rollback can release networkd before restoring ownership.json.
-            adoption::handover(&receipt)?;
+            self.take_ownership(&receipt.originals)?;
             let captured = receipt.clone();
             let wanted = token.request.clone();
             session(self.namespace.clone(), move |rt, handle| {
-                let current = rt.block_on(networking::capture_vlan_snapshot(handle, &wanted))?;
                 let expected = captured
                     .originals
                     .get(&wanted.name)
                     .context("VLAN snapshot missing")?;
-                crate::ensure_unchanged(
-                    current.boot == expected.boot
-                        && current.index == expected.index
-                        && current.mac == expected.mac
-                        && current.mtu == expected.mtu
-                        && current.up == expected.up
-                        && current.addresses == expected.addresses,
-                    "VLAN changed during networkd handover",
-                )?;
+                rt.block_on(networking::check_vlan_identity(handle, &wanted, expected))?;
                 rt.block_on(adoption::transfer_routes(handle, &captured, false))
             })?;
             let snapshot = receipt
@@ -1553,15 +1537,10 @@ impl Backend for Native {
                     .is_some_and(|snapshot| snapshot.name == link.name)),
             "inherited interface snapshot identities do not match the baseline"
         );
-        let originals = receipt.originals.clone();
-        session(self.namespace.clone(), move |rt, handle| {
-            rt.block_on(networking::check_ethernet(handle, &originals))
-        })?;
         let result = (|| -> Result<()> {
-            adoption::handover(&receipt)?;
+            self.take_ownership(&receipt.originals)?;
             let captured = receipt.clone();
             session(self.namespace.clone(), move |rt, handle| {
-                rt.block_on(networking::restore_ethernet(handle, &captured.originals))?;
                 rt.block_on(adoption::transfer_routes(handle, &captured, false))
             })?;
             for (name, lease) in &receipt.leases {
@@ -2345,32 +2324,23 @@ mod ownership_tests {
     }
 
     #[test]
-    fn handover_restores_only_still_managed_interfaces() {
+    fn interface_ownership_handover_restores_only_still_managed_interfaces() {
         let ownership = inherited_ownership();
-        let selected = ownership.handover_originals(true, true);
+        let selected = ownership.handover_originals(true);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected["owned0"], ownership.ethernet_originals["owned0"]);
         assert!(!selected.contains_key("released0"));
     }
 
     #[test]
-    fn handover_skips_labs_and_non_inherited_configurations() {
+    fn interface_ownership_handover_includes_non_inherited_physical_interfaces() {
         let ownership = inherited_ownership();
-        for (host_mode, inherited) in [(false, false), (false, true), (true, false)] {
-            assert!(
-                ownership
-                    .handover_originals(host_mode, inherited)
-                    .is_empty()
-            );
-        }
+        assert!(ownership.handover_originals(false).is_empty());
+        assert!(ownership.handover_originals(true).contains_key("owned0"));
     }
 
     #[test]
-    fn handover_does_not_discover_new_interfaces() {
-        assert!(
-            Ownership::default()
-                .handover_originals(true, true)
-                .is_empty()
-        );
+    fn interface_ownership_handover_does_not_discover_new_interfaces() {
+        assert!(Ownership::default().handover_originals(true).is_empty());
     }
 }

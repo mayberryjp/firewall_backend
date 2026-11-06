@@ -352,10 +352,46 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
         return Ok(());
     }
     ensure!(
-        unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0,
+        unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWNS) } == 0,
         "child fixture requires CAP_SYS_ADMIN for unshare: {}",
         std::io::Error::last_os_error()
     );
+    ensure!(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        } == 0,
+        "make fixture mounts private: {}",
+        std::io::Error::last_os_error()
+    );
+    for (source, target, kind) in [
+        (c"sysfs", c"/sys", c"sysfs"),
+        (c"tmpfs", c"/run", c"tmpfs"),
+        (c"tmpfs", c"/etc/systemd", c"tmpfs"),
+    ] {
+        ensure!(
+            unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    kind.as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                )
+            } == 0,
+            "mount isolated fixture {}: {}",
+            target.to_string_lossy(),
+            std::io::Error::last_os_error()
+        );
+    }
+    for path in ["/run", "/etc/systemd"] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
     let namespace = Arc::new(File::open("/proc/thread-self/ns/net")?);
     session(namespace.clone(), |rt, handle| {
         rt.block_on(async {

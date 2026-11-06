@@ -28,6 +28,18 @@
 
 ### Fixed
 
+- Physical-interface inheritance and explicit VLAN ownership recovery now share
+  active takeover: relinquish networkd management and reapply captured settings
+  instead of requiring mutable live settings
+  to remain frozen. Compare address configuration without kernel timestamps or
+  dump ordering, avoiding false drift after reconfiguration/rollback. Retain
+  identity checks, finite lease expiry, durable recovery and unrelated appliance
+  configuration. Restart reasserts exclusions for all still-owned physical
+  interfaces, not only those with an initial-inheritance receipt.
+  Release impact: runtime fix, Unreleased; next automatic calendar version.
+  Optional recovery-help update:
+  [handoff 2026-11-06-04](docs/frontend-handoffs/2026-11-06.md#2026-11-06-04-active-vlan-ownership-recovery).
+
 - Stage unprivileged local-control test executables outside private CI build
   paths so UID-drop probes reach the CLI/root-peer authorization checks instead
   of failing at process launch. Add a private-build-directory regression.

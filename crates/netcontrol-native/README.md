@@ -75,6 +75,12 @@ Successful adoption saves an unassigned VLAN baseline. Subsequent confirmed LAN
 transactions can change its role/address; their rollback preserves that baseline.
 Interrupted adoption retains recovery intent and blocks conflicting writes.
 Inspect the error and recover deliberately; do not delete state or blindly retry.
+Recovery fences networkd for the selected VLAN, actively restores the captured
+address/MTU/up settings and verifies the result. Live settings do not have to
+remain frozen between capture and handover. Address comparison ignores kernel
+creation/update timestamps and dump ordering, but retains prefix, scope, flags,
+lifetime, identity and actual configuration checks. Raw recovery snapshots remain
+unchanged. Unrelated interfaces/configuration are not reset.
 See the [API contract](../../FRONTEND_SPEC.md#explicit-existing-vlan-adoption)
 and [local factory-LAN correction](../../docs/CLI.md#correcting-an-initially-untagged-factory-lan).
 Real systemd D-Bus handover and appliance connectivity still require on-device
@@ -438,7 +444,13 @@ receipt files receive the same readable mode on retry. This does not relax
 private receipt/lease permissions. An unsuccessful ownership check includes the
 observed administrative state, selected network file and expected override.
 
-On restart, inherited host interfaces that remain in durable native ownership
+Physical inheritance and explicit VLAN adoption share the same active takeover:
+check identity, install networkd exclusions, restore captured address/MTU/up
+settings and verify the resulting configuration. Address verification ignores
+kernel timestamps and dump ordering, ages finite leases and rejects actual
+lifetime changes (allowing one second of kernel/capture rounding).
+
+On restart, host interfaces that remain in durable native ownership
 have their identities checked and their networkd exclusions reasserted before
 interrupted-operation recovery, DHCP startup or resolver publication. Missing
 exclusions are recreated; conflicting files still fail explicitly. This prevents
@@ -446,6 +458,11 @@ resolved's `LinkBusy` failure after networkd has reclaimed an interface. Explici
 lab configurations and interfaces no longer managed are not handed over through
 this restart path. It does not change saved addresses, DHCP settings or roles,
 and it does not discard recovery intents.
+
+Interfaces without networkd runtime state still receive persistent exclusions;
+they do not require a networkd D-Bus service merely to reopen native ownership.
+Links with runtime state must pass the existing D-Bus relinquishment check.
+Initial capture restrictions and supported manager requirements are unchanged.
 
 Ordinary startup reads the core journal without initial inheritance. If an
 already-owned host interface differs from the saved desired configuration,

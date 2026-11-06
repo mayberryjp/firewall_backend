@@ -132,6 +132,167 @@ mod tests {
         assert!(validate_vlan_connected_route(&route, &[address]).is_err());
     }
 
+    fn permanent_vlan_address(ip: &str) -> AddressMessage {
+        let mut address = AddressMessage::default();
+        address.header.family = AddressFamily::Inet;
+        address.header.prefix_len = 24;
+        address.header.index = 3;
+        address.header.flags = vec![AddressHeaderFlag::Permanent];
+        let mut cache = netlink_packet_route::address::CacheInfo::default();
+        cache.ifa_valid = u32::MAX;
+        cache.ifa_preferred = u32::MAX;
+        cache.cstamp = 10;
+        cache.tstamp = 20;
+        address.attributes = vec![
+            AddressAttribute::Address(ip.parse().unwrap()),
+            AddressAttribute::Local(ip.parse().unwrap()),
+            AddressAttribute::Label("vlan50".into()),
+            AddressAttribute::CacheInfo(cache),
+        ];
+        address
+    }
+
+    fn vlan_snapshot(addresses: Vec<AddressMessage>) -> EthernetSnapshot {
+        EthernetSnapshot {
+            name: "vlan50".into(),
+            kind: "vlan".into(),
+            index: 3,
+            mac: "02:00:00:00:00:01".into(),
+            mtu: 1500,
+            up: true,
+            boot: "test-boot".into(),
+            captured_unix: 1,
+            addresses: addresses
+                .into_iter()
+                .map(|address| {
+                    let mut raw = vec![0; address.buffer_len()];
+                    address.emit(&mut raw);
+                    raw
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn interface_ownership_comparison_ignores_timestamps_and_dump_order() {
+        let mut first = permanent_vlan_address("192.0.2.1");
+        let second = permanent_vlan_address("198.51.100.1");
+        let expected = vlan_snapshot(vec![first.clone(), second.clone()]);
+        for attribute in &mut first.attributes {
+            if let AddressAttribute::CacheInfo(info) = attribute {
+                info.cstamp += 100;
+                info.tstamp += 200;
+            }
+        }
+        first.attributes.reverse();
+        let mut current = vlan_snapshot(vec![second, first]);
+        current.captured_unix += 300;
+        assert_ne!(current.addresses, expected.addresses);
+        check_interface_snapshot(&current, &expected).unwrap();
+    }
+
+    #[test]
+    fn interface_ownership_comparison_rejects_identity_and_settings_changes() {
+        let address = permanent_vlan_address("192.0.2.1");
+        let expected = vlan_snapshot(vec![address.clone()]);
+        for field in ["name", "kind", "index", "mac", "mtu", "up", "addresses"] {
+            let mut current = expected.clone();
+            match field {
+                "name" => current.name = "different".into(),
+                "kind" => current.kind = "veth".into(),
+                "index" => current.index += 1,
+                "mac" => current.mac = "02:00:00:00:00:02".into(),
+                "mtu" => current.mtu += 1,
+                "up" => current.up = false,
+                "addresses" => current.addresses.clear(),
+                _ => unreachable!(),
+            }
+            let error = check_interface_snapshot(&current, &expected).unwrap_err();
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+        for field in [
+            "prefix",
+            "scope",
+            "flags",
+            "local",
+            "label",
+            "valid",
+            "preferred",
+        ] {
+            let mut changed = address.clone();
+            match field {
+                "prefix" => changed.header.prefix_len = 25,
+                "scope" => changed.header.scope = AddressScope::Host,
+                "flags" => changed.header.flags.clear(),
+                "local" => {
+                    changed.attributes[1] = AddressAttribute::Local("192.0.2.2".parse().unwrap())
+                }
+                "label" => changed.attributes[2] = AddressAttribute::Label("different".into()),
+                "valid" | "preferred" => {
+                    let AddressAttribute::CacheInfo(info) = &mut changed.attributes[3] else {
+                        unreachable!()
+                    };
+                    if field == "valid" {
+                        info.ifa_valid = 120;
+                    } else {
+                        info.ifa_preferred = 120;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                check_interface_snapshot(&vlan_snapshot(vec![changed]), &expected).is_err(),
+                "{field}"
+            );
+        }
+        let mut malformed = expected.clone();
+        malformed.addresses = vec![vec![0]];
+        assert!(check_interface_snapshot(&malformed, &expected).is_err());
+    }
+
+    #[test]
+    fn interface_ownership_comparison_handles_lease_expiry_and_reboot_indices() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut address = permanent_vlan_address("192.0.2.1");
+        let AddressAttribute::CacheInfo(cache) = &mut address.attributes[3] else {
+            unreachable!()
+        };
+        cache.ifa_valid = 120;
+        cache.ifa_preferred = 60;
+        let mut expected = vlan_snapshot(vec![address.clone()]);
+        expected.kind = "veth".into();
+        expected.captured_unix = now - 10;
+        let AddressAttribute::CacheInfo(cache) = &mut address.attributes[3] else {
+            unreachable!()
+        };
+        cache.ifa_valid = 110;
+        cache.ifa_preferred = 50;
+        let mut current = vlan_snapshot(vec![address.clone()]);
+        current.kind = "veth".into();
+        current.captured_unix = now;
+        check_interface_snapshot(&current, &expected).unwrap();
+        let mut changed = address.clone();
+        let AddressAttribute::CacheInfo(cache) = &mut changed.attributes[3] else {
+            unreachable!()
+        };
+        cache.ifa_valid -= 20;
+        let mut drifted = current.clone();
+        drifted.addresses = vlan_snapshot(vec![changed]).addresses;
+        assert!(check_interface_snapshot(&drifted, &expected).is_err());
+
+        current.boot = "new-boot".into();
+        current.index += 1;
+        check_interface_snapshot(&current, &expected).unwrap();
+        expected.captured_unix = now - 121;
+        current.addresses.clear();
+        check_interface_snapshot(&current, &expected).unwrap();
+        expected.captured_unix = now + 60;
+        assert!(check_interface_snapshot(&current, &expected).is_err());
+    }
+
     #[test]
     fn loopback_kind_uses_kernel_flags_not_interface_name() {
         let mut link = LinkMessage::default();
@@ -414,28 +575,40 @@ pub async fn capture_ethernet(
     before: &Network,
     after: &Network,
 ) -> Result<BTreeMap<String, EthernetSnapshot>> {
+    let names = before
+        .interfaces
+        .iter()
+        .chain(&after.interfaces)
+        .filter(|link| link.kind == "ethernet")
+        .map(|link| link.name.clone())
+        .collect();
+    let snapshots = capture_interfaces(handle, &names).await?;
+    for snapshot in snapshots.values() {
+        ensure!(
+            ethernet_kind(&snapshot.kind) && snapshot.mac.len() == 17,
+            "{} is not a physical Ethernet device or veth",
+            snapshot.name
+        );
+    }
+    Ok(snapshots)
+}
+
+async fn capture_interfaces(
+    handle: &Handle,
+    names: &BTreeSet<String>,
+) -> Result<BTreeMap<String, EthernetSnapshot>> {
     let available = links(handle).await?;
     let mut result = BTreeMap::new();
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let captured_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    for desired in before
-        .interfaces
-        .iter()
-        .chain(&after.interfaces)
-        .filter(|l| l.kind == "ethernet")
-    {
+    for desired in names {
         let link = available
             .iter()
-            .find(|l| name(l) == desired.name)
-            .with_context(|| format!("Ethernet interface {} must already exist", desired.name))?;
+            .find(|link| name(link) == *desired)
+            .with_context(|| format!("interface {desired} must already exist"))?;
         let p = parent(link);
-        ensure!(
-            ethernet_kind(&p.kind) && p.mac.len() == 17,
-            "{} is not a physical Ethernet device or veth",
-            desired.name
-        );
         let messages = addresses(handle, p.index).await?;
         let addresses = messages
             .iter()
@@ -543,20 +716,7 @@ pub(super) async fn capture_vlan_snapshot(
     handle: &Handle,
     request: &netcontrol_core::AdoptVlanRequest,
 ) -> Result<EthernetSnapshot> {
-    let available = links(handle).await?;
-    let link = available
-        .iter()
-        .find(|link| name(link) == request.name)
-        .context("requested VLAN does not exist")?;
-    let parent_link = available
-        .iter()
-        .find(|link| name(link) == request.parent)
-        .context("VLAN parent does not exist")?;
-    validate_adoptable_vlan(link, parent_link, request)?;
-    ensure!(!available.iter().any(|other| other.attributes.iter()
-        .any(|attribute| matches!(attribute, LinkAttribute::Link(index) if *index == link.header.index))),
-        "VLAN has stacked/dependent links");
-    let p = parent(link);
+    let p = adoptable_vlan(handle, request).await?;
     let messages = addresses(handle, p.index).await?;
     for version in [IpVersion::V4, IpVersion::V6] {
         let routes: Vec<RouteMessage> = handle.route().get(version).execute().try_collect().await?;
@@ -606,6 +766,159 @@ pub(super) async fn capture_vlan_snapshot(
             .as_secs(),
         addresses: raw,
     })
+}
+
+async fn adoptable_vlan(
+    handle: &Handle,
+    request: &netcontrol_core::AdoptVlanRequest,
+) -> Result<Parent> {
+    let available = links(handle).await?;
+    let link = available
+        .iter()
+        .find(|link| name(link) == request.name)
+        .context("requested VLAN does not exist")?;
+    let parent_link = available
+        .iter()
+        .find(|link| name(link) == request.parent)
+        .context("VLAN parent does not exist")?;
+    validate_adoptable_vlan(link, parent_link, request)?;
+    ensure!(!available.iter().any(|other| other.attributes.iter()
+        .any(|attribute| matches!(attribute, LinkAttribute::Link(index) if *index == link.header.index))),
+        "VLAN has stacked/dependent links");
+    Ok(parent(link))
+}
+
+pub(super) async fn check_vlan_identity(
+    handle: &Handle,
+    request: &netcontrol_core::AdoptVlanRequest,
+    expected: &EthernetSnapshot,
+) -> Result<()> {
+    let current = adoptable_vlan(handle, request).await?;
+    crate::ensure_unchanged(
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim() == expected.boot
+            && current.name == expected.name
+            && current.kind == expected.kind
+            && current.index == expected.index
+            && current.mac == expected.mac,
+        "VLAN identity changed since durable capture",
+    )
+}
+
+fn normalized_interface_addresses(snapshot: &EthernetSnapshot, now: u64) -> Result<Vec<Vec<u8>>> {
+    let mut addresses = Vec::new();
+    for raw in &snapshot.addresses {
+        let mut address = AddressMessage::parse(&AddressMessageBuffer::new_checked(raw)?)?;
+        address.header.index = 0;
+        let mut expired = false;
+        for attribute in &mut address.attributes {
+            if let AddressAttribute::CacheInfo(info) = attribute {
+                info.cstamp = 0;
+                info.tstamp = 0;
+                for lifetime in [&mut info.ifa_valid, &mut info.ifa_preferred] {
+                    if *lifetime != u32::MAX {
+                        let elapsed = now.checked_sub(snapshot.captured_unix).context(
+                            "clock moved backward while verifying an interface address lifetime",
+                        )?;
+                        *lifetime =
+                            lifetime.saturating_sub(u32::try_from(elapsed).unwrap_or(u32::MAX));
+                    }
+                }
+                expired = info.ifa_valid == 0;
+            }
+        }
+        if expired {
+            continue;
+        }
+        address.attributes.sort_by_key(|attribute| attribute.kind());
+        let mut normalized = vec![0; address.buffer_len()];
+        address.emit(&mut normalized);
+        addresses.push(normalized);
+    }
+    addresses.sort();
+    Ok(addresses)
+}
+
+fn interface_addresses_match(
+    current: &EthernetSnapshot,
+    expected: &EthernetSnapshot,
+    now: u64,
+) -> Result<bool> {
+    let current = normalized_interface_addresses(current, now)?;
+    let expected = normalized_interface_addresses(expected, now)?;
+    if current.len() != expected.len() {
+        return Ok(false);
+    }
+    for (current, expected) in current.iter().zip(&expected) {
+        let mut current = AddressMessage::parse(&AddressMessageBuffer::new_checked(current)?)?;
+        let expected = AddressMessage::parse(&AddressMessageBuffer::new_checked(expected)?)?;
+        for (current, expected) in current.attributes.iter_mut().zip(&expected.attributes) {
+            if let (AddressAttribute::CacheInfo(current), AddressAttribute::CacheInfo(expected)) =
+                (current, expected)
+            {
+                for (current, expected) in [
+                    (&mut current.ifa_valid, expected.ifa_valid),
+                    (&mut current.ifa_preferred, expected.ifa_preferred),
+                ] {
+                    // Netlink lifetimes and capture times have independent one-second rounding.
+                    if *current > 0
+                        && *current < u32::MAX
+                        && expected > 0
+                        && expected < u32::MAX
+                        && current.abs_diff(expected) <= 1
+                    {
+                        *current = expected;
+                    }
+                }
+            }
+        }
+        if current != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn check_interface_snapshot(
+    current: &EthernetSnapshot,
+    expected: &EthernetSnapshot,
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    for (field, unchanged) in [
+        ("name", current.name == expected.name),
+        ("kind", current.kind == expected.kind),
+        (
+            "index",
+            current.boot != expected.boot || current.index == expected.index,
+        ),
+        ("mac", current.mac == expected.mac),
+        ("mtu", current.mtu == expected.mtu),
+        ("up", current.up == expected.up),
+        (
+            "addresses",
+            interface_addresses_match(current, expected, now)?,
+        ),
+    ] {
+        crate::ensure_unchanged(
+            unchanged,
+            format!("interface {} changed {field}", expected.name),
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) async fn restore_interfaces(
+    handle: &Handle,
+    snapshots: &BTreeMap<String, EthernetSnapshot>,
+) -> Result<()> {
+    restore_ethernet(handle, snapshots).await?;
+    let names = snapshots.keys().cloned().collect();
+    let current = capture_interfaces(handle, &names).await?;
+    for (name, expected) in snapshots {
+        check_interface_snapshot(&current[name], expected)?;
+    }
+    Ok(())
 }
 
 fn validate_vlan_address(message: &AddressMessage, name: &str) -> Result<()> {

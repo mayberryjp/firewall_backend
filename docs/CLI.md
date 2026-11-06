@@ -174,6 +174,24 @@ No key/password bypass, DHCP server or new firewall WAN management permit is
 introduced. These commands require the updated running Linux device daemon and
 its protected local control socket.
 
+If adoption was interrupted, recovery takes ownership of that same VLAN and
+reapplies its captured address/MTU/up settings after releasing networkd. It does
+not require those mutable settings to remain unchanged while networkd runs.
+Kernel address timestamps and dump ordering are not configuration drift.
+The VLAN's actual identity is still checked before mutation.
+
+Physical-interface inheritance uses this same active takeover, including
+restoring captured addresses, MTU and administrative state after handover.
+On restart, exclusions are reasserted for every still-owned physical interface,
+even without an initial-inheritance receipt. Startup then reconciles the saved
+desired configuration, not the original bootstrap addresses. Unrelated links
+are not claimed; existing initial capture restrictions still apply.
+
+An updated daemon resumes a retained adoption intent during startup. This only
+finishes the ownership baseline: rerun `--configure-lan` afterward to perform
+the provisional LAN move, then verify and confirm it normally. Do not edit the
+journal or remove the VLAN to clear pending recovery.
+
 ## Candidate, apply, and confirmation
 
 BGP uses `bgp JSON` / `no bgp` to replace/reset the private candidate's BGP

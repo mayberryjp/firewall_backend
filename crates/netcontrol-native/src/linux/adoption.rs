@@ -833,10 +833,6 @@ fn override_contents(name: &str) -> String {
     )
 }
 
-pub fn handover(receipt: &Receipt) -> Result<()> {
-    handover_interfaces(&receipt.originals)
-}
-
 pub fn handover_interfaces(originals: &BTreeMap<String, EthernetSnapshot>) -> Result<()> {
     let directory = Path::new("/etc/systemd/network");
     fs::DirBuilder::new()
@@ -887,9 +883,23 @@ pub fn handover_interfaces(originals: &BTreeMap<String, EthernetSnapshot>) -> Re
             fs::File::open(path.parent().context("handover directory missing")?)?.sync_all()?;
         }
     }
-    let indices = current_indices(originals)?;
-    networkd(indices.clone())?;
-    for (snapshot, index) in originals.values().zip(indices) {
+    let mut managed_by_networkd = Vec::new();
+    for (snapshot, index) in originals.values().zip(current_indices(originals)?) {
+        if Path::new(&format!("/run/systemd/netif/links/{index}")).try_exists()? {
+            managed_by_networkd.push((snapshot, index));
+        }
+    }
+    // Keep overrides for future networkd starts even when it does not manage these links.
+    if managed_by_networkd.is_empty() {
+        return Ok(());
+    }
+    networkd(
+        managed_by_networkd
+            .iter()
+            .map(|(_, index)| *index)
+            .collect(),
+    )?;
+    for (snapshot, index) in managed_by_networkd {
         let state = fields(Path::new(&format!("/run/systemd/netif/links/{}", index)))?;
         let admin_state = state
             .get("default", "ADMIN_STATE")

@@ -4457,8 +4457,26 @@ Capture and recovery intent are durable before handover. Interrupted adoption
 blocks other configuration writes until explicit recovery/retry or restart;
 do not automatically retry, prefetch or poll this mutation.
 
+After capture, explicit ownership recovery checks the VLAN's identity, relinquishes
+networkd management and actively reapplies the captured address/MTU/up settings.
+Physical-interface inheritance uses the same active takeover and verification.
+Startup reasserts networkd exclusions for all still-owned physical interfaces,
+including those without an initial-inheritance receipt, then reconciles saved
+desired configuration rather than restoring bootstrap addressing. This does
+not add an endpoint, discover/claim unrelated links or remove initial capture
+restrictions.
+External changes to those mutable settings during handover are overwritten on
+the selected VLAN, not treated as a requirement for manual reconciliation.
+Verification compares address configuration rather than raw kernel creation/
+update timestamps or dump ordering. Real identity or post-apply configuration
+mismatches remain errors, with recovery intent retained. Other interfaces and
+saved appliance configuration are not reset. No request/response fields,
+permissions or status codes change.
+
 Required API Explorer/client registration and optional operator UX are tracked
 in [handoff 2026-11-06-03](docs/frontend-handoffs/2026-11-06.md#2026-11-06-03-interactive-and-tagged-lan-setup).
+The active recovery fix is tracked in
+[handoff 2026-11-06-04](docs/frontend-handoffs/2026-11-06.md#2026-11-06-04-active-vlan-ownership-recovery).
 
 ##### Live interface selection
 

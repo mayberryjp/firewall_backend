@@ -81,7 +81,7 @@ fn config(value: Value) -> Result<Config> {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
-fn native_vlan_adoption_snapshot_is_passive_strict_and_ordinary_apply_still_refuses() -> Result<()>
+fn native_interface_ownership_restores_physical_and_vlan_without_touching_other_links() -> Result<()>
 {
     let fixture = Fixture::new()?;
     let namespace = Arc::new(File::open(&fixture.namespace)?);
@@ -115,6 +115,44 @@ fn native_vlan_adoption_snapshot_is_passive_strict_and_ordinary_apply_still_refu
         let repeated = networking::capture_vlan_snapshot(handle, &wanted).await?;
         assert_eq!(repeated.index, index);
         assert_eq!(repeated.addresses, snapshot.addresses);
+        handle.address().add(parent, "203.0.113.1".parse()?, 24).execute().await?;
+        let mut dynamic = handle.address().add(parent, "203.0.114.1".parse()?, 24);
+        let mut cache = netlink_packet_route::address::CacheInfo::default();
+        cache.ifa_valid = 180;
+        cache.ifa_preferred = 120;
+        dynamic.message_mut().attributes.push(netlink_packet_route::address::AddressAttribute::CacheInfo(cache));
+        dynamic.execute().await?;
+        let mut originals = networking::capture_ethernet(handle, &before, &before).await?;
+        originals.insert(wanted.name.clone(), snapshot.clone());
+        let untouched = networking::links(handle).await?.into_iter()
+            .find(|link| networking::name(link) == "peer0").context("peer missing")?;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        for address in networking::addresses(handle, parent).await? {
+            if address.header.scope != netlink_packet_route::address::AddressScope::Link {
+                handle.address().del(address).execute().await?;
+            }
+        }
+        handle.address().add(parent, "203.0.115.1".parse()?, 24).execute().await?;
+        handle.link().set(parent).mtu(1450).execute().await?;
+        handle.link().set(parent).down().execute().await?;
+        handle.address().add(index, "198.51.100.1".parse()?, 24).execute().await?;
+        handle.link().set(index).mtu(1400).execute().await?;
+        networking::check_vlan_identity(handle, &wanted, &snapshot).await?;
+        networking::restore_interfaces(handle, &originals).await?;
+        let restored = networking::capture_vlan_snapshot(handle, &wanted).await?;
+        assert_ne!(restored.addresses, snapshot.addresses);
+        networking::check_interface_snapshot(&restored, &snapshot)?;
+        networking::restore_interfaces(handle, &originals).await?;
+        let retried = networking::capture_vlan_snapshot(handle, &wanted).await?;
+        networking::check_interface_snapshot(&retried, &snapshot)?;
+        let peer_after = networking::links(handle).await?.into_iter()
+            .find(|link| networking::name(link) == "peer0").context("peer disappeared")?;
+        let peer_before = networking::parent(&untouched);
+        let peer_after = networking::parent(&peer_after);
+        assert_eq!((peer_after.name, peer_after.index, peer_after.mac, peer_after.mtu, peer_after.up),
+            (peer_before.name, peer_before.index, peer_before.mac, peer_before.mtu, peer_before.up));
+        assert_eq!(networking::addresses(handle, parent).await?.iter()
+            .filter(|address| address.header.scope != netlink_packet_route::address::AddressScope::Link).count(), 2);
         handle.link().add().vlan("stacked".into(), index, 51).execute().await?;
         assert!(networking::capture_vlan_snapshot(handle, &wanted).await.is_err());
         let stacked = networking::links(handle).await?.into_iter().find(|link| networking::name(link) == "stacked").context("stacked missing")?;
