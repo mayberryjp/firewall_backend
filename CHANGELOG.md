@@ -85,6 +85,13 @@
 
 ### Fixed
 
+- Repair CI fixtures after the APT policy and IPv6-default changes: validate
+  root-owned APT directory-install arguments without requiring fixture chown,
+  and explicitly enable global IPv6 for the mDNS AAAA-over-IPv4 positive case
+  before verifying global disablement suppresses AAAA. Installer tests remain
+  non-root-capable; production ownership and IPv6 policy are unchanged.
+  Release impact: none (test-only); no API, runtime or deployment contract change.
+
 - MQTT Home Assistant discovery renders missing/null numeric measurements as
   `None`, rather than the rejected literal `unknown`. Preserve JSON null/absent
   measurements, real zeroes, fractional/negative readings, exact counter strings

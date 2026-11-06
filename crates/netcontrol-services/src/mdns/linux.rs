@@ -3206,6 +3206,7 @@ mod tests {
                 .clone();
             ensure!(row["state"] == "running", "mDNS repair failed: {row}");
             let mut publishing = config.clone();
+            publishing.ipv6_enabled = true;
             publishing.mdns.reflection.enabled = false;
             publishing.mdns.publishing = netcontrol_core::MDNSPublishing {
                 enabled: true,

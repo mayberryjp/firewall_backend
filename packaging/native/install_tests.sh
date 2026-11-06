@@ -1113,6 +1113,15 @@ for policy_profile in snap apt; do
                 dpkg-query() { printf 'Unexpected package query.\n' >&2; return 1; }
                 apt-get() { printf 'Unexpected package mutation.\n' >&2; return 1; }
             fi
+            install() {
+                if [[ $# -ne 8 || ${1:-} != -d || ${2:-} != -o || ${3:-} != root ||
+                      ${4:-} != -g || ${5:-} != root || ${6:-} != -m ||
+                      ${7:-} != 0755 || ${8:-} != "$policy_directory/apt" ]]; then
+                    printf 'Unexpected APT fixture install command: %s\n' "$*" >&2
+                    return 1
+                fi
+                command install -d -m "$7" -- "$8"
+            }
             apt-config() {
                 [[ $1 == dump ]] || return 1
                 [[ $policy_scenario != config_query_failure ]] || return 1
