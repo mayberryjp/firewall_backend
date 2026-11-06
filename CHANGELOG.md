@@ -28,6 +28,12 @@
 
 ### Fixed
 
+- Stage unprivileged local-control test executables outside private CI build
+  paths so UID-drop probes reach the CLI/root-peer authorization checks instead
+  of failing at process launch. Add a private-build-directory regression.
+  Production filesystem/socket permissions and authorization are unchanged.
+  Release impact: test-only fix; no runtime/API contract or frontend action.
+
 - Allow fresh-install retries after initial network capture fails before saving
   a journal. Retain and reuse only a verified inactive, private, empty state lock
   when both saved state and appliance environment are absent; active/unsafe

@@ -14,7 +14,7 @@ use std::{
         fd::{AsRawFd, FromRawFd},
         unix::{fs::PermissionsExt, process::CommandExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
@@ -42,6 +42,44 @@ fn make_app(directory: &Path, scoped: bool) -> Arc<App> {
         ))
     };
     App::new(Arc::new(Mutex::new(engine)), auth, false)
+}
+
+fn unprivileged_executable(source: &Path) -> (tempfile::TempDir, PathBuf) {
+    // CI build directories may not be traversable after dropping UID.
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let executable = directory.path().join("probe");
+    fs::copy(source, &executable).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o711)).unwrap();
+    (directory, executable)
+}
+
+#[test]
+#[ignore = "requires Linux root"]
+fn unprivileged_probe_executes_from_private_build_directory() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let private = tempfile::tempdir_in("/tmp").unwrap();
+    fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let source = private.path().join("netcontrold");
+    fs::copy(env!("CARGO_BIN_EXE_netcontrold"), &source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+    let denied = Command::new(&source)
+        .arg("--version")
+        .uid(65534)
+        .gid(65534)
+        .output()
+        .unwrap_err();
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let (_directory, executable) = unprivileged_executable(&source);
+    let output = Command::new(executable)
+        .arg("--version")
+        .uid(65534)
+        .gid(65534)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"netcontrold "));
 }
 
 async fn exchange(path: &Path, request: Value) -> Value {
@@ -459,7 +497,9 @@ async fn exact_cli_prompts_once_then_adds_key_without_resetting_account() {
         );
         assert!(app.authenticate_api_key(&token).unwrap().is_some());
     }
-    let denied = Command::new(env!("CARGO_BIN_EXE_netcontrold"))
+    let (_executable_directory, executable) =
+        unprivileged_executable(Path::new(env!("CARGO_BIN_EXE_netcontrold")));
+    let denied = Command::new(executable)
         .args(["--create-api-key", "nonroot", "--control-socket"])
         .arg(&path)
         .uid(65534)
@@ -505,7 +545,9 @@ async fn root_peer_credentials_are_required_even_if_socket_permissions_are_relax
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o711)).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
     let task = tokio::spawn(listener.serve(app, receiver));
-    let status = Command::new(std::env::current_exe().unwrap())
+    let (_executable_directory, executable) =
+        unprivileged_executable(&std::env::current_exe().unwrap());
+    let status = Command::new(executable)
         .args([
             "--exact",
             "root_peer_credentials_are_required_even_if_socket_permissions_are_relaxed",
