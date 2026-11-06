@@ -1,4 +1,4 @@
-//! Root-only live identity administration; never exposed over TCP.
+//! Root-only local administration; never exposed over TCP.
 pub const DEFAULT_SOCKET: &str = "/run/netcontrol/control.sock";
 
 #[cfg(target_os = "linux")]
@@ -33,6 +33,15 @@ mod linux {
             name: String,
             account: Option<AccountInput>,
         },
+        ConfigureLan {
+            name: String,
+            parent: String,
+            id: u16,
+            address: String,
+        },
+        ConfirmNetworkChange {
+            id: String,
+        },
     }
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -50,6 +59,8 @@ mod linux {
     enum Response {
         Status { account_exists: bool },
         Created { api_key: String },
+        NetworkChanged { transaction_id: String },
+        NetworkConfirmed {},
         Error { message: String },
     }
     impl Drop for Response {
@@ -63,7 +74,7 @@ mod linux {
     fn root() -> Result<()> {
         ensure!(
             unsafe { libc::geteuid() } == 0,
-            "local key administration requires root"
+            "local administration requires root"
         );
         Ok(())
     }
@@ -204,8 +215,69 @@ mod linux {
     }
     fn execute(app: &App, request: &Request) -> Result<Response> {
         let Authentication::Device(store) = &app.auth else {
-            bail!("local key creation is unavailable with --auth-file");
+            bail!("local control administration is unavailable with --auth-file");
         };
+        match request {
+            Request::ConfigureLan {
+                name,
+                parent,
+                id,
+                address,
+            } => {
+                let mut engine = app
+                    .engine
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+                let transaction = crate::provision::configure_vlan_lan(
+                    &mut engine,
+                    &crate::provision::VlanLan {
+                        name: name.clone(),
+                        parent: parent.clone(),
+                        id: *id,
+                    },
+                    address,
+                )?;
+                let transaction_id = transaction["id"]
+                    .as_str()
+                    .context("LAN transaction returned no ID")?
+                    .to_owned();
+                return Ok(Response::NetworkChanged { transaction_id });
+            }
+            Request::ConfirmNetworkChange { id } => {
+                ensure!(
+                    !id.is_empty()
+                        && id.len() <= 80
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+                    "invalid transaction ID"
+                );
+                let permissions = netcontrol_core::PERMISSIONS
+                    .iter()
+                    .map(|permission| (*permission).to_owned())
+                    .collect::<Vec<_>>();
+                let reply = app
+                    .engine
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+                    .request(
+                        "POST",
+                        &format!("/api/v1/transactions/{id}/confirm"),
+                        "",
+                        "local-lan-setup",
+                        &permissions,
+                        &[],
+                    );
+                ensure!(
+                    reply.status < 300,
+                    "network confirmation failed ({}): {}",
+                    reply.status,
+                    reply.body
+                );
+                return Ok(Response::NetworkConfirmed {});
+            }
+            _ => {}
+        }
         let mut store = store
             .lock()
             .map_err(|_| anyhow::anyhow!("credential store unavailable"))?;
@@ -223,6 +295,9 @@ mod linux {
                 )?;
                 Ok(Response::Created { api_key })
             }
+            Request::ConfigureLan { .. } | Request::ConfirmNetworkChange { .. } => {
+                unreachable!("network commands handled before identity lock")
+            }
         }
     }
     async fn handle(mut stream: UnixStream, app: Arc<App>) -> Result<()> {
@@ -233,14 +308,14 @@ mod linux {
             serde_json::from_slice(&bytes).context("invalid local control request")?;
         let response = tokio::task::spawn_blocking(move || {
             execute(&app, &request).unwrap_or_else(|error| {
-                tracing::warn!(%error, "local identity operation rejected");
+                tracing::warn!(%error, "local control operation rejected");
                 Response::Error {
                     message: error.to_string(),
                 }
             })
         })
         .await
-        .context("local identity operation failed")?;
+        .context("local control operation failed")?;
         tokio::time::timeout(IO_TIMEOUT, write_frame(&mut stream, &response))
             .await
             .context("local control output timed out")?
@@ -248,7 +323,12 @@ mod linux {
     async fn exchange(path: &Path, request: &Request) -> Result<Response> {
         secure_directory(path)?;
         socket_metadata(path)?;
-        tokio::time::timeout(IO_TIMEOUT, async {
+        let timeout = if matches!(request, Request::ConfigureLan { .. }) {
+            Duration::from_secs(120)
+        } else {
+            IO_TIMEOUT
+        };
+        tokio::time::timeout(timeout, async {
             let mut stream = UnixStream::connect(path)
                 .await
                 .context("connect to running daemon control socket")?;
@@ -262,7 +342,7 @@ mod linux {
         })
         .await
         .context(
-            "local control request timed out; key outcome may be uncertain; do not blindly retry",
+            "local control request timed out; operation outcome may be uncertain; inspect state before retrying",
         )?
     }
 
@@ -356,12 +436,80 @@ mod linux {
             _ => bail!("unexpected local control response"),
         }
     }
+
+    pub async fn configure_lan(
+        path: &Path,
+        name: &str,
+        parent: &str,
+        id: u16,
+        address: &str,
+    ) -> Result<()> {
+        root()?;
+        eprintln!(
+            "Moving the factory LAN changes addressing, firewall and NAT. Verify from the console; confirmation expires in 120 seconds."
+        );
+        match exchange(
+            path,
+            &Request::ConfigureLan {
+                name: name.to_owned(),
+                parent: parent.to_owned(),
+                id,
+                address: address.to_owned(),
+            },
+        )
+        .await?
+        {
+            Response::NetworkChanged { ref transaction_id } => {
+                println!("{transaction_id}");
+                eprintln!(
+                    "Provisional LAN change applied. Verify tagged-LAN connectivity, then run:\n  sudo netcontrold --confirm-network-change {transaction_id}"
+                );
+                eprintln!(
+                    "Do not restart the daemon until confirmed. After confirmation, set NETCONTROL_LISTEN={}:8080 in /etc/netcontrol/appliance.env, preserving other settings, then restart netcontrold with systemctl.",
+                    address.split('/').next().context("LAN address missing")?
+                );
+                Ok(())
+            }
+            Response::Error { ref message } => bail!("{message}"),
+            _ => bail!("unexpected local control response"),
+        }
+    }
+
+    pub async fn confirm_network_change(path: &Path, id: &str) -> Result<()> {
+        root()?;
+        match exchange(path, &Request::ConfirmNetworkChange { id: id.to_owned() }).await? {
+            Response::NetworkConfirmed {} => {
+                println!(
+                    "Network transaction confirmed and saved. Update the management listener environment and restart the service only if required for its new address."
+                );
+                Ok(())
+            }
+            Response::Error { ref message } => bail!("{message}"),
+            _ => bail!("unexpected local control response"),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{Listener, create_key};
+pub use linux::{Listener, configure_lan, confirm_network_change, create_key};
 
 #[cfg(not(target_os = "linux"))]
 pub async fn create_key(_: &std::path::Path, _: &str) -> anyhow::Result<()> {
     anyhow::bail!("live local API-key creation is supported only on Linux");
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn configure_lan(
+    _: &std::path::Path,
+    _: &str,
+    _: &str,
+    _: u16,
+    _: &str,
+) -> anyhow::Result<()> {
+    anyhow::bail!("local LAN configuration is supported only on Linux");
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn confirm_network_change(_: &std::path::Path, _: &str) -> anyhow::Result<()> {
+    anyhow::bail!("local network confirmation is supported only on Linux");
 }

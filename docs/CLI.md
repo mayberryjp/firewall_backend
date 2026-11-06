@@ -114,6 +114,60 @@ has no socket. It does not enable SSH when SSH is disabled, assign network
 addresses, or add firewall permits. Use the existing candidate/confirmed
 configuration commands after login to set LAN addresses and VLANs.
 
+## Correcting an initially untagged factory LAN
+
+The installer now prompts for an existing physical or VLAN LAN and its IPv4
+address. It does not reconfigure already-provisioned devices. If an unchanged
+factory installation selected the physical parent instead of the intended VLAN,
+use the updated daemon's root-only local command:
+
+```sh
+sudo netcontrold --configure-lan vlan50 \
+  --lan-parent enp2s0 --lan-vlan 50 --lan-address 192.168.50.1/24
+```
+
+This is not a factory reset. It first validates that saved network policy is the
+unchanged factory policy with one physical LAN/address and one physical WAN.
+Customized policy, extra LAN addresses or conflicting VLAN identity/addresses
+are refused; use a deliberately reviewed complete configuration for those cases.
+An existing unmanaged VLAN needs an explicit ownership handoff that preserves
+its live addressing/MTU and becomes a saved unassigned baseline; an absent VLAN
+is created by the subsequent transaction. Ordinary configuration commands still
+do not implicitly seize foreign links.
+
+The requested change moves the LAN address/role, input and forwarding rules and
+NAT subnet to the VLAN and removes untagged addressing from the parent. It
+preserves the physical WAN DHCP configuration. The command displays a transaction
+ID and applies provisionally for **120 seconds**. Verify connectivity from the
+tagged LAN, then run from the console:
+
+```sh
+sudo netcontrold --confirm-network-change TRANSACTION_ID
+```
+
+You may also confirm the ID through the existing authenticated SSH CLI/API.
+Without confirmation, normal transaction rollback restores the original saved
+LAN policy. If the VLAN was explicitly imported first, that imported baseline
+remains managed with its original settings; rollback does not delete the
+operator's preexisting VLAN. Errors/uncertain outcomes require inspecting
+transactions, not resetting state or blindly retrying.
+
+HTTP binding is deployment configuration, separate from the network transaction.
+After confirmation, edit only `NETCONTROL_LISTEN` in the root-owned
+`/etc/netcontrol/appliance.env` to the new address (for example
+`NETCONTROL_LISTEN=192.168.50.1:8080`), preserving its other settings, then:
+
+```sh
+sudo systemctl restart netcontrold
+```
+
+Do not restart or change the listener environment before confirmation.
+Keep local console access throughout; connect the switch port as a tagged trunk.
+The usual wildcard SSH listener includes the new address and localhost.
+No key/password bypass, DHCP server or new firewall WAN management permit is
+introduced. These commands require the updated running Linux device daemon and
+its protected local control socket.
+
 ## Candidate, apply, and confirmation
 
 BGP uses `bgp JSON` / `no bgp` to replace/reset the private candidate's BGP

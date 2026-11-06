@@ -421,9 +421,14 @@ download failures stop installation; there is no CI-artifact/source fallback.
 The installer uses Python 3 for metadata verification only; protocol services
 remain in-process Rust. The Ubuntu assets are unsigned; trust rests on HTTPS and
 the GitHub repository/account, not an independent publisher signature.
-Optional installation/help text should use `sudo bash install.sh` with optional
-paired `--wan`/`--lan` and `--lan-address`, not the removed `--run-id` option.
-No HTTP endpoint, authentication permission or saved configuration schema changes.
+Installation/help text should use `sudo bash install.sh`, not the removed
+`--run-id` option. Interactive installs prompt for missing LAN interface and IPv4
+host/prefix, suggesting the second physical port and `192.168.0.1/24`.
+`--wan` overrides WAN independently; `--lan` and `--lan-address` skip their
+individual prompts. Unattended installs require both LAN flags and fail if either
+is missing. Invalid interactive answers are prompted again; EOF cancels.
+The stable-release download mechanism itself adds no HTTP endpoint,
+authentication permission or saved configuration schema.
 An initial capture failure can leave an empty journal lock without a saved
 journal. Fresh-install retries retain and reuse only a verified root-owned,
 mode-0600, empty, singly linked regular lock that is currently unlocked, and
@@ -431,9 +436,17 @@ only while both journal and appliance environment are absent. Existing state,
 environment and active/unsafe locks still block installation; no files are
 deleted to force setup. See the installation guide for operator recovery.
 Alpine packages and the bare daemon default to HTTP on `0.0.0.0:8080`.
-Ubuntu's fresh appliance installer selects the first physical Ethernet NIC in
-natural name order as WAN and the second as LAN (Wi-Fi/virtual NICs excluded).
-Both NICs may be explicitly overridden. LAN defaults to `192.168.0.1/24`; WAN
+Ubuntu's fresh appliance installer defaults WAN to the first physical Ethernet
+NIC in natural name order (Wi-Fi/virtual NICs excluded). LAN is explicitly
+selected through a prompt or flag. It can be a physical Ethernet port or an
+existing standard 802.1Q VLAN on another physical port, with ID 1..4094.
+Enter its real name, for example `vlan50`, not `vlan50@enp2s0`. Tagged LAN uses
+the VLAN for its address, role, input/forwarding rules and NAT subnet; the physical
+parent remains up, unassigned and without an untagged LAN address. VLAN-on-WAN,
+stacked VLANs and unsupported ownership are rejected. The selected release must
+support tagged provisioning; no physical-parent fallback is allowed.
+LAN addresses must be canonical usable RFC1918 IPv4 hosts, prefixes 8..30,
+entirely within RFC1918 space and not a network/broadcast address. WAN
 is configured as DHCPv4, with static WAN address/route/DNS removed and an
 upstream lease/default route required within 30 seconds of provisional apply.
 The installer commits LAN allow-all forwarding/input, WAN unsolicited-input
@@ -441,6 +454,17 @@ denial with reply/DHCP exceptions, LAN-subnet WAN NAT, and starts/enables the
 service with `--appliance`. It binds HTTP to the selected LAN address using
 `/etc/netcontrol/appliance.env`; there is no new HTTP provisioning endpoint.
 LAN clients need static addressing/gateway; no DHCP/DNS server is provisioned.
+Existing installations are not rerun or reset by the installer. A root-only
+local `--configure-lan NAME --lan-parent NAME --lan-vlan ID --lan-address CIDR`
+command can move an unchanged factory physical LAN to an explicitly identified
+VLAN. Customized policy, extra LAN addresses and conflicting existing VLAN
+settings are refused. It uses a normal 120-second provisional transaction;
+verify tagged connectivity and explicitly confirm through
+`--confirm-network-change ID` or the authenticated transaction API/SSH CLI.
+Unconfirmed changes roll back. After confirmation the operator must update only
+`NETCONTROL_LISTEN` in `/etc/netcontrol/appliance.env` and restart the service;
+the HTTP listener is not automatically rebound by network transactions.
+Keep console access throughout. See the [CLI guide](docs/CLI.md#correcting-an-initially-untagged-factory-lan).
 Ordinary native startup and `upgrade.sh` require a saved journal and apply that
 desired configuration; they never initialize desired state from current NIC
 settings. Managed-interface drift is reconciled to the saved plan, subject to

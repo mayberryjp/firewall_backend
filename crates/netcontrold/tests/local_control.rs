@@ -522,3 +522,108 @@ async fn root_peer_credentials_are_required_even_if_socket_permissions_are_relax
     stop.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires Linux root"]
+async fn local_vlan_correction_is_provisional_then_explicitly_confirmed() {
+    let directory = tempfile::tempdir_in("/run").unwrap();
+    let app = make_app(directory.path(), false);
+    let permissions = netcontrol_core::PERMISSIONS
+        .iter()
+        .map(|permission| (*permission).to_owned())
+        .collect::<Vec<_>>();
+    let baseline: netcontrol_core::Config = serde_json::from_value(json!({"interfaces":[
+        {"name":"wan0","kind":"ethernet","role":"unassigned","up":true,"mtu":1500,"addresses":[]},
+        {"name":"lan0","kind":"ethernet","role":"unassigned","up":true,"mtu":1500,"addresses":[]}
+    ]}))
+    .unwrap();
+    let baseline =
+        netcontrold::provision::candidate(baseline, "wan0", "lan0", "192.168.0.1/24").unwrap();
+    {
+        let mut engine = app.engine.lock().unwrap();
+        let body = serde_json::to_vec(&json!({"base_revision": engine.committed_revision(),
+            "confirm_timeout_seconds":120,"description":"fixture","config":baseline}))
+        .unwrap();
+        let reply = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "fixture",
+            &permissions,
+            &body,
+        );
+        assert_eq!(reply.status, 202);
+        let id = reply.body["id"].as_str().unwrap();
+        assert_eq!(
+            engine
+                .request(
+                    "POST",
+                    &format!("/api/v1/transactions/{id}/confirm"),
+                    "",
+                    "fixture",
+                    &permissions,
+                    &[]
+                )
+                .status,
+            200
+        );
+    }
+    let path = directory.path().join("control.sock");
+    let (stop, receiver) = watch::channel(false);
+    let task = tokio::spawn(Listener::bind(&path).unwrap().serve(app.clone(), receiver));
+    let request = json!({"operation":"ConfigureLan","name":"vlan50","parent":"lan0","id":50,"address":"10.4.50.1/24"});
+    let changed = exchange(&path, request.clone()).await;
+    assert_eq!(changed["result"], "NetworkChanged");
+    let id = changed["transaction_id"].as_str().unwrap();
+    {
+        let mut engine = app.engine.lock().unwrap();
+        assert_eq!(engine.saved_configuration(), &baseline);
+        assert_eq!(
+            engine
+                .request(
+                    "POST",
+                    &format!("/api/v1/transactions/{id}/rollback"),
+                    "",
+                    "fixture",
+                    &permissions,
+                    &[]
+                )
+                .status,
+            200
+        );
+        assert_eq!(engine.saved_configuration(), &baseline);
+    }
+    let changed = exchange(&path, request).await;
+    assert_eq!(changed["result"], "NetworkChanged");
+    let id = changed["transaction_id"].as_str().unwrap();
+    let confirmed = exchange(&path, json!({"operation":"ConfirmNetworkChange","id":id})).await;
+    assert_eq!(confirmed["result"], "NetworkConfirmed");
+    let saved = app.engine.lock().unwrap().saved_configuration().clone();
+    assert_eq!(
+        saved
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "vlan50")
+            .unwrap()
+            .role,
+        "lan"
+    );
+    assert!(
+        saved
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "lan0")
+            .unwrap()
+            .addresses
+            .is_empty()
+    );
+    assert_eq!(saved.firewall.nat.masquerade[0].source, "10.4.50.0/24");
+    let invalid = exchange(
+        &path,
+        json!({"operation":"ConfirmNetworkChange","id":"../reset"}),
+    )
+    .await;
+    assert_eq!(invalid["result"], "Error");
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}

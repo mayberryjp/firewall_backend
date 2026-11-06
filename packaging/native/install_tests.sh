@@ -385,6 +385,39 @@ for port_fixture_pair in 'eno1 eno1' 'eno1 missing' 'wlan0 eno1' 'eno1'; do
     read -r fixture_wan fixture_lan <<< "$port_fixture_pair"
     if select_appliance_ports "$fixture_wan" "$fixture_lan" "$ports_fixture"; then exit 1; fi
 done
+[[ $(prompt_appliance_lan '' '' '' "$ports_fixture" <<< $'eno10\n10.4.50.1/24') == 'eno1 eno10 10.4.50.1/24' ]]
+[[ $(prompt_appliance_lan '' '' '' "$ports_fixture" <<< $'\n') == 'eno1 eno2 192.168.0.1/24' ]]
+[[ $(prompt_appliance_lan eno2 '' '' "$ports_fixture" <<< $'\n') == 'eno2 eno1 192.168.0.1/24' ]]
+[[ $(prompt_appliance_lan eno1 eno10 '' "$ports_fixture" <<< '10.4.50.1/24') == 'eno1 eno10 10.4.50.1/24' ]]
+[[ $(prompt_appliance_lan eno1 '' '10.4.50.1/24' "$ports_fixture" <<< 'eno10') == 'eno1 eno10 10.4.50.1/24' ]]
+[[ $(prompt_appliance_lan eno1 '' '' "$ports_fixture" <<< $'missing\neno2\ninvalid\n192.168.0.0/24\n10.4.50.1/24') == 'eno1 eno2 10.4.50.1/24' ]]
+if prompt_appliance_lan '' '' '' "$ports_fixture" </dev/null; then exit 1; fi
+if prompt_appliance_lan eno1 eno2 '' "$ports_fixture" </dev/null; then exit 1; fi
+if prompt_appliance_lan missing '' '' "$ports_fixture" </dev/null 2>"$temporary/invalid-wan"; then exit 1; fi
+! grep -q '^LAN interface' "$temporary/invalid-wan"
+for address in 10.4.50.1/24 172.16.0.1/12 192.168.0.1/16 10.0.0.1/30; do
+    valid_lan_address "$address"
+done
+for address in 10.4.50.0/24 10.4.50.255/24 192.168.0.1/15 172.16.0.1/11 172.32.0.1/24 8.8.8.8/24 999.1.1.1/24 10.0.0.1/31 010.0.0.1/24 10.0.0.1/08 '10.0.0.1/24 extra'; do
+    if valid_lan_address "$address"; then printf 'Invalid LAN address accepted: %s\n' "$address" >&2; exit 1; fi
+done
+printf 'Interactive LAN selection, address validation, defaults, overrides and cancellation tests passed.\n'
+mkdir "$ports_fixture/vlan50" "$ports_fixture/wanvlan" "$ports_fixture/stacked"
+printf '1\n' > "$ports_fixture/vlan50/type"
+printf '1\n' > "$ports_fixture/wanvlan/type"
+printf '1\n' > "$ports_fixture/stacked/type"
+vlan_fixture="$temporary/vlans"
+printf 'VLAN Dev name | VLAN ID | Interface\nvlan50 | 50 | eno2\nwanvlan | 20 | eno1\nstacked | 51 | vlan50\n' > "$vlan_fixture"
+[[ $(lan_vlan_details vlan50 "$vlan_fixture") == 'eno2 50' ]]
+[[ $(select_appliance_ports eno1 vlan50 "$ports_fixture" "$vlan_fixture") == 'eno1 vlan50' ]]
+[[ $(prompt_appliance_lan eno1 '' '' "$ports_fixture" "$vlan_fixture" <<< $'vlan50\n10.4.50.1/24') == 'eno1 vlan50 10.4.50.1/24' ]]
+if select_appliance_ports eno1 wanvlan "$ports_fixture" "$vlan_fixture"; then exit 1; fi
+if select_appliance_ports eno1 stacked "$ports_fixture" "$vlan_fixture"; then exit 1; fi
+printf 'invalid | 4095 | eno2\n' >> "$vlan_fixture"
+if lan_vlan_details invalid "$vlan_fixture"; then exit 1; fi
+printf 'vlan50 | 50 | eno2\n' >> "$vlan_fixture"
+if lan_vlan_details vlan50 "$vlan_fixture"; then exit 1; fi
+printf 'Existing VLAN LAN selection and unsafe topology refusal tests passed.\n'
 mkdir "$temporary/one-port"
 mv "$ports_fixture/eno1" "$temporary/one-port/"
 if select_appliance_ports '' '' "$temporary/one-port"; then exit 1; fi
@@ -500,7 +533,7 @@ PY
     fi
 done
 unset -f curl
-for scenario in valid wrong_version version_failure help_failure missing_option; do
+for scenario in valid wrong_version version_failure help_failure missing_option vlan_supported vlan_missing_parent vlan_missing_id vlan_unsupported; do
     destination="$temporary/prebuilt-$scenario"
     mkdir "$destination"
     printf '2026.11.05.2\n' > "$destination/release-version"
@@ -514,15 +547,19 @@ case $1 in
     --help)
         [[ $prebuilt_scenario != help_failure ]] || exit 1
         printf '%s\n' --provision-wan NETCONTROL_ALLOW_HOST_SERVICES NETCONTROL_GATEWAY_MONITORING NETCONTROL_SSH_LISTEN NETCONTROL_UPGRADE_CONFIG
-        if [[ $prebuilt_scenario != missing_option ]]; then printf '%s\n' --configure-updates; fi ;;
+        if [[ $prebuilt_scenario != missing_option ]]; then printf '%s\n' --configure-updates; fi
+        if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_id ]]; then printf '%s\n' --provision-lan-parent; fi
+        if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_parent ]]; then printf '%s\n' --provision-lan-vlan; fi ;;
     *) exit 1 ;;
 esac
 SH
     export prebuilt_scenario=$scenario
-    if check_prebuilt "$destination"; then
-        [[ $scenario == valid ]] || exit 1
+    selected_lan=''
+    if [[ $scenario == vlan_* ]]; then selected_lan=vlan50; fi
+    if (lan_vlan_details() { [[ $1 == vlan50 ]]; }; check_prebuilt "$destination" "$selected_lan"); then
+        [[ $scenario == valid || $scenario == vlan_supported ]] || exit 1
     else
-        [[ $scenario != valid ]] || exit 1
+        [[ $scenario != valid && $scenario != vlan_supported ]] || exit 1
     fi
 done
 unset prebuilt_scenario
@@ -578,10 +615,16 @@ done
 )
 printf 'Prebuilt download verification and service-installation tests passed (mocked GitHub/system commands).\n'
 
-for provision_scenario in success config_failure env_failure reload_failure start_failure http_failure forwarding_failure; do
+for provision_scenario in success tagged_success config_failure env_failure reload_failure start_failure http_failure forwarding_failure; do
     provision_directory="$temporary/provision-$provision_scenario"
     mkdir "$provision_directory"
+    selected_lan=lan0
+    if [[ $provision_scenario == tagged_success ]]; then selected_lan=vlan50; fi
     if (
+        lan_vlan_details() {
+            [[ $provision_scenario == tagged_success && $1 == vlan50 ]] || return 1
+            printf 'lan0 50\n'
+        }
         provision_fixture() {
             printf 'configure %s\n' "$*" >> "$provision_directory/commands"
             [[ $provision_scenario != config_failure ]]
@@ -603,13 +646,16 @@ for provision_scenario in success config_failure env_failure reload_failure star
         sysctl() {
             if [[ $provision_scenario == forwarding_failure ]]; then printf '0\n'; else printf '1\n'; fi
         }
-        provision_appliance provision_fixture wan0 lan0 192.168.50.1/24
+        provision_appliance provision_fixture wan0 "$selected_lan" 192.168.50.1/24
     ); then
-        [[ $provision_scenario == success ]] || exit 1
+        [[ $provision_scenario == success || $provision_scenario == tagged_success ]] || exit 1
     else
-        [[ $provision_scenario != success ]] || exit 1
+        [[ $provision_scenario != success && $provision_scenario != tagged_success ]] || exit 1
     fi
-    grep -q -- '--provision-wan wan0 --provision-lan lan0 --provision-lan-address 192.168.50.1/24' "$provision_directory/commands"
+    grep -q -- "--provision-wan wan0 --provision-lan $selected_lan --provision-lan-address 192.168.50.1/24" "$provision_directory/commands"
+    if [[ $provision_scenario == tagged_success ]]; then
+        grep -q -- '--provision-lan-parent lan0 --provision-lan-vlan 50' "$provision_directory/commands"
+    fi
     if [[ $provision_scenario == config_failure ]]; then
         ! grep -Eq '^(install|systemctl|curl) ' "$provision_directory/commands"
     else
@@ -618,7 +664,7 @@ for provision_scenario in success config_failure env_failure reload_failure star
     if [[ $provision_scenario == env_failure || $provision_scenario == reload_failure ]]; then
         ! grep -q '^systemctl enable' "$provision_directory/commands"
     fi
-    if [[ $provision_scenario == success ]]; then
+    if [[ $provision_scenario == success || $provision_scenario == tagged_success ]]; then
         grep -q '^systemctl enable --now netcontrold.service' "$provision_directory/commands"
         grep -q 'http://192.168.50.1:8080/' "$provision_directory/commands"
     fi

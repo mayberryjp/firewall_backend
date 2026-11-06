@@ -809,7 +809,8 @@ An Ubuntu amd64 [prebuilt installer](install.sh) downloads verified binaries
 from the latest published stable GitHub Release. No Rust/compiler installation,
 GitHub login, CI run ID or manual workflow dispatch is needed on the firewall.
 See the [download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-prebuilt-installation-amd64).
-It automatically provisions a fresh appliance:
+From a local terminal, it prompts for the LAN interface and IPv4 address/prefix
+before provisioning a fresh appliance:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh
@@ -822,9 +823,15 @@ SHA-256, amd64 ELF header and compiled version, and fetches its systemd unit fro
 the same release tag. Downloads use verified HTTPS; Ubuntu release assets are
 unsigned, unlike `.ncpkg` packages. Missing or invalid releases fail explicitly.
 The first physical Ethernet interface
-in natural name order (`eno1`, `eno2`, ...; Wi-Fi/virtual links excluded) is WAN;
-the second is LAN. Override with both `--wan` and `--lan` when needed. LAN
-defaults to `192.168.0.1/24` (`--lan-address` overrides it); WAN is configured
+in natural name order (`eno1`, `eno2`, ...; Wi-Fi/virtual links excluded) is WAN.
+The prompts suggest the second physical port and `192.168.0.1/24`, but you can
+choose an existing VLAN such as `vlan50` and `192.168.50.1/24`. The list shows
+the VLAN's ID and physical parent; enter `vlan50`, not `vlan50@enp2s0`.
+Its parent must differ from WAN. An existing VLAN requires explicit safe
+ownership handoff and a release containing VLAN provisioning support.
+Override WAN with `--wan`. Unattended installation must provide both
+`--lan NAME --lan-address CIDR`; omitted values are not silently selected without
+a terminal. WAN is configured
 for DHCPv4, not retained as static. The installer waits up to 30 seconds for an
 upstream lease/default route and rolls back its transaction on failure.
 It enables/starts the service, binds HTTP management to the LAN address,

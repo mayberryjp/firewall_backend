@@ -109,6 +109,8 @@ struct Ownership {
     #[serde(default)]
     ethernet_originals: BTreeMap<String, EthernetSnapshot>,
     #[serde(default)]
+    vlan_originals: BTreeMap<String, EthernetSnapshot>,
+    #[serde(default)]
     managed_interfaces: BTreeSet<String>,
     #[serde(default)]
     boot: String,
@@ -143,11 +145,17 @@ impl Ownership {
         host_mode: bool,
         inherited: bool,
     ) -> BTreeMap<String, EthernetSnapshot> {
-        if !host_mode || !inherited {
+        if !host_mode {
             return BTreeMap::new();
         }
         self.ethernet_originals
             .iter()
+            .filter(|_| inherited)
+            .chain(
+                self.vlan_originals
+                    .iter()
+                    .filter(|(name, _)| Path::new("/sys/class/net").join(name).exists()),
+            )
             .filter(|(name, _)| self.managed_interfaces.contains(*name))
             .map(|(name, snapshot)| (name.clone(), snapshot.clone()))
             .collect()
@@ -1146,6 +1154,9 @@ impl Native {
             ownership
                 .ethernet_originals
                 .retain(|name, _| ownership.managed_interfaces.contains(name));
+            ownership
+                .vlan_originals
+                .retain(|name, _| ownership.managed_interfaces.contains(name));
             ownership.committed_config = Some(after.clone());
             ownership
                 .kernel_baseline
@@ -1169,6 +1180,192 @@ impl Native {
 }
 
 impl Backend for Native {
+    fn prepare_vlan_adoption(
+        &mut self,
+        before: &Config,
+        request: &netcontrol_core::AdoptVlanRequest,
+    ) -> Result<netcontrol_core::VlanAdoption> {
+        self.path_test.ensure_idle()?;
+        self.check_scope()?;
+        ensure!(
+            self.options.namespace.is_empty(),
+            "VLAN adoption requires native host mode"
+        );
+        ensure!(
+            !self.state.join("intent.json").try_exists()?,
+            "native recovery is pending"
+        );
+        self.verify(&before.operational_value()?)?;
+        let ownership = self.ownership()?;
+        ensure!(
+            !ownership.managed_interfaces.contains(&request.name),
+            "VLAN already owned"
+        );
+        let scope = self.identity.clone();
+        let saved = serde_json::to_value(&ownership)?;
+        let wanted = request.clone();
+        let captured = session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(adoption::capture_vlan(handle, scope, saved, &wanted))
+        })?;
+        let mut config = before.clone();
+        let mut link = captured
+            .config
+            .interfaces
+            .first()
+            .context("VLAN capture missing")?
+            .clone();
+        link.kind = "vlan".into();
+        link.vlan = Some(netcontrol_core::VLAN {
+            parent: request.parent.clone(),
+            id: i64::from(request.id),
+        });
+        config.interfaces.push(link);
+        config.routes.extend(captured.config.routes.clone());
+        config.dns.extend(captured.config.dns.clone());
+        config = config.normalized();
+        config.validate()?;
+        self.preflight(&config.operational_value()?)?;
+        self.services.validate(&config.operational_value()?)?;
+        Ok(netcontrol_core::VlanAdoption {
+            config,
+            receipt: serde_json::json!({"request":request,"capture":captured}),
+        })
+    }
+
+    fn finish_vlan_adoption(
+        &mut self,
+        before: &Config,
+        imported: &netcontrol_core::VlanAdoption,
+    ) -> Result<()> {
+        self.path_test.ensure_idle()?;
+        self.check_scope()?;
+        ensure!(
+            self.options.namespace.is_empty(),
+            "VLAN adoption requires native host mode"
+        );
+        ensure!(
+            !self.state.join("intent.json").try_exists()?,
+            "native recovery is pending"
+        );
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Capture {
+            request: netcontrol_core::AdoptVlanRequest,
+            capture: adoption::Receipt,
+        }
+        let token: Capture = serde_json::from_value(imported.receipt.clone())?;
+        let receipt = token.capture;
+        ensure!(
+            receipt.scope == self.identity,
+            "VLAN adoption belongs to another scope"
+        );
+        let previous: Ownership = serde_json::from_value(receipt.ownership_before.clone())?;
+        let before_value = before.operational_value()?;
+        let after_value = imported.config.operational_value()?;
+        ensure!(
+            previous.committed_config.as_ref() == Some(&before_value),
+            "VLAN adoption baseline ownership mismatch"
+        );
+        let actual = self.ownership()?;
+        adoption::check_vlan_source(&receipt)?;
+        let wanted = token.request.clone();
+        let originals = receipt.originals.clone();
+        session(self.namespace.clone(), move |rt, handle| {
+            let current = rt.block_on(networking::capture_vlan_snapshot(handle, &wanted))?;
+            let expected = originals
+                .get(&wanted.name)
+                .context("VLAN snapshot missing")?;
+            crate::ensure_unchanged(
+                current.boot == expected.boot
+                    && current.index == expected.index
+                    && current.mac == expected.mac
+                    && current.mtu == expected.mtu
+                    && current.up == expected.up
+                    && current.addresses == expected.addresses,
+                "VLAN changed since durable capture",
+            )?;
+            Ok(())
+        })?;
+        if actual.committed_config.as_ref() == Some(&after_value) {
+            self.verify(&after_value)?;
+            self.services.apply(&before_value, &after_value)?;
+            return Ok(());
+        }
+        ensure!(
+            serde_json::to_value(&actual)? == serde_json::to_value(&previous)?,
+            "VLAN adoption ownership changed"
+        );
+        self.verify(&before_value)?;
+        let result = (|| -> Result<()> {
+            adoption::handover(&receipt)?;
+            let captured = receipt.clone();
+            let wanted = token.request.clone();
+            session(self.namespace.clone(), move |rt, handle| {
+                let current = rt.block_on(networking::capture_vlan_snapshot(handle, &wanted))?;
+                let expected = captured
+                    .originals
+                    .get(&wanted.name)
+                    .context("VLAN snapshot missing")?;
+                crate::ensure_unchanged(
+                    current.boot == expected.boot
+                        && current.index == expected.index
+                        && current.mac == expected.mac
+                        && current.mtu == expected.mtu
+                        && current.up == expected.up
+                        && current.addresses == expected.addresses,
+                    "VLAN changed during networkd handover",
+                )?;
+                rt.block_on(adoption::transfer_routes(handle, &captured, false))
+            })?;
+            let snapshot = receipt
+                .originals
+                .get(&token.request.name)
+                .context("VLAN snapshot missing")?;
+            adoption::set_dns(
+                snapshot.index,
+                &receipt
+                    .config
+                    .dns
+                    .get(&token.request.name)
+                    .cloned()
+                    .unwrap_or_default(),
+                None,
+            )?;
+            self.services.apply(&before_value, &after_value)?;
+            let mut ownership = previous.clone();
+            ownership
+                .managed_interfaces
+                .insert(token.request.name.clone());
+            ownership.vlan_originals.extend(receipt.originals.clone());
+            ownership.committed_config = Some(after_value.clone());
+            self.save_ownership(&ownership)?;
+            self.verify(&after_value)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.services
+                .apply(&after_value, &before_value)
+                .context("VLAN service recovery failed; core adoption intent retained")?;
+            let captured = receipt.clone();
+            session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::restore_ethernet(handle, &captured.originals))?;
+                rt.block_on(adoption::transfer_routes(handle, &captured, true))
+            })
+            .context("VLAN route recovery failed; core adoption intent retained")?;
+            adoption::check_vlan_source(&receipt)?;
+            adoption::release(&receipt)
+                .context("VLAN networkd recovery failed; core intent retained")?;
+            let originals = receipt.originals.clone();
+            session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::restore_ethernet(handle, &originals))
+            })
+            .context("VLAN live configuration recovery failed; core intent retained")?;
+            self.save_ownership(&previous)?;
+            return Err(error.context("VLAN adoption failed; original ownership restored, retry requires unchanged capture"));
+        }
+        Ok(())
+    }
+
     fn path_test_active(&self) -> bool {
         self.path_test.active()
     }
@@ -1547,6 +1744,9 @@ impl Backend for Native {
                     .collect();
                 ownership
                     .ethernet_originals
+                    .retain(|name, _| ownership.managed_interfaces.contains(name));
+                ownership
+                    .vlan_originals
                     .retain(|name, _| ownership.managed_interfaces.contains(name));
                 ownership.committed_config = Some(after.clone());
                 ownership

@@ -8,10 +8,13 @@ use netlink_packet_route::{
         AddressScope,
     },
     link::{InfoData, InfoVlan, LinkAttribute, LinkFlag, LinkInfo, LinkMessage, VlanProtocol},
-    route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
+    route::{
+        RouteAddress, RouteAttribute, RouteMessage, RoutePreference, RouteProtocol, RouteScope,
+        RouteType,
+    },
     rule::{RuleAction, RuleAttribute, RuleMessage},
 };
-use netlink_packet_utils::{Emitable, Parseable};
+use netlink_packet_utils::{Emitable, Parseable, nla::Nla};
 use rtnetlink::{Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,6 +26,111 @@ use std::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn adoption_links() -> (LinkMessage, LinkMessage, netcontrol_core::AdoptVlanRequest) {
+        let request = netcontrol_core::AdoptVlanRequest {
+            name: "vlan50".into(),
+            parent: "eth0".into(),
+            id: 50,
+        };
+        let mut parent = LinkMessage::default();
+        parent.header.index = 2;
+        parent.attributes = vec![
+            LinkAttribute::IfName("eth0".into()),
+            LinkAttribute::Address(vec![2, 0, 0, 0, 0, 1]),
+        ];
+        let mut link = LinkMessage::default();
+        link.header.index = 3;
+        link.attributes = vec![
+            LinkAttribute::IfName("vlan50".into()),
+            LinkAttribute::Address(vec![2, 0, 0, 0, 0, 1]),
+            LinkAttribute::Link(2),
+            LinkAttribute::LinkInfo(vec![
+                LinkInfo::Kind(netlink_packet_route::link::InfoKind::Vlan),
+                LinkInfo::Data(InfoData::Vlan(vec![
+                    InfoVlan::Id(50),
+                    InfoVlan::Protocol(VlanProtocol::Ieee8021Q),
+                    InfoVlan::Flags((1, u32::MAX)),
+                ])),
+            ]),
+        ];
+        (link, parent, request)
+    }
+
+    #[test]
+    fn vlan_adoption_requires_exact_unmastered_nonstacked_standard_identity() {
+        let (link, parent, request) = adoption_links();
+        validate_adoptable_vlan(&link, &parent, &request).unwrap();
+        let mut wrong = request.clone();
+        wrong.id = 51;
+        assert!(validate_adoptable_vlan(&link, &parent, &wrong).is_err());
+        let mut replacement = parent.clone();
+        replacement.header.index = 7;
+        assert!(validate_adoptable_vlan(&link, &replacement, &request).is_err());
+        let mut mastered = link.clone();
+        mastered.attributes.push(LinkAttribute::Controller(9));
+        assert!(validate_adoptable_vlan(&mastered, &parent, &request).is_err());
+        let mut mastered_parent = parent.clone();
+        mastered_parent
+            .attributes
+            .push(LinkAttribute::Controller(9));
+        assert!(validate_adoptable_vlan(&link, &mastered_parent, &request).is_err());
+        let mut stacked = parent.clone();
+        stacked
+            .attributes
+            .push(LinkAttribute::LinkInfo(vec![LinkInfo::Kind(
+                netlink_packet_route::link::InfoKind::Vlan,
+            )]));
+        assert!(validate_adoptable_vlan(&link, &stacked, &request).is_err());
+        for attribute in [
+            InfoVlan::Protocol(VlanProtocol::Ieee8021Ad),
+            InfoVlan::Flags((2, u32::MAX)),
+            InfoVlan::Flags((0, u32::MAX)),
+            InfoVlan::IngressQos(vec![netlink_packet_route::link::VlanQosMapping::Mapping(
+                0, 1,
+            )]),
+        ] {
+            let mut foreign = link.clone();
+            foreign
+                .attributes
+                .retain(|attribute| !matches!(attribute, LinkAttribute::LinkInfo(_)));
+            foreign.attributes.push(LinkAttribute::LinkInfo(vec![
+                LinkInfo::Kind(netlink_packet_route::link::InfoKind::Vlan),
+                LinkInfo::Data(InfoData::Vlan(vec![InfoVlan::Id(50), attribute])),
+            ]));
+            assert!(validate_adoptable_vlan(&foreign, &parent, &request).is_err());
+        }
+    }
+
+    #[test]
+    fn vlan_adoption_rejects_nonconnected_and_nonstandard_routes() {
+        let mut address = AddressMessage::default();
+        address.header.family = AddressFamily::Inet;
+        address.header.prefix_len = 24;
+        address
+            .attributes
+            .push(AddressAttribute::Local("192.0.2.1".parse().unwrap()));
+        let mut route = RouteMessage::default();
+        route.header.address_family = AddressFamily::Inet;
+        route.header.destination_prefix_length = 24;
+        route.header.table = 254;
+        route.header.protocol = RouteProtocol::Kernel;
+        route.header.kind = RouteType::Unicast;
+        route.header.scope = RouteScope::Link;
+        route.attributes = vec![
+            RouteAttribute::Oif(3),
+            RouteAttribute::Destination(RouteAddress::Inet("192.0.2.0".parse().unwrap())),
+        ];
+        validate_vlan_connected_route(&route, &[address.clone()]).unwrap();
+        route.header.protocol = RouteProtocol::Static;
+        assert!(validate_vlan_connected_route(&route, &[address.clone()]).is_err());
+        route.header.protocol = RouteProtocol::Kernel;
+        route.attributes.push(RouteAttribute::Priority(5));
+        assert!(validate_vlan_connected_route(&route, &[address.clone()]).is_err());
+        route.attributes.pop();
+        route.header.destination_prefix_length = 0;
+        assert!(validate_vlan_connected_route(&route, &[address]).is_err());
+    }
 
     #[test]
     fn loopback_kind_uses_kernel_flags_not_interface_name() {
@@ -356,6 +464,249 @@ pub async fn capture_ethernet(
     Ok(result)
 }
 
+fn validate_vlan_connected_route(route: &RouteMessage, addresses: &[AddressMessage]) -> Result<()> {
+    let table = route
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+        .unwrap_or(u32::from(route.header.table));
+    ensure!(
+        route.header.protocol == RouteProtocol::Kernel
+            && route
+                .header
+                .flags
+                .iter()
+                .all(|flag| *flag == netlink_packet_route::route::RouteFlag::Linkdown)
+            && route.header.source_prefix_length == 0
+            && route.header.tos == 0,
+        "VLAN adoption supports only ordinary kernel-connected routes"
+    );
+    if table == 255 {
+        let multicast = route.header.kind == RouteType::Multicast
+            && route.header.address_family == AddressFamily::Inet6
+            && route.header.destination_prefix_length == 8
+            && route.attributes.iter().any(|attribute| matches!(attribute,
+                RouteAttribute::Destination(RouteAddress::Inet6(address)) if *address == "ff00::".parse::<std::net::Ipv6Addr>().expect("constant IPv6")));
+        ensure!(
+            matches!(route.header.kind, RouteType::Local | RouteType::Broadcast) || multicast,
+            "unsupported VLAN local-table route: {:?}",
+            route.header
+        );
+        return Ok(());
+    }
+    ensure!(
+        table == 254 && route.header.kind == RouteType::Unicast,
+        "unsupported VLAN route table/type"
+    );
+    let destination = route
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Destination(address) => Some(route_ip(address)),
+            _ => None,
+        })
+        .context("VLAN default routes cannot be adopted")??;
+    let prefix = route.header.destination_prefix_length;
+    ensure!(
+        addresses.iter().any(|address| {
+            address.header.prefix_len == prefix
+                && address.attributes.iter().any(|attribute| {
+                    let ip = match attribute {
+                        AddressAttribute::Address(ip) | AddressAttribute::Local(ip) => ip,
+                        _ => return false,
+                    };
+                    ipnet::IpNet::new(*ip, prefix)
+                        .is_ok_and(|network| network.network() == destination)
+                })
+        }),
+        "VLAN kernel route is not address-connected"
+    );
+    for attribute in &route.attributes {
+        ensure!(match attribute {
+            RouteAttribute::Destination(_) | RouteAttribute::Oif(_) | RouteAttribute::Table(_) => true,
+            RouteAttribute::Priority(metric) => *metric == if destination.is_ipv4() { 0 } else { 256 },
+            RouteAttribute::Preference(preference) => *preference == RoutePreference::Medium,
+            RouteAttribute::CacheInfo(cache) => cache.expires == 0 && cache.error == 0,
+            RouteAttribute::PrefSource(ip) => route_ip(ip).is_ok_and(|ip| addresses.iter().any(|address|
+                address.attributes.iter().any(|attribute| matches!(attribute,
+                    AddressAttribute::Address(value) | AddressAttribute::Local(value) if *value == ip)))),
+            _ => false,
+        },         "unsupported VLAN connected-route attribute: {attribute:?}");
+    }
+    Ok(())
+}
+
+pub(super) async fn capture_vlan_snapshot(
+    handle: &Handle,
+    request: &netcontrol_core::AdoptVlanRequest,
+) -> Result<EthernetSnapshot> {
+    let available = links(handle).await?;
+    let link = available
+        .iter()
+        .find(|link| name(link) == request.name)
+        .context("requested VLAN does not exist")?;
+    let parent_link = available
+        .iter()
+        .find(|link| name(link) == request.parent)
+        .context("VLAN parent does not exist")?;
+    validate_adoptable_vlan(link, parent_link, request)?;
+    ensure!(!available.iter().any(|other| other.attributes.iter()
+        .any(|attribute| matches!(attribute, LinkAttribute::Link(index) if *index == link.header.index))),
+        "VLAN has stacked/dependent links");
+    let p = parent(link);
+    let messages = addresses(handle, p.index).await?;
+    for version in [IpVersion::V4, IpVersion::V6] {
+        let routes: Vec<RouteMessage> = handle.route().get(version).execute().try_collect().await?;
+        for route in routes {
+            ensure!(
+                !route.attributes.iter().any(|attribute| matches!(
+                    attribute,
+                    RouteAttribute::MultiPath(_)
+                ) || matches!(attribute, RouteAttribute::Other(value) if value.kind() == 30)),
+                "VLAN adoption cannot safely attribute multipath/nexthop-object routes"
+            );
+            let associated = route.attributes.iter().any(|attribute| {
+                matches!(attribute,
+                RouteAttribute::Oif(index) | RouteAttribute::Iif(index) if *index == p.index)
+            });
+            if associated {
+                validate_vlan_connected_route(&route, &messages)?;
+            }
+        }
+    }
+    let mut raw = Vec::new();
+    for message in messages {
+        if message.header.scope == AddressScope::Link {
+            continue;
+        }
+        address_string(&message)?.context("unsupported VLAN address")?;
+        validate_vlan_address(&message, &request.name)?;
+        ensure!(!message.attributes.iter().any(|attribute| matches!(attribute,
+            AddressAttribute::CacheInfo(info) if info.ifa_valid != u32::MAX || info.ifa_preferred != u32::MAX)),
+            "dynamic VLAN addresses cannot be adopted");
+        let mut bytes = vec![0; message.buffer_len()];
+        message.emit(&mut bytes);
+        raw.push(bytes);
+    }
+    Ok(EthernetSnapshot {
+        name: p.name,
+        kind: p.kind,
+        index: p.index,
+        mac: p.mac,
+        mtu: p.mtu,
+        up: p.up,
+        boot: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+            .trim()
+            .into(),
+        captured_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        addresses: raw,
+    })
+}
+
+fn validate_vlan_address(message: &AddressMessage, name: &str) -> Result<()> {
+    let ipv4 = message.header.family == AddressFamily::Inet;
+    ensure!(
+        message
+            .header
+            .flags
+            .iter()
+            .all(|flag| *flag == AddressHeaderFlag::Permanent
+                || (ipv4 && *flag == AddressHeaderFlag::Secondary)),
+        "unsupported VLAN address flags"
+    );
+    for attribute in &message.attributes {
+        let supported = match attribute {
+            AddressAttribute::Address(_)
+            | AddressAttribute::Local(_)
+            | AddressAttribute::CacheInfo(_) => true,
+            AddressAttribute::Label(label) => label == name,
+            AddressAttribute::Flags(flags) => flags.iter().all(|flag| {
+                *flag == AddressFlag::Permanent || (ipv4 && *flag == AddressFlag::Secondary)
+            }),
+            AddressAttribute::Broadcast(broadcast) => {
+                message.attributes.iter().any(|attribute| match attribute {
+                    AddressAttribute::Local(IpAddr::V4(address))
+                    | AddressAttribute::Address(IpAddr::V4(address)) => {
+                        ipnet::Ipv4Net::new(*address, message.header.prefix_len)
+                            .is_ok_and(|network| network.broadcast() == *broadcast)
+                    }
+                    _ => false,
+                })
+            }
+            _ => false,
+        };
+        ensure!(supported, "unsupported VLAN address attribute");
+    }
+    Ok(())
+}
+
+fn validate_adoptable_vlan(
+    link: &LinkMessage,
+    parent_link: &LinkMessage,
+    request: &netcontrol_core::AdoptVlanRequest,
+) -> Result<()> {
+    ensure!(
+        name(link) == request.name && name(parent_link) == request.parent,
+        "VLAN name mismatch"
+    );
+    ensure!(
+        ethernet_kind(&kind(parent_link)),
+        "stacked/non-Ethernet VLAN parent is unsupported"
+    );
+    for device in [link, parent_link] {
+        ensure!(
+            !device
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::Controller(_))),
+            "mastered VLAN or parent cannot be adopted"
+        );
+    }
+    ensure!(
+        vlan(link)? == Some((parent_link.header.index, request.id)),
+        "VLAN parent/ID mismatch"
+    );
+    ensure!(
+        link.header.flags.iter().all(|flag| matches!(
+            flag,
+            LinkFlag::Up
+                | LinkFlag::Broadcast
+                | LinkFlag::Running
+                | LinkFlag::Multicast
+                | LinkFlag::LowerUp
+                | LinkFlag::Dormant
+        )),
+        "unsupported VLAN link flags"
+    );
+    for attribute in &link.attributes {
+        if let LinkAttribute::LinkInfo(info) = attribute {
+            for entry in info {
+                match entry {
+                    LinkInfo::Kind(_) => {}
+                    LinkInfo::Data(InfoData::Vlan(attributes)) => {
+                        ensure!(
+                            attributes.iter().all(|attribute| !matches!(attribute,
+                            InfoVlan::Flags((flags, _)) if *flags != 1)),
+                            "nondefault VLAN flags cannot be adopted"
+                        );
+                    }
+                    _ => bail!("unsupported VLAN link identity"),
+                }
+            }
+        }
+    }
+    ensure!(
+        parent(link).mac.len() == 17 && parent(parent_link).mac.len() == 17,
+        "VLAN/parent Ethernet identity missing"
+    );
+    Ok(())
+}
+
 pub async fn check_ethernet(
     handle: &Handle,
     snapshots: &BTreeMap<String, EthernetSnapshot>,
@@ -666,6 +1017,14 @@ pub(super) fn route_key(message: &RouteMessage) -> Result<(u32, u32, String)> {
 }
 
 pub async fn check_initial_policy_rules(handle: &Handle) -> Result<()> {
+    check_policy_rules(handle, false).await
+}
+
+pub(super) async fn check_vlan_policy_rules(handle: &Handle) -> Result<()> {
+    check_policy_rules(handle, true).await
+}
+
+async fn check_policy_rules(handle: &Handle, allow_managed: bool) -> Result<()> {
     for version in [IpVersion::V4, IpVersion::V6] {
         let messages: Vec<RuleMessage> = handle.rule().get(version).execute().try_collect().await?;
         for message in messages {
@@ -677,6 +1036,9 @@ pub async fn check_initial_policy_rules(handle: &Handle) -> Result<()> {
                     _ => None,
                 })
                 .unwrap_or_default();
+            if allow_managed && (10000..=19999).contains(&priority) {
+                continue;
+            }
             let table = message
                 .attributes
                 .iter()

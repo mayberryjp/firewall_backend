@@ -214,7 +214,7 @@ install_systemd_service() {
 }
 
 select_appliance_ports() {
-    local wan=${1:-} lan=${2:-} directory=${3:-/sys/class/net} path name
+    local wan=${1:-} lan=${2:-} directory=${3:-/sys/class/net} vlan_table=${4:-/proc/net/vlan/config} path name
     local -a interfaces=()
     mapfile -t interfaces < <(
         for path in "$directory"/*; do
@@ -229,22 +229,119 @@ select_appliance_ports() {
         wan=${interfaces[0]}
         lan=${interfaces[1]}
     fi
-    [[ -n $wan && -n $lan && $wan != "$lan" && " ${interfaces[*]} " == *" $wan "* &&
-       " ${interfaces[*]} " == *" $lan "* ]] || {
-        printf 'Provide both --wan and --lan with distinct physical Ethernet ports, or omit both for automatic selection.\n' >&2
+    local lan_parent=$lan details
+    if [[ " ${interfaces[*]} " != *" $lan "* ]]; then
+        details=$(lan_vlan_details "$lan" "$vlan_table") || {
+            printf 'LAN must be an existing physical Ethernet interface or an existing VLAN on a physical Ethernet parent.\n' >&2
+            return 1
+        }
+        read -r lan_parent _ <<< "$details"
+        [[ -d $directory/$lan && -r $directory/$lan/type && $(< "$directory/$lan/type") == 1 ]] || return 1
+    fi
+    [[ -n $wan && -n $lan && $wan != "$lan" && $wan != "$lan_parent" &&
+       " ${interfaces[*]} " == *" $wan "* && " ${interfaces[*]} " == *" $lan_parent "* ]] || {
+        printf 'WAN must be a physical Ethernet port distinct from the physical LAN or VLAN parent.\n' >&2
         return 1
     }
     printf '%s %s\n' "$wan" "$lan"
 }
 
+lan_vlan_details() {
+    local wanted=$1 table=${2:-/proc/net/vlan/config} name id parent rest found='' count=0
+    [[ -r $table ]] || return 1
+    while IFS='|' read -r name id parent rest; do
+        name=${name//[[:space:]]/}
+        [[ $name == "$wanted" ]] || continue
+        id=${id//[[:space:]]/}
+        parent=${parent//[[:space:]]/}
+        [[ $id =~ ^[1-9][0-9]{0,3}$ && $parent =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ]] || return 1
+        (( id <= 4094 )) || return 1
+        found="$parent $id"
+        count=$((count + 1))
+    done < "$table"
+    [[ $count -eq 1 ]] || return 1
+    printf '%s\n' "$found"
+}
+
+prompt_appliance_lan() {
+    local wan=$1 lan=$2 address=$3 directory=${4:-/sys/class/net} vlan_table=${5:-/proc/net/vlan/config} defaults answer
+    defaults=$(select_appliance_ports '' '' "$directory" "$vlan_table") || return 1
+    local default_wan default_lan
+    read -r default_wan default_lan <<< "$defaults"
+    wan=${wan:-$default_wan}
+    if [[ $default_lan == "$wan" ]]; then default_lan=$default_wan; fi
+    select_appliance_ports "$wan" "${lan:-$default_lan}" "$directory" "$vlan_table" >/dev/null || return 1
+    printf 'WAN interface: %s (DHCP). Use --wan NAME to change it.\n' "$wan" >&2
+    if [[ -z $lan ]]; then
+        printf 'Available LAN interfaces:\n' >&2
+        local path name details parent id
+        for path in "$directory"/*; do
+            name=${path##*/}
+            if [[ $name != lo && -d $path/device && -r $path/type && $(< "$path/type") == 1 &&
+               ! -d $path/wireless && ! -e $path/phy80211 ]]; then
+                printf '  %s%s\n' "$name" "$([[ $name == "$wan" ]] && printf ' (selected WAN)')" >&2
+            elif details=$(lan_vlan_details "$name" "$vlan_table"); then
+                read -r parent id <<< "$details"
+                if select_appliance_ports "$wan" "$name" "$directory" "$vlan_table" >/dev/null 2>&1; then
+                    printf '  %s (VLAN %s on %s)\n' "$name" "$id" "$parent" >&2
+                fi
+            fi
+        done
+        while :; do
+            printf 'LAN interface [%s]: ' "$default_lan" >&2
+            if ! IFS= read -r answer; then
+                printf '\nInstallation cancelled: LAN selection input ended.\n' >&2
+                return 1
+            fi
+            lan=${answer:-$default_lan}
+            if select_appliance_ports "$wan" "$lan" "$directory" "$vlan_table" >/dev/null; then break; fi
+        done
+    fi
+    if [[ -z $address ]]; then
+        while :; do
+            printf 'LAN IPv4 address/prefix [192.168.0.1/24]: ' >&2
+            if ! IFS= read -r answer; then
+                printf '\nInstallation cancelled: LAN address input ended.\n' >&2
+                return 1
+            fi
+            address=${answer:-192.168.0.1/24}
+            if valid_lan_address "$address"; then break; fi
+            printf 'Enter a usable private IPv4 host address/prefix (8..30), for example 192.168.50.1/24.\n' >&2
+        done
+    fi
+    printf '%s %s %s\n' "$wan" "$lan" "$address"
+}
+
+valid_lan_address() {
+    local address=$1 a b c d prefix ip mask network
+    [[ $address =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+    IFS='./' read -r a b c d prefix <<< "$address"
+    a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d)); prefix=$((10#$prefix))
+    [[ $address == "$a.$b.$c.$d/$prefix" ]] || return 1
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 && prefix >= 8 && prefix <= 30 )) || return 1
+    (( (a == 10 && prefix >= 8) ||
+       (a == 172 && b >= 16 && b <= 31 && prefix >= 12) ||
+       (a == 192 && b == 168 && prefix >= 16) )) || return 1
+    ip=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+    mask=$(( (0xffffffff << (32 - prefix)) & 0xffffffff ))
+    network=$(( ip & mask ))
+    (( ip != network && ip != (network | (0xffffffff ^ mask)) ))
+}
+
 provision_appliance() {
-    local binary=$1 wan=$2 lan=$3 address=$4
+    local binary=$1 wan=$2 lan=$3 address=$4 details parent id
+    local -a vlan_arguments=()
+    if details=$(lan_vlan_details "$lan"); then
+        read -r parent id <<< "$details"
+        vlan_arguments=(--provision-lan-parent "$parent" --provision-lan-vlan "$id")
+    fi
     "$binary" --backend linux --appliance \
         --state /var/lib/netcontrol/native-state.json \
         --credential-db /var/lib/netcontrol/credentials.json \
         --keys /etc/netcontrol/keys \
         --services-state-dir /var/lib/netcontrol/services \
-        --provision-wan "$wan" --provision-lan "$lan" --provision-lan-address "$address" || return 1
+        --provision-wan "$wan" --provision-lan "$lan" --provision-lan-address "$address" \
+        "${vlan_arguments[@]}" || return 1
     printf 'NETCONTROL_LISTEN=%s:8080\n' "${address%/*}" |
         install -o root -g root -m 0600 /dev/stdin /etc/netcontrol/appliance.env || return 1
     systemctl daemon-reload || return 1
@@ -381,6 +478,12 @@ check_prebuilt() (
         printf 'Release lacks current appliance provisioning/service/SSH environment support. No older-contract fallback is provided.\n' >&2
         exit 1
     fi
+    if [[ -n ${2:-} ]] && lan_vlan_details "$2" >/dev/null; then
+        if ! grep -q -- --provision-lan-parent <<< "$help" || ! grep -q -- --provision-lan-vlan <<< "$help"; then
+            printf 'This release does not support VLAN LAN provisioning; install a release containing tagged LAN support.\n' >&2
+            exit 1
+        fi
+    fi
 )
 
 check_fresh_installation() {
@@ -410,9 +513,9 @@ check_fresh_installation() {
 }
 
 main() {
-    local wan='' lan='' lan_address=192.168.0.1/24 ports
+    local wan='' lan='' lan_address='' ports
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash install.sh [--wan WAN_NIC --lan LAN_NIC] [--lan-address 192.168.0.1/24]\nDownloads the latest stable Ubuntu amd64 release over verified HTTPS; no CI run ID or GitHub login is needed.\nDefaults: first physical Ethernet port (natural name order) is DHCP WAN, second is LAN; LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Saved configuration controls which workers run. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
+        printf 'Usage: bash install.sh [--wan WAN_NIC] [--lan LAN_INTERFACE] [--lan-address CIDR]\nDownloads the latest stable Ubuntu amd64 release over verified HTTPS; no CI run ID or GitHub login is needed.\nInteractive installs prompt for missing LAN interface and IPv4 address/prefix. Noninteractive installs must supply --lan and --lan-address. WAN defaults to the first physical Ethernet port in natural name order; prompt suggestions are the second physical port and 192.168.0.1/24. LAN can be a physical Ethernet port or an existing VLAN on another physical port (use vlan50, not vlan50@enp2s0). VLAN LAN requires a release with tagged provisioning support and safe ownership handoff. LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Saved configuration controls which workers run. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
         return
     fi
     while [[ $# -gt 0 ]]; do
@@ -427,8 +530,8 @@ main() {
     done
     if [[ ( -n $wan && ! $wan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
             ( -n $lan && ! $lan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
-          ! $lan_address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-        printf 'Specify an IPv4 LAN prefix and optionally both --wan/--lan; use --help.\n' >&2
+          ( -n $lan_address && ! $lan_address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ) ]]; then
+        printf 'Specify valid interface names and an IPv4 LAN host/prefix; --wan may be overridden independently. Use --help.\n' >&2
         return 1
     fi
     if [[ $(uname -s) != Linux || ! -r /etc/os-release ]]; then
@@ -451,6 +554,21 @@ main() {
     fi
 
     check_fresh_installation /var/lib/netcontrol/native-state.json /etc/netcontrol/appliance.env || return 1
+    if [[ -z $lan || -z $lan_address ]]; then
+        if [[ ! -t 0 ]]; then
+            printf 'Noninteractive installation requires --lan NAME and --lan-address CIDR; use a local terminal for prompted setup.\n' >&2
+            return 1
+        fi
+        ports=$(prompt_appliance_lan "$wan" "$lan" "$lan_address") || return 1
+        read -r wan lan lan_address <<< "$ports"
+    elif [[ -z $wan ]]; then
+        ports=$(select_appliance_ports '' '') || return 1
+        read -r wan _ <<< "$ports"
+    fi
+    valid_lan_address "$lan_address" || {
+        printf 'LAN address must be a usable RFC1918 IPv4 host prefix (8..30).\n' >&2
+        return 1
+    }
     ports=$(select_appliance_ports "$wan" "$lan") || return 1
     read -r wan lan <<< "$ports"
     printf 'Selected WAN: %s (DHCP); LAN: %s (%s).\n' "$wan" "$lan" "$lan_address"
@@ -467,7 +585,7 @@ main() {
     printf -v cleanup 'rm -rf -- %q' "$work"
     trap "$cleanup" EXIT
     download_prebuilt "$work" || return 1
-    check_prebuilt "$work" || return 1
+    check_prebuilt "$work" "$lan" || return 1
     cd "$work"
     check_systemd_unit
     configure_conntrack || return 1

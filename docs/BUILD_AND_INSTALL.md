@@ -783,14 +783,45 @@ or foreign asset URLs. All subsequent downloads are pinned to that version:
 
 Only after verification is the binary executed to check its compiled version
 and required provisioning/service options. It is installed at
-`/usr/local/sbin/netcontrold`. No installation arguments are required.
-The first physical Ethernet interface in natural name order is WAN and the
-second is LAN (`eno1`, `eno2`, ...; `eno2` precedes `eno10`). Loopback, virtual
-and Wi-Fi interfaces are excluded. At least two physical Ethernet ports are
-required. Both `--wan WAN_NIC --lan LAN_NIC` may override selection; a partial
-override is rejected. Selection does not depend on current addresses or the
-current default route. Extra ports retain `unassigned` roles.
-`--lan-address` defaults to `192.168.0.1/24` and must describe a usable host
+`/usr/local/sbin/netcontrold`. No installation arguments are required when run
+from an interactive local terminal. The installer lists physical Ethernet ports
+and eligible existing VLANs, then asks for the LAN interface and IPv4
+address/prefix. Invalid selections/addresses are prompted again; EOF cancels
+without provisioning. Explicit `--lan` or `--lan-address` skips that individual
+prompt. Noninteractive invocation requires both; it never silently chooses a LAN
+or management address. Example:
+
+```text
+WAN interface: enp1s0 (DHCP). Use --wan NAME to change it.
+Available LAN interfaces:
+  enp1s0 (selected WAN)
+  enp2s0
+  vlan50 (VLAN 50 on enp2s0)
+LAN interface [enp2s0]: vlan50
+LAN IPv4 address/prefix [192.168.0.1/24]: 192.168.50.1/24
+```
+
+For unattended installation, for example:
+
+```sh
+sudo bash /tmp/netcontrol-install.sh --wan enp1s0 --lan vlan50 --lan-address 192.168.50.1/24
+```
+
+The first physical Ethernet interface in natural name order is the default WAN
+(`eno1`, `eno2`, ...; `eno2` precedes `eno10`); the second is only a suggested LAN.
+Use `--wan WAN_NIC` to override WAN. Physical-port discovery excludes loopback,
+virtual and Wi-Fi links and requires at least two physical Ethernet ports.
+An existing VLAN may be selected by its real name (for example `vlan50`, not the
+displayed `vlan50@enp2s0`). `/proc/net/vlan/config` supplies its ID/parent; the
+daemon independently validates live 802.1Q identity and explicitly acquires
+ownership without deleting the interface. Stacked VLANs, VLANs on WAN and
+unsupported ownership/configurations are rejected. A release must expose the
+tagged provisioning options; the installer rejects an older binary rather than
+misconfigure its physical parent. Additional VLANs may be configured later
+through normal confirmed transactions.
+
+Selection does not depend on current addresses or the current default route.
+Extra physical ports retain `unassigned` roles. The proposed address must describe a usable host
 inside an RFC1918 subnet with prefix length 8..30, entirely within private
 space and not overlapping another interface or active DHCP lease. There is no
 source-build fallback or `--ref` option. No checkout is needed.
@@ -836,7 +867,12 @@ settings still fail explicitly; the installer does not convert OS managers.
 
 The install-time root-only daemon invocation uses `--backend linux --appliance
 --provision-wan WAN_NIC --provision-lan LAN_NIC --provision-lan-address LAN_CIDR`
-with the installed state paths. It captures the initial physical NIC baseline,
+with the installed state paths. For an existing selected VLAN it additionally
+supplies `--provision-lan-parent PHYSICAL_NIC --provision-lan-vlan ID`; `--provision-lan`
+is then the actual VLAN name. The tagged interface receives the LAN address,
+role, input/forwarding permits and NAT source subnet. Its physical parent
+remains up and unassigned, without an untagged LAN address.
+It captures the initial physical NIC baseline,
 then provisionally applies a normal durable configuration transaction. It
 waits for WAN DHCP/address/default-route readiness and checks subnet overlap,
 then confirms locally without waiting for remote confirmation. Failure attempts

@@ -43,6 +43,21 @@ pub use simulator::Simulator;
 use anyhow::Result;
 use serde_json::Value;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptVlanRequest {
+    pub name: String,
+    pub parent: String,
+    pub id: u16,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VlanAdoption {
+    pub config: Config,
+    pub receipt: Value,
+}
+
 #[derive(Debug)]
 pub struct BackendDrift(pub String);
 impl std::fmt::Display for BackendDrift {
@@ -57,6 +72,18 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    /// Capture only: no networking or ownership changes before the core intent is durable.
+    fn prepare_vlan_adoption(
+        &mut self,
+        _before: &Config,
+        _request: &AdoptVlanRequest,
+    ) -> Result<VlanAdoption> {
+        anyhow::bail!("VLAN adoption requires the native Linux host backend")
+    }
+    /// Resume the exact durable capture; implementations must be idempotent and fail closed on drift.
+    fn finish_vlan_adoption(&mut self, _before: &Config, _adoption: &VlanAdoption) -> Result<()> {
+        anyhow::bail!("VLAN adoption requires the native Linux host backend")
+    }
     fn path_test_active(&self) -> bool {
         false
     }

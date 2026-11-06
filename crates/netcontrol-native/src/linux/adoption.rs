@@ -15,6 +15,7 @@ use netlink_packet_route::{
 use netlink_packet_utils::{Emitable, Parseable};
 use rtnetlink::{Handle, IpVersion};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
@@ -34,6 +35,88 @@ pub struct Receipt {
     pub routes: Vec<Vec<u8>>,
     pub ownership_before: serde_json::Value,
     pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    networkd_source: Option<NetworkdSource>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkdSource {
+    path: PathBuf,
+    sha256: String,
+}
+
+pub(super) fn check_vlan_source(receipt: &Receipt) -> Result<()> {
+    let source = receipt
+        .networkd_source
+        .as_ref()
+        .context("VLAN networkd source snapshot missing")?;
+    let current = settings(&source.path)?;
+    ensure!(
+        settings_digest(&current)? == source.sha256,
+        "VLAN networkd source changed since capture"
+    );
+    Ok(())
+}
+
+fn settings_digest(settings: &Ini) -> Result<String> {
+    let ordered: BTreeMap<_, BTreeMap<_, _>> = settings
+        .get_map_ref()
+        .iter()
+        .map(|(section, entries)| (section, entries.iter().collect()))
+        .collect();
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&ordered)?)))
+}
+
+fn validate_vlan_settings(settings: &Ini) -> Result<()> {
+    for (section, entries) in settings.get_map_ref() {
+        for key in entries.keys() {
+            let supported = match section.as_str() {
+                "match" => true,
+                "link" => matches!(
+                    key.as_str(),
+                    "mtubytes" | "requiredforonline" | "requiredfamilyforonline" | "description"
+                ),
+                "network" => matches!(
+                    key.as_str(),
+                    "address"
+                        | "gateway"
+                        | "dns"
+                        | "domains"
+                        | "dhcp"
+                        | "ipv6acceptra"
+                        | "linklocaladdressing"
+                        | "configurewithoutcarrier"
+                        | "keepconfiguration"
+                ),
+                "address" => key == "address",
+                _ => false,
+            };
+            ensure!(
+                supported,
+                "unsupported VLAN networkd setting [{section}] {key}"
+            );
+        }
+    }
+    ensure!(
+        settings
+            .get("Network", "DHCP")
+            .is_none_or(|value| matches!(value.as_str(), "no" | "false")),
+        "VLAN adoption does not support DHCP"
+    );
+    ensure!(
+        settings
+            .get("Network", "IPv6AcceptRA")
+            .is_some_and(|value| matches!(value.as_str(), "no" | "false")),
+        "VLAN adoption requires explicit networkd IPv6AcceptRA=no"
+    );
+    ensure!(
+        settings
+            .get("Network", "LinkLocalAddressing")
+            .is_none_or(|value| matches!(value.as_str(), "yes" | "true" | "ipv6")),
+        "unsupported VLAN link-local addressing mode"
+    );
+    Ok(())
 }
 
 fn bus<T: Send + 'static>(
@@ -264,11 +347,41 @@ pub async fn capture(
     ownership_before: serde_json::Value,
     readonly: std::collections::BTreeSet<String>,
 ) -> Result<Receipt> {
+    capture_selected(handle, scope, ownership_before, readonly, None).await
+}
+
+pub(super) async fn capture_vlan(
+    handle: &Handle,
+    scope: String,
+    ownership_before: serde_json::Value,
+    request: &netcontrol_core::AdoptVlanRequest,
+) -> Result<Receipt> {
+    networking::capture_vlan_snapshot(handle, request).await?;
+    capture_selected(
+        handle,
+        scope,
+        ownership_before,
+        Default::default(),
+        Some(request),
+    )
+    .await
+}
+
+async fn capture_selected(
+    handle: &Handle,
+    scope: String,
+    ownership_before: serde_json::Value,
+    readonly: std::collections::BTreeSet<String>,
+    selected: Option<&netcontrol_core::AdoptVlanRequest>,
+) -> Result<Receipt> {
     let available = networking::links(handle).await?;
     let available: Vec<_> = available
         .into_iter()
         .filter(|link| {
             let name = networking::name(link);
+            if let Some(request) = selected {
+                return name == request.name;
+            }
             name != "lo"
                 && !readonly.contains(&name)
                 && Path::new("/sys/class/net")
@@ -286,6 +399,7 @@ pub async fn capture(
             routes: Vec::new(),
             ownership_before,
             complete: false,
+            networkd_source: None,
         });
     }
     bus(|connection| {
@@ -309,22 +423,29 @@ pub async fn capture(
         }
         Ok(())
     })?;
-    networking::check_initial_policy_rules(handle).await?;
+    if selected.is_some() {
+        networking::check_vlan_policy_rules(handle).await?;
+    } else {
+        networking::check_initial_policy_rules(handle).await?;
+    }
     let mut config = Config::empty();
     let mut leases = BTreeMap::new();
     let mut names = BTreeMap::new();
+    let mut networkd_source = None;
     for link in &available {
         let parent = networking::parent(link);
-        if parent.name == "lo"
-            || !Path::new("/sys/class/net")
-                .join(&parent.name)
-                .join("device")
-                .try_exists()?
+        if selected.is_none()
+            && (parent.name == "lo"
+                || !Path::new("/sys/class/net")
+                    .join(&parent.name)
+                    .join("device")
+                    .try_exists()?)
         {
             continue;
         }
         ensure!(
-            parent.kind == "device" && parent.mac.len() == 17,
+            (parent.kind == "device" || (selected.is_some() && parent.kind == "vlan"))
+                && parent.mac.len() == 17,
             "unsupported physical NIC {}",
             parent.name
         );
@@ -350,6 +471,22 @@ pub async fn capture(
             .as_ref()
             .map(|path| settings(Path::new(path)))
             .transpose()?;
+        if selected.is_some() {
+            ensure!(
+                settings.is_some(),
+                "VLAN adoption requires a networkd configuration"
+            );
+            let source = network.as_ref().context("VLAN networkd source missing")?;
+            validate_vlan_settings(settings.as_ref().context("VLAN settings missing")?)?;
+            networkd_source = Some(NetworkdSource {
+                path: PathBuf::from(source),
+                sha256: settings_digest(
+                    settings
+                        .as_ref()
+                        .context("VLAN networkd settings missing")?,
+                )?,
+            });
+        }
         let mut dhcp = false;
         let mut client = DHCPClientConfig::default();
         if let Some(settings) = &settings {
@@ -362,6 +499,18 @@ pub async fn capture(
                 parent.name
             );
             dhcp = mode == "ipv4";
+            if selected.is_some() {
+                ensure!(
+                    matches!(mode.as_str(), "no" | "false"),
+                    "VLAN adoption does not support DHCP"
+                );
+                ensure!(
+                    settings
+                        .get("Network", "IPv6AcceptRA")
+                        .is_some_and(|value| matches!(value.as_str(), "no" | "false")),
+                    "VLAN adoption requires explicit networkd IPv6AcceptRA=no"
+                );
+            }
             for key in [
                 "DHCPServer",
                 "IPv6SendRA",
@@ -562,6 +711,12 @@ pub async fn capture(
             {
                 continue;
             }
+            if selected.is_some() {
+                ensure!(
+                    message.header.protocol == RouteProtocol::Kernel,
+                    "VLAN adoption supports only kernel-connected routes; static, DHCP and RA routes are unsupported"
+                );
+            }
             let mut decoded = message.clone();
             let interface = names
                 .get(&index.context("route interface missing")?)
@@ -643,7 +798,12 @@ pub async fn capture(
         .validate()
         .context("host configuration cannot be inherited without changing its semantics")?;
     let network = Network::parse(&serde_json::to_value(&config)?)?;
-    let originals = networking::capture_ethernet(handle, &network, &network).await?;
+    let originals = if let Some(request) = selected {
+        let snapshot = networking::capture_vlan_snapshot(handle, request).await?;
+        BTreeMap::from([(request.name.clone(), snapshot)])
+    } else {
+        networking::capture_ethernet(handle, &network, &network).await?
+    };
     for interface in &config.interfaces {
         ensure!(
             !override_path(&interface.name).try_exists()?,
@@ -659,6 +819,7 @@ pub async fn capture(
         routes,
         ownership_before,
         complete: false,
+        networkd_source,
     })
 }
 
@@ -837,6 +998,32 @@ fn current_indices(originals: &BTreeMap<String, EthernetSnapshot>) -> Result<Vec
 mod dns_tests {
     use super::{DNSConfig, DnsServer, dns_reset_needed, dns_servers};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn vlan_capture_rejects_dynamic_and_unrepresentable_networkd_options() {
+        for body in [
+            "[Network]\nDHCP=ipv4\nIPv6AcceptRA=no\n",
+            "[Network]\nDHCP=ipv6\nIPv6AcceptRA=no\n",
+            "[Network]\nIPv6AcceptRA=yes\n",
+            "[Network]\nAddress=192.0.2.1/24\n",
+            "[Network]\nIPv6AcceptRA=no\nDNSOverTLS=yes\n",
+            "[Network]\nIPv6AcceptRA=no\n[Route]\nDestination=203.0.113.0/24\n",
+            "[Network]\nIPv6AcceptRA=no\n[Link]\nMACAddress=02:00:00:00:00:02\n",
+        ] {
+            let settings =
+                super::parse_fields(std::path::Path::new("vlan.network"), body.into()).unwrap();
+            assert!(super::validate_vlan_settings(&settings).is_err(), "{body}");
+        }
+        let valid = super::parse_fields(std::path::Path::new("vlan.network"),
+            "[Match]\nName=vlan50\n[Network]\nAddress=192.0.2.1/24\nDHCP=no\nIPv6AcceptRA=no\nDNS=192.0.2.2\nDomains=example.invalid\n".into()).unwrap();
+        super::validate_vlan_settings(&valid).unwrap();
+        let reordered = super::parse_fields(std::path::Path::new("vlan.network"),
+            "[Network]\nDomains=example.invalid\nDNS=192.0.2.2\nIPv6AcceptRA=no\nDHCP=no\nAddress=192.0.2.1/24\n[Match]\nName=vlan50\n".into()).unwrap();
+        assert_eq!(
+            super::settings_digest(&valid).unwrap(),
+            super::settings_digest(&reordered).unwrap()
+        );
+    }
 
     fn configured(servers: &[&str], override_dhcp_dns: bool) -> DNSConfig {
         DNSConfig {

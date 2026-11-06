@@ -75,6 +75,16 @@ struct State {
     initialized_at: DateTime<Utc>,
     transactions: BTreeMap<String, Transaction>,
     interface_capabilities: Option<crate::InterfaceCapabilitySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vlan_adoption: Option<VlanAdoptionIntent>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VlanAdoptionIntent {
+    id: String,
+    actor: String,
+    request: crate::AdoptVlanRequest,
+    adoption: crate::VlanAdoption,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -419,6 +429,7 @@ impl Engine {
                     initialized_at,
                     transactions: BTreeMap::new(),
                     interface_capabilities: None,
+                    vlan_adoption: None,
                 };
                 store.save(&s).context("initialize durable journal")?;
                 s
@@ -449,11 +460,13 @@ impl Engine {
         };
         if !reconcile {
             ensure!(
-                e.state.active_transaction.is_none(),
+                e.state.active_transaction.is_none() && e.state.vlan_adoption.is_none(),
                 "factory reset requires completing the active transaction recovery first"
             );
             return Ok(e);
         }
+        e.finish_vlan_adoption()
+            .context("resume durable VLAN adoption; intent retained on failure")?;
         if let Some(id) = e.state.active_transaction.clone() {
             let t = e
                 .state
@@ -504,6 +517,44 @@ impl Engine {
         self.state = next;
         Ok(())
     }
+    fn finish_vlan_adoption(&mut self) -> Result<()> {
+        let Some(intent) = self.state.vlan_adoption.clone() else {
+            return Ok(());
+        };
+        self.backend
+            .finish_vlan_adoption(&self.state.desired, &intent.adoption)?;
+        let actual = self.backend.observe(&intent.adoption.config)?;
+        ensure!(
+            actual.same_settings(&intent.adoption.config),
+            "VLAN adoption verification mismatch"
+        );
+        let now = self.now();
+        let mut next = self.state.clone();
+        next.revision = next.revision.next(now.date_naive())?;
+        next.transactions.insert(
+            intent.id.clone(),
+            Transaction {
+                id: intent.id,
+                actor: intent.actor.clone(),
+                status: "committed".into(),
+                base_revision: self.state.revision,
+                committed_revision: Some(next.revision),
+                candidate: intent.adoption.config.clone(),
+                previous: self.state.desired.clone(),
+                confirmation_deadline: now + Duration::seconds(300),
+                error: String::new(),
+                description: format!("Explicit adoption of existing VLAN {}", intent.request.name),
+                submitted_at: now,
+                committed_at: Some(now),
+                committed_by: intent.actor,
+                restored_from_revision: None,
+            },
+        );
+        next.desired = intent.adoption.config;
+        next.vlan_adoption = None;
+        validate_state(&next)?;
+        self.persist(next)
+    }
     pub fn tick(&mut self) -> Result<()> {
         if self.closed {
             bail!("engine is shut down");
@@ -532,7 +583,10 @@ impl Engine {
     pub fn set_upgrade_maintenance(&mut self, enabled: bool) -> Result<()> {
         ensure!(
             !enabled
-                || (!self.closed && self.active().is_none() && !self.backend.path_test_active()),
+                || (!self.closed
+                    && self.active().is_none()
+                    && self.state.vlan_adoption.is_none()
+                    && !self.backend.path_test_active()),
             "upgrade requires a healthy engine with no active transaction or path test"
         );
         self.maintenance = enabled;
@@ -584,6 +638,110 @@ impl Engine {
             return Err(ApiError::new(
                 409,
                 "configuration writes are blocked during software upgrade",
+            ));
+        }
+        if self.state.vlan_adoption.is_some()
+            && writes_state
+            && path != "/api/v1/interfaces/adopt-vlan"
+        {
+            return Err(ApiError::new(
+                409,
+                "VLAN adoption recovery is pending; retry adoption or restart",
+            ));
+        }
+        if path == "/api/v1/interfaces/adopt-vlan" {
+            if method != "POST" {
+                return Err(ApiError::new(405, "VLAN adoption requires POST"));
+            }
+            require(permissions, "interfaces.write")?;
+            require(permissions, "transactions.write")?;
+            if !query.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "VLAN adoption accepts no query parameters",
+                ));
+            }
+            let request: crate::AdoptVlanRequest = parse(body)?;
+            if !valid_interface_name(&request.name)
+                || !valid_interface_name(&request.parent)
+                || request.name == request.parent
+                || request.name == "lo"
+                || request.parent == "lo"
+                || !(1..=4094).contains(&request.id)
+            {
+                return Err(ApiError::new(
+                    422,
+                    "valid distinct interface names and VLAN ID 1..4094 required",
+                ));
+            }
+            if let Some(intent) = &self.state.vlan_adoption {
+                if intent.request.name != request.name
+                    || intent.request.parent != request.parent
+                    || intent.request.id != request.id
+                {
+                    return Err(ApiError::new(
+                        409,
+                        "another VLAN adoption requires recovery",
+                    ));
+                }
+            } else {
+                if self.configuration_busy() {
+                    return Err(ApiError::new(409, "configuration is busy"));
+                }
+                if self
+                    .state
+                    .desired
+                    .interfaces
+                    .iter()
+                    .any(|link| link.name == request.name)
+                {
+                    return Err(ApiError::new(409, "interface is already managed"));
+                }
+                if !self
+                    .state
+                    .desired
+                    .interfaces
+                    .iter()
+                    .any(|link| link.name == request.parent && link.kind == "ethernet")
+                {
+                    return Err(ApiError::new(422, "VLAN parent must be managed Ethernet"));
+                }
+                let observed = self
+                    .backend
+                    .observe(&self.state.desired)
+                    .map_err(service_error)?;
+                if !observed.same_settings(&self.state.desired) {
+                    return Err(ApiError::new(409, "managed state has drifted"));
+                }
+                let adoption = self
+                    .backend
+                    .prepare_vlan_adoption(&self.state.desired, &request)
+                    .map_err(|error| service_error(format!("VLAN adoption refused: {error:#}")))?;
+                validate_vlan_adoption(&self.state.desired, &request, &adoption)
+                    .map_err(service_error)?;
+                let mut next = self.state.clone();
+                next.vlan_adoption = Some(VlanAdoptionIntent {
+                    id: hex::encode(rand::random::<[u8; 16]>()),
+                    actor: actor.into(),
+                    request: request.clone(),
+                    adoption,
+                });
+                self.persist(next).map_err(internal_error)?;
+            }
+            self.finish_vlan_adoption().map_err(|error| {
+                service_error(format!(
+                    "VLAN adoption incomplete; durable recovery intent retained: {error:#}"
+                ))
+            })?;
+            let interface = self
+                .state
+                .desired
+                .interfaces
+                .iter()
+                .find(|link| link.name == request.name);
+            return Ok(Reply::value(
+                200,
+                json!({"revision":self.state.revision,"interface":interface}),
             ));
         }
         if path == "/api/v1/diagnostics/path-tests" || path_test_cancel.is_some() {
@@ -1108,6 +1266,10 @@ impl Engine {
 
     pub fn update_software_metadata(&mut self, metadata: SoftwareMetadata) -> Result<()> {
         ensure!(!self.closed, "engine is shut down");
+        ensure!(
+            self.state.vlan_adoption.is_none(),
+            "VLAN adoption recovery is pending"
+        );
         metadata.validate()?;
         let mut next = self.state.clone();
         next.desired.software = metadata;
@@ -1121,6 +1283,7 @@ impl Engine {
         self.restarting
             || self.maintenance
             || self.active().is_some()
+            || self.state.vlan_adoption.is_some()
             || self.backend.path_test_active()
     }
 
@@ -1226,6 +1389,10 @@ impl Engine {
 
     pub fn factory_reset(&mut self, config: Config) -> Result<Transaction> {
         ensure!(!self.closed, "engine is shut down");
+        ensure!(
+            self.state.vlan_adoption.is_none(),
+            "VLAN adoption recovery is pending"
+        );
         let request = SubmitRequest {
             base_revision: self.state.revision,
             confirm_timeout_seconds: 300,
@@ -2041,13 +2208,72 @@ pub fn validate_offline_state(payload: &[u8]) -> Result<()> {
     let state: State = serde_json::from_slice(payload).context("invalid converted state")?;
     validate_state(&state)?;
     ensure!(
-        state.active_transaction.is_none(),
+        state.active_transaction.is_none() && state.vlan_adoption.is_none(),
         "finish or recover the active transaction with the previous binary before conversion"
     );
     Ok(())
 }
 
+fn validate_vlan_adoption(
+    before: &Config,
+    request: &crate::AdoptVlanRequest,
+    adoption: &crate::VlanAdoption,
+) -> Result<()> {
+    adoption.config.validate()?;
+    let imported = adoption
+        .config
+        .interfaces
+        .iter()
+        .find(|link| link.name == request.name)
+        .context("imported VLAN missing")?;
+    ensure!(
+        imported.kind == "vlan"
+            && imported.role == "unassigned"
+            && imported.vlan.as_ref().is_some_and(
+                |vlan| vlan.parent == request.parent && vlan.id == i64::from(request.id)
+            ),
+        "imported VLAN identity/role mismatch"
+    );
+    ensure!(
+        !before
+            .interfaces
+            .iter()
+            .any(|link| link.name == request.name),
+        "VLAN already managed"
+    );
+    let mut expected = before.clone();
+    expected.interfaces.push(imported.clone());
+    if let Some(dns) = adoption.config.dns.get(&request.name) {
+        expected.dns.insert(request.name.clone(), dns.clone());
+    }
+    expected.routes.extend(
+        adoption
+            .config
+            .routes
+            .iter()
+            .filter(|route| route.interface == request.name)
+            .cloned(),
+    );
+    ensure!(
+        expected.normalized() == adoption.config
+            && !adoption.config.dhcp_clients.contains_key(&request.name),
+        "VLAN adoption changed unrelated configuration or imported unsupported DHCP"
+    );
+    Ok(())
+}
+
 fn validate_state(s: &State) -> Result<()> {
+    if let Some(intent) = &s.vlan_adoption {
+        ensure!(
+            s.active_transaction.is_none()
+                && !intent.actor.trim().is_empty()
+                && intent.id.len() == 32
+                && intent.id.bytes().all(|c| c.is_ascii_hexdigit())
+                && !s.transactions.contains_key(&intent.id),
+            "invalid VLAN adoption intent"
+        );
+        validate_vlan_adoption(&s.desired, &intent.request, &intent.adoption)?;
+    }
     if let Some(snapshot) = &s.interface_capabilities {
         ensure!(
             snapshot.scope == s.scope,

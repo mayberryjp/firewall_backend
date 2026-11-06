@@ -79,6 +79,63 @@ fn config(value: Value) -> Result<Config> {
     Ok(serde_json::from_value(value)?)
 }
 
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_vlan_adoption_snapshot_is_passive_strict_and_ordinary_apply_still_refuses() -> Result<()>
+{
+    let fixture = Fixture::new()?;
+    let namespace = Arc::new(File::open(&fixture.namespace)?);
+    session(namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+        handle.link().add().veth("parent0".into(), "peer0".into()).execute().await?;
+        let links = networking::links(handle).await?;
+        let parent = links.iter().find(|link| networking::name(link) == "parent0").context("parent missing")?.header.index;
+        handle.link().set(parent).up().execute().await?;
+        let peer = links.iter().find(|link| networking::name(link) == "peer0").context("peer missing")?.header.index;
+        handle.link().set(peer).up().execute().await?;
+        handle.link().add().vlan("vlan50".into(), parent, 50).execute().await?;
+        let links = networking::links(handle).await?;
+        let index = links.iter().find(|link| networking::name(link) == "vlan50").context("VLAN missing")?.header.index;
+        handle.link().set(index).up().execute().await?;
+        handle.address().add(index, "192.0.2.1".parse()?, 24).execute().await?;
+        let wanted = netcontrol_core::AdoptVlanRequest {name:"vlan50".into(),parent:"parent0".into(),id:50};
+        let snapshot = networking::capture_vlan_snapshot(handle, &wanted).await?;
+        assert_eq!(snapshot.index, index);
+        assert_eq!(snapshot.addresses.len(), 1);
+        assert_eq!(snapshot.kind, "vlan");
+        let mut wrong = wanted.clone();
+        wrong.id = 51;
+        assert!(networking::capture_vlan_snapshot(handle, &wrong).await.is_err());
+        let before = Network::parse(&config(json!({"interfaces":[{"name":"parent0","kind":"ethernet","role":"unassigned","up":false,"mtu":1500,"addresses":[]}]}))?.operational_value()?)?;
+        let after = Network::parse(&config(json!({"interfaces":[
+            {"name":"parent0","kind":"ethernet","role":"unassigned","up":false,"mtu":1500,"addresses":[]},
+            {"name":"vlan50","kind":"vlan","role":"unassigned","up":false,"mtu":1500,"addresses":["192.0.2.1/24"],"vlan":{"parent":"parent0","id":50}}
+        ]}))?.operational_value()?)?;
+        assert!(networking::preflight(handle, &before, &after).await.is_err());
+        let repeated = networking::capture_vlan_snapshot(handle, &wanted).await?;
+        assert_eq!(repeated.index, index);
+        assert_eq!(repeated.addresses, snapshot.addresses);
+        handle.link().add().vlan("stacked".into(), index, 51).execute().await?;
+        assert!(networking::capture_vlan_snapshot(handle, &wanted).await.is_err());
+        let stacked = networking::links(handle).await?.into_iter().find(|link| networking::name(link) == "stacked").context("stacked missing")?;
+        handle.link().del(stacked.header.index).execute().await?;
+        let mut address = handle.address().add(index, "198.51.100.1".parse()?, 24);
+        let mut cache = netlink_packet_route::address::CacheInfo::default();
+        cache.ifa_preferred = 120;
+        cache.ifa_valid = 120;
+        address.message_mut().attributes.push(netlink_packet_route::address::AddressAttribute::CacheInfo(cache));
+        address.execute().await?;
+        assert!(networking::capture_vlan_snapshot(handle, &wanted).await.is_err());
+        let present = networking::links(handle).await?.into_iter().find(|link| networking::name(link) == "vlan50").context("VLAN was deleted")?;
+        assert_eq!(present.header.index, index);
+        assert_eq!(networking::addresses(handle, index).await?.iter()
+            .filter(|address| address.header.scope != netlink_packet_route::address::AddressScope::Link).count(), 2);
+        Ok(())
+    })
+    })?;
+    Ok(())
+}
+
 fn firewall_counter<'a>(snapshot: &'a Value, id: &str) -> Result<&'a Value> {
     snapshot["rules"]
         .as_array()

@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-mod provision;
+use netcontrold::provision;
 
 #[derive(Parser)]
 #[command(name = "netcontrold", version = netcontrol_core::RELEASE_VERSION, about = "Native Rust network control daemon")]
@@ -32,6 +32,10 @@ struct Options {
         help = "One-time appliance LAN interface"
     )]
     provision_lan: Option<String>,
+    #[arg(long, requires_all = ["provision_lan", "provision_lan_vlan"], conflicts_with = "factory_reset", help = "Physical parent for a tagged provisioning LAN")]
+    provision_lan_parent: Option<String>,
+    #[arg(long, requires_all = ["provision_lan", "provision_lan_parent"], conflicts_with = "factory_reset", value_parser = clap::value_parser!(u16).range(1..=4094), help = "802.1Q VLAN ID for the provisioning LAN")]
+    provision_lan_vlan: Option<u16>,
     #[arg(long, requires_all = ["appliance", "provision_wan", "provision_lan"], help = "Explicitly replace saved networking with factory configuration and exit")]
     factory_reset: bool,
     #[arg(long, default_value = "192.168.0.1/24")]
@@ -96,6 +100,24 @@ struct Options {
     control_socket: Option<PathBuf>,
     #[arg(long, value_name = "NAME", conflicts_with_all = ["auth_file", "provision_wan", "factory_reset", "configure_updates", "upgrade_worker", "upgrade_recover", "create_wireguard_key", "wireguard_public_key"], help = "Interactively create a device API key through the running daemon's local control socket and exit (Linux root only)")]
     create_api_key: Option<String>,
+    #[arg(long, value_name = "NAME", requires_all = ["lan_parent", "lan_vlan", "lan_address"], conflicts_with_all = ["create_api_key", "confirm_network_change", "auth_file", "provision_wan", "factory_reset", "configure_updates", "upgrade_worker", "upgrade_recover", "create_wireguard_key", "wireguard_public_key"], help = "Move the existing factory LAN to this VLAN through the running daemon; requires explicit confirmation (Linux root only)")]
+    configure_lan: Option<String>,
+    #[arg(
+        long,
+        requires = "configure_lan",
+        help = "Physical parent of the VLAN LAN"
+    )]
+    lan_parent: Option<String>,
+    #[arg(long, requires = "configure_lan", value_parser = clap::value_parser!(u16).range(1..=4094), help = "802.1Q VLAN ID")]
+    lan_vlan: Option<u16>,
+    #[arg(
+        long,
+        requires = "configure_lan",
+        help = "Tagged LAN IPv4 host address/prefix"
+    )]
+    lan_address: Option<String>,
+    #[arg(long, value_name = "ID", conflicts_with_all = ["create_api_key", "configure_lan", "auth_file", "provision_wan", "factory_reset", "configure_updates", "upgrade_worker", "upgrade_recover", "create_wireguard_key", "wireguard_public_key"], help = "Confirm a provisional network transaction through the running daemon (Linux root only)")]
+    confirm_network_change: Option<String>,
     #[arg(
         long,
         env = "NETCONTROL_UPGRADE_CONFIG",
@@ -168,6 +190,36 @@ fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
     }
 }
 async fn run(options: Options) -> Result<()> {
+    if options.configure_lan.is_some() || options.confirm_network_change.is_some() {
+        let path = options
+            .control_socket
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(netcontrold::local_control::DEFAULT_SOCKET));
+        if let Some(name) = &options.configure_lan {
+            return netcontrold::local_control::configure_lan(
+                path,
+                name,
+                options
+                    .lan_parent
+                    .as_deref()
+                    .context("--lan-parent is required")?,
+                options.lan_vlan.context("--lan-vlan is required")?,
+                options
+                    .lan_address
+                    .as_deref()
+                    .context("--lan-address is required")?,
+            )
+            .await;
+        }
+        return netcontrold::local_control::confirm_network_change(
+            path,
+            options
+                .confirm_network_change
+                .as_deref()
+                .context("transaction ID required")?,
+        )
+        .await;
+    }
     if let Some(name) = &options.create_api_key {
         let path = options
             .control_socket
@@ -384,7 +436,23 @@ async fn run(options: Options) -> Result<()> {
             provision::factory_reset(&mut engine, wan, lan, &options.provision_lan_address)?;
             provision::enable_forwarding(&mut engine)?;
         } else {
-            provision::apply(&mut engine, wan, lan, &options.provision_lan_address).await?;
+            let vlan = options
+                .provision_lan_parent
+                .as_ref()
+                .zip(options.provision_lan_vlan)
+                .map(|(parent, id)| provision::VlanLan {
+                    name: lan.clone(),
+                    parent: parent.clone(),
+                    id,
+                });
+            provision::apply_with_vlan(
+                &mut engine,
+                wan,
+                lan,
+                &options.provision_lan_address,
+                vlan.as_ref(),
+            )
+            .await?;
         }
         engine.shutdown()?;
         tracing::info!(
@@ -739,6 +807,71 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tagged_lan_commands_require_complete_explicit_topology() {
+        let options = Options::try_parse_from([
+            "netcontrold",
+            "--configure-lan",
+            "vlan50",
+            "--lan-parent",
+            "lan0",
+            "--lan-vlan",
+            "50",
+            "--lan-address",
+            "10.4.50.1/24",
+        ])
+        .unwrap();
+        assert_eq!(options.configure_lan.as_deref(), Some("vlan50"));
+        assert_eq!(options.lan_vlan, Some(50));
+        assert!(Options::try_parse_from(["netcontrold", "--configure-lan", "vlan50"]).is_err());
+        assert!(
+            Options::try_parse_from([
+                "netcontrold",
+                "--configure-lan",
+                "vlan50",
+                "--lan-parent",
+                "lan0",
+                "--lan-vlan",
+                "4095",
+                "--lan-address",
+                "10.4.50.1/24",
+            ])
+            .is_err()
+        );
+        let options = Options::try_parse_from([
+            "netcontrold",
+            "--backend",
+            "linux",
+            "--appliance",
+            "--provision-wan",
+            "wan0",
+            "--provision-lan",
+            "vlan50",
+            "--provision-lan-parent",
+            "lan0",
+            "--provision-lan-vlan",
+            "50",
+        ])
+        .unwrap();
+        assert_eq!(options.provision_lan_parent.as_deref(), Some("lan0"));
+        assert_eq!(options.provision_lan_vlan, Some(50));
+        assert!(
+            Options::try_parse_from([
+                "netcontrold",
+                "--backend",
+                "linux",
+                "--appliance",
+                "--provision-wan",
+                "wan0",
+                "--provision-lan",
+                "vlan50",
+                "--provision-lan-vlan",
+                "50",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn local_key_command_is_explicit_and_rejects_other_identity_modes() {

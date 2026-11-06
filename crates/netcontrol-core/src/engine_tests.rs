@@ -1646,6 +1646,11 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    vlan_prepares: usize,
+    vlan_finishes: usize,
+    fail_vlan_finish: bool,
+    partial_vlan_finish: bool,
+    invalid_vlan_capture: bool,
     path_active: bool,
     path_starts: usize,
     path_cleanup_failure: bool,
@@ -1679,6 +1684,44 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn prepare_vlan_adoption(
+        &mut self,
+        before: &Config,
+        request: &crate::AdoptVlanRequest,
+    ) -> Result<crate::VlanAdoption> {
+        let mut faults = self.0.lock().unwrap();
+        faults.vlan_prepares += 1;
+        let mut config = before.clone();
+        config.interfaces.push(serde_json::from_value(json!({
+            "name":request.name,"kind":"vlan","role":"unassigned","mtu":1496,"up":true,
+            "addresses":["198.51.100.1/24"],"vlan":{"parent":request.parent,"id":request.id}
+        }))?);
+        if faults.invalid_vlan_capture {
+            config.firewall.allow_all_icmp = !config.firewall.allow_all_icmp;
+        }
+        Ok(crate::VlanAdoption {
+            config: config.normalized(),
+            receipt: json!({"snapshot":"captured"}),
+        })
+    }
+    fn finish_vlan_adoption(
+        &mut self,
+        before: &Config,
+        adoption: &crate::VlanAdoption,
+    ) -> Result<()> {
+        let mut faults = self.0.lock().unwrap();
+        faults.vlan_finishes += 1;
+        ensure!(
+            faults.state == *before || faults.state == adoption.config,
+            "adoption identity drift"
+        );
+        if faults.partial_vlan_finish {
+            faults.state = adoption.config.clone();
+        }
+        ensure!(!faults.fail_vlan_finish, "injected VLAN handover failure");
+        faults.state = adoption.config.clone();
+        Ok(())
+    }
     fn path_test_active(&self) -> bool {
         self.0.lock().unwrap().path_active
     }
@@ -2621,6 +2664,259 @@ fn faulty(f: &Fixture) -> (Engine, Arc<Mutex<Faults>>) {
     let state = Arc::new(Mutex::new(Faults::default()));
     let e = Engine::open(&f.path(), Box::new(FaultBackend(state.clone()))).unwrap();
     (e, state)
+}
+
+fn vlan_fixture() -> (Fixture, Engine, Arc<Mutex<Faults>>) {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    let mut baseline = config();
+    baseline.interfaces[0].kind = "ethernet".into();
+    baseline.system.domain = "example.invalid".into();
+    let pending = submit(&mut engine, baseline);
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    (fixture, engine, faults)
+}
+
+fn adopt_vlan(engine: &mut Engine) -> Reply {
+    request(
+        engine,
+        "POST",
+        "/api/v1/interfaces/adopt-vlan",
+        json!({"name":"vlan50","parent":"lan0","id":50}),
+    )
+}
+
+#[test]
+fn vlan_adoption_is_strict_authorized_explicit_and_preserves_saved_configuration() {
+    let (fixture, mut engine, faults) = vlan_fixture();
+    let original = engine.state.desired.clone();
+    let revision = engine.state.revision;
+    let bytes = fs::read(fixture.path()).unwrap();
+    for (method, query, permissions, body, status) in [
+        (
+            "GET",
+            "",
+            all(),
+            r#"{"name":"vlan50","parent":"lan0","id":50}"#,
+            405,
+        ),
+        (
+            "POST",
+            "force=true",
+            all(),
+            r#"{"name":"vlan50","parent":"lan0","id":50}"#,
+            400,
+        ),
+        (
+            "POST",
+            "",
+            vec!["interfaces.write".into()],
+            r#"{"name":"vlan50","parent":"lan0","id":50}"#,
+            403,
+        ),
+        (
+            "POST",
+            "",
+            vec!["transactions.write".into()],
+            r#"{"name":"vlan50","parent":"lan0","id":50}"#,
+            403,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"vlan50","parent":"lan0","id":50,"force":true}"#,
+            400,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"vlan50","parent":"lan0","id":50.1}"#,
+            400,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"vlan50","parent":"lan0","id":"50"}"#,
+            400,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"vlan50","parent":"lan0"}"#,
+            400,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"../vlan50","parent":"lan0","id":50}"#,
+            422,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"vlan50","parent":"lan0","id":4095}"#,
+            422,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"vlan50","parent":"absent","id":50}"#,
+            422,
+        ),
+        (
+            "POST",
+            "",
+            all(),
+            r#"{"name":"lan0","parent":"other","id":50}"#,
+            409,
+        ),
+    ] {
+        let reply = engine.request(
+            method,
+            "/api/v1/interfaces/adopt-vlan",
+            query,
+            "operator",
+            &permissions,
+            body.as_bytes(),
+        );
+        assert_eq!(reply.status, status, "{}", reply.body);
+    }
+    assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    assert_eq!(faults.lock().unwrap().vlan_prepares, 0);
+    faults.lock().unwrap().invalid_vlan_capture = true;
+    assert_eq!(adopt_vlan(&mut engine).status, 503);
+    assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    assert_eq!(faults.lock().unwrap().vlan_finishes, 0);
+    faults.lock().unwrap().invalid_vlan_capture = false;
+    let response = engine.request(
+        "POST",
+        "/api/v1/interfaces/adopt-vlan",
+        "",
+        "operator",
+        &["interfaces.write".into(), "transactions.write".into()],
+        br#"{"name":"vlan50","parent":"lan0","id":50}"#,
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.body["interface"]["role"], "unassigned");
+    assert_eq!(response.body["interface"]["mtu"], 1496);
+    assert_eq!(
+        response.body["interface"]["addresses"],
+        json!(["198.51.100.1/24"])
+    );
+    assert_eq!(
+        engine.state.revision,
+        revision.next(engine.now().date_naive()).unwrap()
+    );
+    let mut imported = engine.state.desired.clone();
+    imported.interfaces.retain(|link| link.name != "vlan50");
+    assert_eq!(imported, original);
+    assert_eq!(adopt_vlan(&mut engine).status, 409);
+    validate_state(&engine.state).unwrap();
+}
+
+#[test]
+fn vlan_adoption_baseline_survives_transaction_timeout_and_reopen() {
+    let (fixture, mut engine, faults) = vlan_fixture();
+    assert_eq!(adopt_vlan(&mut engine).status, 200);
+    let imported = engine.state.desired.clone();
+    let mut candidate = imported.clone();
+    candidate.interfaces[0].role = "unassigned".into();
+    candidate
+        .interfaces
+        .iter_mut()
+        .find(|link| link.name == "vlan50")
+        .unwrap()
+        .role = "lan".into();
+    let transaction = submit(&mut engine, candidate);
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    engine.now = Some(engine.now() + Duration::seconds(31));
+    engine.tick().unwrap();
+    assert_eq!(faults.lock().unwrap().state, imported);
+    drop(engine);
+    let reopened = Engine::open_saved(&fixture.path(), Box::new(FaultBackend(faults))).unwrap();
+    assert_eq!(reopened.state.desired, imported);
+    assert!(
+        reopened
+            .state
+            .desired
+            .interfaces
+            .iter()
+            .any(|link| link.name == "vlan50")
+    );
+}
+
+#[test]
+fn vlan_adoption_intent_precedes_handover_and_recovers_partial_native_and_core_commit_failures() {
+    for failure in ["intent", "handover", "partial", "commit"] {
+        let (fixture, mut engine, faults) = vlan_fixture();
+        let saved = engine.state.desired.clone();
+        let revision = engine.state.revision;
+        if failure == "intent" {
+            engine.store.fail_after.set(Some(0));
+        }
+        if failure == "commit" {
+            engine.store.fail_after.set(Some(1));
+        }
+        if failure == "handover" || failure == "partial" {
+            let mut faults = faults.lock().unwrap();
+            faults.fail_vlan_finish = true;
+            faults.partial_vlan_finish = failure == "partial";
+        }
+        assert_ne!(adopt_vlan(&mut engine).status, 200);
+        assert_eq!(engine.state.desired, saved);
+        assert_eq!(engine.state.revision, revision);
+        if failure == "intent" {
+            assert_eq!(faults.lock().unwrap().vlan_finishes, 0);
+            assert!(engine.state.vlan_adoption.is_none());
+            assert_eq!(faults.lock().unwrap().state, saved);
+            continue;
+        }
+        assert!(engine.configuration_busy());
+        let blocked = submit(&mut engine, saved.clone());
+        assert_eq!(blocked.status, 409);
+        assert_eq!(
+            request(
+                &mut engine,
+                "POST",
+                "/api/v1/interfaces/adopt-vlan",
+                json!({"name":"vlan60","parent":"lan0","id":60})
+            )
+            .status,
+            409
+        );
+        assert!(engine.factory_reset(saved.clone()).is_err());
+        assert!(engine.set_upgrade_maintenance(true).is_err());
+        let pending: State = engine.store.load().unwrap().unwrap();
+        assert!(pending.vlan_adoption.is_some());
+        drop(engine);
+        faults.lock().unwrap().fail_vlan_finish = false;
+        let mut reopened =
+            Engine::open_saved(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+        assert!(!reopened.configuration_busy());
+        assert_eq!(
+            reopened.state.revision,
+            revision.next(reopened.now().date_naive()).unwrap()
+        );
+        assert_eq!(
+            reopened.state.desired.interfaces.len(),
+            saved.interfaces.len() + 1
+        );
+        assert_eq!(faults.lock().unwrap().state, reopened.state.desired);
+        assert_eq!(faults.lock().unwrap().vlan_prepares, 1);
+        assert_eq!(adopt_vlan(&mut reopened).status, 409);
+        validate_state(&reopened.state).unwrap();
+    }
 }
 #[test]
 fn apply_failure_rolls_back_and_returns_transaction() {

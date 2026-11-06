@@ -11,6 +11,7 @@ mod mqtt_host;
 mod mqtt_stats;
 mod private_store;
 pub mod processes;
+pub mod provision;
 pub mod sando;
 pub mod ssh;
 pub mod updates;
