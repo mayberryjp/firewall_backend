@@ -24,7 +24,7 @@ struct Options {
         help = "Enable IPv4 forwarding after native firewall reconciliation"
     )]
     appliance: bool,
-    #[arg(long, requires_all = ["appliance", "provision_lan"], help = "One-time appliance WAN interface; provision and exit")]
+    #[arg(long, requires_all = ["appliance", "provision_lan"], help = "One-time console-host-takeover WAN; preserve imported settings and commit without connectivity confirmation")]
     provision_wan: Option<String>,
     #[arg(
         long,

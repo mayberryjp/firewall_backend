@@ -1229,7 +1229,7 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(&fixture.options.state).unwrap(), original);
         let mut envelope = parse_json(&original).unwrap();
-        envelope["state"]["desired"]["ipv6_enabled"] = json!(false);
+        envelope["state"]["desired"]["ipv6_enabled"] = json!(true);
         fs::write(
             &fixture.options.state,
             serde_json::to_vec(&envelope).unwrap(),

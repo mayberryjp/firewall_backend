@@ -1,6 +1,6 @@
 use super::{
     dhcp_client::{Lease, now},
-    networking,
+    ipv6, networking,
 };
 use crate::model::{EthernetSnapshot, Network, PROTOCOL};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -8,7 +8,7 @@ use configparser::ini::Ini;
 use futures_util::TryStreamExt;
 use netcontrol_core::{Config, DHCPClientConfig, DHCPRelayConfig, DNSConfig, DNSDomain, Interface};
 use netlink_packet_route::{
-    address::{AddressAttribute, AddressScope},
+    address::{AddressAttribute, AddressMessage, AddressMessageBuffer, AddressScope},
     link::LinkAttribute,
     route::{RouteAddress, RouteAttribute, RouteMessage, RouteMessageBuffer, RouteProtocol},
 };
@@ -35,8 +35,64 @@ pub struct Receipt {
     pub routes: Vec<Vec<u8>>,
     pub ownership_before: serde_json::Value,
     pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) takeover: Option<super::takeover::Plan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ipv6_before: Option<ipv6::Snapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     networkd_source: Option<NetworkdSource>,
+}
+
+impl Receipt {
+    pub(super) fn host(
+        scope: String,
+        config: Config,
+        originals: BTreeMap<String, EthernetSnapshot>,
+        ownership_before: serde_json::Value,
+        ipv6_before: ipv6::Snapshot,
+        takeover: super::takeover::Plan,
+    ) -> Self {
+        Self {
+            scope,
+            config,
+            originals,
+            leases: BTreeMap::new(),
+            routes: vec![],
+            ownership_before,
+            complete: false,
+            ipv6_before: Some(ipv6_before),
+            networkd_source: None,
+            takeover: Some(takeover),
+        }
+    }
+
+    pub(super) fn managed_originals(&self) -> Result<BTreeMap<String, EthernetSnapshot>> {
+        let mut originals = self.originals.clone();
+        if !self.config.ipv6_enabled {
+            for snapshot in originals.values_mut() {
+                let mut addresses = Vec::new();
+                for raw in &snapshot.addresses {
+                    let message = AddressMessage::parse(&AddressMessageBuffer::new_checked(raw)?)?;
+                    if self.takeover.is_some()
+                        && !networking::address_string(&message).is_ok_and(|address| {
+                            address.is_some_and(|address| {
+                                self.config.interfaces.iter().any(|link| {
+                                    link.name == snapshot.name && link.addresses.contains(&address)
+                                })
+                            })
+                        })
+                    {
+                        continue;
+                    }
+                    if message.header.family != netlink_packet_route::AddressFamily::Inet6 {
+                        addresses.push(raw.clone());
+                    }
+                }
+                snapshot.addresses = addresses;
+            }
+        }
+        Ok(originals)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,7 +175,7 @@ fn validate_vlan_settings(settings: &Ini) -> Result<()> {
     Ok(())
 }
 
-fn bus<T: Send + 'static>(
+pub(super) fn bus<T: Send + 'static>(
     operation: impl FnOnce(zbus::blocking::Connection) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     std::thread::spawn(move || {
@@ -253,7 +309,7 @@ pub fn set_dns(index: u32, configured: &DNSConfig, lease: Option<&Lease>) -> Res
     })
 }
 
-fn fields(path: &Path) -> Result<Ini> {
+pub(super) fn fields(path: &Path) -> Result<Ini> {
     parse_fields(path, fs::read_to_string(path)?)
 }
 
@@ -302,7 +358,7 @@ fn parse_fields(path: &Path, contents: String) -> Result<Ini> {
     Ok(ini)
 }
 
-fn settings(path: &Path) -> Result<Ini> {
+pub(super) fn settings(path: &Path) -> Result<Ini> {
     let mut contents = fs::read_to_string(path)?;
     let basename = path
         .file_name()
@@ -335,7 +391,7 @@ fn settings(path: &Path) -> Result<Ini> {
     parse_fields(path, contents)
 }
 
-fn dhcp_setting(config: &Ini, key: &str) -> Option<String> {
+pub(super) fn dhcp_setting(config: &Ini, key: &str) -> Option<String> {
     config
         .get("DHCPv4", key)
         .or_else(|| config.get("DHCP", key))
@@ -347,7 +403,7 @@ pub async fn capture(
     ownership_before: serde_json::Value,
     readonly: std::collections::BTreeSet<String>,
 ) -> Result<Receipt> {
-    capture_selected(handle, scope, ownership_before, readonly, None).await
+    super::takeover::capture(handle, scope, ownership_before, readonly).await
 }
 
 pub(super) async fn capture_vlan(
@@ -355,6 +411,7 @@ pub(super) async fn capture_vlan(
     scope: String,
     ownership_before: serde_json::Value,
     request: &netcontrol_core::AdoptVlanRequest,
+    ipv6_enabled: bool,
 ) -> Result<Receipt> {
     networking::capture_vlan_snapshot(handle, request).await?;
     capture_selected(
@@ -363,6 +420,7 @@ pub(super) async fn capture_vlan(
         ownership_before,
         Default::default(),
         Some(request),
+        ipv6_enabled,
     )
     .await
 }
@@ -373,6 +431,7 @@ async fn capture_selected(
     ownership_before: serde_json::Value,
     readonly: std::collections::BTreeSet<String>,
     selected: Option<&netcontrol_core::AdoptVlanRequest>,
+    ipv6_enabled: bool,
 ) -> Result<Receipt> {
     let available = networking::links(handle).await?;
     let available: Vec<_> = available
@@ -399,6 +458,8 @@ async fn capture_selected(
             routes: Vec::new(),
             ownership_before,
             complete: false,
+            takeover: None,
+            ipv6_before: None,
             networkd_source: None,
         });
     }
@@ -429,6 +490,7 @@ async fn capture_selected(
         networking::check_initial_policy_rules(handle).await?;
     }
     let mut config = Config::empty();
+    config.ipv6_enabled = ipv6_enabled;
     let mut leases = BTreeMap::new();
     let mut names = BTreeMap::new();
     let mut networkd_source = None;
@@ -493,12 +555,7 @@ async fn capture_selected(
             let mode = settings
                 .get("Network", "DHCP")
                 .unwrap_or_else(|| "no".into());
-            ensure!(
-                !matches!(mode.as_str(), "yes" | "true" | "ipv6" | "both"),
-                "{} uses DHCPv6; dynamic IPv6 inheritance is not implemented",
-                parent.name
-            );
-            dhcp = mode == "ipv4";
+            dhcp = inherited_dhcpv4(&mode, ipv6_enabled)?;
             if selected.is_some() {
                 ensure!(
                     matches!(mode.as_str(), "no" | "false"),
@@ -511,12 +568,7 @@ async fn capture_selected(
                     "VLAN adoption requires explicit networkd IPv6AcceptRA=no"
                 );
             }
-            for key in [
-                "DHCPServer",
-                "IPv6SendRA",
-                "DHCPPrefixDelegation",
-                "IPMasquerade",
-            ] {
+            for key in ["DHCPServer", "IPMasquerade"] {
                 ensure!(
                     settings
                         .get("Network", key)
@@ -524,6 +576,17 @@ async fn capture_selected(
                     "{} has unsupported networkd {key}",
                     parent.name
                 );
+            }
+            if ipv6_enabled {
+                for key in ["IPv6SendRA", "DHCPPrefixDelegation"] {
+                    ensure!(
+                        settings
+                            .get("Network", key)
+                            .is_none_or(|value| matches!(value.as_str(), "no" | "false")),
+                        "{} has unsupported networkd {key}",
+                        parent.name
+                    );
+                }
             }
             for key in [
                 "VendorClassIdentifier",
@@ -568,6 +631,12 @@ async fn capture_selected(
                     .unwrap_or_default()
                     .split_whitespace()
                     .map(str::to_owned)
+                    .filter(|server| {
+                        ipv6_enabled
+                            || !server
+                                .parse::<std::net::IpAddr>()
+                                .is_ok_and(|ip| ip.is_ipv6())
+                    })
                     .collect(),
                 domains: settings
                     .get("Network", "Domains")
@@ -666,6 +735,10 @@ async fn capture_selected(
             None
         };
         for message in messages {
+            if !ipv6_enabled && message.header.family == netlink_packet_route::AddressFamily::Inet6
+            {
+                continue;
+            }
             if message.header.scope == AddressScope::Link {
                 continue;
             }
@@ -698,6 +771,9 @@ async fn capture_selected(
     }
     let mut routes = Vec::new();
     for version in [IpVersion::V4, IpVersion::V6] {
+        if !ipv6_enabled && version == IpVersion::V6 {
+            continue;
+        }
         let live: Vec<RouteMessage> = handle.route().get(version).execute().try_collect().await?;
         for message in live {
             let index = message
@@ -796,7 +872,7 @@ async fn capture_selected(
     config = config.normalized();
     config
         .validate()
-        .context("host configuration cannot be inherited without changing its semantics")?;
+        .context("host IPv4 configuration cannot be inherited")?;
     let network = Network::parse(&serde_json::to_value(&config)?)?;
     let originals = if let Some(request) = selected {
         let snapshot = networking::capture_vlan_snapshot(handle, request).await?;
@@ -819,8 +895,26 @@ async fn capture_selected(
         routes,
         ownership_before,
         complete: false,
+        takeover: None,
+        ipv6_before: if selected.is_none() {
+            Some(ipv6::capture(handle).await?)
+        } else {
+            None
+        },
         networkd_source,
     })
+}
+
+fn inherited_dhcpv4(mode: &str, ipv6_enabled: bool) -> Result<bool> {
+    ensure!(
+        !ipv6_enabled || !matches!(mode, "yes" | "true" | "ipv6" | "both"),
+        "dynamic IPv6 inheritance is not implemented"
+    );
+    match mode {
+        "yes" | "true" | "both" | "ipv4" => Ok(true),
+        "no" | "false" | "ipv6" => Ok(false),
+        _ => bail!("unsupported networkd DHCP mode {mode}"),
+    }
 }
 
 fn override_path(name: &str) -> PathBuf {
@@ -1008,6 +1102,20 @@ fn current_indices(originals: &BTreeMap<String, EthernetSnapshot>) -> Result<Vec
 mod dns_tests {
     use super::{DNSConfig, DnsServer, dns_reset_needed, dns_servers};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn initial_handover_keeps_dhcpv4_and_disables_dhcpv6() {
+        for mode in ["yes", "true", "both", "ipv4"] {
+            assert!(super::inherited_dhcpv4(mode, false).unwrap());
+        }
+        for mode in ["no", "false", "ipv6"] {
+            assert!(!super::inherited_dhcpv4(mode, false).unwrap());
+        }
+        for mode in ["yes", "true", "both", "ipv6"] {
+            assert!(super::inherited_dhcpv4(mode, true).is_err());
+        }
+        assert!(super::inherited_dhcpv4("invalid", false).is_err());
+    }
 
     #[test]
     fn vlan_capture_rejects_dynamic_and_unrepresentable_networkd_options() {

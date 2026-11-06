@@ -13,11 +13,10 @@ fn accept() -> String {
     "accept".into()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub software: crate::SoftwareMetadata,
-    #[serde(default = "yes")]
     pub ipv6_enabled: bool,
     pub ntp: NTPConfig,
     pub syslog: SyslogConfig,
@@ -42,34 +41,6 @@ pub struct Config {
     pub firewall: Firewall,
     pub softflowd: Vec<SoftflowdConfig>,
     pub kernel: KernelConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            software: Default::default(),
-            ipv6_enabled: true,
-            ntp: Default::default(),
-            syslog: Default::default(),
-            vnstat: Default::default(),
-            mdns: Default::default(),
-            udp_broadcast_relay: Default::default(),
-            bgp: Default::default(),
-            mqtt: Default::default(),
-            system: Default::default(),
-            sando: Default::default(),
-            dynamic_dns: Vec::new(),
-            gateway_monitors: Vec::new(),
-            interfaces: Vec::new(),
-            dhcp_clients: BTreeMap::new(),
-            dns: BTreeMap::new(),
-            routes: Vec::new(),
-            blackhole: Default::default(),
-            firewall: Default::default(),
-            softflowd: Vec::new(),
-            kernel: Default::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1388,8 +1359,8 @@ impl Config {
             ensure!(
                 (names.contains(&r.interface) || blackhole.targets(&r.interface))
                     && (r.table == 254 || (10000..=19999).contains(&r.table))
-                    && (1..=2147483647).contains(&r.metric),
-                "route requires managed interface or the configured blackhole, table 254 or 10000..19999, positive 32-bit metric"
+                    && (0..=2147483647).contains(&r.metric),
+                "route requires managed interface or the configured blackhole, table 254 or 10000..19999, metric 0..2147483647"
             );
             ensure!(
                 !blackhole.targets(&r.interface) || r.gateway.is_empty(),

@@ -563,7 +563,7 @@ fn firewall_bulk_clear_rolls_back_explicitly_or_at_deadline_after_restart() {
         drop(engine);
         let mut engine = fixture.engine();
         if expire {
-            engine.now = Some(engine.active().unwrap().confirmation_deadline);
+            engine.now = engine.active().unwrap().confirmation_deadline;
             engine.tick().unwrap();
         } else {
             let rolled_back = request(
@@ -1310,8 +1310,8 @@ fn static_route_enabled_permission_restart_and_rollback() {
 fn global_ipv6_permission_commit_restart_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
-    let mut disabled = Config::empty();
-    disabled.ipv6_enabled = false;
+    let mut enabled = Config::empty();
+    enabled.ipv6_enabled = true;
     let reply = engine.request(
         "POST",
         "/api/v1/transactions",
@@ -1319,7 +1319,7 @@ fn global_ipv6_permission_commit_restart_and_rollback() {
         "limited",
         &["transactions.write".into()],
         &serde_json::to_vec(
-            &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":disabled}),
+            &json!({"base_revision":test_revision(0),"confirm_timeout_seconds":30,"config":enabled}),
         )
         .unwrap(),
     );
@@ -1330,18 +1330,18 @@ fn global_ipv6_permission_commit_restart_and_rollback() {
             .unwrap()
             .contains("kernel.namespace.write")
     );
-    let reply = submit(&mut engine, disabled.clone());
+    let reply = submit(&mut engine, enabled.clone());
     assert_eq!(reply.status, 202);
     let id = reply.body["id"].as_str().unwrap();
     assert_eq!(confirm(&mut engine, id).status, 200);
-    assert!(!engine.saved_configuration().ipv6_enabled);
+    assert!(engine.saved_configuration().ipv6_enabled);
     drop(engine);
     let mut engine = Engine::open(
         &fixture.path(),
-        Box::new(Simulator::with_config(disabled).unwrap()),
+        Box::new(Simulator::with_config(enabled).unwrap()),
     )
     .unwrap();
-    assert!(!engine.saved_configuration().ipv6_enabled);
+    assert!(engine.saved_configuration().ipv6_enabled);
     let reply = submit(&mut engine, Config::empty());
     assert_eq!(reply.status, 202);
     let id = reply.body["id"].as_str().unwrap();
@@ -1352,9 +1352,9 @@ fn global_ipv6_permission_commit_restart_and_rollback() {
         Value::Null,
     );
     assert_eq!(rollback.status, 200);
-    assert!(!engine.saved_configuration().ipv6_enabled);
+    assert!(engine.saved_configuration().ipv6_enabled);
     let runtime = request(&mut engine, "GET", "/api/v1/runtime", Value::Null);
-    assert_eq!(runtime.body["ipv6"]["enabled"], false);
+    assert_eq!(runtime.body["ipv6"]["enabled"], true);
     assert_eq!(runtime.body["ipv6"]["status"], "simulated");
 }
 
@@ -1579,7 +1579,7 @@ fn pending_confirmation_survives_restart_and_expiry_rolls_back() {
     let mut e = f.engine();
     assert_eq!(e.active().unwrap().id, id);
     assert_eq!(e.expected(), config().normalized());
-    e.now = Some(e.active().unwrap().confirmation_deadline);
+    e.now = e.active().unwrap().confirmation_deadline;
     e.tick().unwrap();
     assert!(e.active().is_none());
     assert_eq!(e.state.transactions[&id].status, "rolled_back");
@@ -1604,6 +1604,44 @@ fn startup_recovers_applying_rolling_back_and_recovery_failed() {
         assert_eq!(e.state.transactions[&id].status, "rolled_back");
         assert!(e.active().is_none());
     }
+}
+#[test]
+fn console_provisioning_commits_without_confirmation_and_cannot_recapture() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    let candidate = config().normalized();
+    let transaction = e.commit_initial_configuration(candidate.clone()).unwrap();
+    assert_eq!(transaction.status, "committed");
+    assert!(transaction.confirmation_deadline.is_none());
+    assert!(e.active().is_none());
+    assert!(e.commit_initial_configuration(Config::empty()).is_err());
+    drop(e);
+    let e = f.engine();
+    assert!(e.state.desired.same_settings(&candidate));
+    assert!(!e.is_initial_configuration());
+}
+
+#[test]
+fn console_provisioning_interruption_resumes_candidate_after_an_expired_normal_deadline() {
+    let f = Fixture::new();
+    let mut e = f.engine();
+    e.state.initialized_at = Utc::now() - Duration::hours(26);
+    e.state.initial_revision = Version::first(e.state.initialized_at.date_naive()).unwrap();
+    e.state.revision = e.state.initial_revision;
+    e.now = Some(e.state.initialized_at + Duration::hours(1));
+    let reply = submit(&mut e, config());
+    let id = reply.body["id"].as_str().unwrap().to_string();
+    let transaction = e.state.transactions.get_mut(&id).unwrap();
+    transaction.actor = "local-host-takeover".into();
+    transaction.status = "applying_local".into();
+    transaction.confirmation_deadline = None;
+    e.store.save(&e.state).unwrap();
+    drop(e);
+    let e = f.engine();
+    assert_eq!(e.state.transactions[&id].status, "committed");
+    assert!(e.state.transactions[&id].confirmation_deadline.is_none());
+    assert!(e.state.desired.same_settings(&config().normalized()));
+    assert!(e.active().is_none());
 }
 #[test]
 fn startup_recovers_expired_pending_confirmation() {
@@ -1639,7 +1677,7 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
     let mut e = f.engine();
     let r = submit(&mut e, config());
     let id = r.body["id"].as_str().unwrap();
-    e.now = Some(e.active().unwrap().confirmation_deadline);
+    e.now = e.active().unwrap().confirmation_deadline;
     let r = confirm(&mut e, id);
     assert_eq!(r.status, 409);
     assert_eq!(r.body["transaction"]["status"], "rolled_back");
@@ -3711,6 +3749,7 @@ fn unsupported_flow_filters_and_v5_sampling_fail_validation_before_backend_apply
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
     let mut config = config();
+    config.ipv6_enabled = true;
     config.softflowd = vec![
         serde_json::from_value(json!({
             "name":"flow0","enabled":true,"interface":"lan0","collector":"192.0.2.10:9995",
@@ -5204,7 +5243,7 @@ fn performance_rps_pending_restart_timeout_restores_committed_masks() {
         Box::new(Simulator::with_config(initial).unwrap()),
     )
     .unwrap();
-    engine.now = Some(engine.active().unwrap().confirmation_deadline);
+    engine.now = engine.active().unwrap().confirmation_deadline;
     engine.tick().unwrap();
     assert_eq!(engine.state.desired.kernel.rps["eno1/rx-0"], "2");
     assert_eq!(engine.state.revision, revision);
@@ -5326,7 +5365,7 @@ fn nic_offload_and_rfs_transactions_are_permission_checked_saved_and_reversible(
         Box::new(Simulator::with_config(provisional).unwrap()),
     )
     .unwrap();
-    engine.now = Some(engine.active().unwrap().confirmation_deadline);
+    engine.now = engine.active().unwrap().confirmation_deadline;
     engine.tick().unwrap();
     assert_eq!(engine.state.desired, committed);
     assert_eq!(engine.state.revision, revision);

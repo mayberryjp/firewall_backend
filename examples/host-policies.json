@@ -3,6 +3,7 @@
   "confirm_timeout_seconds": 60,
   "description": "Host-centric outbound policies with ingress-interface overrides",
   "config": {
+    "ipv6_enabled": true,
     "interfaces": [
       {"name": "lan", "kind": "dummy", "role": "lan", "mtu": 1500, "up": true, "addresses": ["192.0.2.1/24"]},
       {"name": "wan", "kind": "dummy", "role": "wan", "mtu": 1500, "up": true, "addresses": ["198.51.100.2/24"]}

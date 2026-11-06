@@ -180,12 +180,13 @@ not require those mutable settings to remain unchanged while networkd runs.
 Kernel address timestamps and dump ordering are not configuration drift.
 The VLAN's actual identity is still checked before mutation.
 
-Physical-interface inheritance uses this same active takeover, including
-restoring captured addresses, MTU and administrative state after handover.
-On restart, exclusions are reasserted for every still-owned physical interface,
-even without an initial-inheritance receipt. Startup then reconciles the saved
-desired configuration, not the original bootstrap addresses. Unrelated links
-are not claimed; existing initial capture restrictions still apply.
+Initial host inheritance instead uses aggressive console-only takeover:
+import supported IPv4/interfaces/routes/DNS/firewall, disable unsupported
+networking and mask competing managers. It preserves the import during local
+provisioning, without a connectivity confirmation deadline. Startup uses saved
+desired state, not recapture. This differs from explicit later VLAN adoption,
+whose targeted handover and provisional LAN move still require confirmation.
+See [host takeover](BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
 
 An updated daemon resumes a retained adoption intent during startup. This only
 finishes the ownership baseline: rerun `--configure-lan` afterward to perform
@@ -363,7 +364,7 @@ specified path/table/metric regardless of its enabled flag or metadata, so a
 disabled route remains deletable. Route enabled toggles use the complete
 configuration transaction API; there is no dedicated CLI toggle command.
 
-`ipv6 enable|disable` stages the top-level `ipv6_enabled` policy (default true).
+`ipv6 enable|disable` stages the top-level `ipv6_enabled` policy (default false).
 It requires `kernel.namespace.write` when applied, in addition to transaction
 permission. Disabling requires removing conflicting IPv6 configuration in the
 same candidate; use IPv4 management and independently verify connectivity before

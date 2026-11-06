@@ -746,6 +746,22 @@ latest published stable GitHub Release, not source code or temporary CI artifact
 Rust, Cargo, compiler, libclang or build headers are installed on the appliance.
 
 No CI run ID, GitHub CLI/login, artifact upload or workflow dispatch is required.
+Fresh installation stops/disables and persistently masks installed
+`snapd.service` and `snapd.socket` during service setup, before appliance network
+provisioning. It verifies `UnitFileState=masked` and inactive/failed active state;
+inspection, stop/disable, mask or verification failures stop installation.
+Already-masked units are explicitly stopped; absent units are skipped.
+No Snap package or data is purged, and separate Snap application units are not
+explicitly stopped. Snap management/installation and refreshes are blocked;
+review Snap-dependent workloads before proceeding. Fresh installation also
+disables automatic APT checks, downloads and installations, **including security
+updates**, using the same verified timer/service masks and periodic/shutdown
+configuration described under [automatic APT updates](#automatic-apt-updates).
+Manual APT operations (including installer dependency setup) remain available,
+as do Netcontrol release checks. Schedule manual OS patching. Running APT jobs
+are not forcibly stopped; an active job fails verification, requiring completion
+and retry. This is not a full invocation of the optional purge profile.
+
 From a local console, ensure Ubuntu has internet addressing, a default gateway
 and working DNS. If `curl` or trusted CA certificates are missing, install them:
 
@@ -792,7 +808,7 @@ prompt. Noninteractive invocation requires both; it never silently chooses a LAN
 or management address. Example:
 
 ```text
-WAN interface: enp1s0 (DHCP). Use --wan NAME to change it.
+WAN interface: enp1s0 (retain imported settings; DHCP if empty). Use --wan NAME to change it.
 Available LAN interfaces:
   enp1s0 (selected WAN)
   enp2s0
@@ -857,55 +873,33 @@ installer remains self-contained; no checkout or extra helper script is needed.
 
 ### Initial appliance provisioning
 
-Use a local console and connect the selected WAN to an upstream network before
-installation. Ubuntu must already provide supported networkd/resolved state;
-the installer explicitly configures WAN as DHCPv4 even if Ubuntu initially used
-a static WAN. A previously inherited DHCP identity is retained when available.
-An upstream DHCP server must supply an IPv4 address and default route within
-30 seconds after provisional application. NetworkManager and unsupported initial network
-settings still fail explicitly; the installer does not convert OS managers.
+Use a local console. Initial provisioning aggressively takes ownership of the
+host, including supported settings from networkd or active NetworkManager
+connections. Static WAN addressing, routes, resolver configuration and supported
+firewall policy are retained; an empty WAN receives an in-process DHCPv4 client.
+An unplugged/unleased WAN does not prevent commitment. systemd and resolved must
+be available; competing networking managers are persistently masked and stopped.
 
 The install-time root-only daemon invocation uses `--backend linux --appliance
 --provision-wan WAN_NIC --provision-lan LAN_NIC --provision-lan-address LAN_CIDR`
 with the installed state paths. For an existing selected VLAN it additionally
 supplies `--provision-lan-parent PHYSICAL_NIC --provision-lan-vlan ID`; `--provision-lan`
-is then the actual VLAN name. The tagged interface receives the LAN address,
-role, input/forwarding permits and NAT source subnet. Its physical parent
-remains up and unassigned, without an untagged LAN address.
-It captures the initial physical NIC baseline,
-then provisionally applies a normal durable configuration transaction. It
-waits for WAN DHCP/address/default-route readiness and checks subnet overlap,
-then confirms locally without waiting for remote confirmation. Failure attempts
-an explicit transaction rollback; rollback errors remain explicit. This local
-installer confirmation is deliberate; it is
-not independent connectivity verification. The command exits after committing.
-Configured roles/firewall, nonzero revisions and active transactions are refused.
-Failures can leave durable handover/state evidence; inspect it from the console,
-do not delete it or rerun installation as an assumed rollback.
+is then the actual VLAN name. Only the selected LAN's addresses and DHCP client
+are replaced by the explicit static LAN choice; WAN/LAN roles are assigned and
+those ports are enabled. Other imported interfaces, MTUs, routes, DNS and firewall
+rules remain. Subnet overlap and invalid current configurations fail explicitly.
+Literal firewall subnets are not automatically rewritten to the chosen LAN.
+No factory NAT or LAN allow-all policy is invented: inspect the imported policy
+from console before exposing management or expecting routed client access.
 
-The resulting configuration assigns WAN/LAN roles, replaces the LAN's addresses
-with the selected static IPv4 address, removes LAN DHCP-client/DNS/static routes,
-clears static WAN addressing/routes/DNS and configures a WAN DHCPv4 client.
-The forward default is drop, with an unrestricted LAN-ingress allow-all rule
-(no egress restriction), established/related return acceptance and the global
-IPv4 ICMP bypass enabled (`firewall.allow_all_icmp: true`). This accepts all
-IPv4 ICMP types/codes before input/forwarding drops on every interface, including
-WAN, and also accepts locally generated IPv4 ICMP. It does not cover ICMPv6.
-First installation and explicit factory reset use this setting; ordinary
-startup and upgrades preserve the saved value. LAN-subnet IPv4 traffic exiting
-WAN is masqueraded. WAN DHCP
-addresses/routes remain runtime state, not static copies. Competing default
-routes on additional ports are rejected.
-
-An explicit host-input policy defaults to drop for both IP families. It accepts
-loopback, established/related replies, all traffic entering LAN, and WAN IPv4
-UDP destination port 68 for DHCP. New WAN connections to the appliance,
-including system SSH and packets addressed to its LAN IP, are denied except
-for the global IPv4 ICMP bypass. Local
-output is unrestricted. These are Netcontrol-owned nftables rules, installed
-atomically with forwarding/NAT and persisted in configuration, not a second
-UFW ruleset. The policy is editable through configuration transactions;
-removing it removes that input protection.
+The local transaction has `confirmation_deadline: null` and commits after
+apply/readback, without connectivity confirmation or a WAN-readiness timer.
+Interrupted local provisioning durably resumes the candidate on restart.
+Unsupported host features/managers are not automatically restored on loss of
+connectivity. Apply failures still use normal transaction recovery to the valid
+imported baseline; failures retain explicit errors and private capture for retry.
+Configured journals are never recaptured. Explicit factory reset remains a
+separate destructive configuration choice with its documented factory policy.
 
 Installation writes root-only `/etc/netcontrol/appliance.env` with
 `NETCONTROL_LISTEN=<LAN-IP>:8080`, then enables/starts the systemd service.
@@ -1419,40 +1413,64 @@ This unreleased implementation needs Linux build and console-assisted runtime
 acceptance before deployment. No runtime acceptance is claimed by local Rust
 syntax checks. Build first with `bash upgrade.sh --build-only` on Ubuntu amd64.
 
-Explicit first-install provisioning seeds only a new journal, or an empty revision-zero
-journal with no transaction history. Existing configurations are never reset or
-recaptured. Lab namespaces and explicitly read-only adopted parents do not
-participate. Physical detection requires a sysfs device, excluding loopback,
-veth and virtual links. All eligible NICs are imported together, with role
-`unassigned`; MTU/up state, supported static addresses/routes, DHCPv4 identity,
-route metric and resolver settings are inherited.
+Explicit first-install provisioning seeds only a new journal or an untouched
+empty initial journal. Configured journals are never reset or recaptured.
+Lab namespaces and explicitly read-only parents do not participate. Supported
+Ethernet/veth, dummy and standard 802.1Q VLAN topology (including nested VLANs)
+is imported as owned configuration with unassigned roles, MTU/up state and
+static IPv4. Finite IPv4 becomes DHCPv4, never a saved static lease. Networkd
+DHCP settings and active NetworkManager method/DNS/metric are read before their
+managers stop; unleased clients are supported. Only representable settings are
+imported; inactive manager profiles, private WireGuard keys, DHCP servers and
+Wi-Fi association configuration are not translated.
 
-Requirements: root, trusted persistent native/core state, stable machine identity,
-running systemd-networkd and systemd-resolved. NetworkManager is currently
-rejected. Every DHCPv4 NIC needs a live finite lease with its client identifier;
-an unplugged/unleased DHCP NIC is an explicit startup error, not a static-address
-fallback. Bridged/bonded ports, custom policy rules, active dynamic global IPv6
-and unsupported networkd options are rejected before takeover. DHCPv6/SLAAC,
-DHCP servers and Wi-Fi association configuration are not imported.
+Root, a 64-bit Linux kernel, stable machine identity, trusted persistent state,
+systemd D-Bus, resolved, netfilter and BPF administration privileges are required.
+Before mutation, private `adoption.json` records the desired import, original
+interfaces/IPv6, raw routes/rules/qdiscs/nftables/legacy xtables and action plan.
+Keep this receipt plus core/native state; it is evidence for console recovery,
+not an automatic connectivity rollback.
 
-The daemon writes an adoption receipt under the private native state directory
-and per-NIC `/etc/systemd/network/00-netcontrol-NAME.network` ownership files.
-Those non-secret ownership files are root-owned and mode `0644`, readable by
-networkd's unprivileged account. Adoption receipts and lease data remain private.
-It reloads/reconfigures networkd through D-Bus and checks that each NIC is
-unmanaged before taking ownership. A failed check reports `ADMIN_STATE`, the
-selected `NETWORK_FILE` and the expected override path. No manager is globally disabled; original
-Netplan/networkd and supplicant files remain. Caught handover failures attempt
-snapshot/route restoration and remove only matching ownership files; failed
-recovery retains its receipt for diagnosis/retry. Preserve both core and native
-state; the ownership files alone are not a backup.
+Takeover detaches controllers; unsupported links are downed and stripped of
+addresses. Unsupported routes and custom policy rules are removed, including
+foreign entries in native protocol/priority ranges. Only exact expected native
+routes/rules and valid DHCP routes survive subsequent enforcement. Kernel
+connected/local routes remain. Custom qdiscs, XDP and ingress/egress TCX programs
+are detached. Foreign nftables tables, including an unowned `inet/netcontrol`,
+are removed atomically after importing representable policy. Legacy IPv4/IPv6
+xtables are captured and made inert with empty ACCEPT chains, not imported.
+
+Firewall import supports a single representable IPv4/inet base chain per input,
+forward or postrouting hook, accept/drop policy, exact/prefix IPv4 predicates,
+TCP/UDP destination ports, input-interface selection, and source/egress
+masquerade. Unsupported traversal, multiple competing base chains, jumps, sets,
+extensions and other expressions are reported disabled, not approximated.
+Native loopback/established input exceptions remain. IPv6 is disabled globally;
+IPv6 addresses/routes/DNS, DHCPv6 and SLAAC are not imported.
+
+Known competing network/firewall/DHCP/RA, VPN, virtual-topology and routing
+systemd units are persistently masked and stopped, including installed inactive
+units and templates. Known standalone competitors in this network namespace
+are terminated using pidfds, with bounded TERM/KILL and respawn verification.
+Netcontrol, resolved, SSH and Wi-Fi authentication are retained. The exact
+unit/process allowlists are in the [takeover code](../crates/netcontrol-native/src/linux/takeover.rs)
+and [process control](../crates/netcontrol-native/src/linux/takeover_processes.rs);
+custom launchers, renamed binaries and unrelated namespaces are not a claim of
+universal host sanitization. Original OS files/data are retained.
+
+Native runtime exposes `host_takeover` with console mode, phase/error and
+per-resource imported/disabled decisions, without raw private captures.
+`captured`/`applying`/`owned` are incomplete; `failed` requires console correction
+and retry; `complete` follows native reconciliation. Startup reasserts ownership
+against the saved desired configuration, not a fresh capture.
 
 Netcontrold must remain running for lease renewal. Stopping/uninstalling it does
 not hand IP ownership back to networkd; finite addresses eventually expire.
 Do not revert to an older binary or remove ownership files while this daemon is
 running. A console-assisted operator hand-back must stop the daemon, preserve
-its state, remove only its matching per-NIC ownership files, and reload/reconfigure
-networkd using the retained OS configuration. New leases may change addresses.
+its state, deliberately restore the intended OS topology/firewall/settings,
+unmask/restart the chosen manager and verify leases/routes/DNS. Do not simply
+unmask every disabled feature. New leases may change addresses.
 
 Operator acceptance: verify current connectivity and DNS before/after first
 start, static and DHCP NICs, renew/rebind/NAK/expiry, daemon restart/reboot,
@@ -1557,6 +1575,33 @@ disabled; absent or masked units are skipped. This removes printing, mDNS
 discovery and crash-reporting functions, so do not use it on a host needing them.
 Use the appliance IP instead of relying on its `.local` discovery name.
 
+The profile additionally handles `snapd.service` and `snapd.socket`: preview lists
+the stop/disable and persistent-mask actions, and `--apply` disables/stops loaded
+units, explicitly stops already-masked units and persistently masks both present
+units. It verifies each is inactive/failed with `UnitFileState=masked`; a runtime
+mask alone or an active unit is not success. Absent Snap units are skipped,
+including the normal systemd `not-found` exit status. Inspection, service-command
+and verification failures stop subsequent actions.
+
+Snap packages/data are not purged and separate Snap application units are not
+explicitly stopped. This is not complete Snap-application removal or shutdown.
+Snap management/installation and refreshes are blocked, so do not apply while
+depending on Snap-managed workloads. Fresh installation applies this narrow
+Snap policy automatically; existing installations must run reviewed hardening
+explicitly. Ordinary binary/source upgrades do not apply it.
+
+After applying, inspect persistent state:
+
+```sh
+systemctl show snapd.service snapd.socket --property ActiveState --property UnitFileState;
+systemctl status snapd.service snapd.socket --no-pager;
+```
+
+For present units, expect `UnitFileState=masked` and `ActiveState=inactive` (or
+`failed` without a running unit). `systemctl status` normally returns a nonzero
+exit code for stopped units; use the explicit properties to verify the result.
+Skipped absent units still report not-found.
+
 Only installed packages from this list are requested for purge: `cups`,
 `cups-browsed`, `cups-daemon`, `cups-client`, `avahi-daemon`, `avahi-utils`,
 `apport`, `apport-gtk`, `whoopsie`, `popularity-contest`, `ubuntu-report`.
@@ -1566,12 +1611,62 @@ anything outside that exact selected list. Desktop/metapackage dependency chains
 can therefore cause a refusal; the script does not override that guard. It never
 runs autoremove, update, upgrade, cache cleanup or broad wildcard purges.
 
-Networkd/resolved, Wi-Fi supplicants, SSH, time synchronization, security updates,
+Networkd/resolved, Wi-Fi supplicants, SSH, time synchronization,
 firmware, kernels, boot tools, logging, cloud-init, NetworkManager, Bluetooth and
 the Rust/build/download toolchain are not targeted. No addresses, routes,
 firewall rules, Netcontrol journals/credentials/keys or network configuration are
 rewritten. No new protocol worker or external service is installed. This initial
 profile deliberately does not strip every package or kernel module.
+
+### Automatic APT Updates
+
+Both fresh installation and hardening `--apply` disable Ubuntu's standard
+automatic APT update machinery. **This includes automatic security patching; it
+is an operator-selected appliance policy, not a security improvement.** Review
+and schedule manual OS patching before applying.
+
+Present `apt-daily.timer` and `apt-daily-upgrade.timer` are disabled/stopped and
+persistently masked. Their `apt-daily.service` and `apt-daily-upgrade.service`
+jobs are disabled and masked **without stopping running jobs**. Verification
+requires every present unit to be inactive/failed and persistently masked.
+If an APT job is active, wait for it to finish and rerun; earlier unit changes
+may already be applied. Absent units are skipped, but the APT configuration
+policy is still written.
+
+The root-owned mode-0644 `/etc/apt/apt.conf.d/99-netcontrol-no-automatic-updates`
+is replaced atomically with:
+
+```text
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::Unattended-Upgrade "0";
+Unattended-Upgrade::InstallOnShutdown "false";
+```
+
+The scripts verify these effective values using `apt-config dump`; conflicting
+later settings or inspection failures are errors, not success. No APT or
+unattended-upgrades package is removed by this policy. The unattended-upgrades
+shutdown watcher may remain running; its install-on-shutdown setting is disabled.
+Cached login update notices can remain. This covers standard Ubuntu APT periodic
+and unattended shutdown automation, not arbitrary third-party schedulers or
+graphical updaters. Netcontrol's own daily release checks are unchanged.
+
+Preview is still read-only. Ordinary daemon upgrades/reset do not apply this
+host policy; existing installations must explicitly apply reviewed hardening.
+Manual OS updates remain available:
+
+```sh
+sudo apt-get update;
+sudo apt-get upgrade;
+```
+
+Verify present units and all five effective configuration values:
+
+```sh
+systemctl show apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service --property ActiveState --property UnitFileState;
+apt-config dump | grep -E '^(APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade)|Unattended-Upgrade::InstallOnShutdown) ';
+```
 
 ### Optional AppArmor Protection Opt-Out
 
@@ -1599,8 +1694,10 @@ After a deliberate console-maintenance reboot, inspect `/proc/cmdline` and
 Apply stores root-only pre-change records under
 `/var/lib/netcontrol/os-hardening.XXXXXX`: selected service active/enablement
 states, selected package versions, and, for the AppArmor option, its service
-state and any previous script drop-in. The state record is not a filesystem
-snapshot: package payloads and purged application configuration are not backed
+state and any previous script drop-in. Present Snap units, including already-masked
+units, have pre-change active/enablement records too. Review these when deliberately
+restoring Snap. The state record is not a filesystem snapshot: package payloads
+and purged application configuration are not backed
 up, and reinstalling packages may require network access. APT maintainer scripts
 still run; real-device boot and management continuity require separate testing.
 
@@ -1621,6 +1718,16 @@ Verify kernel state afterward; stopping/starting the service alone cannot undo
 the `apparmor=0` boot parameter.
 
 Do not run hardening concurrently with install, upgrade, reset or APT/dpkg jobs.
+
+The records also include APT timer/service states and the previous owned APT
+fragment (`apt-periodic.conf` plus `apt-periodic.state=present`, or just
+`apt-periodic.state=absent`). To deliberately restore automatic OS updates,
+restore that prior fragment, or remove only the owned
+`/etc/apt/apt.conf.d/99-netcontrol-no-automatic-updates` when it was previously
+absent. Restore the selected units' prior masks/enablement and timers using their
+state records; do not blindly start service jobs or unmask units that were already
+masked. Verify effective APT settings and timers afterward. No automatic rollback
+is attempted on partial failure.
 The script serializes its own apply runs, not other package managers. It is not
 automatically invoked by any deployment script. Preview and mocked tests do not
 prove the live Ubuntu package plan, bootloader or post-reboot connectivity.

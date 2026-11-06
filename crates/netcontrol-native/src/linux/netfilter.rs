@@ -329,6 +329,70 @@ pub fn connections() -> Result<Vec<Vec<u8>>> {
     dump_messages(1, 1, libc::AF_UNSPEC as u8, &[])
 }
 
+pub(super) fn host_firewall_snapshot() -> Result<Vec<Vec<u8>>> {
+    let mut snapshot = Vec::new();
+    for kind in [1u16, 4, 7, 10, 19, 23] {
+        for payload in dump_messages(10, kind, libc::NFPROTO_UNSPEC as u8, &[])? {
+            let mut record = kind.to_ne_bytes().to_vec();
+            record.extend(payload);
+            snapshot.push(record);
+        }
+    }
+    Ok(snapshot)
+}
+
+#[cfg(not(feature = "nftables"))]
+pub(super) fn clear_host_firewall(_preserve_owned: bool) -> Result<()> {
+    bail!("host takeover requires the nftables feature")
+}
+
+#[cfg(feature = "nftables")]
+pub(super) fn clear_host_firewall(preserve_owned: bool) -> Result<()> {
+    use rustables::{Batch, MsgType, ProtocolFamily, Table};
+    let mut batch = Batch::new();
+    let mut count = 0;
+    for payload in dump_messages(10, 1, libc::NFPROTO_UNSPEC as u8, &[])? {
+        ensure!(payload.len() >= 4, "short host nftables table");
+        let attrs = attributes(&payload[4..])?;
+        let name = attrs
+            .iter()
+            .find(|(kind, _)| kind & 0x3fff == 1)
+            .context("nftables table name missing")?;
+        let name = c_string(&name.1)?;
+        if preserve_owned && payload[0] == libc::NFPROTO_INET as u8 && name == "netcontrol" {
+            continue;
+        }
+        let family = match i32::from(payload[0]) {
+            libc::NFPROTO_INET => ProtocolFamily::Inet,
+            libc::NFPROTO_IPV4 => ProtocolFamily::Ipv4,
+            libc::NFPROTO_IPV6 => ProtocolFamily::Ipv6,
+            libc::NFPROTO_ARP => ProtocolFamily::Arp,
+            libc::NFPROTO_BRIDGE => ProtocolFamily::Bridge,
+            libc::NFPROTO_NETDEV => ProtocolFamily::NetDev,
+            _ => bail!("unsupported nftables family {}", payload[0]),
+        };
+        batch.add(&Table::new(family).with_name(name), MsgType::Del);
+        count += 1;
+    }
+    if count > 0 {
+        send_batch(&batch.finalize(), count)?;
+    }
+    let remaining = dump_messages(10, 1, libc::NFPROTO_UNSPEC as u8, &[])?;
+    ensure!(
+        remaining.iter().all(|payload| {
+            preserve_owned
+                && payload.first() == Some(&(libc::NFPROTO_INET as u8))
+                && attributes(&payload[4..]).is_ok_and(|attrs| {
+                    attrs
+                        .iter()
+                        .any(|(kind, name)| kind & 0x3fff == 1 && name == b"netcontrol\0")
+                })
+        }),
+        "foreign nftables tables remain after takeover"
+    );
+    Ok(())
+}
+
 pub fn delete_connections(target: Option<(u32, &netcontrol_core::ConnectionTarget)>) -> Result<()> {
     let (family, attrs) = match target {
         Some((id, target)) => crate::conntrack::delete_attributes(id, target)?,

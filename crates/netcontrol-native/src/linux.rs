@@ -69,6 +69,11 @@ mod path_test;
 mod rps;
 mod rps_recommendations;
 mod sysctl;
+mod takeover;
+mod takeover_bpf;
+mod takeover_firewall;
+mod takeover_legacy;
+mod takeover_processes;
 mod wireguard;
 mod wireguard_dns;
 
@@ -394,7 +399,23 @@ impl Native {
         );
         native.bgp.recover()?;
         let originals = ownership.handover_originals(host_mode);
-        if !originals.is_empty() {
+        let takeover_path = native.state.join("adoption.json");
+        let takeover = if host_mode && takeover_path.try_exists()? {
+            let receipt: adoption::Receipt = read_json(&takeover_path)?;
+            receipt.takeover.is_some()
+        } else {
+            false
+        };
+        if takeover {
+            let config = ownership
+                .committed_config
+                .as_ref()
+                .map(Network::parse)
+                .transpose()?;
+            if let Some(config) = config {
+                native.enforce_host_takeover(&config, ownership.firewall_fingerprint.is_some())?;
+            }
+        } else if !originals.is_empty() {
             let snapshots = originals.clone();
             session(native.namespace.clone(), move |rt, handle| {
                 rt.block_on(networking::check_ethernet(handle, &snapshots))
@@ -417,6 +438,75 @@ impl Native {
             rt.block_on(networking::restore_interfaces(handle, &snapshots))
         })
         .context("apply captured settings after interface ownership takeover")
+    }
+
+    fn enforce_host_takeover(&self, config: &Network, preserve_owned: bool) -> Result<()> {
+        if !self.options.namespace.is_empty() {
+            return Ok(());
+        }
+        let path = self.state.join("adoption.json");
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        let mut receipt: adoption::Receipt = read_json(&path)?;
+        let Some(plan) = &mut receipt.takeover else {
+            return Ok(());
+        };
+        plan.phase = "applying".into();
+        plan.error.clear();
+        write_json(&path, &receipt)?;
+        let result = (|| -> Result<()> {
+            let mut target = config.clone();
+            let leases = self
+                .dhcp
+                .state
+                .lock()
+                .map_err(|_| anyhow!("DHCP state poisoned"))?
+                .clone();
+            dhcp_client::effective(&mut target, &leases)?;
+            let dhcp_routes = leases
+                .leases
+                .iter()
+                .filter(|(name, lease)| {
+                    lease.valid() && target.dhcp_clients.get(*name) == Some(&lease.client)
+                })
+                .flat_map(|(_, lease)| lease.routes.clone())
+                .collect::<Vec<_>>();
+            takeover::disable_managers()?;
+            takeover_processes::disable()?;
+            let readonly = self.parents.keys().cloned().collect();
+            session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(takeover::enforce_kernel(
+                    handle,
+                    &target,
+                    preserve_owned,
+                    &dhcp_routes,
+                    &readonly,
+                ))
+            })
+        })();
+        let plan = receipt
+            .takeover
+            .as_mut()
+            .context("host takeover plan missing")?;
+        match result {
+            Ok(()) => {
+                plan.phase = if receipt.complete {
+                    "complete"
+                } else {
+                    "owned"
+                }
+                .into();
+                plan.error.clear();
+                write_json(&path, &receipt)
+            }
+            Err(error) => {
+                plan.phase = "failed".into();
+                plan.error = format!("{error:#}");
+                write_json(&path, &receipt)?;
+                Err(error.context("console host takeover failed; partial changes and durable capture retained; rerun from console"))
+            }
+        }
     }
 
     fn check_scope(&self) -> Result<()> {
@@ -687,6 +777,7 @@ impl Native {
                 || !after.dhcp_clients.is_empty()
                 || self.state.join("adoption.json").exists());
         let original_ipv6 = ownership.ipv6_original.clone();
+        let takeover_network = after.clone();
         let (fingerprint, original_ipv6) = session(self.namespace.clone(), move |rt, handle| {
             let mut original_ipv6 = original_ipv6;
             if after.ipv6_enabled {
@@ -718,6 +809,10 @@ impl Native {
             Ok((fingerprint, original_ipv6))
         })?;
         ownership.ipv6_original = original_ipv6;
+        drop(leases);
+        if self.state.join("adoption.json").try_exists()? {
+            self.enforce_host_takeover(&takeover_network, true)?;
+        }
         if !kernel.host.is_empty() {
             let host = self
                 .host_namespace
@@ -1214,8 +1309,15 @@ impl Backend for Native {
         let scope = self.identity.clone();
         let saved = serde_json::to_value(&ownership)?;
         let wanted = request.clone();
+        let ipv6_enabled = before.ipv6_enabled;
         let captured = session(self.namespace.clone(), move |rt, handle| {
-            rt.block_on(adoption::capture_vlan(handle, scope, saved, &wanted))
+            rt.block_on(adoption::capture_vlan(
+                handle,
+                scope,
+                saved,
+                &wanted,
+                ipv6_enabled,
+            ))
         })?;
         let mut config = before.clone();
         let mut link = captured
@@ -1527,16 +1629,60 @@ impl Backend for Native {
             let receipt = session(self.namespace.clone(), move |rt, handle| {
                 rt.block_on(adoption::capture(handle, scope, previous, readonly))
             })?;
-            if receipt.config.interfaces.is_empty() {
-                return Ok(Config::empty());
-            }
             write_json(&path, &receipt)?;
             receipt
         };
+        ensure!(
+            receipt.ipv6_before.is_some(),
+            "initial physical takeover requires its captured IPv6 rollback snapshot"
+        );
         receipt
             .config
             .validate()
             .context("invalid inherited baseline")?;
+        if receipt.takeover.is_some() {
+            let result = (|| -> Result<()> {
+                let originals = receipt.managed_originals()?;
+                let captured = originals.clone();
+                session(self.namespace.clone(), move |rt, handle| {
+                    rt.block_on(networking::check_ethernet(handle, &captured))
+                })?;
+                self.enforce_host_takeover(
+                    &Network::parse(&receipt.config.operational_value()?)?,
+                    self.ownership()?.firewall_fingerprint.is_some(),
+                )?;
+                session(self.namespace.clone(), move |rt, handle| {
+                    rt.block_on(networking::restore_interfaces(handle, &originals))
+                })?;
+                let mut ownership = self.ownership()?;
+                ownership.scope = self.identity.clone();
+                ownership.ethernet_originals = receipt.managed_originals()?;
+                ownership.managed_interfaces = receipt
+                    .config
+                    .interfaces
+                    .iter()
+                    .map(|link| link.name.clone())
+                    .collect();
+                ownership.committed_config = Some(receipt.config.operational_value()?);
+                ownership.boot = self.boot.clone();
+                self.save_ownership(&ownership)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let mut failed: adoption::Receipt = read_json(&path)?;
+                let plan = failed
+                    .takeover
+                    .as_mut()
+                    .context("host takeover plan missing")?;
+                plan.phase = "failed".into();
+                plan.error = format!("{error:#}");
+                write_json(&path, &failed)?;
+                return Err(
+                    error.context("console takeover incomplete; capture retained for retry")
+                );
+            }
+            return Ok(receipt.config);
+        }
         ensure!(
             receipt.config.interfaces.len() == receipt.originals.len()
                 && receipt.config.interfaces.iter().all(|link| receipt
@@ -1545,8 +1691,9 @@ impl Backend for Native {
                     .is_some_and(|snapshot| snapshot.name == link.name)),
             "inherited interface snapshot identities do not match the baseline"
         );
+        let managed_originals = receipt.managed_originals()?;
         let result = (|| -> Result<()> {
-            self.take_ownership(&receipt.originals)?;
+            self.take_ownership(&managed_originals)?;
             let captured = receipt.clone();
             session(self.namespace.clone(), move |rt, handle| {
                 rt.block_on(adoption::transfer_routes(handle, &captured, false))
@@ -1556,7 +1703,7 @@ impl Backend for Native {
             }
             let mut ownership = self.ownership()?;
             ownership.scope = self.identity.clone();
-            ownership.ethernet_originals = receipt.originals.clone();
+            ownership.ethernet_originals = managed_originals;
             ownership.managed_interfaces = receipt.originals.keys().cloned().collect();
             ownership.committed_config = Some(receipt.config.operational_value()?);
             ownership.boot = self.boot.clone();
@@ -1578,6 +1725,10 @@ impl Backend for Native {
             self.dhcp.shutdown()?;
             let captured = receipt.clone();
             session(self.namespace.clone(), move |rt, handle| {
+                if let Some(snapshot) = &captured.ipv6_before {
+                    ipv6::restore_controls(snapshot)?;
+                    rt.block_on(ipv6::restore_network(handle, snapshot))?;
+                }
                 rt.block_on(networking::restore_ethernet(handle, &captured.originals))?;
                 rt.block_on(adoption::transfer_routes(handle, &captured, true))
             })
@@ -1831,6 +1982,17 @@ impl Backend for Native {
         value["parents"] = parent_status;
         value["dhcp_clients"] = self.dhcp.status()?;
         value["scope"] = json!(self.identity);
+        let adoption = self.state.join("adoption.json");
+        value["host_takeover"] = if adoption.try_exists()? {
+            let receipt: adoption::Receipt = read_json(&adoption)?;
+            receipt
+                .takeover
+                .as_ref()
+                .map(takeover::Plan::report)
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
         value["wireguard_dns"] = self.wireguard_dns.snapshot()?;
         let enabled = config.ipv6_enabled;
         value["ipv6"] = session(self.namespace.clone(), move |_, _| ipv6::status(enabled))?;
@@ -2020,14 +2182,6 @@ impl Backend for Native {
         // Refresh the verified firewall through a recovery intent so startup installs
         // the current compiler's telemetry without changing configuration revisions.
         let mut ownership = self.ownership()?;
-        if self.options.namespace.is_empty()
-            && ownership.firewall_fingerprint.is_none()
-            && config == &Config::empty()
-        {
-            self.repair_services(&value)?;
-            self.reconcile_interface_aliases(config)?;
-            return Ok(self.services.status());
-        }
         if ownership.committed_config.is_none() {
             self.apply(config, config)?;
             ownership = self.ownership()?;
@@ -2072,6 +2226,10 @@ impl Backend for Native {
             let mut receipt: adoption::Receipt = read_json(&adoption_path)?;
             if !receipt.complete {
                 receipt.complete = true;
+                if let Some(plan) = &mut receipt.takeover {
+                    plan.phase = "complete".into();
+                    plan.error.clear();
+                }
                 write_json(&adoption_path, &receipt)?;
             }
         }

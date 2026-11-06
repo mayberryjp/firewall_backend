@@ -2,7 +2,6 @@ use anyhow::{Context, Result, ensure};
 use netcontrol_core::{Config, Engine, PERMISSIONS, Reply, canonical_prefix, valid_interface_name};
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct VlanLan {
@@ -187,40 +186,66 @@ pub fn candidate(mut config: Config, wan: &str, lan: &str, address: &str) -> Res
     Ok(config.normalized())
 }
 
-fn wan_ready(runtime: &Value, wan: &str, lan: &str, address: &str) -> Result<bool> {
-    let errors = &runtime["dhcp_clients"]["errors"];
-    ensure!(
-        errors.get(wan).is_none(),
-        "WAN DHCP worker failed: {}",
-        errors[wan]
-    );
-    let lease = &runtime["dhcp_clients"]["leases"][wan];
-    if let Some(leases) = runtime["dhcp_clients"]["leases"].as_object() {
-        for (name, lease) in leases {
-            if name == lan {
-                continue;
-            }
-            ensure!(
-                name == wan
-                    || !lease["routes"].as_array().is_some_and(|routes| routes
-                        .iter()
-                        .any(|route| route["destination"] == "0.0.0.0/0")),
-                "another DHCP interface has a default route: {name}"
-            );
-            if let Some(other) = lease["address"].as_str() {
+pub fn takeover_candidate(
+    saved: &Config,
+    wan: &str,
+    lan: &str,
+    address: &str,
+    vlan: Option<&VlanLan>,
+) -> Result<Config> {
+    factory_vlan_candidate(saved, wan, lan, address, vlan)?;
+    let mut config = saved.clone();
+    if let Some(vlan) = vlan {
+        vlan.validate()?;
+        ensure!(
+            vlan.name == lan,
+            "requested LAN name differs from VLAN name"
+        );
+        if let Some(existing) = config.interfaces.iter().find(|i| i.name == lan) {
+            vlan.check_identity(existing)?;
+        } else {
+            let mut interface = vlan.interface(address)?;
+            interface.mtu = config
+                .interfaces
+                .iter()
+                .find(|i| i.name == vlan.parent)
+                .context("VLAN parent missing")?
+                .mtu;
+            config.interfaces.push(interface);
+        }
+    }
+    for interface in &config.interfaces {
+        if interface.name != lan {
+            for other in &interface.addresses {
                 ensure!(
                     !overlaps(address, other)?,
-                    "LAN subnet overlaps DHCP lease on {name}"
+                    "LAN subnet overlaps imported interface {}",
+                    interface.name
                 );
             }
         }
     }
-    Ok(lease["address"].is_string()
-        && lease["routes"].as_array().is_some_and(|routes| {
-            routes
-                .iter()
-                .any(|route| route["destination"] == "0.0.0.0/0" && route["table"] == 254)
-        }))
+    for interface in &mut config.interfaces {
+        if interface.name == wan {
+            interface.role = "wan".into();
+            interface.up = true;
+        }
+        if interface.name == lan {
+            interface.role = "lan".into();
+            interface.addresses = vec![address.into()];
+            interface.up = true;
+        }
+    }
+    config.dhcp_clients.remove(lan);
+    if config
+        .interfaces
+        .iter()
+        .any(|i| i.name == wan && i.addresses.is_empty())
+    {
+        config.dhcp_clients.entry(wan.into()).or_default();
+    }
+    config.validate()?;
+    Ok(config.normalized())
 }
 
 pub async fn apply(engine: &mut Engine, wan: &str, lan: &str, address: &str) -> Result<()> {
@@ -250,86 +275,8 @@ pub async fn apply_with_vlan(
         engine.is_initial_configuration() && state.get("active_transaction").is_none(),
         "appliance provisioning requires an unconfigured initial journal; existing state was not reset"
     );
-    let baseline: Config = serde_json::from_value(state["desired"].clone())?;
-    ensure!(
-        baseline.firewall == netcontrol_core::Firewall::default()
-            && baseline
-                .interfaces
-                .iter()
-                .all(|interface| interface.role == "unassigned"),
-        "appliance provisioning refuses existing role or firewall configuration"
-    );
-    if let Some(vlan) = vlan {
-        ensure!(
-            vlan.name == lan,
-            "requested LAN name differs from VLAN name"
-        );
-        vlan.validate()?;
-        // Validate the requested network before any explicit ownership handoff.
-        factory_vlan_candidate(&baseline, wan, lan, address, Some(vlan))?;
-        prepare_vlan(engine, vlan, &permissions)?;
-    }
-    let config = factory_vlan_candidate(engine.saved_configuration(), wan, lan, address, vlan)?;
-    let request = serde_json::to_vec(
-        &json!({"base_revision": engine.committed_revision(), "confirm_timeout_seconds": 60,
-        "description": "Initial LAN/WAN appliance provisioning", "config": config}),
-    )?;
-    let transaction = checked(engine.request(
-        "POST",
-        "/api/v1/transactions",
-        "",
-        "local-installer",
-        &permissions,
-        &request,
-    ))?;
-    let id = transaction["id"]
-        .as_str()
-        .context("provisioning transaction has no ID")?;
-    let ready = async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            engine.tick()?;
-            let runtime = checked(engine.request(
-                "GET",
-                "/api/v1/runtime",
-                "",
-                "local-installer",
-                &permissions,
-                &[],
-            ))?;
-            if wan_ready(&runtime, wan, lan, address)? {
-                return Ok::<(), anyhow::Error>(());
-            }
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "WAN DHCP did not obtain an IPv4 lease/default route within 30 seconds"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-    .await;
-    if let Err(error) = ready {
-        checked(engine.request(
-            "POST",
-            &format!("/api/v1/transactions/{id}/rollback"),
-            "",
-            "local-installer",
-            &permissions,
-            &[],
-        ))
-        .with_context(|| {
-            format!("WAN DHCP provisioning failed ({error:#}); rollback also failed")
-        })?;
-        return Err(error.context("WAN DHCP provisioning failed; initial transaction rolled back"));
-    }
-    checked(engine.request(
-        "POST",
-        &format!("/api/v1/transactions/{id}/confirm"),
-        "",
-        "local-installer",
-        &permissions,
-        &[],
-    ))?;
+    let config = takeover_candidate(engine.saved_configuration(), wan, lan, address, vlan)?;
+    engine.commit_initial_configuration(config)?;
     Ok(())
 }
 
@@ -680,6 +627,7 @@ mod tests {
     #[test]
     fn factory_reset_discards_custom_network_configuration() {
         let mut saved = initial();
+        saved.ipv6_enabled = true;
         saved.firewall.allow_all_icmp = false;
         saved.dhcp_clients.insert("lan0".into(), Default::default());
         saved.interfaces.push(
@@ -700,6 +648,7 @@ mod tests {
             serde_json::from_value(json!({"servers":["192.0.2.53"]})).unwrap(),
         );
         let factory = factory_candidate(&saved, "wan0", "lan0", "192.168.0.1/24").unwrap();
+        assert!(!factory.ipv6_enabled);
         assert_eq!(
             factory.dhcp_clients.keys().cloned().collect::<Vec<_>>(),
             ["wan0"]
@@ -818,14 +767,36 @@ mod tests {
         assert!(provisioned.dhcp_clients.contains_key("wan0"));
     }
     #[test]
-    fn wan_readiness_requires_dhcp_default_route_and_no_subnet_collision() {
-        let mut runtime = json!({"dhcp_clients": {"errors": {}, "leases": {}}});
-        assert!(!wan_ready(&runtime, "wan0", "lan0", "192.168.0.1/24").unwrap());
-        runtime["dhcp_clients"]["leases"]["wan0"] = json!({"address": "198.51.100.2/24", "routes": [{"destination": "0.0.0.0/0", "table": 254}]});
-        assert!(wan_ready(&runtime, "wan0", "lan0", "192.168.0.1/24").unwrap());
-        runtime["dhcp_clients"]["leases"]["wan0"]["address"] = json!("192.168.0.2/24");
-        assert!(wan_ready(&runtime, "wan0", "lan0", "192.168.0.1/24").is_err());
-        runtime["dhcp_clients"]["errors"]["wan0"] = json!("synthetic failure");
-        assert!(wan_ready(&runtime, "wan0", "lan0", "192.168.0.1/24").is_err());
+    fn takeover_preserves_static_wan_routes_dns_firewall_and_other_interfaces() {
+        let mut saved = initial();
+        saved
+            .interfaces
+            .iter_mut()
+            .find(|i| i.name == "wan0")
+            .unwrap()
+            .addresses = vec!["198.51.100.2/24".into()];
+        saved.routes=serde_json::from_value(json!([{"destination":"0.0.0.0/0","gateway":"198.51.100.1","interface":"wan0","table":254,"metric":10}])).unwrap();
+        saved.dns.insert(
+            "wan0".into(),
+            serde_json::from_value(json!({"servers":["192.0.2.53"]})).unwrap(),
+        );
+        saved.firewall.policy = "drop".into();
+        let next = takeover_candidate(&saved, "wan0", "lan0", "192.168.0.1/24", None).unwrap();
+        assert_eq!(next.routes, saved.routes);
+        assert_eq!(next.dns, saved.dns);
+        assert_eq!(next.firewall, saved.firewall);
+        assert_eq!(
+            next.interfaces
+                .iter()
+                .find(|i| i.name == "wan0")
+                .unwrap()
+                .addresses,
+            ["198.51.100.2/24"]
+        );
+        assert!(!next.dhcp_clients.contains_key("wan0"));
+        assert_eq!(
+            next.interfaces.iter().find(|i| i.name == "wifi0"),
+            saved.interfaces.iter().find(|i| i.name == "wifi0")
+        );
     }
 }

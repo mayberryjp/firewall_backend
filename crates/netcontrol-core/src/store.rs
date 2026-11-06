@@ -312,7 +312,7 @@ mod tests {
         drop(store);
         fs::remove_dir_all(directory).unwrap();
 
-        assert!(loaded.unwrap().unwrap().desired.ipv6_enabled);
+        assert!(!loaded.unwrap().unwrap().desired.ipv6_enabled);
         assert!(corruption.contains("checksum mismatch"));
         assert!(incompatible.contains("invalid/incompatible Rust state payload"));
     }

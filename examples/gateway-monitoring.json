@@ -3,6 +3,7 @@
   "confirm_timeout_seconds": 120,
   "description": "Explicit dual-stack VLAN monitors and an automatic DHCPv4 monitor on a second WAN",
   "config": {
+    "ipv6_enabled": true,
     "interfaces": [
       {
         "name": "wan0",

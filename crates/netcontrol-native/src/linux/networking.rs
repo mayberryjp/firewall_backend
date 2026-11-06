@@ -593,7 +593,7 @@ pub async fn capture_ethernet(
     Ok(snapshots)
 }
 
-async fn capture_interfaces(
+pub(super) async fn capture_interfaces(
     handle: &Handle,
     names: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, EthernetSnapshot>> {
@@ -1195,7 +1195,7 @@ pub async fn parent_status(handle: &Handle, parents: &BTreeMap<String, Parent>) 
     Ok(json!(result))
 }
 
-fn vlan(link: &LinkMessage) -> Result<Option<(u32, u16)>> {
+pub(super) fn vlan(link: &LinkMessage) -> Result<Option<(u32, u16)>> {
     if kind(link) != "vlan" {
         return Ok(None);
     }
@@ -1645,6 +1645,7 @@ pub async fn boot_snapshot(
         "unexpected owned policy rule after reboot"
     );
     let mut value = serde_json::to_value(netcontrol_core::Config::empty())?;
+    value["ipv6_enabled"] = serde_json::json!(expected.ipv6_enabled);
     value["interfaces"] = serde_json::to_value(actual)?;
     value["routes"] = serde_json::to_value(routes)?;
     value["blackhole"] = serde_json::to_value(&expected.blackhole)?;
@@ -1675,7 +1676,7 @@ async fn owned_rules(handle: &Handle) -> Result<Vec<RuleMessage>> {
     }
     Ok(owned)
 }
-fn decode_rule(message: &RuleMessage) -> Result<Rule> {
+pub(super) fn decode_rule(message: &RuleMessage) -> Result<Rule> {
     ensure!(
         message.header.action == RuleAction::ToTable
             && message.header.dst_len == 0

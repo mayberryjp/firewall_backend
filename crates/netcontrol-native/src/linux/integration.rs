@@ -1274,6 +1274,7 @@ fn native_destination_rewrite_packets_filtering_restart_and_rollback() -> Result
     let empty = Config::empty();
     native.repair(&empty)?;
     let desired = config(json!({
+        "ipv6_enabled":true,
         "interfaces":[
             {"name":"lan0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["192.0.2.1/24","2001:db8:3::1/64"]},
             {"name":"lan1","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["198.51.100.1/24","2001:db8:2::1/64"]},
@@ -1870,6 +1871,7 @@ fn native_blackhole_routes_drop_traffic_change_action_rename_rollback_and_restar
     native.repair(&empty)?;
     let build = |name: &str, action: &str| -> Result<Config> {
         let config = config(json!({
+            "ipv6_enabled":true,
             "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,
                 "addresses":["192.0.2.1/24","2001:db8::1/64"]}],
             "blackhole":{"name":name,"action":action},
@@ -1975,6 +1977,7 @@ fn native_static_route_enabled_toggle_restart_and_rollback() -> Result<()> {
     let empty = Config::empty();
     native.repair(&empty)?;
     let active = config(json!({
+        "ipv6_enabled":true,
         "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,
             "addresses":["192.0.2.1/24","2001:db8::1/64"]}],
         "routes":[
@@ -2021,7 +2024,8 @@ fn native_static_route_enabled_toggle_restart_and_rollback() -> Result<()> {
 fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Result<()> {
     let fixture = Fixture::new()?;
     let mut native = Native::open(fixture.options())?;
-    let empty = Config::empty();
+    let mut empty = Config::empty();
+    empty.ipv6_enabled = true;
     native.repair(&empty)?;
     session(native.namespace.clone(), |rt, handle| {
         rt.block_on(async {
@@ -2124,6 +2128,7 @@ fn global_ipv6_managed_addresses_routes_and_interrupted_disable_recover() -> Res
     let empty = Config::empty();
     native.repair(&empty)?;
     let dual = config(json!({
+        "ipv6_enabled":true,
         "interfaces":[{"name":"dual0","kind":"dummy","role":"lan","mtu":1500,"up":true,
             "addresses":["192.0.2.1/24","2001:db8::1/64"]}],
         "routes":[{"enabled":true,"destination":"2001:db8:10::/64","interface":"dual0","table":10000,"metric":10}]
@@ -3865,6 +3870,7 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
     let empty = Config::empty();
     native.repair(&empty)?;
     let mut value = serde_json::to_value(&empty)?;
+    value["ipv6_enabled"] = json!(true);
     value["interfaces"] = json!([
         {"name":"trunk0","kind":"dummy","role":"wan","mtu":1500,"up":true,"addresses":["192.0.2.2/24"],"dhcp_relay":{"enabled":false,"servers":[]}},
         {"name":"vlan100","kind":"vlan","role":"lan","mtu":1400,"up":true,"addresses":["198.51.100.2/24","2001:db8:100::2/64"],"vlan":{"parent":"trunk0","id":100},"dhcp_relay":{"enabled":false,"servers":[]}},

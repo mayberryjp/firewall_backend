@@ -42,7 +42,7 @@ Support:
 - IPv4/IPv6 masquerading.
 - Exact-port IPv4/IPv6 destination rewrite of forwarded traffic originally
   routed through a selected WAN to another device on a managed LAN.
-- Transactional global IPv6 enable/disable policy, enabled by default.
+- Transactional global IPv6 enable/disable policy, disabled by default.
 - WireGuard key references, peers, endpoints, allowed networks, and keepalive.
 - Typed softflowd configuration, runtime inspection, and explicit reconciliation.
 - Per-interface DHCPv4 relay server lists and enable flags, native Rust relay,
@@ -61,7 +61,8 @@ Support:
 - Read-only host NIC discovery and explicit Ethernet static configuration.
 - Initial physical-NIC inheritance on supported native host installations,
   in-process DHCPv4 clients and per-interface systemd-resolved configuration.
-- Ubuntu install-time LAN/WAN provisioning, IPv4 LAN-to-WAN masquerade and
+- Ubuntu import-preserving console LAN/WAN provisioning, explicit factory-reset
+  LAN-to-WAN masquerade and
   service-managed host IPv4 forwarding after native policy reconciliation.
 - Persisted host-input default policy and managed-ingress rules, with implicit
   loopback and established/related acceptance when input filtering is configured.
@@ -72,8 +73,9 @@ Do not present as supported:
 
 - Hardware creation, parent adoption, namespace creation or selection
   through the API, bridges, DHCP server management, DHCPv6 clients/relay, DNS
-  server management, or forwarding sysctl management. NetworkManager takeover
-  and dynamic global IPv6 inheritance are not implemented.
+  server management, or forwarding sysctl management. Active NetworkManager
+  IPv4 capture is supported only during console host takeover, not as browser
+  manager control. Dynamic global IPv6 inheritance is not implemented.
 - Static SNAT, general DNAT/port forwarding beyond destination rewrite,
   arbitrary protocol matches/port ranges, sets, conntrack
   controls, traffic control, NIC offload/channel/ring/coalescing tuning, or
@@ -422,7 +424,28 @@ The installer uses Python 3 for metadata verification only; protocol services
 remain in-process Rust. The Ubuntu assets are unsigned; trust rests on HTTPS and
 the GitHub repository/account, not an independent publisher signature.
 Installation/help text should use `sudo bash install.sh`, not the removed
-`--run-id` option. Interactive installs prompt for missing LAN interface and IPv4
+`--run-id` option. Fresh installation also stops/disables and persistently masks
+installed `snapd.service` and `snapd.socket`, including stopping already-masked
+units. It verifies inactive/failed active state and persistent `masked` enablement
+before appliance provisioning; missing units are skipped and failures abort.
+Snap packages/data and separate application units are not removed. Snap
+management/installation and refreshes are blocked; operator instructions must
+require review of Snap-dependent workloads. It also disables automatic Ubuntu APT
+checks, downloads and installs, **including security updates**, by persistently
+masking present `apt-daily.timer`, `apt-daily-upgrade.timer`, `apt-daily.service`
+and `apt-daily-upgrade.service` and verifying inactive/failed state. Running APT
+jobs are never forcibly stopped; verification fails until completion and retry.
+Absent units are skipped. The atomic root-owned mode-0644
+`/etc/apt/apt.conf.d/99-netcontrol-no-automatic-updates` sets
+`APT::Periodic::{Enable,Update-Package-Lists,Download-Upgradeable-Packages,Unattended-Upgrade}`
+to `"0"` and `Unattended-Upgrade::InstallOnShutdown` to `"false"`.
+Effective `apt-config dump` values must match; conflicting configuration fails.
+Manual APT commands and Netcontrol release checks remain available. Operator
+instructions must require planned manual OS patching and must not describe
+disabled automatic security patching as a security improvement.
+This host policy adds no API fields, permissions or web action and does not
+change the saved firewall configuration.
+Interactive installs prompt for missing LAN interface and IPv4
 host/prefix, suggesting the second physical port and `192.168.0.1/24`.
 `--wan` overrides WAN independently; `--lan` and `--lan-address` skip their
 individual prompts. Unattended installs require both LAN flags and fail if either
@@ -447,11 +470,17 @@ stacked VLANs and unsupported ownership are rejected. The selected release must
 support tagged provisioning; no physical-parent fallback is allowed.
 LAN addresses must be canonical usable RFC1918 IPv4 hosts, prefixes 8..30,
 entirely within RFC1918 space and not a network/broadcast address. WAN
-is configured as DHCPv4, with static WAN address/route/DNS removed and an
-upstream lease/default route required within 30 seconds of provisional apply.
-The installer commits LAN allow-all forwarding/input, WAN unsolicited-input
-denial with reply/DHCP exceptions, LAN-subnet WAN NAT, and starts/enables the
-service with `--appliance`. It binds HTTP to the selected LAN address using
+retains imported static IPv4, routes and DNS; an empty WAN receives DHCPv4.
+Provisioning preserves imported supported interfaces/firewall/MTU/routes/DNS
+instead of replacing them with factory policy. It sets the chosen WAN/LAN roles,
+enables those ports and replaces only the LAN's addresses/DHCP client. It does
+not invent LAN allow-all, WAN input denial or NAT; operators must review the
+imported rules, including literal subnets affected by the LAN address choice.
+The console transaction commits after verification without a connectivity or
+WAN-readiness timer, and interrupted provisioning resumes its durable candidate.
+Unsupported networking/managers are not restored on connectivity loss.
+Explicit factory reset retains its separate factory contract.
+The installer starts/enables the service with `--appliance` and binds HTTP to the selected LAN address using
 `/etc/netcontrol/appliance.env`; there is no new HTTP provisioning endpoint.
 LAN clients need static addressing/gateway; no DHCP/DNS server is provisioned.
 Existing installations are not rerun or reset by the installer. A root-only
@@ -522,8 +551,21 @@ Optional Ubuntu OS footprint reduction is a separate console operator workflow:
 `sudo bash hardening.sh` previews only; `--apply` stops/disables explicit printing,
 mDNS discovery and crash-reporting units and purges only explicit installed
 profile packages. Dependency removals outside that list are refused; there is no
-autoremove. Network, Wi-Fi, SSH, time/security updates and build tools are not
-targeted. It is not automatically run during installation/upgrade/reset and adds
+autoremove. It also previews, then only with `--apply` stops/disables and
+persistently masks installed `snapd.service` and `snapd.socket`, with stopped/
+persistent-mask verification. Already-masked Snap units are still stopped;
+absent ones are skipped. Snap packages/data are retained, and separate Snap
+application units are not explicitly stopped; this is not full app removal.
+Snap management and refreshes are blocked. Existing hosts must explicitly run
+reviewed hardening to apply this policy; binary/source upgrades alone do not.
+It also previews, then applies the same verified automatic-APT policy as fresh
+installation, retaining packages/manual APT access and recording prior unit
+states and the owned APT fragment (or its absence) for deliberate recovery.
+Cached login update notices may remain; arbitrary third-party schedulers and
+graphical updaters are outside this Ubuntu APT policy.
+Network, Wi-Fi, SSH, time synchronization and build tools are not
+targeted. The full footprint/purge profile is not automatically run during
+installation/upgrade/reset and adds
 no HTTP endpoint, browser action, permissions or schema fields. mDNS discovery
 may disappear, so operator instructions should use the appliance IP.
 AppArmor remains enabled by default. `--disable-apparmor` explicitly opts out of
@@ -2986,7 +3028,16 @@ Publisher and deployment contract:
   lost/pending/loss percent and RTT min/max/average/stddev/p50/p95/variation.
   These are rolling summaries, not individual probes/cumulative probe totals.
   Counter decimal strings remain lossless; stale/unavailable values are unknown,
-  not zero. Software version is the embedded public date version, independent
+  not zero. For sensors with units or a state class, discovery templates render
+  null or missing metrics as Home Assistant's `None` sentinel, not the literal
+  `unknown` string that numeric sensors reject. The state payload still carries
+  JSON null (or omits a retained-source metric); it does not contain fabricated
+  zeroes or string sentinels. Text sensors retain their `unknown` fallback.
+  Valid zero, fractional/negative readings and exact 64-bit counter strings
+  pass through without numeric coercion. Corrected discovery is reannounced
+  through the existing startup/reconnect/birth workflow; old per-sensor discovery
+  conflicts remain a separate broker-administrator cleanup concern.
+  Software version is the embedded public date version, independent
   of Cargo's internal package version. Configuration revision is also a
   date-version string, not a numeric counter.
 - Host health sensors, read from the same snapshot as `GET /api/v1/statistics/host`
@@ -4507,7 +4558,8 @@ do not automatically retry, prefetch or poll this mutation.
 
 After capture, explicit ownership recovery checks the VLAN's identity, relinquishes
 networkd management and actively reapplies the captured address/MTU/up settings.
-Physical-interface inheritance uses the same active takeover and verification.
+Initial host inheritance instead uses the aggressive console-only takeover
+contract below; it does not share these narrow later-VLAN capture restrictions.
 Startup reasserts networkd exclusions for all still-owned physical interfaces,
 including those without an initial-inheritance receipt, then reconciles saved
 desired configuration rather than restoring bootstrap addressing. This does
@@ -4632,6 +4684,42 @@ empty revision-zero journal without transactions inherits supported physical
 NICs with `unassigned` roles; existing configurations are not recaptured. A
 populated interface list at the initial revision is therefore valid. This is not WAN
 detection, a browser-side import or an automatically confirmed user transaction.
+Initial physical capture now keeps DHCPv4 from dual-stack networkd DHCP modes
+but excludes IPv6 addresses/routes and IPv6 DNS literals; DHCPv6/SLAAC is disabled,
+not imported as static configuration. Native reconciliation enforces the disabled
+IPv6 default globally, including empty configuration and loopback/unmanaged links.
+Opening discovery alone remains read-only. Initial console takeover imports
+supported Ethernet/veth, dummy and standard VLAN topology, static IPv4/routes,
+DHCPv4 (including unleased clients), networkd/active NetworkManager settings and
+representable nftables rules as owned configuration. Unsupported topology is
+detached/downed/address-cleared; custom routing, foreign nftables/legacy xtables,
+qdiscs, XDP/TCX and known competing managers/processes are disabled. Original OS
+files and private capture remain, but there is no connectivity-loss rollback.
+Known units are persistently masked/stopped; same-namespace standalone
+competitors are terminated with pidfds. Resolved, SSH, Netcontrol and Wi-Fi
+authentication remain. Inactive manager profiles/private keys are not translated;
+custom launchers/renamed competitors require operator review.
+Explicit read-only parents retain link-level settings. Removing a managed
+interface from an aggressively adopted host does not hand it back to an OS
+manager: unconfigured links remain down/address-cleared, except read-only parents.
+Normal confirmed transaction rollback can restore the prior valid managed plan.
+
+`GET /api/v1/runtime` (`state.read`) adds native `host_takeover: null | HostTakeover`.
+It is null without a host takeover receipt. The object has `mode: "console"`,
+`phase: "captured" | "applying" | "owned" | "failed" | "complete"`, `error: string`
+(empty without a recorded error), `connectivity_confirmation_required: false`,
+and `items: {resource: string, disposition: "imported" | "disabled", reason: string}[]`.
+Items describe the captured plan/decisions, not live reachability. Raw snapshots,
+lease secrets and OS configuration contents are never returned. Incomplete/failed
+phases must not render as successful takeover; show console correction/retry
+guidance. No new mutation endpoint or permission is introduced.
+
+Local provisioning transactions use durable `applying_local` and then
+`committed`, with `confirmation_deadline: null`; restart resumes and verifies
+the candidate before commitment. The browser must not offer confirmation or a
+countdown for these transactions. Normal HTTP/SSH edits still require their
+non-null deadline, independent verification and explicit confirmation; ordinary
+apply/rollback failure semantics are unchanged.
 
 #### DHCPv4 and resolver configuration
 
@@ -4752,22 +4840,21 @@ acquisition. Compare `acquired_at`/expiry and show an unconfirmed outcome if no
 update is observed, rather than claiming success from `202`. No attempt ID,
 completion event, forced release, DHCPv6 retry or automatic retry is provided.
 
-Deployment: takeover currently requires systemd-networkd/systemd-resolved and a
-live finite lease for each DHCPv4 NIC. Physical sysfs NICs only, not veth/loopback;
-read-only adopted parents and lab namespaces are excluded. Bridged/bonded ports,
-custom policy rules, active dynamic global IPv6, unsupported OS-manager settings
-and NetworkManager cause explicit startup errors rather than static snapshots.
-Wi-Fi association stays with its existing supplicant. Persistent per-NIC
-networkd exclusions remain on daemon stop/removal from desired configuration;
-neither operation automatically restores OS DHCP ownership. Require console
-access for first-start, recovery and hand-back. This unreleased work still needs
-Linux compilation and runtime acceptance; it is not proof of production safety.
+Deployment: console takeover requires root network/BPF privileges,
+systemd/resolved, trusted persistent state and stable host identity. It supports
+unleased DHCPv4 and active NetworkManager capture, disables unsupported
+networking and masks competing managers. Read-only parents/lab namespaces are
+excluded and actual loopback remains read-only. Wi-Fi authentication stays with
+its supplicant. Stopping the daemon does not hand ownership back to OS managers.
+Real Ubuntu/systemd interruption, reboot and management acceptance remain
+required; isolated Linux tests are not proof of production safety.
 
 Installed Ubuntu appliance mode enables host IPv4 forwarding after native
-policy reconciliation on each startup. The installer explicitly commits the
-initial LAN/WAN roles, static LAN address, DHCPv4 WAN, forward/input drop defaults,
-LAN allow-all rules, enabled global IPv4 ICMP acceptance, and LAN-subnet WAN
-masquerade. Explicit factory reset uses the same defaults. Ordinary startup and
+policy reconciliation on each startup. Initial installation retains imported
+supported policy, routes, DNS and WAN addressing and sets explicit LAN addressing
+and WAN/LAN roles. Empty WAN uses DHCPv4. Only explicit factory reset selects
+DHCPv4 WAN, forward/input drop defaults, LAN allow-all, global IPv4 ICMP acceptance
+and LAN-subnet WAN masquerade. Ordinary startup and
 upgrades preserve saved `firewall.allow_all_icmp`, including explicit false.
 Role edits alone do not regenerate policy.
 IPv6 forwarding and non-appliance deployments remain operator responsibilities.
@@ -4779,9 +4866,10 @@ Netcontrol configures every host subsystem.
 #### Global IPv6 policy
 
 The complete configuration has a top-level `ipv6_enabled: boolean`. Omission
-defaults to `true`; normalized configuration/revision/transaction reads include
+defaults to `false`; normalized configuration/revision/transaction reads include
 it explicitly. `null`, strings and numbers are `400`. Fresh install/factory
-configuration enables IPv6. Preserve this scalar in every full-package edit,
+configuration disables IPv6. Explicit saved `true` remains enabled; changing a
+default does not overwrite that saved choice. Preserve this scalar in every full-package edit,
 export/import, compare and historical restore.
 
 Expose an **Enable IPv6** global switch in the candidate editor. Changes use
@@ -4962,7 +5050,7 @@ response shapes and can succeed while these routes are suspended. Other
 networking drift and worker failures still produce `503`, not synthetic success.
 
 Disabled routes still require valid canonical prefixes, matching gateway family,
-a managed interface, table 254 or 10000..19999, and a positive 32-bit metric.
+a managed interface, table 254 or 10000..19999, and an integer metric 0..2147483647.
 Duplicate `(table, destination, metric)` identities remain invalid across both
 states; enabled is not part of identity. IPv6 policy still validates disabled
 routes. Enabled explicit gateway monitors require a matching enabled route;
@@ -5615,14 +5703,15 @@ The existing policy limits apply: at most 32 unique managed ingress entries,
 plus the implicit loopback entry. Rule order is semantic; port lists and unique
 ingress entries are normalized by sorting.
 
-Fresh Ubuntu provisioning creates input default-drop, LAN allow-all, and WAN
+Explicit factory reset creates input default-drop, LAN allow-all, and WAN
 IPv4 UDP destination-port 68 acceptance for DHCP. Loopback and replies remain
 implicit. The forwarding policy has a LAN allow-all rule without egress matching,
 default-drop for other new traffic, and stateful returns. NAT remains restricted
 to LAN-subnet IPv4 traffic exiting WAN. Show the DHCP exception and implicit
 rules clearly; deleting the DHCP/LAN allowances can affect reachability/renewal.
-First-install provisioning and explicit factory reset set
-`firewall.allow_all_icmp: true`; previously provisioning explicitly set false.
+Explicit factory reset sets `firewall.allow_all_icmp: true`. Initial provisioning
+instead retains supported imported policy; imported existing chains disable
+the default implicit ICMP bypass rather than silently widening their policy.
 This allows all IPv4 ICMP types/codes on every interface, including WAN, before
 input/forwarding drops, and accepts local IPv4 ICMP output. It does not cover
 ICMPv6. Show the enabled exception rather than describing WAN as blocking all
@@ -6102,7 +6191,7 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Route gateway | Optional canonical numeric address; same family as destination, no mapped IPv6 or zone |
 | Route interface | Must exist in managed draft interfaces |
 | Route table | 254 (main) or 10000..19999 |
-| Route metric | 1..2147483647 |
+| Route metric | 0..2147483647; zero preserves the kernel's default static-route priority |
 | Route uniqueness | `(table, destination, metric)` unique, even if device/gateway differs |
 | Policy source | Canonical network |
 | Policy priority | 10000..19999, unique across policy rules |
@@ -6691,7 +6780,7 @@ interface SoftflowdConfig {
 }
 
 type TransactionStatus =
-  | "applying" | "pending_confirmation" | "committed"
+  | "applying" | "applying_local" | "pending_confirmation" | "committed"
   | "rolling_back" | "rolled_back" | "recovery_failed";
 
 interface Transaction {
@@ -6702,7 +6791,7 @@ interface Transaction {
   committed_revision: RevisionNumber | null;
   candidate: Config;
   previous: Config;
-  confirmation_deadline: Timestamp;
+  confirmation_deadline: Timestamp | null; // Null only for console host provisioning.
   error?: string;
   description?: string;
   submitted_at: Timestamp | null;
@@ -6778,6 +6867,7 @@ interface SoftflowdStatus {
 }
 
 interface RuntimeState {
+  host_takeover?: HostTakeover | null; // Native host takeover only.
   process_health?: ProcessHealth; // Always present on HTTP GET /runtime; absent from some core action responses.
   active_alerts?: ActiveAlert[];
   capabilities: {
@@ -6791,6 +6881,14 @@ interface RuntimeState {
   dhcp_relay: DHCPRelayStatus[];
   gateway_monitors: GatewayMonitorStatistics[];
   error?: string;
+}
+
+interface HostTakeover {
+  mode: "console";
+  phase: "captured" | "applying" | "owned" | "failed" | "complete";
+  error: string;
+  connectivity_confirmation_required: false;
+  items: { resource: string; disposition: "imported" | "disabled"; reason: string }[];
 }
 
 interface DHCPRelayStatus {

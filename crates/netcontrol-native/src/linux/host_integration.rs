@@ -333,7 +333,209 @@ fn foreign_routes(namespace: Arc<File>) -> Result<usize> {
     })
 }
 
-fn isolate_host_fixture(test_name: &str) -> Result<bool> {
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated namespaces, nftables, XDP and traffic-control support"]
+fn native_aggressive_takeover_imports_supported_state_and_clears_foreign_networking() -> Result<()>
+{
+    if !isolate_host_fixture(
+        "linux::host_integration::native_aggressive_takeover_imports_supported_state_and_clears_foreign_networking",
+    )? {
+        return Ok(());
+    }
+    let namespace = Arc::new(File::open("/proc/thread-self/ns/net")?);
+    session(namespace, |rt, handle| {
+        rt.block_on(async {
+        use rustables::{Batch,Chain,ChainType,ChainPolicy,Hook,HookClass,Table,ProtocolFamily,Rule,Protocol};
+        use rustables::expr::{Conntrack,ConntrackKey,Masquerade};
+        use netlink_packet_route::{address::CacheInfo,link::LinkXdp};
+        use std::os::fd::{AsRawFd,FromRawFd,OwnedFd};
+        ipv6::set(true)?;
+        handle.link().add().veth("nic0".into(),"peer0".into()).execute().await?;
+        handle.link().add().dummy("aux0".into()).execute().await?;
+        handle.link().add().bridge("foreign0".into()).execute().await?;
+        let links=networking::links(handle).await?;
+        let index=|name:&str|links.iter().find(|link|networking::name(link)==name).map(|link|link.header.index).context("fixture link missing");
+        let nic=index("nic0")?;
+        let peer=index("peer0")?;
+        let bridge=index("foreign0")?;
+        for id in [nic,peer,bridge,index("aux0")?] {
+            handle.link().set(id).up().execute().await?;
+        }
+        handle.link().set(nic).controller(bridge).mtu(1450).execute().await?;
+        handle.link().add().vlan("tag10".into(),nic,10).execute().await?;
+        let vlan=networking::links(handle).await?.into_iter().find(|link|networking::name(link)=="tag10").context("fixture VLAN missing")?.header.index;
+        handle.link().add().vlan("tag20".into(),vlan,20).execute().await?;
+        handle.address().add(nic,"192.0.2.1".parse()?,24).execute().await?;
+        handle.address().add(bridge,"198.18.0.1".parse()?,24).execute().await?;
+        let mut dynamic=handle.address().add(peer,"198.51.100.8".parse()?,24);
+        let mut lifetime=CacheInfo::default();
+        lifetime.ifa_preferred=1800;
+        lifetime.ifa_valid=3600;
+        dynamic.message_mut().attributes.push(AddressAttribute::CacheInfo(lifetime));
+        dynamic.execute().await?;
+        handle.route().add().v4().destination_prefix("10.50.0.0".parse()?,16).output_interface(nic).protocol(RouteProtocol::Static).scope(RouteScope::Link).execute().await?;
+        for priority in [9999,10005] {
+            handle.rule().add().v4().priority(priority).table_id(10005).execute().await?;
+        }
+        handle.qdisc().add(i32::try_from(nic)?).ingress().execute().await?;
+        #[repr(C)]
+        struct Program {kind:u32,count:u32,instructions:u64,license:u64,log_level:u32,log_size:u32,log:u64}
+        let instructions:[u8;16]=[0xb7,0,0,0,2,0,0,0,0x95,0,0,0,0,0,0,0];
+        let program=Program{kind:6,count:2,instructions:instructions.as_ptr() as u64,license:c"GPL".as_ptr() as u64,log_level:0,log_size:0,log:0};
+        let fd=unsafe{libc::syscall(libc::SYS_bpf,5,&program,std::mem::size_of::<Program>())};
+        ensure!(fd>=0,"load fixture XDP: {}",std::io::Error::last_os_error());
+        let fd=unsafe{OwnedFd::from_raw_fd(i32::try_from(fd)?)};
+        let mut attach=handle.link().set(nic);
+        attach.message_mut().attributes.push(LinkAttribute::Xdp(vec![LinkXdp::Fd(fd.as_raw_fd()),LinkXdp::Flags(1<<1)]));
+        attach.execute().await?;
+        let tc_instructions:[u8;16]=[0xb7,0,0,0,0,0,0,0,0x95,0,0,0,0,0,0,0];
+        let tc_program=Program{kind:3,count:2,instructions:tc_instructions.as_ptr() as u64,license:c"GPL".as_ptr() as u64,log_level:0,log_size:0,log:0};
+        let tc_fd=unsafe{libc::syscall(libc::SYS_bpf,5,&tc_program,std::mem::size_of::<Program>())};
+        ensure!(tc_fd>=0,"load fixture TCX: {}",std::io::Error::last_os_error());
+        let tc_fd=unsafe{OwnedFd::from_raw_fd(i32::try_from(tc_fd)?)};
+        let tc_attach=[nic,tc_fd.as_raw_fd() as u32,46,0u32];
+        ensure!(unsafe{libc::syscall(libc::SYS_bpf,8,tc_attach.as_ptr(),std::mem::size_of_val(&tc_attach))}==0,
+            "attach fixture TCX: {}",std::io::Error::last_os_error());
+        #[repr(C)]
+        struct TcLink {program:u32,interface:u32,hook:u32,flags:u32,relative:u32,padding:u32,revision:u64}
+        let tc_link=TcLink{program:tc_fd.as_raw_fd() as u32,interface:nic,hook:47,flags:0,relative:0,padding:0,revision:0};
+        let tc_link=unsafe{libc::syscall(libc::SYS_bpf,28,&tc_link,std::mem::size_of::<TcLink>())};
+        ensure!(tc_link>=0,"attach fixture TCX link: {}",std::io::Error::last_os_error());
+        let _tc_link=unsafe{OwnedFd::from_raw_fd(i32::try_from(tc_link)?)};
+        let state=format!("/run/systemd/netif/links/{nic}");
+        fs::create_dir_all("/run/systemd/netif/links")?;
+        fs::write(&state,"NETWORK_FILE=/etc/systemd/import.network\n")?;
+        fs::write("/etc/systemd/import.network","[Network]\nDNS=203.0.113.53\n")?;
+        let mut batch=Batch::new();
+        let table=Table::new(ProtocolFamily::Ipv4).with_name("foreign").add_to_batch(&mut batch);
+        let forward=Chain::new(&table).with_name("forward").with_type(ChainType::Filter).with_hook(Hook::new(HookClass::Forward,0)).with_policy(ChainPolicy::Drop).add_to_batch(&mut batch);
+        Rule::new(&forward)?.snetwork("192.0.2.0/24".parse()?)?.accept().add_to_batch(&mut batch);
+        Rule::new(&forward)?.with_expr(Conntrack::new(ConntrackKey::State)).drop().add_to_batch(&mut batch);
+        let input=Chain::new(&table).with_name("input").with_type(ChainType::Filter).with_hook(Hook::new(HookClass::In,0)).with_policy(ChainPolicy::Drop).add_to_batch(&mut batch);
+        Rule::new(&input)?.iiface("nic0")?.dport(443,Protocol::TCP).accept().add_to_batch(&mut batch);
+        let post=Chain::new(&table).with_name("post").with_type(ChainType::Nat).with_hook(Hook::new(HookClass::PostRouting,100)).with_policy(ChainPolicy::Accept).add_to_batch(&mut batch);
+        Rule::new(&post)?.oiface("nic0")?.with_expr(Masquerade{}).add_to_batch(&mut batch);
+        Table::new(ProtocolFamily::Inet).with_name("netcontrol").add_to_batch(&mut batch);
+        netfilter::send_batch(&batch.finalize(),9)?;
+        let (receipt,plan)=takeover::capture_kernel(handle,"takeover-fixture".into(),json!({}),BTreeSet::new()).await?;
+        let config=&receipt.config;
+        assert!(!config.ipv6_enabled);
+        assert_eq!(config.interfaces.len(),5);
+        assert!(config.interfaces.iter().any(|link|link.name=="aux0" && link.kind=="dummy"));
+        assert!(config.interfaces.iter().any(|link|link.name=="tag20" && link.vlan.as_ref().is_some_and(|vlan|vlan.parent=="tag10")));
+        assert!(!config.interfaces.iter().any(|link|link.name=="foreign0"));
+        assert_eq!(config.dns["nic0"].servers,vec!["203.0.113.53"]);
+        assert!(config.dhcp_clients.contains_key("peer0"));
+        assert!(config.interfaces.iter().find(|link|link.name=="peer0").unwrap().addresses.is_empty());
+        assert_eq!(config.routes.len(),1,"report: {}",plan.report());
+        assert_eq!(config.firewall.policy,"drop");
+        assert_eq!(config.firewall.rules.len(),1,"report: {}",plan.report());
+        assert_eq!(config.firewall.rules[0].source,"192.0.2.0/24");
+        let input=config.firewall.input.as_ref().unwrap();
+        assert_eq!(input.policy,"drop");
+        let rules=&input.interfaces.iter().find(|link|link.interface=="nic0").unwrap().rules;
+        assert_eq!(rules.len(),1,"report: {}",plan.report());
+        assert_eq!(rules[0].destination_ports,vec![443]);
+        assert_eq!(config.firewall.nat.masquerade.len(),1,"report: {}",plan.report());
+        assert!(plan.items.iter().any(|item|item.resource.starts_with("firewall-rule:") && item.disposition=="disabled"));
+        assert!(plan.items.iter().any(|item|item.resource.starts_with("tcx:nic0:") && item.disposition=="disabled"));
+        let mut network=Network::parse(&config.operational_value()?)?;
+        takeover::enforce_kernel(handle,&network,false,&[],&BTreeSet::new()).await?;
+        networking::restore_interfaces(handle,&receipt.managed_originals()?).await?;
+        let rules=handle.rule().get(rtnetlink::IpVersion::V4).execute().try_collect::<Vec<_>>().await?;
+        assert!(rules.iter().all(takeover::standard_rule));
+        network.policy_rules.push(crate::model::Rule{source:"0.0.0.0/0".into(),priority:10006,table:10006});
+        for priority in [10006,10007] {
+            handle.rule().add().v4().priority(priority).table_id(priority).execute().await?;
+        }
+        for prefix in ["10.50.0.0","10.51.0.0"] {
+            handle.route().add().v4().destination_prefix(prefix.parse()?,16).output_interface(nic).protocol(RouteProtocol::Other(crate::model::PROTOCOL)).scope(RouteScope::Link).execute().await?;
+        }
+        takeover::enforce_kernel(handle,&network,true,&[],&BTreeSet::new()).await?;
+        let routes=handle.route().get(rtnetlink::IpVersion::V4).execute().try_collect::<Vec<_>>().await?;
+        assert_eq!(routes.iter().filter(|route|route.header.protocol==RouteProtocol::Other(crate::model::PROTOCOL)).count(),1);
+        assert_eq!(netfilter::host_firewall_snapshot()?.len(),0);
+        let links=networking::links(handle).await?;
+        let bridge=links.iter().find(|link|networking::name(link)=="foreign0").unwrap();
+        assert!(!bridge.header.flags.contains(&netlink_packet_route::link::LinkFlag::Up));
+        assert!(networking::addresses(handle,bridge.header.index).await?.is_empty());
+        let nic=links.iter().find(|link|networking::name(link)=="nic0").unwrap();
+        assert!(!nic.attributes.iter().any(|attr|matches!(attr,LinkAttribute::Controller(_))));
+        assert!(!nic.attributes.iter().any(|attr|matches!(attr,LinkAttribute::Xdp(values) if values.iter().any(|attr|matches!(attr,LinkXdp::ProgId(id) if *id!=0)))));
+        let rules=handle.rule().get(rtnetlink::IpVersion::V4).execute().try_collect::<Vec<_>>().await?;
+        assert!(rules.iter().all(|rule|takeover::standard_rule(rule) || networking::decode_rule(rule).is_ok_and(|rule|network.policy_rules.contains(&rule))));
+        assert!(networking::addresses(handle,peer).await?.iter().all(|message|message.header.family!=netlink_packet_route::AddressFamily::Inet));
+        assert!(fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")?.trim()=="1");
+        let nic_addresses=networking::addresses(handle,nic.header.index).await?;
+        assert!(nic_addresses.iter().any(|address|networking::address_string(address).is_ok_and(|value|value.as_deref()==Some("192.0.2.1/24"))));
+        let mut released=network.clone();
+        released.interfaces.retain(|link|!matches!(link.name.as_str(),"nic0"|"tag10"|"tag20"));
+        released.routes.clear();
+        released.policy_rules.clear();
+        handle.qdisc().add(i32::try_from(nic.header.index)?).ingress().execute().await?;
+        let readonly=["nic0".into()].into();
+        takeover::enforce_kernel(handle,&released,true,&[],&readonly).await?;
+        assert!(networking::addresses(handle,nic.header.index).await?.iter().any(|address|networking::address_string(address).is_ok_and(|value|value.as_deref()==Some("192.0.2.1/24"))));
+        let qdiscs=handle.qdisc().get().execute().try_collect::<Vec<_>>().await?;
+        assert!(qdiscs.iter().any(|qdisc|qdisc.header.index==i32::try_from(nic.header.index).unwrap() && qdisc.header.parent==netlink_packet_route::tc::TcHandle::INGRESS));
+        let (_,protected_plan)=takeover::capture_kernel(handle,"readonly-fixture".into(),json!({}),readonly).await?;
+        assert!(!protected_plan.items.iter().any(|item|item.resource.starts_with(&format!("traffic-control:{}:",nic.header.index))));
+        takeover::enforce_kernel(handle,&released,true,&[],&BTreeSet::new()).await?;
+        assert!(networking::addresses(handle,nic.header.index).await?.is_empty());
+        Ok(())
+    })
+    })
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated namespaces, pidfds and /bin/sleep fixture"]
+fn native_takeover_stops_only_same_namespace_competitors() -> Result<()> {
+    if !isolate_host_fixture(
+        "linux::host_integration::native_takeover_stops_only_same_namespace_competitors",
+    )? {
+        return Ok(());
+    }
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Child, Command},
+    };
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let directory = StateDirectory(
+        std::env::current_dir()?.join(format!(".native-takeover-process-{}", std::process::id())),
+    );
+    fs::DirBuilder::new().mode(0o700).create(&directory.0)?;
+    let executable = directory.0.join("dhclient");
+    fs::copy("/bin/sleep", &executable)?;
+    let mut same = ChildGuard(Command::new(&executable).arg("60").spawn()?);
+    let mut other = Command::new(&executable);
+    other.arg("60");
+    unsafe {
+        other.pre_exec(|| {
+            if libc::unshare(libc::CLONE_NEWNET) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut other = ChildGuard(other.spawn()?);
+    let processes = takeover_processes::capture()?;
+    assert!(processes.iter().any(|(pid, _)| *pid == same.0.id()));
+    assert!(!processes.iter().any(|(pid, _)| *pid == other.0.id()));
+    takeover_processes::disable()?;
+    assert!(!same.0.wait()?.success());
+    assert!(other.0.try_wait()?.is_none());
+    takeover_processes::disable()?;
+    Ok(())
+}
+
+pub(super) fn isolate_host_fixture(test_name: &str) -> Result<bool> {
     ensure!(
         std::env::var("NETCONTROL_INTEGRATION").as_deref() == Ok("1"),
         "set NETCONTROL_INTEGRATION=1; privileged tests never mutate the invoking namespace"
@@ -397,6 +599,143 @@ fn isolate_host_fixture(test_name: &str) -> Result<bool> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     }
     Ok(true)
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
+fn native_default_ipv6_policy_controls_empty_host_restart_and_future_links() -> Result<()> {
+    if !isolate_host_fixture(
+        "linux::host_integration::native_default_ipv6_policy_controls_empty_host_restart_and_future_links",
+    )? {
+        return Ok(());
+    }
+    let namespace = Arc::new(File::open("/proc/thread-self/ns/net")?);
+    session(namespace.clone(), |rt, handle| {
+        ipv6::set(true)?;
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .veth("nic0".into(), "peer0".into())
+                .execute()
+                .await?;
+            let link = handle
+                .link()
+                .get()
+                .match_name("nic0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("fixture NIC missing")?;
+            handle.link().set(link.header.index).up().execute().await?;
+            for address in ["192.0.2.1", "2001:db8::1"] {
+                let ip: std::net::IpAddr = address.parse()?;
+                let mut request =
+                    handle
+                        .address()
+                        .add(link.header.index, ip, if ip.is_ipv4() { 24 } else { 64 });
+                request
+                    .message_mut()
+                    .attributes
+                    .push(AddressAttribute::Flags(vec![AddressFlag::Nodad]));
+                request.execute().await?;
+            }
+            Ok(())
+        })
+    })?;
+    let directory = StateDirectory(std::env::current_dir()?.join(format!(
+        ".native-ipv6-default-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    )));
+    fs::DirBuilder::new().mode(0o700).create(&directory.0)?;
+    let options = NativeOptions {
+        namespace: String::new(),
+        keys: directory.0.join("keys"),
+        services_state: directory.0.join("services"),
+        adopted_parents: vec![],
+        allow_host_tunables: false,
+        allow_host_services: false,
+        gateway_monitoring: false,
+    };
+    let empty = Config::empty();
+    assert!(!empty.ipv6_enabled);
+    let mut native = Native::open(options.clone())?;
+    let mut imported = empty.clone();
+    imported.interfaces = serde_json::from_value(json!([{
+        "name":"nic0","kind":"ethernet","role":"unassigned","mtu":1500,"up":true,
+        "addresses":["192.0.2.1/24"]
+    }]))?;
+    let plan = Network::parse(&imported.operational_value()?)?;
+    let originals = session(namespace.clone(), move |rt, handle| {
+        rt.block_on(networking::capture_ethernet(handle, &plan, &plan))
+    })?;
+    let receipt: adoption::Receipt = serde_json::from_value(json!({
+        "scope":native.identity,"config":imported,"originals":originals,
+        "leases":{},"routes":[],"ownership_before":native.ownership()?,"complete":false
+    }))?;
+    let managed = receipt.managed_originals()?;
+    assert!(managed["nic0"].addresses.len() < receipt.originals["nic0"].addresses.len());
+    native.repair(&empty)?;
+    native.observe(&empty)?;
+    assert_eq!(native.runtime(&empty)?["ipv6"]["drift"], false);
+    session(namespace.clone(), |rt, handle| {
+        ipv6::verify(false)?;
+        rt.block_on(async {
+            handle
+                .link()
+                .add()
+                .dummy("future0".into())
+                .execute()
+                .await?;
+            for link in networking::links(handle).await? {
+                let addresses = networking::addresses(handle, link.header.index).await?;
+                assert!(
+                    addresses
+                        .iter()
+                        .all(|a| a.header.family != netlink_packet_route::AddressFamily::Inet6)
+                );
+                if networking::name(&link) == "nic0" {
+                    assert!(
+                        addresses
+                            .iter()
+                            .any(|a| networking::address_string(a).unwrap().as_deref()
+                                == Some("192.0.2.1/24"))
+                    );
+                }
+            }
+            Ok(())
+        })
+    })?;
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.repair(&empty)?;
+    native.observe(&empty)?;
+    let mut enabled = empty.clone();
+    enabled.ipv6_enabled = true;
+    native.apply(&empty, &enabled)?;
+    session(namespace, |rt, handle| {
+        ipv6::verify(true)?;
+        rt.block_on(async {
+            let nic = handle
+                .link()
+                .get()
+                .match_name("nic0".into())
+                .execute()
+                .try_next()
+                .await?
+                .context("fixture NIC missing")?;
+            assert!(
+                networking::addresses(handle, nic.header.index)
+                    .await?
+                    .iter()
+                    .any(|a| networking::address_string(a).unwrap().as_deref()
+                        == Some("2001:db8::1/64"))
+            );
+            Ok(())
+        })
+    })?;
+    Ok(())
 }
 
 #[test]
@@ -694,7 +1033,8 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     );
     let scope = native.scope()?;
     assert!(scope.starts_with("linux:host:"));
-    let empty = Config::empty();
+    let mut empty = Config::empty();
+    empty.ipv6_enabled = true;
     let unchanged_ownership = serde_json::to_value(native.ownership()?)?;
     let unchanged_firewall = session(namespace.clone(), |_, _| netfilter::fingerprint())?;
     let first = native.statistics(&empty, "/api/v1/statistics/performance", "")?;
@@ -770,10 +1110,8 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     let foreign_count = foreign_routes(namespace.clone())?;
     native.repair(&empty)?;
     assert_eq!(row(&mut native, "nic0")?, baseline);
-    assert_eq!(
-        session(namespace.clone(), |_, _| netfilter::fingerprint())?,
-        netfilter::empty_fingerprint()
-    );
+    let baseline_firewall = session(namespace.clone(), |_, _| netfilter::fingerprint())?;
+    assert_ne!(baseline_firewall, netfilter::empty_fingerprint());
 
     let mut value = serde_json::to_value(&empty)?;
     value["interfaces"] = json!([
@@ -819,7 +1157,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     assert!(!native.state.join("intent.json").exists());
     assert_eq!(
         session(namespace.clone(), |_, _| netfilter::fingerprint())?,
-        netfilter::empty_fingerprint()
+        baseline_firewall
     );
 
     native.apply(&empty, &desired)?;

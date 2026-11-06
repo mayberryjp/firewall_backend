@@ -70,6 +70,7 @@ fn loopback_role_and_addressing_are_readonly_inventory_only() {
 #[test]
 fn vnstat_collector_requires_explicit_valid_socket_address() {
     let mut config = candidate();
+    config.ipv6_enabled = true;
     config.vnstat.enabled = true;
     for address in ["192.0.2.10:9999", "127.0.0.1:9999", "[2001:db8::10]:9999"] {
         config.vnstat.collector = Some(address.into());
@@ -216,6 +217,7 @@ fn rule_origins_cover_filter_input_and_nat_without_changing_operational_identity
 #[test]
 fn destination_rewrite_exact_ports_local_targets_and_strict_schema() {
     let mut value = serde_json::to_value(candidate()).unwrap();
+    value["ipv6_enabled"] = json!(true);
     value["interfaces"].as_array_mut().unwrap().push(json!({
         "name":"wan0","kind":"dummy","role":"wan","up":true,"mtu":1500,
         "addresses":["198.51.100.1/24","2001:db8:1::1/64"]
@@ -314,6 +316,7 @@ fn destination_rewrite_exact_ports_local_targets_and_strict_schema() {
 #[test]
 fn blackhole_section_is_named_once_and_many_routes_may_target_it() {
     let mut config = candidate();
+    config.ipv6_enabled = true;
     let default_json = serde_json::to_value(&config).unwrap();
     assert!(default_json.get("blackhole").is_none());
     assert!(default_json.get("dynamic_dns").is_none());
@@ -636,6 +639,7 @@ fn mqtt_configuration_defaults_validation_and_no_inline_password() {
         ("broker.example.test".into(), 8883, true)
     );
     let mut ipv6 = config.clone();
+    ipv6.ipv6_enabled = true;
     ipv6.mqtt.endpoint = "mqtt://[2001:db8::1]".into();
     assert_eq!(
         ipv6.mqtt.broker().unwrap(),
@@ -766,6 +770,8 @@ fn static_route_enabled_controls_operational_projection() {
         1
     );
     config.routes[0].metric = 0;
+    config.validate().unwrap();
+    config.routes[0].metric = -1;
     assert!(config.validate().is_err());
 }
 
@@ -803,15 +809,15 @@ fn static_route_disabled_cannot_support_enabled_gateway_monitor() {
 
 #[test]
 fn global_ipv6_defaults_and_conflicting_configuration() {
-    assert!(Config::empty().ipv6_enabled);
+    assert!(!Config::empty().ipv6_enabled);
     assert!(
-        serde_json::from_value::<Config>(json!({}))
+        !serde_json::from_value::<Config>(json!({}))
             .unwrap()
             .ipv6_enabled
     );
     assert_eq!(
         serde_json::to_value(Config::empty()).unwrap()["ipv6_enabled"],
-        true
+        false
     );
     for invalid in [json!(null), json!("false"), json!(0)] {
         assert!(serde_json::from_value::<Config>(json!({"ipv6_enabled":invalid})).is_err());
@@ -1265,6 +1271,7 @@ fn vlan_cycles_identity_and_mtu_are_rejected() {
 fn wireguard_keys_endpoints_and_allowed_ips() {
     use base64::Engine as _;
     let mut c = candidate();
+    c.ipv6_enabled = true;
     let l = &mut c.interfaces[0];
     l.kind = "wireguard".into();
     l.wireguard = Some(WireGuard {

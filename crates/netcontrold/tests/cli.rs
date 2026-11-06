@@ -296,6 +296,7 @@ fn blackhole_routes_are_staged_with_ip_route_and_checked_against_the_named_secti
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();
     f.configure(&mut cli);
+    f.ok(&mut cli, "ipv6 enable");
     f.interface(&mut cli, "lan0");
     f.ok(
         &mut cli,
@@ -384,13 +385,13 @@ fn global_ipv6_cli_stages_checks_commits_and_rolls_back() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();
     f.configure(&mut cli);
-    f.ok(&mut cli, "ipv6 disable");
+    f.ok(&mut cli, "ipv6 enable");
     f.ok(&mut cli, "commit check");
-    assert_eq!(f.request("/api/v1/state")["desired"]["ipv6_enabled"], true);
-    f.ok(&mut cli, "commit confirmed 30 Disable IPv6");
-    assert_eq!(f.request("/api/v1/runtime")["ipv6"]["enabled"], false);
-    f.ok(&mut cli, "rollback");
+    assert_eq!(f.request("/api/v1/state")["desired"]["ipv6_enabled"], false);
+    f.ok(&mut cli, "commit confirmed 30 Enable IPv6");
     assert_eq!(f.request("/api/v1/runtime")["ipv6"]["enabled"], true);
+    f.ok(&mut cli, "rollback");
+    assert_eq!(f.request("/api/v1/runtime")["ipv6"]["enabled"], false);
     f.ok(&mut cli, "configure terminal");
     f.ok(&mut cli, "ipv6 disable");
     f.ok(&mut cli, "ipv6 enable");
@@ -647,6 +648,7 @@ fn ergonomic_interfaces_routes_policies_and_services_preserve_complete_config() 
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();
     f.configure(&mut cli);
+    f.ok(&mut cli, "ipv6 enable");
     f.interface(&mut cli, "uplink");
     f.ok(&mut cli, "interface uplink.10 vlan");
     f.ok(&mut cli, "vlan parent uplink");

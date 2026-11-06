@@ -533,7 +533,7 @@ PY
     fi
 done
 unset -f curl
-for scenario in valid wrong_version version_failure help_failure missing_option vlan_supported vlan_missing_parent vlan_missing_id vlan_unsupported; do
+for scenario in valid wrong_version version_failure help_failure missing_option missing_takeover vlan_supported vlan_missing_parent vlan_missing_id vlan_unsupported; do
     destination="$temporary/prebuilt-$scenario"
     mkdir "$destination"
     printf '2026.11.05.2\n' > "$destination/release-version"
@@ -547,6 +547,7 @@ case $1 in
     --help)
         [[ $prebuilt_scenario != help_failure ]] || exit 1
         printf '%s\n' --provision-wan NETCONTROL_ALLOW_HOST_SERVICES NETCONTROL_GATEWAY_MONITORING NETCONTROL_SSH_LISTEN NETCONTROL_UPGRADE_CONFIG
+        if [[ $prebuilt_scenario != missing_takeover ]]; then printf '%s\n' console-host-takeover; fi
         if [[ $prebuilt_scenario != missing_option ]]; then printf '%s\n' --configure-updates; fi
         if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_id ]]; then printf '%s\n' --provision-lan-parent; fi
         if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_parent ]]; then printf '%s\n' --provision-lan-vlan; fi ;;
@@ -580,8 +581,11 @@ systemctl() { trace="$trace systemctl $*;"; }
 configure_appliance_services() { trace+=' appliance-services;'; }
 configure_logging_units() { trace+=' logging-units;'; }
 configure_host_logging() { trace+=' host-logging;'; }
+configure_snap() { trace+=' snap;'; }
+configure_os_updates() { trace+=' os-updates;'; }
 configure_upgrade_settings() { trace+=' upgrade-settings;'; }
 install_systemd_service
+[[ $trace == ' os-updates; snap;'* ]]
 [[ $trace == *'install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys;'* ]]
 [[ $trace == *'install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service;'* ]]
 [[ $trace == *'systemctl daemon-reload;'* ]]
@@ -592,7 +596,7 @@ trace=''
 check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
-for failure_stage in upgrade_settings service_setup logging_units reload logging; do
+for failure_stage in os_updates snap upgrade_settings service_setup logging_units reload logging; do
     trace=''
     check_systemd_unit() { return 0; }
     configure_upgrade_settings() { trace+=' upgrade-settings;'; [[ $failure_stage != upgrade_settings ]]; }
@@ -600,7 +604,17 @@ for failure_stage in upgrade_settings service_setup logging_units reload logging
     configure_logging_units() { trace+=' logging-units;'; [[ $failure_stage != logging_units ]]; }
     systemctl() { trace+=" systemctl $*;"; [[ $failure_stage != reload ]]; }
     configure_host_logging() { trace+=' host-logging;'; return 1; }
+    configure_snap() { trace+=' snap;'; [[ $failure_stage != snap ]]; }
+    configure_os_updates() { trace+=' os-updates;'; [[ $failure_stage != os_updates ]]; }
     if install_systemd_service; then exit 1; fi
+    if [[ $failure_stage == os_updates ]]; then
+        [[ $trace == ' os-updates;' ]]
+        continue
+    fi
+    if [[ $failure_stage == snap ]]; then
+        [[ $trace == ' os-updates; snap;' ]]
+        continue
+    fi
     if [[ $failure_stage == upgrade_settings ]]; then
         [[ $trace != *'appliance-services;'* ]]
         continue
@@ -997,6 +1011,7 @@ for hardening_test_scenario in success simulation_failure service_failure purge_
         source ./hardening.sh
         hardening_units=(cups.service)
         hardening_packages=(cups)
+        hardening_configure_os_updates() { :; }
         hardening_test_backup="$temporary/hardening-$hardening_test_scenario"
         mkdir "$hardening_test_backup"
         systemctl() {
@@ -1066,3 +1081,201 @@ for hardening_test_scenario in success grub_failure first_grub_failure; do
     )
 done
 printf 'OS footprint preview, dependency guards, failure ordering and AppArmor boot-option tests passed (mocked host commands).\n'
+
+policy_cases=0
+for policy_profile in snap apt; do
+  for policy_process in install hardening; do
+    for policy_scenario in installed repeat absent missing_unit masked_active runtime_mask query_failure unknown_state disable_failure stop_failure mask_failure verify_failure still_active runtime_only active_job config_override shutdown_override config_query_failure write_failure unsafe_target existing_config; do
+        if [[ $policy_profile == snap ]]; then
+            case $policy_scenario in active_job|config_override|shutdown_override|config_query_failure|write_failure|unsafe_target|existing_config) continue ;; esac
+            policy_units=(snapd.service snapd.socket)
+        else
+            policy_units=(apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service)
+        fi
+        policy_cases=$((policy_cases + 1))
+        policy_missing_unit=${policy_units[1]}
+        policy_directory="$temporary/$policy_profile-$policy_process-$policy_scenario"
+        policy_target="$policy_directory/apt/99-netcontrol-no-automatic-updates"
+        mkdir -p "$policy_directory/apt"
+        : > "$policy_directory/commands"
+        if [[ $policy_scenario == existing_config ]]; then
+            printf 'APT::Periodic::Enable "1";\n' > "$policy_target"
+        elif [[ $policy_scenario == unsafe_target ]]; then
+            printf 'keep original\n' > "$policy_directory/original"
+            ln -s "$policy_directory/original" "$policy_target"
+        fi
+        if (
+            if [[ $policy_process == hardening ]]; then
+                source ./hardening.sh
+                hardening_unit_candidates=("${policy_units[@]}")
+                hardening_package_candidates=()
+                if [[ $policy_profile == snap ]]; then hardening_configure_os_updates() { :; }; fi
+                dpkg-query() { printf 'Unexpected package query.\n' >&2; return 1; }
+                apt-get() { printf 'Unexpected package mutation.\n' >&2; return 1; }
+            fi
+            apt-config() {
+                [[ $1 == dump ]] || return 1
+                [[ $policy_scenario != config_query_failure ]] || return 1
+                if [[ $policy_scenario == config_override ]]; then
+                    sed 's/Enable "0"/Enable "1"/' "$policy_target"
+                elif [[ $policy_scenario == shutdown_override ]]; then
+                    sed 's/InstallOnShutdown "false"/InstallOnShutdown "true"/' "$policy_target"
+                else
+                    cat "$policy_target"
+                fi
+            }
+            if [[ $policy_scenario == write_failure ]]; then mv() { return 1; }; fi
+            systemctl() {
+                printf '%s\n' "$*" >> "$policy_directory/commands"
+                local operation=$1 unit state active
+                shift
+                if [[ $operation == show ]]; then
+                    unit=$1
+                    [[ " ${policy_units[*]} " == *" $unit "* ]] || return 1
+                    if [[ $* == *LoadState* ]]; then
+                        case $policy_scenario in
+                            absent) printf 'not-found\n'; return 4 ;;
+                            missing_unit)
+                                if [[ $unit == "$policy_missing_unit" ]]; then printf 'not-found\n'; return 4; fi ;;
+                            query_failure) return 1 ;;
+                            unknown_state) printf 'error\n'; return 0 ;;
+                        esac
+                        if [[ -e $policy_directory/$unit.masked ||
+                              $policy_scenario == masked_active || $policy_scenario == runtime_mask ||
+                              $policy_scenario == stop_failure ]]; then
+                            printf 'masked\n'
+                        else
+                            printf 'loaded\n'
+                        fi
+                        return 0
+                    fi
+                    if [[ $policy_scenario == verify_failure && -e $policy_directory/$unit.masked ]]; then
+                        return 1
+                    fi
+                    active=active
+                    case $unit in
+                        apt-daily.service|apt-daily-upgrade.service)
+                            if [[ $policy_scenario != active_job ]]; then active=inactive; fi ;;
+                    esac
+                    if [[ -e $policy_directory/$unit.stopped && $policy_scenario != still_active ]]; then
+                        active=inactive
+                    fi
+                    state=enabled
+                    if [[ $policy_scenario == masked_active || $policy_scenario == stop_failure ]]; then
+                        state=masked
+                    elif [[ $policy_scenario == runtime_mask ]]; then
+                        state=masked-runtime
+                    fi
+                    if [[ -e $policy_directory/$unit.masked ]]; then
+                        if [[ $policy_scenario == runtime_only ]]; then state=masked-runtime; else state=masked; fi
+                    fi
+                    printf 'ActiveState=%s\nUnitFileState=%s\n' "$active" "$state"
+                    return 0
+                fi
+                if [[ $operation == disable ]]; then
+                    if [[ $1 == --now ]]; then
+                        shift
+                        for unit in "$@"; do
+                            [[ $unit != apt-daily.service && $unit != apt-daily-upgrade.service ]] || {
+                                printf 'APT job would be forcibly stopped.\n' >&2; return 1;
+                            }
+                        done
+                    fi
+                fi
+                for unit in "$@"; do
+                    [[ " ${policy_units[*]} " == *" $unit "* ]] || return 1
+                    case $operation in
+                        disable)
+                            [[ $policy_scenario != disable_failure ]] || return 1
+                            case $unit in
+                                apt-daily.service|apt-daily-upgrade.service) ;;
+                                *) : > "$policy_directory/$unit.stopped" ;;
+                            esac ;;
+                        stop)
+                            [[ $unit != apt-daily.service && $unit != apt-daily-upgrade.service ]] || return 1
+                            [[ $policy_scenario != stop_failure ]] || return 1
+                            : > "$policy_directory/$unit.stopped" ;;
+                        mask)
+                            [[ $policy_scenario != mask_failure ]] || return 1
+                            : > "$policy_directory/$unit.masked" ;;
+                        *) printf 'Unexpected policy command: %s\n' "$operation" >&2; return 1 ;;
+                    esac
+                done
+            }
+            if [[ $policy_process == install ]]; then
+                if [[ $policy_profile == snap ]]; then
+                    configure_snap || exit 1
+                    if [[ $policy_scenario == repeat ]]; then configure_snap || exit 1; fi
+                else
+                    configure_os_updates "$policy_directory/apt" || exit 1
+                    if [[ $policy_scenario == repeat ]]; then configure_os_updates "$policy_directory/apt" || exit 1; fi
+                fi
+            else
+                hardening_plan || exit 1
+                ! grep -Eq '^(disable|stop|mask) ' "$policy_directory/commands" || exit 1
+                [[ ! -e $policy_target || $policy_scenario == existing_config || $policy_scenario == unsafe_target ]] || exit 1
+                mkdir "$policy_directory/backup"
+                hardening_apply_plan "$policy_directory/backup" false "$policy_directory/apt" || exit 1
+                if [[ $policy_scenario == repeat ]]; then
+                    hardening_plan || exit 1
+                    mkdir "$policy_directory/repeated-backup"
+                    hardening_apply_plan "$policy_directory/repeated-backup" false "$policy_directory/apt" || exit 1
+                fi
+            fi
+        ); then
+            case $policy_scenario in installed|repeat|absent|missing_unit|masked_active|runtime_mask|existing_config) ;; *) exit 1 ;; esac
+            if [[ $policy_scenario == absent ]]; then
+                ! grep -Eq '^(disable|stop|mask) ' "$policy_directory/commands"
+            else
+                for policy_unit in "${policy_units[@]}"; do
+                    if [[ $policy_scenario == missing_unit && $policy_unit == "$policy_missing_unit" ]]; then
+                        [[ ! -e $policy_directory/$policy_unit.masked ]]
+                        continue
+                    fi
+                    [[ -e $policy_directory/$policy_unit.masked ]]
+                    case $policy_unit in
+                        apt-daily.service|apt-daily-upgrade.service) expected_active=inactive ;;
+                        *) expected_active=active; [[ -e $policy_directory/$policy_unit.stopped ]] ;;
+                    esac
+                    if [[ $policy_process == hardening ]]; then
+                        grep -Fxq "ActiveState=$expected_active" "$policy_directory/backup/$policy_unit.state"
+                    fi
+                done
+            fi
+            if [[ $policy_profile == apt ]]; then
+                parsed=$(command apt-config -c "$policy_target" dump)
+                for key in Enable Update-Package-Lists Download-Upgradeable-Packages Unattended-Upgrade; do
+                    grep -Fxq "APT::Periodic::$key \"0\";" "$policy_target"
+                    grep -Fxq "APT::Periodic::$key \"0\";" <<< "$parsed"
+                done
+                [[ $(stat -c '%a' "$policy_target") == 644 ]]
+                grep -Fxq 'Unattended-Upgrade::InstallOnShutdown "false";' "$policy_target"
+                grep -Fxq 'Unattended-Upgrade::InstallOnShutdown "false";' <<< "$parsed"
+                if [[ $policy_process == hardening ]]; then
+                    if [[ $policy_scenario == existing_config ]]; then
+                        grep -Fxq 'APT::Periodic::Enable "1";' "$policy_directory/backup/apt-periodic.conf"
+                        [[ $(< "$policy_directory/backup/apt-periodic.state") == present ]]
+                    else
+                        [[ $(< "$policy_directory/backup/apt-periodic.state") == absent ]]
+                    fi
+                fi
+            fi
+        else
+            case $policy_scenario in installed|repeat|absent|missing_unit|masked_active|runtime_mask|existing_config) exit 1 ;; esac
+            if [[ $policy_scenario == query_failure || $policy_scenario == unknown_state ]]; then
+                ! grep -Eq '^(disable|stop|mask) ' "$policy_directory/commands"
+            fi
+            if [[ $policy_scenario == disable_failure || $policy_scenario == stop_failure ]]; then
+                ! grep -q '^mask ' "$policy_directory/commands"
+            fi
+            if [[ $policy_scenario == active_job || $policy_scenario == write_failure ]]; then [[ ! -e $policy_target ]]; fi
+            if [[ $policy_scenario == unsafe_target ]]; then [[ $(< "$policy_directory/original") == 'keep original' ]]; fi
+        fi
+        if [[ $policy_profile == apt ]]; then
+            ! grep -Eq '^(stop|disable --now).*apt-daily(-upgrade)?\.service' "$policy_directory/commands"
+        fi
+        [[ -z $(find "$policy_directory/apt" -maxdepth 1 -name '.automatic-updates.*' -print) ]]
+    done
+  done
+done
+printf 'Snap/APT install/hardening preview, persistent masks, periodic config, active-job safety, backups and failure tests passed (%s scenarios; mocked systemd, real APT config parser; no package/data removal).\n' "$policy_cases"

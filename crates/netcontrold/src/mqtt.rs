@@ -1048,8 +1048,13 @@ fn telemetry(
                    value: Value,
                    unit: Option<&str>,
                    class: Option<&str>| {
+        let missing = if unit.is_some() || class.is_some() {
+            "None"
+        } else {
+            "unknown"
+        };
         let mut component = json!({"platform":"sensor","name":name,"unique_id":format!("netcontrol_{device_id}_{key}"),
-            "value_template":format!("{{{{ value_json.metrics.get('{key}') if value_json.metrics.get('{key}') is not none else 'unknown' }}}}"),
+            "value_template":format!("{{{{ value_json.metrics.get('{key}') if value_json.metrics.get('{key}') is not none else '{missing}' }}}}"),
             "expire_after":config.interval_seconds * 3});
         if let Some(unit) = unit {
             component["unit_of_measurement"] = json!(unit);
@@ -2872,6 +2877,81 @@ mod tests {
         .unwrap();
         assert!(state["metrics"][metric_key("link", "local_tcp", "rtt_p95_ms")].is_null());
         assert!(state["metrics"][metric_key("link", "monitor", "signal_count")].is_null());
+    }
+
+    #[test]
+    fn mqtt_numeric_discovery_uses_none_without_changing_samples_or_text() {
+        let cases = [
+            (
+                "counter_null",
+                Value::Null,
+                None,
+                Some("total_increasing"),
+                "None",
+            ),
+            ("unit_null", Value::Null, Some("B"), None, "None"),
+            ("zero", json!(0), None, Some("measurement"), "None"),
+            (
+                "fraction",
+                json!(1.25),
+                Some("ms"),
+                Some("measurement"),
+                "None",
+            ),
+            (
+                "negative",
+                json!(-2.5),
+                Some("ms"),
+                Some("measurement"),
+                "None",
+            ),
+            (
+                "maximum_counter",
+                json!("18446744073709551615"),
+                None,
+                Some("total_increasing"),
+                "None",
+            ),
+            ("text_null", Value::Null, None, None, "unknown"),
+            ("text_false", json!(false), None, None, "unknown"),
+            ("text_status", json!("running"), None, None, "unknown"),
+        ];
+        let mut host = crate::mqtt_host::HostSensors::default();
+        for (key, value, unit, class, _) in &cases {
+            crate::mqtt_host::push(&mut host.sensors, *key, *key, value.clone(), *unit, *class);
+        }
+        let (discovery, mut state) = telemetry(
+            "0123456789abcdef0123456789abcdef",
+            &MQTTConfig::default(),
+            test_revision(42),
+            60,
+            &json!({"interfaces":[]}),
+            &host,
+        )
+        .unwrap();
+        let publications =
+            telemetry_publications("0123456789abcdef0123456789abcdef", &discovery, &state).unwrap();
+        let published_discovery: Value = serde_json::from_slice(&publications.discovery.1).unwrap();
+        let published_state: Value = serde_json::from_slice(&publications.state.1).unwrap();
+        for (key, value, _, _, missing) in &cases {
+            assert_eq!(
+                published_discovery["components"][key]["value_template"],
+                format!(
+                    "{{{{ value_json.metrics.get('{key}') if value_json.metrics.get('{key}') is not none else '{missing}' }}}}"
+                )
+            );
+            assert_eq!(&published_state["metrics"][key], value);
+        }
+        state["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("counter_null");
+        let absent =
+            telemetry_publications("0123456789abcdef0123456789abcdef", &discovery, &state).unwrap();
+        let absent_discovery: Value = serde_json::from_slice(&absent.discovery.1).unwrap();
+        let absent_state: Value = serde_json::from_slice(&absent.state.1).unwrap();
+        assert_eq!(absent_discovery, published_discovery);
+        assert!(absent_state["metrics"].get("counter_null").is_none());
     }
 
     #[test]

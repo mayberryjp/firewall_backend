@@ -296,7 +296,7 @@ remain separate from the isolated veth fixtures.
 
 ## Global IPv6 policy
 
-The persisted top-level `ipv6_enabled` switch defaults to true. Native startup
+The persisted top-level `ipv6_enabled` switch defaults to false. Native startup
 and transactional apply enforce `net.ipv6.conf.{all,default}.disable_ipv6` and
 all current per-interface controls, including loopback/unmanaged devices, in
 the managed namespace. Disabled is `1`; enabled is `0`. New devices inherit the
@@ -453,29 +453,41 @@ addresses are not resurrected, and backward wall-clock changes cause an error
 instead of extending a finite lease. External DHCP/network managers must not
 race changes to selected interfaces.
 
-Explicit initial provisioning inherits physical NICs into an otherwise unused core
-journal with role `unassigned`; it does not recapture configured state. Handover
-currently requires networkd/resolved and live finite DHCPv4 leases, preserving
-client identity rather than persisting a lease as static configuration. The
-private adoption receipt records original NIC snapshots/routes; matching per-NIC
-networkd ownership files make those interfaces unmanaged before Netcontrol
-starts its in-process clients. Existing OS/supplicant configuration remains.
+Explicit initial provisioning imports supported Ethernet/veth, dummy and VLAN
+topology, static IPv4, routes, DNS, DHCPv4 and representable nftables policy as
+owned configuration. Finite addresses are never saved as static leases;
+networkd and active NetworkManager sources support unleased clients. Existing
+configured journals are not recaptured. The private adoption receipt precedes
+mutation and retains raw captures, desired import, decisions and retry status.
+Unsupported links/routes/policy rules, foreign nftables, legacy xtables, custom
+qdiscs, XDP and TCX are disabled. Known competing systemd units are persistently
+masked/stopped and same-namespace standalone competitors terminated by pidfd.
+Netcontrol/resolved/SSH/Wi-Fi authentication and original OS files remain.
+IPv6 is disabled initially, including DHCPv6/SLAAC and IPv6 routes/DNS.
+This is console-only takeover, without connectivity rollback; partial failures
+retain capture and an explicit failed phase for correction/retry. Native
+`host_takeover` runtime reports decisions but never raw captures. Provisioning
+preserves the import except selected WAN/LAN roles and explicit LAN addressing.
+Explicit later VLAN adoption retains its separate networkd restrictions and
+normal confirmed transactions; it is not another host recapture.
 See [installation prerequisites and acceptance limits](../../docs/BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
 
-Ownership exclusions are non-secret root-owned `0644` files so the
+Explicit VLAN/selected-interface ownership exclusions are non-secret root-owned `0644` files so the
 `systemd-network` service account can read them. Temporary files remain `0600`
 while written, then become `0644` before fsync/publication; matched existing
 receipt files receive the same readable mode on retry. This does not relax
 private receipt/lease permissions. An unsuccessful ownership check includes the
 observed administrative state, selected network file and expected override.
 
-Physical inheritance and explicit VLAN adoption share the same active takeover:
+Targeted Ethernet/VLAN ownership uses active handover:
 check identity, install networkd exclusions, restore captured address/MTU/up
 settings and verify the resulting configuration. Address verification ignores
 kernel timestamps and dump ordering, ages finite leases and rejects actual
 lifetime changes (allowing one second of kernel/capture rounding).
 
-On restart, host interfaces that remain in durable native ownership
+With a host takeover receipt, startup instead reasserts the saved console
+takeover plan and its global manager/unsupported-feature controls.
+Without that receipt, host interfaces that remain in durable native ownership
 have their identities checked and their networkd exclusions reasserted before
 interrupted-operation recovery, DHCP startup or resolver publication. Missing
 exclusions are recreated; conflicting files still fail explicitly. This prevents
@@ -710,10 +722,10 @@ The durable ownership file stores the firewall configuration and a lossless
 read-only kernel fingerprint, excluding dynamic handles/use counts but including
 chain policies, full expressions and ordering. Sets, objects and flowtables in
 the owned table are rejected. An existing table without durable ownership is
-never adopted. Fresh host startup with empty desired configuration performs only
-verification/discovery and starts no firewall table. The first transaction owns
-its table; failed first bootstrap removes it again. Explicit isolated-lab repair
-can bootstrap the empty current firewall contract.
+never adopted. Startup repair now reconciles even empty desired configuration:
+it disables IPv6 by default and bootstraps the owned firewall table through a
+durable intent. Opening the backend or reading discovery alone remains passive.
+Failed first bootstrap removes the table again. Foreign tables remain untouched.
 
 Sysctls use a strict per-scope allowlist, canonical bounded values, procfs
 verification, and already-loaded congestion algorithms only. Original values are

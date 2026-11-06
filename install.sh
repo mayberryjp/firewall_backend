@@ -84,6 +84,95 @@ configure_deny_logging() (
     printf 'Firewall deny-log and rule-accounting kernel modules enabled for boot; telemetry remains separate from configuration.\n'
 )
 
+configure_masked_units() (
+    set -euo pipefail
+    local label=$1 unit state status
+    shift
+    local -a loaded=() masked=() present=() jobs=()
+    for unit in "$@"; do
+        if ! state=$(systemctl show "$unit" --property LoadState --value); then
+            [[ $state == not-found ]] || {
+                printf 'Cannot inspect %s unit %s.\n' "$label" "$unit" >&2
+                exit 1
+            }
+        fi
+        case $state in
+            loaded)
+                case $unit in
+                    apt-daily.service|apt-daily-upgrade.service) jobs+=("$unit") ;;
+                    *) loaded+=("$unit") ;;
+                esac
+                present+=("$unit") ;;
+            masked) masked+=("$unit"); present+=("$unit") ;;
+            not-found) ;;
+            *) printf 'Unsupported %s unit state for %s: %s\n' "$label" "$unit" "$state" >&2; exit 1 ;;
+        esac
+    done
+    if [[ ${#present[@]} -eq 0 ]]; then
+        printf '%s units absent; nothing to mask.\n' "$label"
+        exit 0
+    fi
+    printf 'Disabling and persistently masking %s units; packages and data are retained.\n' "$label"
+    if [[ ${#loaded[@]} -gt 0 ]]; then
+        systemctl disable --now "${loaded[@]}" || exit 1
+    fi
+    for unit in "${masked[@]}"; do
+        case $unit in
+            apt-daily.service|apt-daily-upgrade.service) ;;
+            *) systemctl stop "$unit" || exit 1 ;;
+        esac
+    done
+    if [[ ${#jobs[@]} -gt 0 ]]; then systemctl disable "${jobs[@]}" || exit 1; fi
+    systemctl mask "${present[@]}" || exit 1
+    for unit in "${present[@]}"; do
+        status=$(systemctl show "$unit" --property ActiveState --property UnitFileState) || exit 1
+        if ! grep -Fxq 'UnitFileState=masked' <<< "$status" ||
+           ! grep -Eq '^ActiveState=(inactive|failed)$' <<< "$status"; then
+            printf '%s unit %s is not stopped and persistently masked.\n' "$label" "$unit" >&2
+            case $unit in
+                apt-daily.service|apt-daily-upgrade.service)
+                    printf 'Wait for the running APT job to finish, then retry; APT jobs are never forcibly stopped.\n' >&2 ;;
+            esac
+            exit 1
+        fi
+    done
+)
+
+configure_snap() {
+    configure_masked_units Snap snapd.service snapd.socket
+}
+
+configure_os_updates() (
+    set -euo pipefail
+    local directory=${1:-/etc/apt/apt.conf.d} staged='' configuration key
+    local target="$directory/99-netcontrol-no-automatic-updates"
+    [[ ! -L $directory && ( ! -e $directory || -d $directory ) &&
+       ! -L $target && ( ! -e $target || -f $target ) ]] || {
+        printf 'Refusing non-regular automatic APT configuration: %s\n' "$target" >&2; exit 1;
+    }
+    printf 'WARNING: automatic APT checks, downloads and installation, including security updates, will be disabled. Schedule manual patching.\n'
+    configure_masked_units APT apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service || exit 1
+    install -d -o root -g root -m 0755 "$directory" || exit 1
+    staged=$(mktemp "$directory/.automatic-updates.XXXXXX") || exit 1
+    trap '[[ -z $staged ]] || rm -f -- "$staged"' EXIT
+    for key in Enable Update-Package-Lists Download-Upgradeable-Packages Unattended-Upgrade; do
+        printf 'APT::Periodic::%s "0";\n' "$key"
+    done > "$staged" || exit 1
+    printf 'Unattended-Upgrade::InstallOnShutdown "false";\n' >> "$staged" || exit 1
+    chmod 0644 "$staged" || exit 1
+    mv -fT -- "$staged" "$target" || exit 1
+    configuration=$(apt-config dump) || exit 1
+    for key in Enable Update-Package-Lists Download-Upgradeable-Packages Unattended-Upgrade; do
+        grep -Fxq "APT::Periodic::$key \"0\";" <<< "$configuration" || {
+            printf 'Effective APT periodic setting %s is not disabled; inspect APT configuration precedence.\n' "$key" >&2; exit 1;
+        }
+    done
+    grep -Fxq 'Unattended-Upgrade::InstallOnShutdown "false";' <<< "$configuration" || {
+        printf 'Effective unattended upgrade on shutdown is not disabled; inspect APT configuration precedence.\n' >&2; exit 1;
+    }
+    printf 'Automatic APT updates disabled; manual apt-get update/upgrade and Netcontrol release checks remain available.\n'
+)
+
 configure_appliance_services() (
     set -euo pipefail
     local directory=${1:-/etc/systemd/system/netcontrold.service.d}
@@ -204,6 +293,8 @@ configure_upgrade_settings() {
 
 install_systemd_service() {
     check_systemd_unit || return 1
+    configure_os_updates || return 1
+    configure_snap || return 1
     install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys || return 1
     install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service || return 1
     configure_upgrade_settings || return 1
@@ -271,7 +362,7 @@ prompt_appliance_lan() {
     wan=${wan:-$default_wan}
     if [[ $default_lan == "$wan" ]]; then default_lan=$default_wan; fi
     select_appliance_ports "$wan" "${lan:-$default_lan}" "$directory" "$vlan_table" >/dev/null || return 1
-    printf 'WAN interface: %s (DHCP). Use --wan NAME to change it.\n' "$wan" >&2
+    printf 'WAN interface: %s (retain imported settings; DHCP if empty). Use --wan NAME to change it.\n' "$wan" >&2
     if [[ -z $lan ]]; then
         printf 'Available LAN interfaces:\n' >&2
         local path name details parent id
@@ -470,6 +561,7 @@ check_prebuilt() (
     fi
     help=$(./netcontrold --help) || exit 1
     if ! grep -q -- --provision-wan <<< "$help" ||
+       ! grep -q console-host-takeover <<< "$help" ||
        ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
        ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help" ||
        ! grep -q NETCONTROL_SSH_LISTEN <<< "$help" ||
@@ -515,7 +607,8 @@ check_fresh_installation() {
 main() {
     local wan='' lan='' lan_address='' ports
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash install.sh [--wan WAN_NIC] [--lan LAN_INTERFACE] [--lan-address CIDR]\nDownloads the latest stable Ubuntu amd64 release over verified HTTPS; no CI run ID or GitHub login is needed.\nInteractive installs prompt for missing LAN interface and IPv4 address/prefix. Noninteractive installs must supply --lan and --lan-address. WAN defaults to the first physical Ethernet port in natural name order; prompt suggestions are the second physical port and 192.168.0.1/24. LAN can be a physical Ethernet port or an existing VLAN on another physical port (use vlan50, not vlan50@enp2s0). VLAN LAN requires a release with tagged provisioning support and safe ownership handoff. LAN allows all traffic, WAN denies unsolicited inbound, LAN-to-WAN traffic is NATed. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Saved configuration controls which workers run. Requires console access and networkd/resolved. LAN clients need static addressing; no DHCP server is installed.\n'
+        printf 'WARNING: fresh installation disables automatic APT checks, downloads and installation, INCLUDING SECURITY UPDATES, using persistent apt-daily/apt-daily-upgrade timer/service masks and APT periodic/shutdown configuration. Active APT jobs are not forcibly stopped; wait for completion and retry if verification fails. Manual apt-get update/upgrade and Netcontrol release checks remain available; schedule manual OS patching.\n'
+        printf 'Usage: bash install.sh [--wan WAN_NIC] [--lan LAN_INTERFACE] [--lan-address CIDR]\nDownloads the latest stable Ubuntu amd64 release over verified HTTPS; no CI run ID or GitHub login is needed.\nInteractive installs prompt for missing LAN interface and IPv4 address/prefix. Noninteractive installs must supply --lan and --lan-address. WAN defaults to the first physical Ethernet port in natural name order; prompt suggestions are the second physical port and 192.168.0.1/24. LAN can be a physical Ethernet port or an existing VLAN on another physical port (use vlan50, not vlan50@enp2s0). Requires a console-host-takeover release. Aggressively imports supported host networking as owned settings and disables unsupported networking/competing managers. Preserves static WAN, routes, DNS, MTU, firewall and other imported interfaces; DHCP is selected only for an empty WAN. Sets WAN/LAN roles and explicit LAN addressing. No connectivity-confirmation rollback or WAN-readiness timer. Review imported input/forwarding/NAT rules from console; factory allow-all/NAT policy is not automatically substituted. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Stops/disables and persistently masks installed snapd.service and snapd.socket; absent units are skipped and Snap packages/data are retained. Review Snap-dependent workloads before installation. Saved configuration controls which workers run. Requires console access, systemd/resolved and root network/BPF privileges. LAN clients need static addressing; no DHCP server is installed.\n'
         return
     fi
     while [[ $# -gt 0 ]]; do
@@ -571,7 +664,7 @@ main() {
     }
     ports=$(select_appliance_ports "$wan" "$lan") || return 1
     read -r wan lan <<< "$ports"
-    printf 'Selected WAN: %s (DHCP); LAN: %s (%s).\n' "$wan" "$lan" "$lan_address"
+    printf 'Selected WAN: %s (retain imported settings; DHCP if empty); LAN: %s (%s). Console takeover has no connectivity rollback.\n' "$wan" "$lan" "$lan_address"
     systemctl is-active --quiet systemd-networkd.service || return 1
     systemctl is-active --quiet systemd-resolved.service || return 1
     apt-get update
@@ -593,9 +686,9 @@ main() {
     configure_deny_logging || return 1
     install -d -m 0755 /usr/local/sbin
     install -m 0755 netcontrold /usr/local/sbin/netcontrold
-    install_systemd_service
+    install_systemd_service || return 1
     provision_appliance /usr/local/sbin/netcontrold "$wan" "$lan" "$lan_address"
-    printf 'Provisioned IPv4 firewall: LAN %s (%s), WAN %s, LAN-to-WAN forwarding and masquerade. Service enabled at boot.\nManagement: http://%s:8080/ (complete onboarding from LAN).\nConfiguration SSH: TCP 2222, username apikey, password is an API key generated after onboarding; no OS shell or separate sshd.\nLAN clients need addresses in this subnet and this appliance as gateway; no DHCP/DNS server was installed.\nLogs: journalctl -u netcontrold -f\n' "$lan" "$lan_address" "$wan" "${lan_address%/*}"
+    printf 'Provisioned owned networking: LAN %s (%s), WAN %s; imported firewall/routes/DNS retained. Review forwarding, input and NAT policy from console. Service enabled at boot.\nManagement: http://%s:8080/ (complete onboarding from LAN).\nConfiguration SSH: TCP 2222, username apikey, password is an API key generated after onboarding; no OS shell or separate sshd.\nLAN clients need addresses in this subnet and this appliance as gateway; no DHCP/DNS server was installed.\nLogs: journalctl -u netcontrold -f\n' "$lan" "$lan_address" "$wan" "${lan_address%/*}"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

@@ -4,6 +4,51 @@
 
 ### Changed
 
+- Aggressive console-only initial host takeover imports supported interfaces,
+  IPv4/routes/DHCP/DNS and nftables policy as owned configuration. Disable
+  unsupported topology/routing/firewall/traffic control/XDP/TCX and known
+  competing managers/processes; persist private capture and explicit runtime
+  decisions/failure status. Provisioning preserves the import instead of
+  replacing it with factory policy, with durable interruption recovery and no
+  WAN-connectivity timer. Local transaction deadlines are nullable; normal
+  HTTP/SSH confirmation remains required. Static-route metric zero is supported.
+  Release impact: breaking takeover/provisioning/runtime contract, Unreleased;
+  next automatic calendar version.
+  [Handoff 2026-11-07-04](docs/frontend-handoffs/2026-11-07.md#2026-11-07-04-aggressive-console-host-takeover).
+
+- IPv6 is disabled by default for omitted configuration, fresh installation and
+  factory reset across core/native/workers. Initial physical takeover keeps
+  DHCPv4 from dual-stack networkd modes and excludes IPv6 addresses/routes/DNS
+  instead of refusing DHCPv6/SLAAC. Preserve original rollback capture without
+  resurrecting IPv6 in the managed release baseline. Empty-host startup repair
+  now enforces the policy and bootstraps its owned firewall through a durable
+  intent. Explicit saved IPv6 enablement is preserved. The subsequent aggressive
+  takeover entry above supersedes this task's original remaining-gap inventory.
+  Release impact: breaking default/startup/takeover contract, Unreleased; next
+  automatic calendar version.
+  [Handoff 2026-11-07-03](docs/frontend-handoffs/2026-11-07.md#2026-11-07-03-ipv6-disabled-by-default-and-initial-takeover).
+
+- Fresh Ubuntu installation and explicit hardening apply disable automatic APT
+  checks, downloads and installations, including security updates. Persistently
+  mask present daily timers/services without interrupting active APT jobs; write
+  and verify periodic/shutdown settings, preserve manual APT access, and retain
+  prior hardening unit/configuration records. Operators must schedule OS patching;
+  Netcontrol release checks and ordinary daemon upgrades are unchanged.
+  Release impact: breaking install/hardening deployment-policy change, Unreleased;
+  next automatic calendar version.
+  [Deployment handoff 2026-11-07-02](docs/frontend-handoffs/2026-11-07.md#2026-11-07-02-disable-automatic-ubuntu-apt-updates).
+
+- Fresh Ubuntu installation and explicit hardening apply stop/disable and
+  persistently mask installed Snap service/socket units, verify stopped/masked
+  state, handle absent/already-masked units and fail explicitly on systemd errors.
+  Hardening preview remains read-only and records present Snap units before apply.
+  Snap packages/data are retained; separate Snap application units are not
+  explicitly stopped. Snap management/refreshes are blocked; the separate APT
+  policy above also applies. Ordinary upgrades do not apply these host policies.
+  Release impact: breaking install/hardening deployment-policy change, Unreleased;
+  next automatic calendar version.
+  [Deployment handoff 2026-11-07-01](docs/frontend-handoffs/2026-11-07.md#2026-11-07-01-snap-service-disablement-during-install-and-hardening).
+
 - MQTT telemetry consolidates back to one retained Home Assistant device-discovery
   message and one complete state message, replacing split sensor/metric/section
   publications. Raise each payload cap from 1 MiB to the selected 32 MiB, with
@@ -39,6 +84,14 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- MQTT Home Assistant discovery renders missing/null numeric measurements as
+  `None`, rather than the rejected literal `unknown`. Preserve JSON null/absent
+  measurements, real zeroes, fractional/negative readings, exact counter strings
+  and text-sensor fallback; no topic splitting, broker mutation or old-discovery
+  cleanup. Release impact: MQTT discovery contract fix, Unreleased; next automatic
+  calendar version. Deploy/reannounce corrected discovery and verify HA ingestion:
+  [handoff 2026-11-07-05](docs/frontend-handoffs/2026-11-07.md#2026-11-07-05-home-assistant-unknown-numeric-measurements).
 
 - Enabling DHCPv4 relay derives narrowly scoped client/server input permissions
   in the native atomic firewall transaction, avoiding silent default-input drops

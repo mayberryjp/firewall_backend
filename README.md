@@ -422,7 +422,19 @@ incompatible and are refused without deletion, reset or automatic conversion.
 
 For optional Ubuntu OS footprint reduction, start with `sudo bash hardening.sh`
 to preview the explicit service/package profile. Nothing changes without
-`--apply`. AppArmor remains enabled unless `--disable-apparmor` is explicitly
+`--apply`. Fresh installation and hardening apply both stop/disable and
+persistently mask installed `snapd.service` and `snapd.socket`, verifying that
+they are inactive/failed and persistently masked. Absent units are skipped;
+Snap packages/data and separate application units are not removed. Snap
+management and refreshes are blocked, so review Snap-dependent workloads first.
+Fresh installation and hardening also disable Ubuntu's automatic APT checks, downloads and installs,
+**including automatic security updates**, with persistent timer/service masks
+and verified APT periodic/shutdown settings. Manual `apt-get update`/`upgrade`
+and Netcontrol release checks remain available; operators must schedule OS
+patching. Running APT jobs are never forcibly stopped; wait for completion and
+retry if verification fails. Binary/source upgrades alone do not apply these
+host policies; existing hosts can use the reviewed hardening workflow.
+AppArmor remains enabled unless `--disable-apparmor` is explicitly
 selected; that protection opt-out requires GRUB and a later manual reboot.
 See [scope and recovery](docs/BUILD_AND_INSTALL.md#ubuntu-os-footprint-reduction).
 
@@ -748,10 +760,10 @@ See [the routing contract](FRONTEND_SPEC.md#65-source-policy-routing).
 
 ### Global IPv6 policy
 
-The top-level `ipv6_enabled` boolean defaults to `true`, including fresh
-installation and factory configuration. Set `"ipv6_enabled": false` in the
+The top-level `ipv6_enabled` boolean defaults to `false`, including fresh
+installation and factory configuration. Set `"ipv6_enabled": true` in the
 complete configuration submitted through the normal confirmed transaction
-workflow, or stage `ipv6 disable` in the configuration CLI. Changing it requires
+workflow to enable IPv6, or stage `ipv6 enable` in the configuration CLI. Changing it requires
 `kernel.namespace.write` as well as `transactions.write`.
 
 On Linux, disabling writes and verifies `net.ipv6.conf.default.disable_ipv6=1`,
@@ -801,20 +813,19 @@ edits:
 Do not treat `202 Accepted` as a committed revision. An uncertain HTTP write
 must be reconciled through transaction reads, not blindly retried.
 Managed interfaces require an explicit `wan`, `lan`, or `unassigned` role; roles do not automatically
-rewrite policy. The Ubuntu appliance installer explicitly provisions those roles,
-a static LAN address, LAN-to-WAN forwarding, and IPv4 masquerade. First-install
-provisioning and explicit factory reset enable `firewall.allow_all_icmp`, accepting
+rewrite policy. The Ubuntu appliance installer sets those roles and a static
+LAN address while retaining imported supported policy. Explicit factory reset
+installs factory LAN-to-WAN forwarding/masquerade and enables `firewall.allow_all_icmp`, accepting
 all IPv4 ICMP to/from/through the appliance, including WAN, before managed drops.
 Ordinary startup and upgrades preserve the saved setting. Installed
 appliance mode enables host IPv4 forwarding after native policy reconciliation
 on every startup; changing roles through the API does not regenerate policy.
 
 During explicit first-install provisioning, a new or untouched empty revision-zero
-journal captures physical NICs, addresses/routes, MTU, administrative state,
-DHCPv4 identity and resolver configuration for handover and rollback. Initial
-installation then applies the same clean factory plan as explicit reset: selected
-WAN/LAN, other saved Ethernet interfaces unassigned without IP/DHCP configuration.
-Netcontrold takes per-NIC IP/DHCP ownership from systemd-networkd; it does not
+journal captures supported interfaces, addresses/routes, MTU, administrative
+state, DHCPv4, DNS and firewall policy before mutation. Initial installation
+retains that import, disables unsupported networking and masks competing owners.
+It uses console-only commitment/recovery, not a connectivity timer. Netcontrold does not
 guess WAN/LAN, reset configured journals, or copy DHCP addresses as static ones.
 The installer provisions and starts the appliance. Ordinary native startup and
 `upgrade.sh` use the saved configuration; they do not inherit live settings.
@@ -828,10 +839,13 @@ ports. Reset backs up state and preserves credentials, keys and revision history
 it does not delete journals or reconstruct desired settings from the live NICs.
 See [factory reset](docs/BUILD_AND_INSTALL.md#factory-configuration-reset).
 
-This implementation targets systemd-networkd/systemd-resolved hosts. A DHCP NIC
-needs an active finite lease for identity/lifetime inheritance. NetworkManager,
-bridged/bonded ports, dynamic global IPv6, custom policy routing and unsupported
-networkd options fail explicitly. Existing Wi-Fi association remains with its
+This implementation requires systemd/systemd-resolved and root network/BPF
+administration. DHCP clients can be inherited without a lease, including active
+NetworkManager sources. Initial takeover keeps DHCPv4 but excludes IPv6
+addresses, routes and DNS servers, and disables IPv6 during startup reconciliation.
+It does not turn DHCPv6/SLAAC addresses into static addresses. Bridged/bonded
+topology, custom policy routing and unimportable manager features are disabled,
+not preserved as external owners. Existing Wi-Fi association remains with its
 supplicant. DHCP runs in Rust, with durable leases and owned routes, not a
 supervised external client. See the [handover prerequisites and acceptance
 limits](docs/BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
@@ -875,12 +889,17 @@ Its parent must differ from WAN. An existing VLAN requires explicit safe
 ownership handoff and a release containing VLAN provisioning support.
 Override WAN with `--wan`. Unattended installation must provide both
 `--lan NAME --lan-address CIDR`; omitted values are not silently selected without
-a terminal. WAN is configured
-for DHCPv4, not retained as static. The installer waits up to 30 seconds for an
-upstream lease/default route and rolls back its transaction on failure.
-It enables/starts the service, binds HTTP management to the LAN address,
-installs LAN allow-all forwarding and input rules, drops unsolicited inbound
-WAN traffic, permits replies and WAN DHCP, and masquerades the LAN subnet on WAN.
+a terminal. Console-only takeover imports supported host networking as owned
+configuration, retaining static WAN, routes, DNS, firewall and other interfaces.
+An empty WAN uses DHCPv4; no lease/connectivity timer gates commitment.
+Unsupported topology/routes/policy/firewall/traffic control and known competing
+managers are disabled, not left active or used as reasons to refuse discovery.
+IPv6 is disabled by default. Private capture and explicit runtime takeover
+status support interruption/retry, not automatic connectivity rollback.
+The installer assigns WAN/LAN roles and the chosen LAN address, enables/starts
+the service and binds HTTP management to LAN. It does not replace imported
+firewall policy with factory allow-all/NAT rules; review management permissions
+and client forwarding from console. Explicit factory reset remains separate.
 Existing appliance state is not reset.
 LAN clients currently need static addresses and the appliance as their gateway;
 no LAN DHCP or DNS server is installed. IPv6 forwarding is not enabled.

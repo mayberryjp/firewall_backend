@@ -151,7 +151,7 @@ fn failure_hold() -> u64 {
 fn recovery_hold() -> u64 {
     5000
 }
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct Config {
     pub mdns: netcontrol_core::MDNSConfig,
@@ -168,24 +168,6 @@ pub(crate) struct Config {
     pub softflowd: Vec<Flow>,
     pub gateway_monitors: Vec<Gateway>,
     pub routes: Vec<Value>,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            mdns: Default::default(),
-            udp_broadcast_relay: Default::default(),
-            mdns_interfaces: Vec::new(),
-            mdns_status: Value::Null,
-            ipv6_enabled: true,
-            ntp: Ntp::default(),
-            syslog: Syslog::default(),
-            vnstat: Vnstat::default(),
-            interfaces: Vec::new(),
-            softflowd: Vec::new(),
-            gateway_monitors: Vec::new(),
-            routes: Vec::new(),
-        }
-    }
 }
 pub(crate) fn name(value: &str, max: usize) -> bool {
     !value.is_empty()
@@ -546,7 +528,12 @@ mod tests {
 
     #[test]
     fn bounds_and_strict_service_fields() {
-        assert!(Config::parse(&json!({})).is_ok());
+        assert!(!Config::parse(&json!({})).unwrap().ipv6_enabled);
+        assert!(
+            Config::parse(&json!({"ipv6_enabled":true}))
+                .unwrap()
+                .ipv6_enabled
+        );
         assert!(Config::parse(&json!({"ntp":{"enabled":true,"servers":[]}})).is_err());
         assert!(Config::parse(&json!({"ntp":{"enabled":false,"unexpected":1}})).is_err());
         assert!(

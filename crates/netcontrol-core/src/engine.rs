@@ -52,7 +52,7 @@ pub struct Transaction {
     pub committed_revision: Option<Version>,
     pub candidate: Config,
     pub previous: Config,
-    pub confirmation_deadline: DateTime<Utc>,
+    pub confirmation_deadline: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -63,6 +63,11 @@ pub struct Transaction {
     pub committed_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored_from_revision: Option<Version>,
+}
+enum ApplyMode {
+    Confirmed,
+    FactoryReset,
+    Initial,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -472,8 +477,23 @@ impl Engine {
                 .state
                 .transactions
                 .get(&id)
-                .context("missing active transaction")?;
-            if t.status != "pending_confirmation" || e.now() >= t.confirmation_deadline {
+                .context("missing active transaction")?
+                .clone();
+            if t.status == "applying_local" {
+                e.backend
+                    .repair(&t.candidate)
+                    .context("resume console provisioning; durable intent retained")?;
+                let observed = e.backend.observe(&t.candidate)?;
+                ensure!(
+                    observed.same_settings(&t.candidate),
+                    "console provisioning recovery verification mismatch"
+                );
+                e.commit_verified(&id, &t, &t.actor, e.now())
+                    .map_err(|error| anyhow::anyhow!(error.error))?;
+            } else if t.status != "pending_confirmation"
+                || t.confirmation_deadline
+                    .is_some_and(|deadline| e.now() >= deadline)
+            {
                 // Failure remains durable and blocks new writes; the operator can retry rollback.
                 let _ = e.rollback(&id, "startup recovery");
             }
@@ -541,7 +561,7 @@ impl Engine {
                 committed_revision: Some(next.revision),
                 candidate: intent.adoption.config.clone(),
                 previous: self.state.desired.clone(),
-                confirmation_deadline: now + Duration::seconds(300),
+                confirmation_deadline: Some(now + Duration::seconds(300)),
                 error: String::new(),
                 description: format!("Explicit adoption of existing VLAN {}", intent.request.name),
                 submitted_at: now,
@@ -560,7 +580,10 @@ impl Engine {
             bail!("engine is shut down");
         }
         if let Some(t) = self.active() {
-            if t.status == "pending_confirmation" && self.now() >= t.confirmation_deadline {
+            if t.status == "pending_confirmation"
+                && t.confirmation_deadline
+                    .is_some_and(|deadline| self.now() >= deadline)
+            {
                 let id = t.id.clone();
                 self.rollback(&id, "confirmation timeout")?;
             }
@@ -1400,9 +1423,30 @@ impl Engine {
             description: "Explicit local factory configuration reset".into(),
         };
         let transaction = self
-            .submit_inner("local-factory-reset", request, None, true)
+            .submit_inner(
+                "local-factory-reset",
+                request,
+                None,
+                ApplyMode::FactoryReset,
+            )
             .map_err(|error| anyhow::anyhow!(error.error))?;
         self.confirm(&transaction.id, "local-factory-reset")
+            .map_err(|error| anyhow::anyhow!(error.error))
+    }
+
+    pub fn commit_initial_configuration(&mut self, config: Config) -> Result<Transaction> {
+        ensure!(
+            self.is_initial_configuration(),
+            "host provisioning requires the initial configuration"
+        );
+        let request = SubmitRequest {
+            base_revision: self.state.revision,
+            confirm_timeout_seconds: 300,
+            config,
+            description: "Console host takeover provisioning; preserve imported configuration"
+                .into(),
+        };
+        self.submit_inner("local-host-takeover", request, None, ApplyMode::Initial)
             .map_err(|error| anyhow::anyhow!(error.error))
     }
 
@@ -1412,7 +1456,7 @@ impl Engine {
         r: SubmitRequest,
         restored: Option<Version>,
     ) -> ApiResult<Transaction> {
-        self.submit_inner(actor, r, restored, false)
+        self.submit_inner(actor, r, restored, ApplyMode::Confirmed)
     }
 
     fn submit_inner(
@@ -1420,7 +1464,7 @@ impl Engine {
         actor: &str,
         mut r: SubmitRequest,
         restored: Option<Version>,
-        factory_reset: bool,
+        mode: ApplyMode,
     ) -> ApiResult<Transaction> {
         if self.backend.path_test_active() {
             return Err(ApiError::new(
@@ -1491,7 +1535,7 @@ impl Engine {
         if self.active().is_some() {
             return Err(ApiError::new(409, "configuration conflict"));
         }
-        if !factory_reset {
+        if !matches!(mode, ApplyMode::FactoryReset) {
             let observed = self
                 .backend
                 .observe(&self.state.desired)
@@ -1521,12 +1565,21 @@ impl Engine {
         let t = Transaction {
             id: id.clone(),
             actor: actor.into(),
-            status: "applying".into(),
+            status: if matches!(mode, ApplyMode::Initial) {
+                "applying_local"
+            } else {
+                "applying"
+            }
+            .into(),
             base_revision: r.base_revision,
             committed_revision: None,
             candidate: r.config,
             previous: self.state.desired.clone(),
-            confirmation_deadline: now + Duration::seconds(r.confirm_timeout_seconds),
+            confirmation_deadline: if matches!(mode, ApplyMode::Initial) {
+                None
+            } else {
+                Some(now + Duration::seconds(r.confirm_timeout_seconds))
+            },
             error: String::new(),
             description: r.description,
             submitted_at: now,
@@ -1540,7 +1593,7 @@ impl Engine {
         self.persist(next)
             .map_err(|e| internal_error(format!("persist intent: {e}")))?;
         let applied = (|| -> Result<()> {
-            if factory_reset {
+            if matches!(mode, ApplyMode::FactoryReset) {
                 self.backend.factory_reset(&t.previous, &t.candidate)?;
             } else {
                 self.backend.apply(&t.previous, &t.candidate)?;
@@ -1551,7 +1604,8 @@ impl Engine {
                 "post-apply verification mismatch"
             );
             ensure!(
-                self.now() < t.confirmation_deadline,
+                t.confirmation_deadline
+                    .is_none_or(|deadline| self.now() < deadline),
                 "confirmation deadline elapsed while applying"
             );
             Ok(())
@@ -1564,6 +1618,9 @@ impl Engine {
                 Err(r) => format!("apply failed: {e:#}; {r:#}"),
             })
             .transaction(t));
+        }
+        if matches!(mode, ApplyMode::Initial) {
+            return self.commit_verified(&id, &t, actor, self.now());
         }
         let mut next = self.state.clone();
         let pending = next
@@ -1597,7 +1654,10 @@ impl Engine {
         {
             return Err(ApiError::new(409, "configuration conflict").transaction(t));
         }
-        if self.now() >= t.confirmation_deadline {
+        let deadline = t
+            .confirmation_deadline
+            .ok_or_else(|| service_error("confirmation transaction has no deadline"))?;
+        if self.now() >= deadline {
             let _ = self.rollback(id, "confirmation expired");
             return Err(ApiError::new(409, "confirmation expired")
                 .transaction(self.state.transactions.get(id).cloned().unwrap_or(t)));
@@ -1610,11 +1670,21 @@ impl Engine {
             return Err(ApiError::new(409, "candidate drifted before confirmation").transaction(t));
         }
         let committed_at = self.now();
-        if committed_at >= t.confirmation_deadline {
+        if committed_at >= deadline {
             let _ = self.rollback(id, "confirmation expired during verification");
             return Err(ApiError::new(409, "confirmation expired")
                 .transaction(self.state.transactions.get(id).cloned().unwrap_or(t)));
         }
+        self.commit_verified(id, &t, actor, committed_at)
+    }
+
+    fn commit_verified(
+        &mut self,
+        id: &str,
+        t: &Transaction,
+        actor: &str,
+        committed_at: DateTime<Utc>,
+    ) -> ApiResult<Transaction> {
         let mut next = self.state.clone();
         next.revision = self
             .state
@@ -2327,6 +2397,7 @@ fn validate_state(s: &State) -> Result<()> {
         ensure!(
             [
                 "applying",
+                "applying_local",
                 "pending_confirmation",
                 "rolling_back",
                 "recovery_failed",
@@ -2346,17 +2417,28 @@ fn validate_state(s: &State) -> Result<()> {
             t.description.len() <= 1024 && t.description.trim() == t.description,
             "invalid transaction description"
         );
-        let timeout = t.confirmation_deadline - t.submitted_at;
-        ensure!(
-            timeout >= Duration::seconds(10) && timeout <= Duration::seconds(300),
-            "invalid transaction deadline"
-        );
+        if let Some(deadline) = t.confirmation_deadline {
+            let timeout = deadline - t.submitted_at;
+            ensure!(
+                timeout >= Duration::seconds(10)
+                    && timeout <= Duration::seconds(300)
+                    && t.status != "applying_local",
+                "invalid transaction deadline"
+            );
+        } else {
+            ensure!(
+                t.actor == "local-host-takeover"
+                    && !matches!(t.status.as_str(), "applying" | "pending_confirmation"),
+                "only console provisioning may omit its confirmation deadline"
+            );
+        }
         ensure!(
             t.submitted_at >= s.initialized_at,
             "transaction predates journal initialization"
         );
         if [
             "applying",
+            "applying_local",
             "pending_confirmation",
             "rolling_back",
             "recovery_failed",
@@ -2374,8 +2456,8 @@ fn validate_state(s: &State) -> Result<()> {
         if t.status == "committed" {
             ensure!(
                 t.base_revision < s.revision
-                    && t.committed_at
-                        .is_some_and(|at| at >= t.submitted_at && at < t.confirmation_deadline)
+                    && t.committed_at.is_some_and(|at| at >= t.submitted_at
+                        && t.confirmation_deadline.is_none_or(|deadline| at < deadline))
                     && !t.committed_by.trim().is_empty(),
                 "invalid committed transaction metadata"
             );

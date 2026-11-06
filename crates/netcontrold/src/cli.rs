@@ -28,7 +28,7 @@ Netcontrol configuration CLI (Cisco-inspired, not an IOS shell)
   discard                             Discard only this session's candidate
   end / exit                          Leave mode / close session; never confirms
 Configuration commands:
-  ipv6 enable|disable                 Global IPv6 policy (default enabled)
+  ipv6 enable|disable                 Global IPv6 policy (default disabled)
   hostname NAME / no hostname         Managed host name; no hostname leaves it unmanaged
   domain NAME / no domain             Cosmetic domain label; never applied to the host or resolver
   timezone ZONE / no timezone         Managed IANA time zone, e.g. UTC or America/New_York
