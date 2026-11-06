@@ -135,6 +135,12 @@ its live addressing/MTU and becomes a saved unassigned baseline; an absent VLAN
 is created by the subsequent transaction. Ordinary configuration commands still
 do not implicitly seize foreign links.
 
+Existing-VLAN adoption requires native host mode and supported static
+systemd-networkd/resolved configuration. The VLAN's networkd source must
+explicitly set `IPv6AcceptRA=no` and not enable DHCP; only kernel-connected
+routes are supported. A runtime IPv6-disable sysctl alone is insufficient.
+Unsupported external settings fail explicitly rather than being discarded.
+
 The requested change moves the LAN address/role, input and forwarding rules and
 NAT subnet to the VLAN and removes untagged addressing from the parent. It
 preserves the physical WAN DHCP configuration. The command displays a transaction

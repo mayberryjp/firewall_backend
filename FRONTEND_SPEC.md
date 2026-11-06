@@ -4416,6 +4416,50 @@ host NICs. See the [design](docs/INTERFACE_CAPABILITIES.md) and required
 The GET-only refresh method and missing explorer registrations are tracked in
 [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
+##### Explicit existing-VLAN adoption
+
+`POST /api/v1/interfaces/adopt-vlan` requires the normal API key plus both
+`interfaces.write` and `transactions.write`. It accepts no query parameters.
+The strict JSON object has exactly three required, nonnull fields:
+
+```json
+{"name":"vlan50","parent":"enp2s0","id":50}
+```
+
+`name` and `parent` are distinct interface names, each 1..15 ASCII bytes using
+letters, digits, underscore, hyphen or dot; `lo`, `.` and `..` are forbidden.
+`id` is an integer 1..4094. The parent must already be managed Ethernet.
+This explicitly imports an existing unmanaged VLAN; it does not create one,
+assign its LAN role or change its address. Ordinary transactions still reject
+implicitly taking ownership of an unmanaged VLAN.
+
+Success is `200 {"revision": <canonical revision string>, "interface": <Interface>}`.
+The interface uses the existing `Interface` schema with kind `vlan`, role
+`unassigned`, matching parent/ID and preserved supported live settings. Other
+saved configuration is preserved. Refresh saved state and the candidate's base
+revision before a subsequent normal confirmed transaction. This ownership
+operation itself has no confirmation timer: later rollback retains the imported
+baseline rather than deleting the operator's original VLAN.
+
+Malformed/unknown/missing fields or query parameters return 400; invalid names,
+IDs or managed-parent requirements return 422. Already-managed links, busy or
+drifted configuration and conflicting recovery return 409. Native refusal,
+unsupported backend/scope or failed handover returns 503; persistence failures
+can return 500. Missing/invalid authentication is 401, missing permission is 403
+and unsupported methods are 405. Show the server error detail.
+
+Native adoption requires host mode, matching live VLAN identity, supported
+static configuration and systemd-networkd/resolved ownership handoff. Its
+networkd source must explicitly disable RA (`IPv6AcceptRA=no`); DHCP, static/
+DHCP/RA routes other than kernel-connected routes, unsupported networkd settings
+and changed capture sources are refused. Lab namespaces are unsupported.
+Capture and recovery intent are durable before handover. Interrupted adoption
+blocks other configuration writes until explicit recovery/retry or restart;
+do not automatically retry, prefetch or poll this mutation.
+
+Required API Explorer/client registration and optional operator UX are tracked
+in [handoff 2026-11-06-03](docs/frontend-handoffs/2026-11-06.md#2026-11-06-03-interactive-and-tagged-lan-setup).
+
 ##### Live interface selection
 
 `GET /api/v1/interfaces/discovered` requires the normal API key and `state.read`.
@@ -6032,6 +6076,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/parent-interfaces` | `ParentInterface[]` |
 | GET | `/interfaces` | Observed `Interface[]` |
 | GET | `/interfaces/discovered` | Read-only `DiscoveredInterface[]`; independent of managed-state observation |
+| POST | `/interfaces/adopt-vlan` | Strict `{name,parent,id}`, no query -> `200 {revision,interface}`; `interfaces.write` + `transactions.write`, explicit preserved-baseline ownership handoff |
 | GET | `/interface-capabilities` | Persisted `InterfaceCapabilitySnapshot \| null`; `state.read`, no implicit scan |
 | GET | `/interface-capabilities/refresh` | No body/query -> `200 InterfaceCapabilitySnapshot`; `state.read` + `interfaces.write`, explicit passive scan and durable save; never auto-run/prefetch/poll |
 | GET | `/statistics/performance` | No body/query -> live host CPU/IRQ/softnet, physical/WireGuard RX queues and physical-only RPS trial evidence; `state.read`, no tuning or persisted scan |

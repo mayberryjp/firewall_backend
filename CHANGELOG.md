@@ -4,6 +4,12 @@
 
 ### Changed
 
+- Fresh Ubuntu installs prompt for the LAN interface and IPv4 address, including
+  eligible existing VLANs. Unattended installs require `--lan` and
+  `--lan-address`; unsafe or ambiguous VLAN topology fails explicitly.
+  Release impact: breaking unattended-install contract, Unreleased; next
+  automatic calendar version.
+
 - Interface capability refresh now uses
   `GET /api/v1/interface-capabilities/refresh`; POST is rejected with 405.
   Permissions, explicit passive scanning, durable save, no-body/query validation
@@ -63,6 +69,15 @@
   Release impact: fix, next automatic calendar version; no frontend action.
 
 ### Added
+
+- Explicit existing-VLAN ownership adoption through
+  `POST /api/v1/interfaces/adopt-vlan`, tagged-LAN fresh provisioning and root
+  `--configure-lan` correction of unchanged factory networking. Corrections use
+  ordinary confirmed transactions, not state resets; adoption preserves the
+  imported VLAN baseline on subsequent rollback.
+  Release impact: additive API/CLI support, Unreleased; next automatic calendar
+  version. Required API registration and optional operator-help work:
+  [handoff 2026-11-06-03](docs/frontend-handoffs/2026-11-06.md#2026-11-06-03-interactive-and-tagged-lan-setup).
 
 - Paired, short-lived path MTU/MSS diagnostics with explicit interface/source/
   peer selection, one-time-secret authentication and bounded bidirectional

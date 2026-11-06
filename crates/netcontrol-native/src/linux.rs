@@ -1286,17 +1286,18 @@ impl Backend for Native {
             )?;
             Ok(())
         })?;
-        if actual.committed_config.as_ref() == Some(&after_value) {
+        let already_owned = actual.committed_config.as_ref() == Some(&after_value);
+        if already_owned {
             self.verify(&after_value)?;
-            self.services.apply(&before_value, &after_value)?;
-            return Ok(());
+        } else {
+            ensure!(
+                serde_json::to_value(&actual)? == serde_json::to_value(&previous)?,
+                "VLAN adoption ownership changed"
+            );
+            self.verify(&before_value)?;
         }
-        ensure!(
-            serde_json::to_value(&actual)? == serde_json::to_value(&previous)?,
-            "VLAN adoption ownership changed"
-        );
-        self.verify(&before_value)?;
         let result = (|| -> Result<()> {
+            // An interrupted rollback can release networkd before restoring ownership.json.
             adoption::handover(&receipt)?;
             let captured = receipt.clone();
             let wanted = token.request.clone();

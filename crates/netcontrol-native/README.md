@@ -56,6 +56,30 @@ without the C/header toolchain: TLS requests then fail explicitly and
 `Native::open` always fails because nftables is essential. It is **not** a
 functional networking build or a permissive firewall fallback.
 
+## Explicit existing-VLAN adoption
+
+`POST /api/v1/interfaces/adopt-vlan` explicitly adopts one existing VLAN on an
+already-managed Ethernet parent. Native adoption is host-mode-only and requires
+the requested kernel name, parent and VLAN ID to match. It captures supported
+live settings and durable recovery information before releasing external
+ownership; it does not delete/recreate the VLAN or weaken normal transaction
+preflight for foreign virtual links.
+
+The systemd-networkd source must explicitly set `IPv6AcceptRA=no` and must not
+enable DHCP. Only kernel-connected routes are supported; static, DHCP and RA
+routes and unsupported networkd settings are rejected. A runtime IPv6 sysctl
+alone does not satisfy the source-configuration requirement. Networkd/resolved
+handoff and unchanged capture-source verification must succeed.
+
+Successful adoption saves an unassigned VLAN baseline. Subsequent confirmed LAN
+transactions can change its role/address; their rollback preserves that baseline.
+Interrupted adoption retains recovery intent and blocks conflicting writes.
+Inspect the error and recover deliberately; do not delete state or blindly retry.
+See the [API contract](../../FRONTEND_SPEC.md#explicit-existing-vlan-adoption)
+and [local factory-LAN correction](../../docs/CLI.md#correcting-an-initially-untagged-factory-lan).
+Real systemd D-Bus handover and appliance connectivity still require on-device
+acceptance; namespace fixtures do not establish that behavior.
+
 ## Performance diagnostics and RPS
 
 The passive `GET /api/v1/statistics/performance` collector is host-mode-only.
