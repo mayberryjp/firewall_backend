@@ -4,6 +4,14 @@
 
 ### Changed
 
+- Installer and source-upgrade output uses concise, terminal-aware colored
+  stages and completion summaries. Hide routine successful command output,
+  show failed-step diagnostics and preserve actionable safety warnings.
+  Support `NO_COLOR` and plain redirected logs; shorten help and LAN prompts.
+  Release impact: presentation-only CLI improvement; next automatic calendar
+  version. Installation policy, upgrade recovery and frontend/API contracts
+  are unchanged.
+
 - Aggressive console-only initial host takeover imports supported interfaces,
   IPv4/routes/DHCP/DNS and nftables policy as owned configuration. Disable
   unsupported topology/routing/firewall/traffic control/XDP/TCX and known

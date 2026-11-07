@@ -8,6 +8,89 @@ printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
 scenario=valid
 
+(
+    export TMPDIR="$temporary/output-logs"
+    mkdir "$TMPDIR"
+    noisy_success() { printf 'routine stdout\n'; printf 'routine stderr\n' >&2; }
+    installer_step 'Installing a fixture' noisy_success > "$temporary/step.stdout" 2> "$temporary/step.stderr"
+    [[ ! -s $temporary/step.stdout ]]
+    [[ $(< "$temporary/step.stderr") == '[..] Installing a fixture' ]]
+    [[ -z $(find "$TMPDIR" -type f -print) ]]
+    noisy_failure() { printf 'failure stdout\n'; printf 'failure stderr\n' >&2; return 23; }
+    if installer_step 'Failing fixture' noisy_failure > "$temporary/step.stdout" 2> "$temporary/step.stderr"; then
+        printf 'Failed step returned success.\n' >&2
+        exit 1
+    else
+        [[ $? -eq 23 ]]
+    fi
+    [[ ! -s $temporary/step.stdout ]]
+    [[ $(< "$temporary/step.stderr") == $'[..] Failing fixture\n[FAIL] Failing fixture (exit 23)\nfailure stdout\nfailure stderr' ]]
+    [[ -z $(find "$TMPDIR" -type f -print) ]]
+    if installer_step 'Interrupted fixture' bash -c 'printf "interrupted output\n"; kill -TERM "$$"' > "$temporary/step.stdout" 2> "$temporary/step.stderr"; then
+        exit 1
+    else
+        [[ $? -eq 143 ]]
+    fi
+    grep -Fq '[FAIL] Interrupted fixture (exit 143)' "$temporary/step.stderr"
+    grep -Fxq 'interrupted output' "$temporary/step.stderr"
+    [[ -z $(find "$TMPDIR" -type f -print) ]]
+    TMPDIR="$temporary/missing-directory"
+    if installer_step 'Unavailable log' noisy_success > "$temporary/step.stdout" 2> "$temporary/step.stderr"; then exit 1; fi
+    grep -Fq '[FAIL] Cannot create a temporary command log.' "$temporary/step.stderr"
+    ! grep -Fq 'routine' "$temporary/step.stderr"
+)
+python3 - <<'PY'
+import errno
+import os
+import pty
+import subprocess
+
+command = ["bash", "-c", 'source ./install.sh; for level in step success warning error; do installer_message "$level" "A short message"; done']
+for term, no_color, terminal in [
+    ("xterm-256color", None, True),
+    ("xterm-256color", "", True),
+    ("xterm-256color", "1", True),
+    ("dumb", None, True),
+    ("xterm-256color", None, False),
+]:
+    environment = dict(os.environ, TERM=term)
+    environment.pop("NO_COLOR", None)
+    if no_color is not None:
+        environment["NO_COLOR"] = no_color
+    if terminal:
+        master, slave = pty.openpty()
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=slave, env=environment)
+            os.close(slave)
+            output = b""
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                output += chunk
+            stdout, _ = process.communicate(timeout=10)
+            assert process.returncode == 0
+        finally:
+            os.close(master)
+    else:
+        result = subprocess.run(command, capture_output=True, env=environment, check=True, timeout=10)
+        stdout, output = result.stdout, result.stderr
+    assert stdout == b""
+    expected_color = terminal and term != "dumb" and not no_color
+    for code in (b"36", b"32", b"33", b"31"):
+        assert (b"\x1b[1;" + code + b"m" in output) == expected_color
+    assert (b"\x1b[0m" in output) == expected_color
+    assert len(output.splitlines()) == 4
+    for label in (b"[..]", b"[OK]", b"[WARN]", b"[FAIL]"):
+        assert label in output
+PY
+printf 'Installer output, exact failure status, diagnostics, log cleanup and terminal color tests passed.\n'
+
 for fresh_scenario in clean unused_lock active_lock nonempty_lock private_mode directory_lock symlink_lock dangling_lock hardlink_lock saved_state empty_state environment state_symlink environment_symlink; do
     fresh_directory="$temporary/fresh-$fresh_scenario"
     mkdir "$fresh_directory"
@@ -700,16 +783,17 @@ printf 'Service executable discovery tests passed (mocked systemd).\n'
 
 for deployment_scenario in success setup_failure deploy_failure; do
     (
-        deployment_trace=''
+        deployment_trace="$temporary/deployment-$deployment_scenario.trace"
+        : > "$deployment_trace"
         root_command() {
             [[ $# -eq 5 && $1 == bash && $2 == -c &&
                 $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
-            deployment_trace+='setup;'
+            printf 'setup;' >> "$deployment_trace"
             [[ $deployment_scenario != setup_failure ]]
         }
         upgrade_binary() {
             [[ $1 == new-binary && $2 == installed-binary && $3 == "$PWD/install.sh" ]] || return 1
-            deployment_trace+='deploy;'
+            printf 'deploy;' >> "$deployment_trace"
             [[ $deployment_scenario != deploy_failure ]]
         }
         if deploy_upgrade new-binary installed-binary "$PWD/install.sh"; then
@@ -718,9 +802,9 @@ for deployment_scenario in success setup_failure deploy_failure; do
             [[ $deployment_scenario != success ]] || exit 1
         fi
         if [[ $deployment_scenario == setup_failure ]]; then
-            [[ $deployment_trace == 'setup;' ]]
+            [[ $(< "$deployment_trace") == 'setup;' ]]
         else
-            [[ $deployment_trace == 'setup;deploy;' ]]
+            [[ $(< "$deployment_trace") == 'setup;deploy;' ]]
         fi
     )
 done
@@ -841,6 +925,8 @@ for scenario in success fail_stage fail_bootstrap fail_logging fail_restart fail
                         [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
                     fi ;;
                 install)
+                    printf "routine deployment stdout\n"
+                    printf "routine deployment stderr\n" >&2
                     [[ $UPGRADE_TEST_SCENARIO != fail_stage ]] || return 1
                     command cp -- "${@: -2}"
                     ;;
@@ -849,7 +935,10 @@ for scenario in success fail_stage fail_bootstrap fail_logging fail_restart fail
                         start)
                             if [[ ! -f $UPGRADE_TEST_DIRECTORY/started ]]; then
                                 touch "$UPGRADE_TEST_DIRECTORY/started"
-                                [[ $UPGRADE_TEST_SCENARIO != fail_restart ]] || return 1
+                                [[ $UPGRADE_TEST_SCENARIO != fail_restart ]] || {
+                                    printf "fixture restart failed\n" >&2
+                                    return 1
+                                }
                                 [[ $UPGRADE_TEST_SCENARIO != fail_first_start && $UPGRADE_TEST_SCENARIO != fail_inactive_start ]] || return 1
                             fi
                             ;;
@@ -868,11 +957,23 @@ for scenario in success fail_stage fail_bootstrap fail_logging fail_restart fail
             esac
         }
         deploy_upgrade "$UPGRADE_TEST_DIRECTORY/new" "$UPGRADE_TEST_DIRECTORY/netcontrold" "$PWD/install.sh"
-    '; then
+    ' > "$destination/stdout" 2> "$destination/stderr"; then
         [[ $scenario == success || $scenario == first_install || $scenario == inactive_existing ]] || { printf 'Unexpected upgrade success: %s\n' "$scenario" >&2; exit 1; }
         cmp "$destination/new" "$destination/netcontrold"
+        grep -Fxq '[OK] Upgrade complete.' "$destination/stderr"
+        ! grep -Fq 'routine deployment' "$destination/stdout" "$destination/stderr"
+        ! grep -Fq '[FAIL]' "$destination/stderr"
     else
         [[ $scenario != success && $scenario != first_install && $scenario != inactive_existing ]] || { printf 'Valid upgrade failed\n' >&2; exit 1; }
+        ! grep -Fq '[OK] Upgrade complete.' "$destination/stderr"
+        if [[ $scenario == fail_stage ]]; then
+            grep -Fxq '[FAIL] Staging the new binary (exit 1)' "$destination/stderr"
+            grep -Fxq 'routine deployment stdout' "$destination/stderr"
+            grep -Fxq 'routine deployment stderr' "$destination/stderr"
+        elif [[ $scenario == fail_restart ]]; then
+            grep -Fxq '[FAIL] Starting Netcontrol (exit 1)' "$destination/stderr"
+            grep -Fxq 'fixture restart failed' "$destination/stderr"
+        fi
         if [[ $scenario == fail_first_start ]]; then
             [[ ! -e $destination/netcontrold ]]
         else

@@ -1,6 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+installer_message() {
+    local level=$1 message=$2 color='' reset='' label
+    case $level in
+        step) label='..'; color=$'\033[1;36m' ;;
+        success) label=OK; color=$'\033[1;32m' ;;
+        warning) label=WARN; color=$'\033[1;33m' ;;
+        error) label=FAIL; color=$'\033[1;31m' ;;
+    esac
+    if [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
+        reset=$'\033[0m'
+    else
+        color=''
+    fi
+    printf '%s[%s]%s %s\n' "$color" "$label" "$reset" "$message" >&2
+}
+
+installer_step() (
+    local label=$1 output
+    shift
+    installer_message step "$label"
+    output=$(mktemp) || {
+        installer_message error 'Cannot create a temporary command log.'
+        exit 1
+    }
+    finish_step() {
+        local status=$?
+        trap - EXIT
+        if [[ $status -ne 0 ]]; then
+            installer_message error "$label (exit $status)"
+            cat -- "$output" >&2
+        fi
+        rm -f -- "$output"
+        exit "$status"
+    }
+    trap finish_step EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    "$@" > "$output" 2>&1
+)
+
 configure_conntrack() (
     set -euo pipefail
     local sysctl_directory=${1:-/etc/sysctl.d} modules_directory=${2:-/etc/modules-load.d}
@@ -35,7 +75,7 @@ configure_conntrack() (
     install -d -m 0755 "$sysctl_directory" "$modules_directory" || exit 1
     install -o root -g root -m 0644 "$work/sysctl" "$sysctl_file" || exit 1
     install -o root -g root -m 0644 "$work/modules" "$modules_file" || exit 1
-    printf 'Conntrack accounting and checksum validation enabled and configured for boot. Existing connections may still lack counters.\n'
+    installer_message success 'Conntrack accounting and checksum validation enabled.'
 )
 
 configure_link_diagnostics() (
@@ -58,7 +98,7 @@ configure_link_diagnostics() (
     printf 'af_packet\ninet_diag\ntcp_diag\n' > "$work/modules" || exit 1
     install -d -m 0755 "$directory" || exit 1
     install -o root -g root -m 0644 "$work/modules" "$destination" || exit 1
-    printf 'Native link diagnostics kernel modules enabled for boot; no eBPF tools or security sysctl changes required.\n'
+    installer_message success 'Link diagnostics modules enabled.'
 )
 
 configure_deny_logging() (
@@ -81,7 +121,7 @@ configure_deny_logging() (
     printf 'nf_tables\nnfnetlink_log\nnft_log\n' > "$work/modules" || exit 1
     install -d -m 0755 "$directory" || exit 1
     install -o root -g root -m 0644 "$work/modules" "$destination" || exit 1
-    printf 'Firewall deny-log and rule-accounting kernel modules enabled for boot; telemetry remains separate from configuration.\n'
+    installer_message success 'Firewall telemetry modules enabled.'
 )
 
 configure_masked_units() (
@@ -109,10 +149,9 @@ configure_masked_units() (
         esac
     done
     if [[ ${#present[@]} -eq 0 ]]; then
-        printf '%s units absent; nothing to mask.\n' "$label"
         exit 0
     fi
-    printf 'Disabling and persistently masking %s units; packages and data are retained.\n' "$label"
+    installer_message step "Disabling $label services."
     if [[ ${#loaded[@]} -gt 0 ]]; then
         systemctl disable --now "${loaded[@]}" || exit 1
     fi
@@ -150,7 +189,7 @@ configure_os_updates() (
        ! -L $target && ( ! -e $target || -f $target ) ]] || {
         printf 'Refusing non-regular automatic APT configuration: %s\n' "$target" >&2; exit 1;
     }
-    printf 'WARNING: automatic APT checks, downloads and installation, including security updates, will be disabled. Schedule manual patching.\n'
+    installer_message warning 'Automatic OS updates, including security fixes, will be disabled. Schedule manual patching.'
     configure_masked_units APT apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service || exit 1
     install -d -o root -g root -m 0755 "$directory" || exit 1
     staged=$(mktemp "$directory/.automatic-updates.XXXXXX") || exit 1
@@ -170,7 +209,7 @@ configure_os_updates() (
     grep -Fxq 'Unattended-Upgrade::InstallOnShutdown "false";' <<< "$configuration" || {
         printf 'Effective unattended upgrade on shutdown is not disabled; inspect APT configuration precedence.\n' >&2; exit 1;
     }
-    printf 'Automatic APT updates disabled; manual apt-get update/upgrade and Netcontrol release checks remain available.\n'
+    installer_message success 'Automatic OS updates disabled.'
 )
 
 configure_appliance_services() (
@@ -188,7 +227,7 @@ configure_appliance_services() (
     printf '[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222\nEnvironment=NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json\n' > "$staged" || exit 1
     chmod 0644 "$staged" || exit 1
     mv -fT -- "$staged" "$destination" || exit 1
-    printf 'Appliance host services, gateway monitoring and embedded configuration SSH (TCP 2222) enabled for the next daemon start; configured protocol services remain controlled by saved configuration. Restrict management access with the host-input firewall.\n'
+    installer_message success 'Host services, gateway monitoring and configuration SSH enabled.'
 )
 
 configure_logging_units() (
@@ -219,7 +258,7 @@ configure_host_logging() (
     set -euo pipefail
     local forwarding_socket=${1:-/run/systemd/journal/syslog} unix_sockets=${2:-/proc/net/unix}
     local unit state status
-    printf 'Configuring journald forwarding to native syslog; stopping/masking competing syslog receivers. Journald retains /dev/log.\n'
+    installer_message step 'Configuring host logging.'
     for unit in rsyslog.service syslog-ng.service syslog.service syslogd.service busybox-syslogd.service \
         syslog.socket; do
         if ! state=$(systemctl show "$unit" --property=LoadState --value); then
@@ -362,7 +401,7 @@ prompt_appliance_lan() {
     wan=${wan:-$default_wan}
     if [[ $default_lan == "$wan" ]]; then default_lan=$default_wan; fi
     select_appliance_ports "$wan" "${lan:-$default_lan}" "$directory" "$vlan_table" >/dev/null || return 1
-    printf 'WAN interface: %s (retain imported settings; DHCP if empty). Use --wan NAME to change it.\n' "$wan" >&2
+    printf 'WAN: %s (use --wan NAME to change).\n' "$wan" >&2
     if [[ -z $lan ]]; then
         printf 'Available LAN interfaces:\n' >&2
         local path name details parent id
@@ -536,7 +575,7 @@ PY
         return 1
     }
     printf '%s\n' "$version" > "$destination/release-version" || return 1
-    printf 'Verified stable Ubuntu release v%s (binary size, SHA-256 and amd64 ELF).\n' "$version"
+    installer_message success "Verified release v$version."
 }
 
 release_download() {
@@ -600,15 +639,31 @@ check_fresh_installation() {
             printf 'State lock %s is held by another process or cannot be checked; stop the owning process before retrying.\n' "$lock" >&2
             return 1
         }
-        printf 'Reusing inactive state lock %s; no saved appliance configuration exists. The lock file is retained.\n' "$lock"
     fi
 }
 
 main() {
     local wan='' lan='' lan_address='' ports
     if [[ ${1:-} == --help ]]; then
-        printf 'WARNING: fresh installation disables automatic APT checks, downloads and installation, INCLUDING SECURITY UPDATES, using persistent apt-daily/apt-daily-upgrade timer/service masks and APT periodic/shutdown configuration. Active APT jobs are not forcibly stopped; wait for completion and retry if verification fails. Manual apt-get update/upgrade and Netcontrol release checks remain available; schedule manual OS patching.\n'
-        printf 'Usage: bash install.sh [--wan WAN_NIC] [--lan LAN_INTERFACE] [--lan-address CIDR]\nDownloads the latest stable Ubuntu amd64 release over verified HTTPS; no CI run ID or GitHub login is needed.\nInteractive installs prompt for missing LAN interface and IPv4 address/prefix. Noninteractive installs must supply --lan and --lan-address. WAN defaults to the first physical Ethernet port in natural name order; prompt suggestions are the second physical port and 192.168.0.1/24. LAN can be a physical Ethernet port or an existing VLAN on another physical port (use vlan50, not vlan50@enp2s0). Requires a console-host-takeover release. Aggressively imports supported host networking as owned settings and disables unsupported networking/competing managers. Preserves static WAN, routes, DNS, MTU, firewall and other imported interfaces; DHCP is selected only for an empty WAN. Sets WAN/LAN roles and explicit LAN addressing. No connectivity-confirmation rollback or WAN-readiness timer. Review imported input/forwarding/NAT rules from console; factory allow-all/NAT policy is not automatically substituted. Provisions LAN-address HTTP management and enables the service at boot. Automatically configures host-service/gateway-monitoring permissions, journald forwarding and native syslog socket activation; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. Stops/disables and persistently masks installed snapd.service and snapd.socket; absent units are skipped and Snap packages/data are retained. Review Snap-dependent workloads before installation. Saved configuration controls which workers run. Requires console access, systemd/resolved and root network/BPF privileges. LAN clients need static addressing; no DHCP server is installed.\n'
+        printf '%s\n' \
+            'Usage: sudo bash install.sh [--wan NAME] [--lan NAME] [--lan-address CIDR]' \
+            '' \
+            'Install the latest stable release on a fresh Ubuntu amd64 host.' \
+            'Requires root, systemd-networkd, systemd-resolved and a local console.' \
+            '' \
+            '  --wan NAME          WAN port (default: first physical Ethernet port)' \
+            '  --lan NAME          LAN port or existing VLAN (prompted if omitted)' \
+            '  --lan-address CIDR  Private LAN IPv4 address (prompt: 192.168.0.1/24)' \
+            '' \
+            'Unattended installs require --lan and --lan-address.' \
+            'Imports supported host networking; disables unsupported settings and competing managers.' \
+            'No connectivity rollback. Review imported firewall rules from the console.' \
+            'Disables Snap, competing syslog receivers and automatic OS updates, including security fixes.' \
+            'Schedule manual OS patching. LAN clients need static addresses; no DHCP/DNS server is installed.' \
+            'Enables LAN HTTP setup, configuration SSH on TCP 2222 and startup at boot.' \
+            '' \
+            'Output: color on terminals; NO_COLOR=1 disables it. Failed steps show diagnostics.' \
+            'Details: docs/BUILD_AND_INSTALL.md'
         return
     fi
     while [[ $# -gt 0 ]]; do
@@ -664,11 +719,20 @@ main() {
     }
     ports=$(select_appliance_ports "$wan" "$lan") || return 1
     read -r wan lan <<< "$ports"
-    printf 'Selected WAN: %s (retain imported settings; DHCP if empty); LAN: %s (%s). Console takeover has no connectivity rollback.\n' "$wan" "$lan" "$lan_address"
-    systemctl is-active --quiet systemd-networkd.service || return 1
-    systemctl is-active --quiet systemd-resolved.service || return 1
-    apt-get update
-    apt-get install --no-install-recommends -y ca-certificates python3 procps kmod curl
+    printf 'WAN: %s; LAN: %s (%s)\n' "$wan" "$lan" "$lan_address"
+    installer_message warning 'Use a local console. Host networking will be taken over without connectivity rollback.'
+    installer_message warning 'Automatic OS updates, including security fixes, and Snap will be disabled. Schedule manual patching.'
+    installer_message warning 'Competing syslog receivers will be disabled. Configuration SSH uses TCP 2222; restrict firewall access.'
+    systemctl is-active --quiet systemd-networkd.service || {
+        installer_message error 'systemd-networkd must be running.'
+        return 1
+    }
+    systemctl is-active --quiet systemd-resolved.service || {
+        installer_message error 'systemd-resolved must be running.'
+        return 1
+    }
+    installer_step 'Refreshing package lists' apt-get update || return 1
+    installer_step 'Installing prerequisites' apt-get install --no-install-recommends -y ca-certificates python3 procps kmod curl || return 1
     if pgrep -x netcontrold >/dev/null; then
         printf 'Stop the running netcontrold before installing; networking will not be stopped automatically.\n' >&2
         return 1
@@ -677,18 +741,21 @@ main() {
     work=$(mktemp -d)
     printf -v cleanup 'rm -rf -- %q' "$work"
     trap "$cleanup" EXIT
-    download_prebuilt "$work" || return 1
-    check_prebuilt "$work" "$lan" || return 1
+    installer_step 'Downloading and verifying the latest release' download_prebuilt "$work" || return 1
+    installer_step 'Checking release support' check_prebuilt "$work" "$lan" || return 1
+    installer_message success "Release v$(< "$work/release-version") ready."
     cd "$work"
-    check_systemd_unit
-    configure_conntrack || return 1
-    configure_link_diagnostics || return 1
-    configure_deny_logging || return 1
-    install -d -m 0755 /usr/local/sbin
-    install -m 0755 netcontrold /usr/local/sbin/netcontrold
-    install_systemd_service || return 1
-    provision_appliance /usr/local/sbin/netcontrold "$wan" "$lan" "$lan_address"
-    printf 'Provisioned owned networking: LAN %s (%s), WAN %s; imported firewall/routes/DNS retained. Review forwarding, input and NAT policy from console. Service enabled at boot.\nManagement: http://%s:8080/ (complete onboarding from LAN).\nConfiguration SSH: TCP 2222, username apikey, password is an API key generated after onboarding; no OS shell or separate sshd.\nLAN clients need addresses in this subnet and this appliance as gateway; no DHCP/DNS server was installed.\nLogs: journalctl -u netcontrold -f\n' "$lan" "$lan_address" "$wan" "${lan_address%/*}"
+    check_systemd_unit || return 1
+    installer_step 'Configuring connection tracking' configure_conntrack || return 1
+    installer_step 'Enabling link diagnostics' configure_link_diagnostics || return 1
+    installer_step 'Enabling firewall telemetry' configure_deny_logging || return 1
+    installer_step 'Creating the install directory' install -d -m 0755 /usr/local/sbin || return 1
+    installer_step 'Installing netcontrold' install -m 0755 netcontrold /usr/local/sbin/netcontrold || return 1
+    installer_step 'Configuring system services' install_systemd_service || return 1
+    installer_step 'Taking over networking and starting Netcontrol' provision_appliance /usr/local/sbin/netcontrold "$wan" "$lan" "$lan_address" || return 1
+    installer_message success 'Installed. Service enabled at boot.'
+    printf 'Setup: http://%s:8080/\nSSH: TCP 2222; user apikey; use an API key created after setup.\nLogs: journalctl -u netcontrold -f\n' "${lan_address%/*}"
+    installer_message warning 'Review imported firewall rules from the console. LAN clients need static addresses and this gateway; no DHCP/DNS server was installed.'
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

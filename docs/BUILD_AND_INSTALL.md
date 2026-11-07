@@ -101,6 +101,23 @@ to resolve telemetry failures. There is no HTTP clear or settings endpoint.
 
 See the [filtered retrieval contract](../FRONTEND_SPEC.md#firewall-deny-log).
 
+## Installer and upgrade output
+
+[install.sh](../install.sh) and [upgrade.sh](../upgrade.sh) show short stage
+labels instead of routine package, build and service-command output. Cyan
+`[..]` labels mark work, green `[OK]` marks completion, yellow `[WARN]` marks
+operator warnings and red `[FAIL]` marks failed steps. Status labels go to
+stderr; final setup URLs and binary/log locations remain on stdout.
+
+ANSI colors are enabled only when stderr is a terminal and `TERM` is not
+`dumb`. Set `NO_COLOR=1` to disable color; redirected logs contain plain text.
+Each step captures command output in a private temporary file, displays it on
+failure with the exit status, and removes it afterward. Successful command
+chatter is not retained. A long build can remain on one stage until it finishes.
+Console/connectivity, disabled automatic security updates, SSH exposure and
+LAN setup warnings remain visible. `--help` lists the options and key safety
+requirements; this guide contains the full deployment details.
+
 ## Incremental Ubuntu development upgrades
 
 [upgrade.sh](../upgrade.sh) builds the current checkout on an
@@ -808,7 +825,7 @@ prompt. Noninteractive invocation requires both; it never silently chooses a LAN
 or management address. Example:
 
 ```text
-WAN interface: enp1s0 (retain imported settings; DHCP if empty). Use --wan NAME to change it.
+WAN: enp1s0 (use --wan NAME to change).
 Available LAN interfaces:
   enp1s0 (selected WAN)
   enp2s0

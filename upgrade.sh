@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname -- "${BASH_SOURCE[0]}")/install.sh"
+
 root_command() {
     if [[ $EUID -eq 0 ]]; then "$@"; else sudo -- "$@"; fi
 }
@@ -64,7 +66,7 @@ upgrade_binary() (
                 --property=ExecMainCode --property=ExecMainStatus >&2 || true
             root_command journalctl -u netcontrold.service --no-pager \
                 --lines=60 --output=short-iso >&2 || true
-            printf 'Deployment interrupted or failed; recovering the previous installation.\n' >&2
+            installer_message warning 'Upgrade failed. Restoring the previous installation.'
             if ! root_command systemctl stop netcontrold.service; then
                 printf 'RECOVERY FAILED: cannot stop service; inspect %s from the local console.\n' "$backup" >&2
                 exit "$status"
@@ -99,43 +101,60 @@ upgrade_binary() (
         no_unmanaged_daemon
     fi
     staged=$(root_command mktemp "${destination}.upgrade.XXXXXX")
-    root_command install -o root -g root -m 0755 -- "$binary" "$staged"
+    installer_step 'Staging the new binary' root_command install -o root -g root -m 0755 -- "$binary" "$staged"
     phase='configure GitHub HTTPS upgrades'
-    root_command "$staged" --configure-updates /etc/netcontrol/updates.json
+    installer_step 'Configuring release updates' root_command "$staged" --configure-updates /etc/netcontrol/updates.json
     if [[ -f $destination ]]; then
-        root_command cp -p -- "$destination" "$backup"
+        installer_step 'Saving the previous binary' root_command cp -p -- "$destination" "$backup"
         had_binary=true
     fi
     stopped=true
     phase='stop previous service'
-    root_command systemctl stop netcontrold.service
+    installer_step 'Stopping Netcontrol' root_command systemctl stop netcontrold.service
     phase='configure journald forwarding'
-    root_command bash -c 'source "$1"; configure_host_logging' bash "$installer"
+    installer_step 'Configuring host logging' root_command bash -c 'source "$1"; configure_host_logging' bash "$installer"
     phase='install replacement binary'
-    root_command mv -fT -- "$staged" "$destination"
+    installer_step 'Installing the new binary' root_command mv -fT -- "$staged" "$destination"
     phase='start replacement service'
-    root_command systemctl start netcontrold.service
+    installer_step 'Starting Netcontrol' root_command systemctl start netcontrold.service
     phase='check replacement service stability'
+    installer_message step 'Checking service stability.'
     local attempt
     for attempt in 1 2 3 4 5; do
         sleep 1
         root_command systemctl is-active --quiet netcontrold.service
     done
     committed=true
-    printf 'Deployment completed: %s\nLogs: journalctl -u netcontrold -f\n' "$destination"
+    installer_message success 'Upgrade complete.'
+    printf 'Installed: %s\nLogs: journalctl -u netcontrold -f\n' "$destination"
     if [[ $had_binary == true ]]; then printf 'Previous binary: %s\n' "$backup"; fi
 )
 
 deploy_upgrade() {
     local binary=$1 destination=$2 installer=$3
-    root_command bash -c 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload' bash "$installer" || return 1
-    printf 'Restarting the firewall daemon with embedded configuration SSH enabled on TCP 2222 by default; existing --ssh-listen overrides take precedence. Review host-input firewall exposure. Use a local console or independent OS SSH session.\n'
+    installer_message warning 'Use a local console or independent OS SSH session. Restarting may interrupt connectivity.'
+    installer_message warning 'Configuration SSH defaults to TCP 2222; explicit overrides are kept. Review firewall access. Competing syslog receivers will be disabled.'
+    installer_step 'Configuring kernel modules and system services' root_command bash -c 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload' bash "$installer" || return 1
     upgrade_binary "$binary" "$destination" "$installer"
 }
 
 main() {
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash upgrade.sh [--build-only]\nBuilds the current checkout on Ubuntu amd64 and replaces/restarts an installed netcontrold service. Full upgrade automatically configures host-service/gateway-monitoring permissions, embedded configuration SSH on 0.0.0.0:2222, journald forwarding and native syslog socket activation without replacing custom startup arguments; stops/masks competing syslog receivers, leaving journald in charge of /dev/log. SSH uses existing API keys, not account passwords or an OS shell. Explicit --ssh-listen overrides the default; review host-input firewall exposure. Build-only changes no service settings. The daemon applies its saved configuration, not live interface settings. No initial provisioning, factory reset, git pull, prerequisite installation or boot enablement.\n'
+        printf '%s\n' \
+            'Usage: bash upgrade.sh [--build-only]' \
+            '' \
+            'Build the current checkout on Ubuntu amd64 and restart the installed service.' \
+            '  --build-only  Build without changing the installed service.' \
+            '' \
+            'Requires stable Rust and installed build prerequisites; uses sudo for deployment.' \
+            'Keeps custom startup arguments and applies saved networking, not live NIC settings.' \
+            'Enables host services, gateway monitoring, configuration SSH and journald forwarding.' \
+            'Disables competing syslog receivers. SSH defaults to TCP 2222; explicit overrides are kept.' \
+            'Use a local console or independent OS SSH session. Review firewall access.' \
+            'No provisioning, reset, git pull, prerequisite installation or boot enablement.' \
+            '' \
+            'Output: color on terminals; NO_COLOR=1 disables it. Failed steps show diagnostics.' \
+            'Details: docs/BUILD_AND_INSTALL.md'
         return
     fi
     [[ $# -eq 0 || $# -eq 1 && $1 == --build-only ]] || { printf 'Use --help for usage.\n' >&2; return 1; }
@@ -157,14 +176,16 @@ main() {
     if [[ $# -eq 0 ]]; then
         [[ -d /run/systemd/system ]] || { printf 'A running systemd installation is required.\n' >&2; return 1; }
     fi
-    CARGO_INCREMENTAL=1 cargo +stable build --locked --target x86_64-unknown-linux-gnu -p netcontrold
+    CARGO_INCREMENTAL=1 installer_step 'Building Netcontrol (the first build may take a while)' cargo +stable build --locked --target x86_64-unknown-linux-gnu -p netcontrold
     binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/debug/netcontrold"
     "$binary" --help >/dev/null
-    printf 'Built %s\n' "$binary"
+    installer_message success 'Build complete.'
     if [[ $# -eq 0 ]]; then
         destination=$(service_target) || return 1
-        printf 'Service executable: %s\n' "$destination"
+        installer_message step "Upgrading $destination."
         deploy_upgrade "$binary" "$destination" "$repository/install.sh"
+    else
+        printf 'Binary: %s\n' "$binary"
     fi
 }
 
