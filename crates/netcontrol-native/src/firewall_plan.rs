@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use netcontrol_core::FIREWALL_EXPANSION_LIMIT;
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr};
 
@@ -164,7 +165,10 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
                     ..Match::default()
                 });
             }
-            ensure!(output.len() <= 4096, "firewall expands beyond 4096 rules");
+            ensure!(
+                output.len() <= FIREWALL_EXPANSION_LIMIT,
+                "firewall expands beyond {FIREWALL_EXPANSION_LIMIT} rules"
+            );
         }
     } else {
         for (index, rule) in rules.iter().enumerate() {
@@ -199,7 +203,10 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
                     action: string(rule, "action").into(),
                     ..Match::default()
                 });
-                ensure!(output.len() <= 4096, "firewall expands beyond 4096 rules");
+                ensure!(
+                    output.len() <= FIREWALL_EXPANSION_LIMIT,
+                    "firewall expands beyond {FIREWALL_EXPANSION_LIMIT} rules"
+                );
             }
         }
     }
@@ -221,7 +228,10 @@ pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
             );
         }
     }
-    ensure!(output.len() <= 4096, "firewall expands beyond 4096 rules");
+    ensure!(
+        output.len() <= FIREWALL_EXPANSION_LIMIT,
+        "firewall expands beyond {FIREWALL_EXPANSION_LIMIT} rules"
+    );
     Ok(output)
 }
 
@@ -270,8 +280,8 @@ pub fn compile_input(firewall: &Value, interfaces: &[crate::model::Link]) -> Res
         }
     }
     ensure!(
-        relay_plans.len() <= 4096,
-        "input firewall expands beyond 4096 rules"
+        relay_plans.len() <= FIREWALL_EXPANSION_LIMIT,
+        "input firewall expands beyond {FIREWALL_EXPANSION_LIMIT} rules"
     );
     let Some(input) = firewall.get("input").filter(|value| !value.is_null()) else {
         return Ok(relay_plans);
@@ -313,8 +323,8 @@ pub fn compile_input(firewall: &Value, interfaces: &[crate::model::Link]) -> Res
         },
     );
     ensure!(
-        plans.len() <= 4096,
-        "input firewall expands beyond 4096 rules"
+        plans.len() <= FIREWALL_EXPANSION_LIMIT,
+        "input firewall expands beyond {FIREWALL_EXPANSION_LIMIT} rules"
     );
     Ok(plans)
 }
@@ -386,7 +396,10 @@ fn expand(
                     action: string(rule, "action").into(),
                     established_related: false,
                 });
-                ensure!(output.len() <= 4096, "firewall expands beyond 4096 rules");
+                ensure!(
+                    output.len() <= FIREWALL_EXPANSION_LIMIT,
+                    "firewall expands beyond {FIREWALL_EXPANSION_LIMIT} rules"
+                );
             }
         }
     }
@@ -455,6 +468,61 @@ mod tests {
             "dhcp_relay":{"enabled":true,"servers":["10.4.40.40","10.4.40.41"]}
         }]))
         .unwrap()
+    }
+
+    #[test]
+    fn forwarding_expansion_accepts_exact_limit_and_rejects_one_extra() {
+        let rule = json!({"action":"accept","protocol":"tcp",
+            "destination_ports":(1..=32).collect::<Vec<_>>()});
+        let mut firewall = json!({
+            "policy":"drop","allow_all_icmp":false,"nat":{"masquerade":[]},
+            "rules":vec![rule.clone(); FIREWALL_EXPANSION_LIMIT / 32]
+        });
+        let plans = compile(&firewall).unwrap();
+        assert_eq!(plans.len(), 20_480);
+        assert_eq!(plans[0].counter_key, "/firewall/rules/0");
+        assert_eq!(plans.last().unwrap().counter_key, "/firewall/rules/639");
+        firewall["rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"action":"drop"}));
+        assert!(
+            compile(&firewall)
+                .unwrap_err()
+                .to_string()
+                .contains("20480")
+        );
+
+        firewall["rules"] = json!([]);
+        let rules = vec![rule; netcontrol_core::FIREWALL_POLICY_RULE_LIMIT];
+        let mut last_rules = rules.clone();
+        last_rules.last_mut().unwrap()["destination_ports"] = json!((1..=29).collect::<Vec<_>>());
+        firewall["policies"] = json!({"hosts":[
+            {"id":"client","name":"Client","addresses":["192.0.2.2"],"policy":"drop","rules":rules},
+            {"id":"server","name":"Server","addresses":["198.51.100.2"],"policy":"drop","rules":last_rules}
+        ],"interfaces":[]});
+        serde_json::from_value::<netcontrol_core::FirewallPolicies>(firewall["policies"].clone())
+            .unwrap()
+            .validate()
+            .unwrap();
+        let plans = compile(&firewall).unwrap();
+        assert_eq!(plans.len(), 20_480);
+        assert!(plans[0].established_related);
+        assert_eq!(plans[1].counter_key, "/firewall/policies/hosts/0/rules/0");
+        assert_eq!(
+            plans.last().unwrap().counter_key,
+            "/firewall/policies/hosts/1/policy"
+        );
+        firewall["policies"]["hosts"][1]["rules"][319]["destination_ports"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(30));
+        assert!(
+            compile(&firewall)
+                .unwrap_err()
+                .to_string()
+                .contains("20480")
+        );
     }
 
     #[test]
@@ -533,17 +601,29 @@ mod tests {
             interfaces[0].dhcp_relay.servers = vec![server.into()];
             assert!(compile_input(&json!({}), &interfaces).is_err());
         }
+        let rules = vec![
+            json!({
+                "action":"drop","protocol":"udp","destination_ports":(1..=32).collect::<Vec<_>>()
+            });
+            netcontrol_core::FIREWALL_POLICY_RULE_LIMIT
+        ];
+        let mut last_rules = rules.clone();
+        last_rules.last_mut().unwrap()["destination_ports"] = json!((1..=30).collect::<Vec<_>>());
         let firewall = json!({
             "input":{"policy":"drop","interfaces":[
-                {"interface":"vlan30","rules":vec![json!({"action":"drop"}); 4092]}
+                {"interface":"vlan30","rules":rules},
+                {"interface":"vlan60","rules":last_rules}
             ]}
         });
-        assert!(compile_input(&firewall, &[]).is_ok());
+        assert_eq!(
+            compile_input(&firewall, &[]).unwrap().len(),
+            FIREWALL_EXPANSION_LIMIT
+        );
         assert!(
             compile_input(&firewall, &relay_interfaces())
                 .unwrap_err()
                 .to_string()
-                .contains("4096")
+                .contains(&FIREWALL_EXPANSION_LIMIT.to_string())
         );
     }
 

@@ -5280,7 +5280,7 @@ or discard rules. Host-only, interface-only, and combined configurations are val
 
 Legacy `protocol` and `destination_ports` default to empty/Any and an empty list;
 normalized responses omit empty fields. All filter scopes limit ports to 32
-unique integers 1..65535; legacy port expansion is limited to 4096 rules.
+unique integers 1..65535; legacy port expansion is limited to 20480 rules.
 Each expanded legacy port retains its logical rule's counter identity.
 Never sort rules before sending. Host inventory and port lists may be sorted.
 Require review acknowledgement for drop defaults and catch-all drops. Provide
@@ -5652,7 +5652,7 @@ Only numeric counter values are excluded from drift fingerprints; identity,
 matches, log/verdict expressions, ordering and other attributes remain checked.
 Malformed, interrupted, mismatched-generation/layout, unsupported, missing-owned-
 firewall, drift or over-limit reads return `503` with `{error, transaction:null}`,
-not partial rows or available zeros. Bounds: 16384 physical rules, 64 MiB per
+not partial rows or available zeros. Bounds: 81920 physical rules, 64 MiB per
 dump, five-second receive budget per dump and 1 MiB maximum datagram; decoding
 and the multiple ownership-verification dumps add overhead.
 
@@ -5698,9 +5698,11 @@ ingress rules, and finally the input default. Local output is not filtered.
 Input and forwarding are distinct views; neither input defaults nor rules
 authorize forwarded traffic. Preserve both through full-package edits/history.
 The existing policy limits apply: at most 32 unique managed ingress entries,
-64 ordered rules each, 32 explicit TCP/UDP destination ports per rule,
-64 KiB policy metadata and 4096 expanded entries including established/related,
-plus the implicit loopback entry. Rule order is semantic; port lists and unique
+320 ordered rules each, 32 explicit TCP/UDP destination ports per rule,
+320 KiB (327680 bytes) serialized policy metadata and 20480 total native input
+entries including established/related, implicit loopback and generated DHCP-relay
+permits. Core policy validation counts established/related but not the generated
+loopback/relay entries; native compilation enforces the final total. Rule order is semantic; port lists and unique
 ingress entries are normalized by sorting.
 
 Explicit factory reset creates input default-drop, LAN allow-all, and WAN
@@ -6201,12 +6203,12 @@ fields below are integers. Do not use JavaScript truthiness to validate `0`.
 | Host inventory | At most 128; unique ID `^[a-zA-Z0-9_-]{1,64}$`; unique nonblank name <=80 bytes, no outer whitespace/control characters |
 | Host addresses/default | 1..16 canonical unicast IPv4/IPv6 addresses, globally unique across hosts; no CIDR, mapped IPv6, zones, loopback or link-local; required accept/drop default |
 | Filter protocols | Omitted/empty Any, `tcp`, `udp`, `icmp` (IPv4 only), `icmpv6` (IPv6 only, requires ipv6_enabled); all types/codes; incompatible families rejected |
-| Host/interface rules | At most 64 ordered rules per host/interface; the five filter protocol choices; accept/drop |
-| Legacy ordered rules | Same protocol/port contract; at most 4096 port-expanded entries; preserve order |
+| Host/interface rules | At most 320 ordered rules per host/interface (also input ingress); the five filter protocol choices; accept/drop |
+| Legacy ordered rules | Same protocol/port contract; at most 20480 port-expanded entries; preserve order |
 | Policy destination | Omitted = Any; existing `destination_host` ID or canonical `destination` network, mutually exclusive; host rule needs at least one compatible source/destination family |
 | Destination ports | Optional <=32 unique integers 1..65535; requires TCP/UDP |
 | Interface overrides | <=32 unique valid ingress names, managed in draft or operator-adopted; no interface default/final verdict for unmatched traffic |
-| Policy expansion | <=64 KiB serialized policy metadata and <=4096 generated forwarding rules, counting stateful and host defaults; backend authoritative |
+| Policy expansion | <=320 KiB (327680 bytes) serialized policy metadata and <=20480 generated forwarding rules, counting stateful and host defaults; backend authoritative |
 | Masquerade family | Exactly `ipv4` or `ipv6` |
 | Masquerade source | Optional canonical network matching explicit family |
 | Masquerade egress | Managed draft interface with an address of matching family, or a DHCPv4 client for IPv4 |

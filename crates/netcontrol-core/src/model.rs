@@ -13,6 +13,10 @@ fn accept() -> String {
     "accept".into()
 }
 
+pub const FIREWALL_POLICY_RULE_LIMIT: usize = 320;
+pub const FIREWALL_EXPANSION_LIMIT: usize = 20_480;
+pub const FIREWALL_POLICY_METADATA_LIMIT: usize = 327_680;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -1415,8 +1419,8 @@ impl Config {
             );
         }
         ensure!(
-            legacy_expansions <= 4096,
-            "firewall expands beyond 4096 rules"
+            legacy_expansions <= FIREWALL_EXPANSION_LIMIT,
+            "firewall expands beyond {FIREWALL_EXPANSION_LIMIT} rules"
         );
         if let Some(p) = &self.firewall.policies {
             ensure!(
@@ -1978,7 +1982,10 @@ impl FirewallPolicies {
         let validate_rules = |rules: &[HostPolicyRule],
                               source: Option<&FirewallHost>|
          -> Result<usize> {
-            ensure!(rules.len() <= 64, "at most 64 rules per host/interface");
+            ensure!(
+                rules.len() <= FIREWALL_POLICY_RULE_LIMIT,
+                "at most {FIREWALL_POLICY_RULE_LIMIT} rules per host/interface"
+            );
             let mut count = 0usize;
             for r in rules {
                 r.origin.validate_source(r.import_source.as_deref())?;
@@ -2053,10 +2060,13 @@ impl FirewallPolicies {
         for h in &self.hosts {
             count += validate_rules(&h.rules, Some(h))? + h.addresses.len();
         }
-        ensure!(count <= 4096, "firewall policies expand beyond 4096 rules");
         ensure!(
-            serde_json::to_vec(self)?.len() <= 65536,
-            "firewall policy metadata exceeds 65536 bytes"
+            count <= FIREWALL_EXPANSION_LIMIT,
+            "firewall policies expand beyond {FIREWALL_EXPANSION_LIMIT} rules"
+        );
+        ensure!(
+            serde_json::to_vec(self)?.len() <= FIREWALL_POLICY_METADATA_LIMIT,
+            "firewall policy metadata exceeds {FIREWALL_POLICY_METADATA_LIMIT} bytes"
         );
         Ok(())
     }

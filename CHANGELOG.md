@@ -4,6 +4,14 @@
 
 ### Changed
 
+- Increase firewall policy limits fivefold: 320 ordered rules per host/interface,
+  20480 expanded forwarding/input rules and 320 KiB serialized policy metadata.
+  Legacy forwarding uses the same expanded-rule limit; counter snapshots allow
+  81920 physical rules so larger accepted policies remain observable.
+  Release impact: additive validation-capacity change, Unreleased; next automatic
+  calendar version. Required frontend validation/help update:
+  [handoff 2026-11-07-06](docs/frontend-handoffs/2026-11-07.md#2026-11-07-06-fivefold-firewall-policy-limits).
+
 - Installer and source-upgrade output uses concise, terminal-aware colored
   stages and completion summaries. Hide routine successful command output,
   show failed-step diagnostics and preserve actionable safety warnings.

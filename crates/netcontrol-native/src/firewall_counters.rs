@@ -8,6 +8,7 @@ use std::{
 };
 
 const PREFIX: &str = "netcontrol-counter-v1";
+const SNAPSHOT_RULE_LIMIT: usize = 81_920;
 
 fn ranges(bytes: &[u8]) -> Result<Vec<(u16, Range<usize>)>> {
     let mut offset = 0;
@@ -107,8 +108,8 @@ pub fn snapshot(
     expected: &BTreeMap<(String, String), usize>,
 ) -> Result<Value> {
     ensure!(
-        payloads.len() <= 16_384,
-        "firewall snapshot exceeds 16384 kernel rules"
+        payloads.len() <= SNAPSHOT_RULE_LIMIT,
+        "firewall snapshot exceeds {SNAPSHOT_RULE_LIMIT} kernel rules"
     );
     let mut totals = BTreeMap::<(String, String), (usize, u128, u128)>::new();
     let mut generation = None;
@@ -257,6 +258,25 @@ mod tests {
             attribute(7, &userdata(generation, key).unwrap()),
         ]
         .concat()
+    }
+
+    #[test]
+    fn counter_snapshot_accepts_exact_rule_limit_and_rejects_one_extra() {
+        let expected = BTreeMap::from([(("forward".into(), KEY.into()), SNAPSHOT_RULE_LIMIT)]);
+        let mut rows: Vec<_> = (1..=SNAPSHOT_RULE_LIMIT)
+            .map(|handle| payload(handle as u64, GENERATION, KEY, 1, 2))
+            .collect();
+        let result = snapshot(&rows, &expected).unwrap();
+        assert_eq!(result["rules"][0]["expanded_rules"], 81_920);
+        assert_eq!(result["rules"][0]["packets"], "81920");
+        assert_eq!(result["rules"][0]["bytes"], "163840");
+        rows.push(payload(81_921, GENERATION, KEY, 1, 2));
+        assert!(
+            snapshot(&rows, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("81920")
+        );
     }
 
     #[test]

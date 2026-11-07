@@ -1601,10 +1601,12 @@ fn icmp_destination_hosts_and_legacy_expansion_limits() {
     let rule: FirewallRule = serde_json::from_value(json!({"protocol":"tcp",
         "destination_ports":(1..=32).collect::<Vec<_>>(),"action":"accept"}))
     .unwrap();
-    c.firewall.rules = vec![rule.clone(); 128];
+    c.firewall.rules = vec![rule; FIREWALL_EXPANSION_LIMIT / 32];
     c.validate().unwrap();
-    c.firewall.rules.push(rule);
-    assert!(c.validate().unwrap_err().to_string().contains("4096"));
+    c.firewall
+        .rules
+        .push(serde_json::from_value(json!({"action":"drop"})).unwrap());
+    assert!(c.validate().unwrap_err().to_string().contains("20480"));
 }
 
 #[test]
@@ -1770,8 +1772,12 @@ fn policy_expansion_accepts_exact_limit_and_rejects_one_extra() {
             policy: "drop".into(),
             rules: vec![],
         };
-        for j in 0..64 {
-            let count = if i == 1 && j == 63 { 29 } else { 32 };
+        for j in 0..FIREWALL_POLICY_RULE_LIMIT {
+            let count = if i == 1 && j == FIREWALL_POLICY_RULE_LIMIT - 1 {
+                29
+            } else {
+                32
+            };
             h.rules.push(HostPolicyRule {
                 origin: Default::default(),
                 import_source: None,
@@ -1787,8 +1793,107 @@ fn policy_expansion_accepts_exact_limit_and_rejects_one_extra() {
         p.hosts.push(h);
     }
     p.validate().unwrap();
-    p.hosts[1].rules[63].destination_ports.push(30);
-    assert!(p.validate().is_err());
+    p.hosts[1]
+        .rules
+        .last_mut()
+        .unwrap()
+        .destination_ports
+        .push(30);
+    assert!(p.validate().unwrap_err().to_string().contains("20480"));
+}
+
+#[test]
+fn policy_rule_limits_apply_to_hosts_forwarding_interfaces_and_input() {
+    let rule: HostPolicyRule = serde_json::from_value(json!({"action":"accept"})).unwrap();
+    for scope in 0..3 {
+        let mut config = candidate();
+        config.firewall.rules.clear();
+        let rules = vec![rule.clone(); FIREWALL_POLICY_RULE_LIMIT];
+        match scope {
+            0 => {
+                config.firewall.policies = Some(
+                    serde_json::from_value(json!({
+                        "hosts":[{"id":"client","name":"Client","addresses":["192.0.2.2"],
+                            "policy":"drop","rules":rules}]
+                    }))
+                    .unwrap(),
+                )
+            }
+            1 => {
+                config.firewall.policies = Some(
+                    serde_json::from_value(json!({
+                        "interfaces":[{"interface":"lan0","rules":rules}]
+                    }))
+                    .unwrap(),
+                )
+            }
+            _ => {
+                config.firewall.input = Some(
+                    serde_json::from_value(json!({
+                        "policy":"drop","interfaces":[{"interface":"lan0","rules":rules}]
+                    }))
+                    .unwrap(),
+                )
+            }
+        }
+        config.validate().unwrap();
+        let mut roundtrip: Config =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        roundtrip.normalize();
+        roundtrip.validate().unwrap();
+        let rules = match scope {
+            0 => &mut config.firewall.policies.as_mut().unwrap().hosts[0].rules,
+            1 => &mut config.firewall.policies.as_mut().unwrap().interfaces[0].rules,
+            _ => &mut config.firewall.input.as_mut().unwrap().interfaces[0].rules,
+        };
+        rules.push(rule.clone());
+        assert!(config.validate().unwrap_err().to_string().contains("320"));
+    }
+}
+
+#[test]
+fn policy_metadata_accepts_exact_byte_limit_and_rejects_one_extra() {
+    let rule: HostPolicyRule = serde_json::from_value(json!({
+        "action":"accept","metadata":{"description":"x"}
+    }))
+    .unwrap();
+    let mut config = candidate();
+    config.firewall.rules.clear();
+    config.firewall.policies = Some(FirewallPolicies {
+        hosts: vec![],
+        interfaces: vec![InterfacePolicy {
+            metadata: Default::default(),
+            interface: "lan0".into(),
+            rules: vec![rule; 160],
+        }],
+    });
+    let policies = config.firewall.policies.as_mut().unwrap();
+    let mut remaining =
+        FIREWALL_POLICY_METADATA_LIMIT - serde_json::to_vec(policies).unwrap().len();
+    for rule in &mut policies.interfaces[0].rules {
+        let count = remaining.min(2047);
+        rule.metadata.description.push_str(&"x".repeat(count));
+        remaining -= count;
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(serde_json::to_vec(policies).unwrap().len(), 327_680);
+    config.validate().unwrap();
+    let policies = config.firewall.policies.as_mut().unwrap();
+    policies.interfaces[0]
+        .rules
+        .last_mut()
+        .unwrap()
+        .metadata
+        .description
+        .push('x');
+    assert_eq!(serde_json::to_vec(policies).unwrap().len(), 327_681);
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("327680")
+    );
 }
 #[test]
 fn monitor_defaults_normalize_and_enabled_cross_references_are_required() {

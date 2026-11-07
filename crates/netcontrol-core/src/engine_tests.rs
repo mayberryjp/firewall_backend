@@ -431,6 +431,60 @@ fn firewall_bulk_clear_confirms_only_hosts_and_forward_rules_and_survives_restar
 }
 
 #[test]
+fn larger_firewall_policies_confirm_persist_and_rollback_with_explicit_limit_errors() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut config = Config::empty();
+    config.firewall.policies = Some(
+        serde_json::from_value(json!({
+            "hosts":[{"id":"client","name":"Client","addresses":["192.0.2.2"],"policy":"drop",
+                "rules":vec![json!({"action":"accept"}); crate::FIREWALL_POLICY_RULE_LIMIT]}]
+        }))
+        .unwrap(),
+    );
+    let initial = submit(&mut engine, config.clone());
+    assert_eq!(initial.status, 202, "{}", initial.body);
+    assert_eq!(
+        confirm(&mut engine, initial.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(engine.saved_configuration(), &config.clone().normalized());
+    config.firewall.policies.as_mut().unwrap().hosts[0].rules[0].action = "drop".into();
+    let changed = submit(&mut engine, config.clone());
+    assert_eq!(changed.status, 202, "{}", changed.body);
+    let rollback = request(
+        &mut engine,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            changed.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200, "{}", rollback.body);
+    assert_eq!(
+        engine
+            .saved_configuration()
+            .firewall
+            .policies
+            .as_ref()
+            .unwrap()
+            .hosts[0]
+            .rules[0]
+            .action,
+        "accept"
+    );
+    let rules = &mut config.firewall.policies.as_mut().unwrap().hosts[0].rules;
+    rules.push(rules[0].clone());
+    let invalid = submit(&mut engine, config);
+    assert_eq!(invalid.status, 422, "{}", invalid.body);
+    assert!(invalid.body["error"].as_str().unwrap().contains("320"));
+    assert!(engine.active().is_none());
+}
+
+#[test]
 fn firewall_bulk_clear_requires_explicit_scoped_input_and_normal_transaction_guards() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

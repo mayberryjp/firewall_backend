@@ -712,7 +712,7 @@ unmarked application traffic. No new public source-policy support, DHCPv6 or WAN
 
 The firewall owns only `inet/netcontrol`. Each update atomically replaces its
 table, chains and ordered rules in one batch. It implements ordered forwarding
-rules, host/interface policy expansion (4096 compiled-rule limit), established/
+rules, host/interface policy expansion (20480 compiled-rule limit), established/
 related acceptance for host policies, explicit host defaults, IPv4 ICMP acceptance
 on input/output/forward when enabled, and IPv4/IPv6 egress masquerade. Interface
 rules precede host-specific rules, and per-host defaults follow that host's
