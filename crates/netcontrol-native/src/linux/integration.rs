@@ -3948,6 +3948,59 @@ fn native_links_routes_rules_firewall_sysctl_rollback_and_restart() -> Result<()
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
+fn native_conntrack_timeouts_apply_restart_rollback_and_restore_originals() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let options = fixture.options();
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    let mut after = empty.clone();
+    for parameter in netcontrol_core::kernel_catalog()
+        .into_iter()
+        .filter(|parameter| {
+            parameter.name.starts_with("net.netfilter.") && parameter.scope == "namespace"
+        })
+    {
+        after
+            .kernel
+            .namespace
+            .insert(parameter.name.into(), "300".into());
+    }
+    after.validate()?;
+    native.apply(&empty, &after)?;
+    native.observe(&after)?;
+    let runtime = native.runtime(&after)?;
+    let original = runtime["kernel_tunables"]["captured_original"]["namespace"].clone();
+    for name in after.kernel.namespace.keys() {
+        assert!(original[name].is_string());
+        assert_eq!(
+            runtime["kernel_tunables"]["observed"]["namespace"][name],
+            "300"
+        );
+    }
+    let mut changed = after.clone();
+    for value in changed.kernel.namespace.values_mut() {
+        *value = "301".into();
+    }
+    native.apply(&after, &changed)?;
+    native.observe(&changed)?;
+    native.apply(&changed, &after)?;
+    native.observe(&after)?;
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.repair(&after)?;
+    native.observe(&after)?;
+    native.apply(&after, &empty)?;
+    native.observe(&empty)?;
+    assert_eq!(
+        native.runtime(&empty)?["kernel_tunables"]["observed"]["namespace"],
+        original
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin privileges"]
 fn native_preserves_unmanaged_links_and_adopted_parent() -> Result<()> {
     let fixture = Fixture::new()?;
     let namespace = Arc::new(open_namespace(&fixture.namespace)?);

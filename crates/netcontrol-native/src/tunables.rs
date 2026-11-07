@@ -42,6 +42,13 @@ pub fn validate(name: &str, scope: &str, value: &str) -> Result<()> {
         ("host", "net.core.netdev_max_backlog" | "net.core.netdev_budget_usecs") => {
             (0, i32::MAX as i64, 1)
         }
+        (_, name) if name.starts_with("net.netfilter.") => {
+            let parameter = netcontrol_core::kernel_catalog()
+                .into_iter()
+                .find(|parameter| parameter.scope == scope && parameter.name == name)
+                .ok_or_else(|| anyhow::anyhow!("unsupported {scope} kernel tunable {name}"))?;
+            (parameter.min, parameter.max, parameter.count)
+        }
         _ => bail!("unsupported {scope} kernel tunable {name}"),
     };
     let fields: Vec<_> = value.split(' ').collect();
@@ -84,5 +91,45 @@ mod tests {
         assert!(validate("../../x", "namespace", "1").is_err());
         assert!(validate("net.core.rmem_max", "namespace", "1").is_err());
         assert!(validate("net.ipv4.tcp_congestion_control", "namespace", "cubic\n").is_err());
+    }
+
+    #[test]
+    fn conntrack_native_validation_matches_catalog_bounds_and_scopes() {
+        let parameters: Vec<_> = netcontrol_core::kernel_catalog()
+            .into_iter()
+            .filter(|parameter| parameter.name.starts_with("net.netfilter."))
+            .collect();
+        assert_eq!(parameters.len(), 9);
+        for parameter in parameters {
+            for value in [parameter.min, parameter.max] {
+                validate(parameter.name, parameter.scope, &value.to_string()).unwrap();
+            }
+            for value in [
+                (parameter.min - 1).to_string(),
+                (parameter.max + 1).to_string(),
+                "01".into(),
+                "+1".into(),
+                "1 2".into(),
+                "1\n".into(),
+            ] {
+                assert!(validate(parameter.name, parameter.scope, &value).is_err());
+            }
+            let wrong_scope = if parameter.scope == "host" {
+                "namespace"
+            } else {
+                "host"
+            };
+            assert!(validate(parameter.name, wrong_scope, &parameter.min.to_string()).is_err());
+        }
+        for name in [
+            "net.netfilter.nf_conntrack_count",
+            "net.netfilter.nf_conntrack_buckets",
+            "net.netfilter.nf_conntrack_tcp_be_liberal",
+            "net.netfilter.nf_conntrack_tcp_loose",
+        ] {
+            for scope in ["namespace", "host"] {
+                assert!(validate(name, scope, "1").is_err());
+            }
+        }
     }
 }

@@ -469,6 +469,41 @@ the rewritten target, and existing conntrack translations persist after edits.
 Commands stage the same confirmed transaction and require `nat.write`; see the
 [canonical contract](../FRONTEND_SPEC.md#destination-rewrite).
 
+## Conntrack controls
+
+Use `kernel host net.netfilter.nf_conntrack_max VALUE` for the host-global
+entry limit (1024..16777216), and `kernel namespace KEY VALUE` for the eight
+TCP/UDP timeout keys in the
+[catalog contract](../FRONTEND_SPEC.md#conntrack-limits-and-timeouts)
+(1..604800 seconds). Values are canonical decimal strings. The existing
+`show kernel` read displays configured/effective/original values.
+
+Synthetic example retaining common values, not a capacity recommendation:
+
+```text
+configure terminal
+kernel host net.netfilter.nf_conntrack_max 65536
+kernel namespace net.netfilter.nf_conntrack_tcp_timeout_established 432000
+kernel namespace net.netfilter.nf_conntrack_udp_timeout 30
+commit check
+commit confirmed 60
+confirm
+```
+
+Perform independent connectivity checks before `confirm`. Use
+`no kernel host net.netfilter.nf_conntrack_max` or
+`no kernel namespace KEY`, followed by the same confirmed workflow, to release
+ownership and restore the captured original rather than a hard-coded default.
+Changes require `transactions.write` and the corresponding
+`kernel.host.write`/`kernel.namespace.write`; the entry limit also requires the
+native host-tunables ownership gate. No Rust source build or external `sysctl`
+process is invoked by these CLI commands.
+
+Increasing limits permits greater memory use; reducing limits can reject new
+connections; short timeouts can disrupt idle flows. No connection flush,
+hash-bucket resizing, TCP validation relaxation or automatic tuning is performed.
+Rollback restores values, not expired connections.
+
 ## Complete-schema JSON editing
 
 All configuration surfaces, including nested fields not given a dedicated

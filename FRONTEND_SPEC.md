@@ -1746,6 +1746,82 @@ Ubuntu install/full source upgrade loads/persists modules. No unprivileged-BPF
 sysctl, AppArmor or lockdown weakening. Other package/manual upgrade paths need
 operator kernel-module prerequisites; API reads never repair them.
 
+#### Conntrack limits and timeouts
+
+Nine advanced conntrack controls are accepted through the existing
+`kernel.host` and `kernel.namespace` string maps. Previously these names were
+rejected as unsupported tunables. No new configuration object, write endpoint,
+permission, automatic tuning, or default override is added.
+
+| Full sysctl key | Scope | Inclusive range | Unit |
+|---|---|---|---|
+| `net.netfilter.nf_conntrack_max` | host | 1024..16777216 | entries |
+| `net.netfilter.nf_conntrack_tcp_timeout_established` | namespace | 1..604800 | seconds |
+| `net.netfilter.nf_conntrack_tcp_timeout_close` | namespace | 1..604800 | seconds |
+| `net.netfilter.nf_conntrack_tcp_timeout_close_wait` | namespace | 1..604800 | seconds |
+| `net.netfilter.nf_conntrack_tcp_timeout_fin_wait` | namespace | 1..604800 | seconds |
+| `net.netfilter.nf_conntrack_tcp_timeout_last_ack` | namespace | 1..604800 | seconds |
+| `net.netfilter.nf_conntrack_tcp_timeout_time_wait` | namespace | 1..604800 | seconds |
+| `net.netfilter.nf_conntrack_udp_timeout` | namespace | 1..604800 | seconds |
+| `net.netfilter.nf_conntrack_udp_timeout_stream` | namespace | 1..604800 | seconds |
+
+Values are nonnull canonical decimal **strings**, not JSON numbers. Reject
+leading zeros, signs, whitespace, multiple elements, incorrect scope and
+out-of-range values. Omission owns nothing and leaves unmanaged kernel settings
+unchanged; removing an owned key restores its captured original through the
+normal transaction lifecycle. Do not silently clamp unsupported current values.
+The native preflight validates both requested and captured current values.
+Read-only `nf_conntrack_count`, hash-bucket tuning and TCP validation-relaxation
+controls (`nf_conntrack_tcp_loose`, `nf_conntrack_tcp_be_liberal`) remain
+unsupported as configuration.
+
+`GET /api/v1/kernel/tunables/catalog` (API key, `state.read`) returns the same
+array schema with nine additional `kind:"integer"`, `count:1` entries:
+`name:string`, `scope:"host"|"namespace"`, `min:number`, `max:number`,
+`description:string`. Descriptions include operational warnings. Catalog bounds
+are configuration limits, not memory sizing recommendations or effective values.
+`GET /api/v1/kernel/tunables` and `GET /api/v1/runtime` expose the keys under the
+existing desired/configured/effective/observed/captured-original maps. Empty maps
+do not imply the kernel has no defaults. Simulator values are synthetic, not
+measurements of the appliance.
+
+Synthetic fragment, not a complete transaction or tuning recommendation:
+
+```json
+{"kernel":{"host":{"net.netfilter.nf_conntrack_max":"65536"},"namespace":{"net.netfilter.nf_conntrack_tcp_timeout_established":"432000","net.netfilter.nf_conntrack_udp_timeout":"30"}}}
+```
+
+Submit the full current configuration through `POST /api/v1/transactions` with
+`base_revision` and `confirm_timeout_seconds` 10..300, then explicitly
+`POST /api/v1/transactions/{id}/confirm` or `/rollback`. Mutations, confirmation,
+rollback and revision restore require `transactions.write` and
+`kernel.host.write` for the entry limit and/or `kernel.namespace.write` for
+timeouts, plus permissions for other changed resources. JSON type/null errors
+are `400`, semantic validation errors `422`, authentication/permissions
+`401`/`403`, stale/busy transactions `409`, native preflight/write/readback
+failures use existing `500` transaction errors; observation availability errors
+are `503`. Successful submit is provisional `202`, confirm/rollback `200`.
+Revision restore uses the existing `POST /api/v1/revisions/{revision}/restore`.
+
+Linux requires loaded conntrack sysctls and writable procfs with the normal
+native permissions. The entry limit is **host-global**, including when accessed
+through a lab namespace, and uses the existing exclusive host-tunables ownership
+gate; lab use requires the explicit host-tuning opt-in. Timeouts are scoped to
+the daemon's network namespace. No module loading, hash-table resizing,
+connection deletion/flush, sysctl.d file, or TCP validation relaxation occurs.
+Saved configuration and native ownership intents provide restart repair,
+exact readback, rollback and original restoration.
+
+Frontend: add an advanced conntrack group driven by catalog scope/bounds, keep
+values as strings, distinguish configured from effective/original values, and
+offer ownership removal rather than a guessed default. Warn that higher limits
+permit greater memory use; lower limits can reject new connections; short
+timeouts can break idle flows or leave late teardown packets untracked.
+Do not claim that a valid value is safe for available RAM, that timeout changes
+rewrite every existing timer, or that restoring sysctls resurrects expired
+connections. Require operator review and independent connectivity checks before
+confirmation. Deploy the accepting backend before enabling the controls.
+
 #### Performance diagnostics and RPS tuning
 
 `GET /api/v1/statistics/performance` requires API-key authentication and

@@ -4435,6 +4435,118 @@ fn revision_pagination_and_strict_queries() {
     }
 }
 #[test]
+fn conntrack_controls_use_existing_permissions_persistence_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut config = Config::empty();
+    config
+        .kernel
+        .host
+        .insert("net.netfilter.nf_conntrack_max".into(), "131072".into());
+    for parameter in kernel_catalog().into_iter().filter(|parameter| {
+        parameter.name.starts_with("net.netfilter.") && parameter.scope == "namespace"
+    }) {
+        config
+            .kernel
+            .namespace
+            .insert(parameter.name.into(), "300".into());
+    }
+    let body = serde_json::to_vec(&json!({
+        "base_revision":engine.state.revision,
+        "confirm_timeout_seconds":30,
+        "config":config
+    }))
+    .unwrap();
+    for missing in ["kernel.host.write", "kernel.namespace.write"] {
+        let permissions: Vec<_> = all()
+            .into_iter()
+            .filter(|permission| permission != missing)
+            .collect();
+        let response = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "limited",
+            &permissions,
+            &body,
+        );
+        assert_eq!(response.status, 403, "{}", response.body);
+        assert!(response.body["error"].as_str().unwrap().contains(missing));
+        assert_eq!(engine.saved_configuration().kernel, KernelConfig::default());
+    }
+    let catalog = engine.request(
+        "GET",
+        "/api/v1/kernel/tunables/catalog",
+        "",
+        "reader",
+        &["state.read".into()],
+        &[],
+    );
+    assert_eq!(catalog.status, 200);
+    assert_eq!(
+        catalog
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|parameter| {
+                parameter["name"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("net.netfilter.")
+            })
+            .count(),
+        9
+    );
+    let provisional = submit(&mut engine, config.clone());
+    assert_eq!(provisional.status, 202, "{}", provisional.body);
+    let kernel = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(kernel.body["configured"], json!(config.kernel));
+    assert_eq!(kernel.body["observed"], json!(config.kernel));
+    let original = kernel.body["captured_original"].clone();
+    assert_eq!(original["host"]["net.netfilter.nf_conntrack_max"], "65536");
+    assert_eq!(
+        original["namespace"]["net.netfilter.nf_conntrack_tcp_timeout_established"],
+        "432000"
+    );
+    assert_eq!(
+        confirm(&mut engine, provisional.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(config.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(engine.saved_configuration().kernel, config.kernel);
+    let removal = submit(&mut engine, Config::empty());
+    assert_eq!(removal.status, 202);
+    let kernel = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(kernel.body["effective"], original);
+    let rollback = request(
+        &mut engine,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            removal.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200);
+    assert_eq!(engine.saved_configuration().kernel, config.kernel);
+    let kernel = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(kernel.body["effective"], json!(config.kernel));
+    let removal = submit(&mut engine, Config::empty());
+    assert_eq!(
+        confirm(&mut engine, removal.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let kernel = request(&mut engine, "GET", "/api/v1/kernel/tunables", Value::Null);
+    assert_eq!(kernel.body["effective"], original);
+}
+
+#[test]
 fn simulator_kernel_removal_and_rollback_restore_original_values() {
     let f = Fixture::new();
     let mut e = f.engine();

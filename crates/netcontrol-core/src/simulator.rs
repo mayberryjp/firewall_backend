@@ -398,6 +398,15 @@ fn simulated_kernel_default(scope: &str, name: &str) -> String {
         "net.core.netdev_max_backlog" => "1000",
         "net.core.netdev_budget" => "300",
         "net.core.netdev_budget_usecs" => "2000",
+        "net.netfilter.nf_conntrack_max" => "65536",
+        "net.netfilter.nf_conntrack_tcp_timeout_established" => "432000",
+        "net.netfilter.nf_conntrack_tcp_timeout_close" => "10",
+        "net.netfilter.nf_conntrack_tcp_timeout_close_wait" => "60",
+        "net.netfilter.nf_conntrack_tcp_timeout_fin_wait"
+        | "net.netfilter.nf_conntrack_tcp_timeout_time_wait"
+        | "net.netfilter.nf_conntrack_udp_timeout_stream" => "120",
+        "net.netfilter.nf_conntrack_tcp_timeout_last_ack"
+        | "net.netfilter.nf_conntrack_udp_timeout" => "30",
         "net.ipv4.tcp_mtu_probing" | "net.ipv4.tcp_no_metrics_save" => "0",
         _ => {
             if scope == "host" {

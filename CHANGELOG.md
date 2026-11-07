@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- Advanced conntrack controls through existing kernel HTTP/SSH configuration:
+  host-global entry limits, namespace TCP established/closing-state and UDP
+  unreplied/stream timeouts. Publish scope, bounded canonical-string values and
+  warnings in the catalog; retain permissions, confirmed transactions,
+  persistence, drift checks, rollback and original-value restoration.
+  No automatic default changes, connection flush, hash resizing or relaxed TCP
+  validation. Release impact: additive contract; next automatic calendar version.
+  Required frontend controls/validation/help:
+  [handoff 2026-11-08-01](docs/frontend-handoffs/2026-11-08.md#2026-11-08-01-conntrack-controls).
+
 ### Changed
 
 - Increase firewall policy limits fivefold: 320 ordered rules per host/interface,

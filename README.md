@@ -157,6 +157,28 @@ See the [contract](FRONTEND_SPEC.md#dns-peer-endpoints) and synthetic
 [BGP-over-WireGuard example](examples/bgp.json); replace its name, addresses
 and public key, and provision the private key/underlay before applying.
 
+## Conntrack limits and timeouts
+
+Advanced conntrack tuning uses the existing confirmed kernel transaction
+workflow, HTTP catalog and configuration SSH commands. Own
+`net.netfilter.nf_conntrack_max` in `kernel.host` (1024..16777216 entries);
+own TCP established/close/close-wait/fin-wait/last-ack/time-wait and UDP
+unreplied/stream timeouts in `kernel.namespace` (1..604800 seconds).
+Values are canonical decimal strings; no defaults are changed automatically.
+Removing a key restores its captured original, with normal persistence,
+restart repair, drift detection and rollback. Host limits require
+`kernel.host.write`, namespace timeouts `kernel.namespace.write`, and all
+mutations use `transactions.write`.
+
+Higher limits permit more memory use, lower limits can block new connections,
+and short timeouts can disrupt idle flows or expose late teardown drops.
+Applying settings never flushes connections, resizes hash buckets or relaxes TCP
+validation. Inspect actual usage and connectivity before confirmation; restoring
+a setting cannot recover a flow that already expired.
+See the [exact catalog/API contract](FRONTEND_SPEC.md#conntrack-limits-and-timeouts),
+[configuration SSH usage](docs/CLI.md#conntrack-controls), and
+[frontend handoff](docs/frontend-handoffs/2026-11-08.md#2026-11-08-01-conntrack-controls).
+
 ## DHCP relay firewall admission
 
 Enabling per-interface DHCPv4 relay automatically installs system-owned native

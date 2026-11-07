@@ -1899,6 +1899,59 @@ pub fn kernel_catalog() -> Vec<KernelParameter> {
             description: "Host-global setting; affects other applications and namespaces.",
         });
     }
+    items.push(KernelParameter {
+        name: "net.netfilter.nf_conntrack_max",
+        scope: "host",
+        kind: "integer",
+        min: 1024,
+        max: 16_777_216,
+        count: 1,
+        description: "Host-global conntrack entry limit; increasing it permits higher memory use, lowering it can block new connections. Does not resize hash buckets or flush entries.",
+    });
+    for (name, description) in [
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_established",
+            "TCP established idle timeout in seconds; short values can interrupt idle connections.",
+        ),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_close",
+            "TCP closed-state timeout in seconds; short values can leave late packets untracked.",
+        ),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_close_wait",
+            "TCP CLOSE_WAIT timeout in seconds; short values can leave late packets untracked.",
+        ),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_fin_wait",
+            "TCP FIN_WAIT timeout in seconds; short values can leave late packets untracked.",
+        ),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_last_ack",
+            "TCP LAST_ACK timeout in seconds; short values can leave late packets untracked.",
+        ),
+        (
+            "net.netfilter.nf_conntrack_tcp_timeout_time_wait",
+            "TCP TIME_WAIT timeout in seconds; short values can leave late packets untracked.",
+        ),
+        (
+            "net.netfilter.nf_conntrack_udp_timeout",
+            "UDP unreplied-flow timeout in seconds; short values can expire idle mappings.",
+        ),
+        (
+            "net.netfilter.nf_conntrack_udp_timeout_stream",
+            "UDP detected-stream timeout in seconds; short values can expire idle mappings.",
+        ),
+    ] {
+        items.push(KernelParameter {
+            name,
+            scope: "namespace",
+            kind: "integer",
+            min: 1,
+            max: 604_800,
+            count: 1,
+            description,
+        });
+    }
     items.sort_by_key(|p| (p.scope, p.name));
     items
 }

@@ -985,6 +985,62 @@ fn confirmation_timeout_rolls_back_even_after_cli_session_is_dropped() {
     );
 }
 #[test]
+fn conntrack_cli_controls_stage_confirm_and_release_ownership() {
+    let fixture = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    fixture.configure(&mut cli);
+    fixture.ok(
+        &mut cli,
+        "kernel host net.netfilter.nf_conntrack_max 131072",
+    );
+    fixture.ok(
+        &mut cli,
+        "kernel namespace net.netfilter.nf_conntrack_tcp_timeout_established 432000",
+    );
+    fixture.ok(
+        &mut cli,
+        "kernel namespace net.netfilter.nf_conntrack_udp_timeout 60",
+    );
+    fixture.ok(&mut cli, "commit check");
+    fixture.ok(&mut cli, "commit confirmed 30");
+    fixture.ok(&mut cli, "confirm");
+    let kernel = fixture.request("/api/v1/kernel/tunables");
+    assert_eq!(
+        kernel["observed"]["host"]["net.netfilter.nf_conntrack_max"],
+        "131072"
+    );
+    assert_eq!(
+        kernel["observed"]["namespace"]["net.netfilter.nf_conntrack_tcp_timeout_established"],
+        "432000"
+    );
+    assert_eq!(
+        kernel["observed"]["namespace"]["net.netfilter.nf_conntrack_udp_timeout"],
+        "60"
+    );
+    fixture.ok(&mut cli, "configure terminal");
+    fixture.ok(&mut cli, "no kernel host net.netfilter.nf_conntrack_max");
+    fixture.ok(
+        &mut cli,
+        "no kernel namespace net.netfilter.nf_conntrack_tcp_timeout_established",
+    );
+    fixture.ok(
+        &mut cli,
+        "no kernel namespace net.netfilter.nf_conntrack_udp_timeout",
+    );
+    fixture.ok(&mut cli, "commit confirmed 30");
+    fixture.ok(&mut cli, "confirm");
+    let kernel = fixture.request("/api/v1/kernel/tunables");
+    assert_eq!(
+        kernel["observed"]["host"]["net.netfilter.nf_conntrack_max"],
+        "65536"
+    );
+    assert_eq!(
+        kernel["observed"]["namespace"]["net.netfilter.nf_conntrack_udp_timeout"],
+        "30"
+    );
+}
+
+#[test]
 fn performance_rps_cli_stages_confirms_and_restores() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

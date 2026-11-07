@@ -1457,7 +1457,7 @@ fn relay_requires_servers_and_unique_bound_address() {
 }
 #[test]
 fn kernel_catalog_and_canonical_values() {
-    assert_eq!(kernel_catalog().len(), 22);
+    assert_eq!(kernel_catalog().len(), 31);
     for (k, v) in [
         ("net.ipv4.tcp_sack", "2"),
         ("net.ipv4.tcp_rmem", "1 3 2"),
@@ -1480,6 +1480,87 @@ fn kernel_catalog_and_canonical_values() {
     c.validate().unwrap();
     c.kernel.host.insert("net.ipv4.tcp_sack".into(), "1".into());
     assert!(c.validate().is_err());
+}
+
+#[test]
+fn conntrack_catalog_controls_are_canonical_bounded_and_scope_specific() {
+    let parameters: Vec<_> = kernel_catalog()
+        .into_iter()
+        .filter(|parameter| parameter.name.starts_with("net.netfilter."))
+        .collect();
+    assert_eq!(parameters.len(), 9);
+    for parameter in parameters {
+        assert_eq!(parameter.kind, "integer");
+        assert_eq!(parameter.count, 1);
+        let host = parameter.name == "net.netfilter.nf_conntrack_max";
+        assert_eq!(parameter.scope, if host { "host" } else { "namespace" });
+        assert_eq!(
+            (parameter.min, parameter.max),
+            if host {
+                (1024, 16_777_216)
+            } else {
+                (1, 604_800)
+            }
+        );
+        for value in [parameter.min, parameter.max] {
+            let mut config = KernelConfig::default();
+            let map = if host {
+                &mut config.host
+            } else {
+                &mut config.namespace
+            };
+            map.insert(parameter.name.into(), value.to_string());
+            config.validate().unwrap();
+            let serialized = serde_json::to_vec(&config).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<KernelConfig>(&serialized).unwrap(),
+                config
+            );
+        }
+        for value in [
+            (parameter.min - 1).to_string(),
+            (parameter.max + 1).to_string(),
+            "01".into(),
+            "+1".into(),
+            "1 ".into(),
+            " 1".into(),
+            "1 2".into(),
+        ] {
+            let mut config = KernelConfig::default();
+            let map = if host {
+                &mut config.host
+            } else {
+                &mut config.namespace
+            };
+            map.insert(parameter.name.into(), value);
+            assert!(config.validate().is_err(), "{}", parameter.name);
+        }
+        let mut config = KernelConfig::default();
+        let wrong_map = if host {
+            &mut config.namespace
+        } else {
+            &mut config.host
+        };
+        wrong_map.insert(parameter.name.into(), parameter.min.to_string());
+        assert!(config.validate().is_err());
+    }
+    for name in [
+        "net.netfilter.nf_conntrack_count",
+        "net.netfilter.nf_conntrack_buckets",
+        "net.netfilter.nf_conntrack_tcp_be_liberal",
+        "net.netfilter.nf_conntrack_tcp_loose",
+    ] {
+        for host in [false, true] {
+            let mut config = KernelConfig::default();
+            let map = if host {
+                &mut config.host
+            } else {
+                &mut config.namespace
+            };
+            map.insert(name.into(), "1".into());
+            assert!(config.validate().is_err());
+        }
+    }
 }
 #[test]
 fn filter_protocols_and_ports_validate_in_every_filter_scope() {
