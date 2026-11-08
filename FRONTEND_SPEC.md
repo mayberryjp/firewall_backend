@@ -1181,7 +1181,11 @@ lookup polling or automatic restart on a DNS error.
 ### 4.4 Transactional SSH configuration CLI
 
 Ubuntu `install.sh` and full `upgrade.sh` enable the daemon's in-process SSH
-server by default on `0.0.0.0:2222` through `NETCONTROL_SSH_LISTEN`. Manual
+server by default on `127.0.0.1:2222` (IPv4 localhost only) through
+`NETCONTROL_SSH_LISTEN`. LAN/WAN clients cannot connect to this default.
+Full upgrades replace the managed wildcard default with loopback; existing
+explicit environment-file/CLI overrides remain effective. Operator help must
+show local-console SSH, not direct appliance-IP access by default. Manual
 invocations remain disabled unless that variable or `--ssh-listen` is supplied;
 an explicit flag takes precedence. Optional `--ssh-host-key` defaults to
 `<state>.ssh-key`. Build-only upgrades change no service settings. This is not a
@@ -1753,7 +1757,25 @@ operator kernel-module prerequisites; API reads never repair them.
 Nine advanced conntrack controls are accepted through the existing
 `kernel.host` and `kernel.namespace` string maps. Previously these names were
 rejected as unsupported tunables. No new configuration object, write endpoint,
-permission, automatic tuning, or default override is added.
+permission, recommended tuning values, or default override is added.
+
+**Native host ownership is mandatory at installation and startup, including
+both source and HTTPS upgrades.** Initial console takeover reads all nine
+current values into the private capture and initial configuration before
+transferring ownership. Saved-host startup first recovers/reconciles saved
+configuration, then captures any missing tuning keys and durably commits them
+as owned configuration. Existing saved values remain authoritative and are
+never replaced with observed drift or a guessed default.
+
+When keys are missing, startup records a verified system transaction
+(`actor:"system-conntrack-ownership"`, `status:"committed"`,
+`confirmation_deadline:null`) and advances the configuration revision.
+Its durable intermediate state is `applying_local`; interrupted application
+resumes through existing recovery. The only allowed changes are additions of
+missing conntrack keys; credentials, saved tuning and unrelated settings remain
+unchanged. This internal host policy is not a frontend auto-confirm action or
+a new HTTP endpoint. Complete ownership is idempotent: no repeated capture,
+revision or application on subsequent startups.
 
 | Full sysctl key | Scope | Inclusive range | Unit |
 |---|---|---|---|
@@ -1769,9 +1791,11 @@ permission, automatic tuning, or default override is added.
 
 Values are nonnull canonical decimal **strings**, not JSON numbers. Reject
 leading zeros, signs, whitespace, multiple elements, incorrect scope and
-out-of-range values. Omission owns nothing and leaves unmanaged kernel settings
-unchanged; removing an owned key restores its captured original through the
-normal transaction lifecycle. Do not silently clamp unsupported current values.
+out-of-range values. Removing an owned key restores its captured original through
+the normal transaction lifecycle, but native host startup reclaims missing
+conntrack keys from the then-current values. Removal is not a permanent opt-out
+from host ownership. Simulator and explicit lab namespaces do not auto-capture.
+Do not silently clamp unsupported current values.
 The native preflight validates both requested and captured current values.
 Read-only `nf_conntrack_count`, hash-bucket tuning and TCP validation-relaxation
 controls (`nf_conntrack_tcp_loose`, `nf_conntrack_tcp_be_liberal`) remain
@@ -1811,12 +1835,18 @@ through a lab namespace, and uses the existing exclusive host-tunables ownership
 gate; lab use requires the explicit host-tuning opt-in. Timeouts are scoped to
 the daemon's network namespace. No module loading, hash-table resizing,
 connection deletion/flush, sysctl.d file, or TCP validation relaxation occurs.
-Saved configuration and native ownership intents provide restart repair,
+Missing/unreadable/unwritable/unsupported current keys abort initial capture
+or saved-host startup explicitly; there is no partial adoption, empty successful
+fallback or state reset. A pending configuration transaction blocks a missing-key
+claim rather than being automatically confirmed or overwritten. Saved
+configuration and native ownership intents provide restart repair,
 exact readback, rollback and original restoration.
 
 Frontend: add an advanced conntrack group driven by catalog scope/bounds, keep
 values as strings, distinguish configured from effective/original values, and
-offer ownership removal rather than a guessed default. Warn that higher limits
+explain mandatory host ownership and restart recapture after removal. Refresh
+state/revision after an installation or upgrade before submitting a draft; show
+captured live values rather than inventing defaults. Warn that higher limits
 permit greater memory use; lower limits can reject new connections; short
 timeouts can break idle flows or leave late teardown packets untracked.
 Do not claim that a valid value is safe for available RAM, that timeout changes
@@ -4798,6 +4828,8 @@ the candidate before commitment. The browser must not offer confirmation or a
 countdown for these transactions. Normal HTTP/SSH edits still require their
 non-null deadline, independent verification and explicit confirmation; ordinary
 apply/rollback failure semantics are unchanged.
+Verified system conntrack-ownership transactions use the same nullable-deadline
+local lifecycle; see [the ownership policy](#conntrack-limits-and-timeouts).
 
 #### DHCPv4 and resolver configuration
 
@@ -5270,6 +5302,16 @@ conversion endpoint, browser repair action or permissive startup fallback.
 
 ### 6.6 Firewall forwarding
 
+Provide a global **Log firewall drops** toggle bound to
+`config.firewall.drop_logging_enabled`. It is a nonnull boolean, enabled by
+default for new installations, factory reset and omitted input. Explicit
+`false` must survive drafts, full-candidate submissions, restart and revision
+restore. Changes require `firewall.write` and `transactions.write` through the
+normal confirmed transaction workflow. Null/wrong types return `400`.
+This controls all owned input/forward drops, not individual rules or syslog.
+Disabling stops capture, not drop verdicts or live rule accounting; retained
+history remains readable. See [deny logging](#firewall-deny-log).
+
 Provide a global **Allow all IPv4 ICMP (protocol 1)** toggle bound to
 `config.firewall.allow_all_icmp`, with `firewall.write` and `transactions.write`
 required to change it. It defaults to `true` when omitted; null returns `400`. Normalized
@@ -5423,14 +5465,27 @@ relabel historical packets using the current draft.
 
 #### Firewall deny log
 
-Native Linux continuously captures owned input/forwarding **drops**, including
+When `firewall.drop_logging_enabled` is true (the default), native Linux
+continuously captures owned input/forwarding **drops**, including
 explicit rules, generated host-policy defaults and chain default Drop policies.
-Records are runtime telemetry, not firewall configuration: no log flags in rule
+Records are runtime telemetry, not firewall configuration: no per-rule log flags in rule
 forms, no transactions/revisions on reads/capture, and no records in configuration
 exports, aggregate state/statistics or MQTT. Backend audit/syslog remains separate.
 Capture does not depend on a browser or request and cannot reconstruct prior
 unrecorded traffic. Existing acceptance, ICMP and established/related precedence
 is unchanged; accepted packets are not deny records.
+
+Setting `firewall.drop_logging_enabled:false` removes NFLOG expressions from all
+owned drop rules/defaults, flushes the pending captured batch, joins the receiver
+and releases group 100. Packets still drop and packet/byte counters still count.
+Already captured/in-flight records can finish persistence during disable;
+traffic after disable completes is not captured, indexed or reconstructed.
+Re-enabling starts the receiver before installing logging expressions. Confirm,
+rollback, revision restore and startup repair apply the target setting.
+Retained history, IDs and lifetime first-seen identities are never cleared.
+Discord sending reports unavailable while capture is disabled; re-enabling does
+not replay traffic missed during that interval. Capture remains independent of
+the separate `discord.enabled` flag.
 
 `GET /api/v1/firewall/deny-log` requires API-key authentication and
 **`firewall.logs.read` only** (not `state.read` or write permissions).
@@ -5463,7 +5518,8 @@ Synthetic `200` response (not actual appliance traffic):
     "source": "192.0.2.2", "destination": "198.51.100.9", "protocol": 17,
     "source_port": 12345, "destination_port": 53,
     "ingress_index": 2, "egress_index": 3, "ingress": "lan0", "egress": "wan0",
-    "packet_length": 64
+    "packet_length": 64,
+    "tcp_flags": null, "tcp_payload_length": null, "tags": []
   }],
   "next_before_id": null, "oldest_id": "42", "newest_id": "42",
   "cursor_expired": false,
@@ -5496,6 +5552,71 @@ replace a historical null name using the current device at a reused index.
 IPv6 base payload length plus 40; not Ethernet bytes or a flow total).
 No packet payload is persisted or returned.
 
+Every record also includes `tcp_flags:integer|null`, `tcp_payload_length:integer|null`
+and required `tags:string[]` (possibly empty). `tcp_flags` is the low eight TCP
+control bits, 0..255: FIN=1, SYN=2, RST=4, PSH=8, ACK=16, URG=32, ECE=64,
+CWR=128; the NS/reserved header bits are not included. Null means non-TCP,
+noninitial fragment, or a fixed TCP header unavailable within the advertised IP
+length and 128-byte capture bound. Never replace null with zero.
+`tcp_payload_length` is the IP-advertised bytes after IP/extension and TCP headers,
+not captured bytes, Ethernet bytes or a flow total. It is null without readable
+TCP flags or when fragmentation prevents knowing the complete TCP segment size.
+TCP options need not fit in the capture to calculate length from the data offset.
+An invalid readable TCP data offset increments malformed capture accounting.
+
+Tags describe packet observations, **not confirmed connection state or safety**:
+
+| Tag | Exact meaning |
+| --- | --- |
+| `tcp_finish` | Readable TCP FIN bit set |
+| `tcp_reset` | Readable TCP RST bit set; may indicate refusal/reset, not normal closure |
+| `tcp_ack_only` | Flags exactly ACK (16) and known TCP payload length zero; not proof of teardown |
+| `tcp_connection_attempt` | SYN set, ACK/FIN/RST clear; not proof a connection was admitted |
+| `ipv4_broadcast` | Destination is `255.255.255.255`, an explicit kernel-reported IPv4 broadcast, or the directed broadcast calculated from a live assigned IPv4 address/prefix; prefix length must be <=30 |
+
+Tags are independent and ordered as in the table; a FIN/RST packet can have both
+tags and an IPv4 broadcast tag. Broadcast tagging is protocol-independent,
+including UDP. IPv6 is never broadcast; multicast is not tagged as broadcast.
+Directed broadcasts use explicit broadcast attributes and live address/prefix
+metadata, so classification also works when the kernel omits `IFA_BROADCAST`.
+They use all live interface address metadata in the managed
+network namespace, including dynamic/unmanaged addresses, refreshed at startup
+and once per capture worker window (approximately one second). Snapshot timeout/
+failure stops capture with an explicit capture error instead of silently using
+stale classification. There is no per-packet scan or request-time reclassification.
+Tags are saved with the record; subsequent address changes do not rewrite history.
+No inference is made for remote/unknown subnet broadcasts. For example,
+`10.4.30.255` is broadcast on `10.4.30.0/24`, but not on `10.4.30.0/23`;
+`10.4.30.127` can be broadcast on a `/25`. `/31` and `/32` do not add directed
+broadcasts. Empty tags mean no recognized observation, not verified unicast/safety.
+
+Add opt-in **Hide TCP FIN/RST drops** and **Hide IPv4 broadcast drops** controls,
+initially off, filtering locally by each record's `tags` array. The backend
+returns all retained drops within normal pagination and existing
+address/protocol/time/chain selection, regardless of traffic tags.
+`tag` and `exclude_tags` are unsupported query parameters and return `400`.
+Keep the fetched records in memory and toggle visibility without discarding them
+or resetting the backend cursor. Page using the original `next_before_id`, never
+the last visible record's ID. A page with no locally visible rows is not the end
+of history: keep Load more available while the backend cursor is nonnull.
+Distinguish no visible matches in loaded pages from exhausted retained history;
+if loading more pages to fill the view, stop on a null cursor or user cancellation.
+Existing backend filters still combine with AND and require resetting pagination
+when their selection changes.
+Do not automatically exclude ACK-only or call FIN/RST traffic harmless/confirmed
+closing. Render readable flag names plus raw bits and independent tag badges.
+Filtering does not stop capture, change verdicts, erase records, or suppress
+Discord notifications.
+
+Deployment contract: private deny-log segments now require **schema 2**, including
+required tags and current traffic metadata. Unsupported segments are rejected
+unchanged at native startup; no conversion, reset or deletion is performed.
+The lifetime first-seen SQLite identity/schema is unchanged. Incompatible queued
+alert records fail explicitly without being claimed when delivery is enabled.
+Preserve private history/index/configuration and follow the
+[operator requirements](docs/BUILD_AND_INSTALL.md#firewall-deny-logging)
+before deployment; new frontend controls require the accepting backend.
+
 `reason` is `rule` or `policy`; `policy` means a chain default Drop, with
 `compiled_rule_index:null`. A generated host default is a `rule` drop.
 Rule indexes are zero-based **compiled** positions (including generated rules),
@@ -5504,7 +5625,7 @@ lowercase SHA-256 `ruleset_id` identifying the actual applied operational firewa
 including provisional/rolled-back rulesets. Never attribute old records to the
 current draft's rule at the same numeric position.
 
-Capture status is `starting`, `capturing`, `error` or `stopped`; `error` is
+Capture status is `disabled`, `starting`, `capturing`, `error` or `stopped`; `error` is
 nullable text and can also contain the last malformed-record warning while
 capture continues. `200` with capture error still exposes retained history, not
 healthy current collection. Fatal I/O/capture errors stop collection until
@@ -5517,7 +5638,7 @@ do not give an exact lost-packet total; do not sum them as such.
 
 History is private persistent rotating storage, at most eight 512-record/512-KiB
 segments (4096 records maximum; segment rotation can retain fewer). There is no
-guaranteed time horizon, log configuration or clear endpoint. Normal shutdown
+guaranteed time horizon, configurable retention or clear endpoint. Normal shutdown
 flushes the pending batch; crashes can lose up to the pending one-second batch
 and kernel-buffered records. Metadata remains sensitive: do not persist it in
 browser storage, analytics or config exports. Retention and capture errors never
@@ -5526,8 +5647,11 @@ clear drafts or change policies.
 #### Discord first-seen drop alerts
 
 Optional Discord notification settings are a nonnull top-level
-`discord:{enabled:boolean,webhook_ref:string}` object. Omission/default is
-`{"enabled":false,"webhook_ref":""}`. Enabled alerts require an existing private
+`discord:{enabled:boolean,notify_broadcast:boolean,notify_tcp_closures:boolean,webhook_ref:string}`
+object. Omission/default is
+`{"enabled":false,"notify_broadcast":false,"notify_tcp_closures":false,"webhook_ref":""}`.
+Both category flags are nonnull booleans defaulting to false independently of
+global enable. Enabled alerts require an existing private
 webhook reference. References are device-local 32-character lowercase hexadecimal
 strings; empty means unconfigured. Unknown fields, nulls and wrong types reject
 with `400`; invalid/missing references or enabling an unavailable backend reject
@@ -5563,14 +5687,32 @@ protected local control path; a webhook URL is a secret bearer credential.
 
 **Identity is exactly `(source IP, destination IP, destination port, numeric IP
 protocol)`**. Source port, chain, reason, ingress/egress and ruleset are ignored.
+TCP flags, payload length and traffic tags are also ignored for identity.
+Messages include raw hexadecimal TCP flags (or `unavailable`) and the
+record's traffic tags (or `none`). Deny-log query selection and frontend-only
+visibility filters do not suppress alerts.
 Absent destination port is distinct from numeric zero. One newly observed tuple
 produces one alert entry, not one entry per packet. The native logger maintains a
 private, durable SQLite first-seen index independent of the rotating drop table;
 seen tuples are never expired by time, rotation, disable/enable or restart.
-First observation while disabled still marks the tuple seen and is not backfilled
-after enabling. Enabling never sends retained history. On first feature startup,
+First observation while globally or categorically disabled still marks the tuple
+seen and is not backfilled after enabling. Enabling never sends retained history,
+including later packets with different tags for an already-seen tuple.
+On first feature startup,
 existing retained records seed the index without alerts; pre-feature records
 already rotated out cannot be reconstructed.
+
+`notify_broadcast:true` permits first drops tagged `ipv4_broadcast` (limited or
+live directed IPv4 broadcast). It does not configure multicast notification.
+`notify_tcp_closures:true` permits first drops tagged `tcp_finish`, `tcp_reset`
+or `tcp_ack_only`: FIN, RST, and flags exactly ACK with a known zero TCP payload
+length. Unknown payload length is not empty ACK-only; SYN or data-bearing ACK
+does not fall into this bucket unless independently tagged FIN/RST. These are
+packet observations, not proof of a closed connection or harmless traffic.
+A record in both categories requires both switches enabled. Other newly seen
+drops remain eligible when global alerts and firewall capture are enabled.
+The switches change Discord delivery only, not firewall verdicts, log collection,
+retention, permanent identity or frontend log visibility.
 
 The index stores exact identities (not probabilistic hashes) and queued first
 records. It grows with lifetime distinct tuples and outstanding alerts; there
@@ -5584,8 +5726,12 @@ retention/counts do not include the separate lifetime index.
 Delivery uses committed settings, pauses during active configuration/upgrade
 work, and runs only in the native Linux host backend. Simulator mode reports
 simulated/disabled and never posts; unsupported mode cannot be enabled.
-Pending alerts survive normal restart; disabling clears pending delivery without
-forgetting identities. A queued record is claimed durably before HTTP delivery
+Eligible pending alerts survive normal restart; global disabling clears pending
+delivery without forgetting identities. Category checks apply at enqueue and
+again before delivery using current committed settings; excluded queued records
+are discarded without backfill. Category-only changes also cancel in-flight
+delivery/retry work. Suppressed records are not delivery attempts and increment
+neither `delivered` nor `failed`. A queued record is claimed durably before HTTP delivery
 to prevent duplicate posts after uncertain results or crashes. Delivery is
 best-effort, **not exactly-once guaranteed**: transport failures, non-rate-limit
 HTTP failures, interrupted in-flight requests or configuration changes are not
@@ -5610,23 +5756,29 @@ no query/body, other methods `405`; authentication/permissions `401`/`403`,
 invalid query/body `400`, unavailable manager/status `503`. Response:
 
 ```json
-{"enabled":false,"state":"disabled","delivered":"0","failed":"0","last_drop_id":null,"error":null,"counters_scope":"daemon_session","deduplication":["source","destination","destination_port","protocol"]}
+{"enabled":false,"notify_broadcast":false,"notify_tcp_closures":false,"state":"disabled","delivered":"0","failed":"0","last_drop_id":null,"error":null,"counters_scope":"daemon_session","deduplication":["source","destination","destination_port","protocol"]}
 ```
 
 `state` is `starting|disabled|simulated|unavailable|paused|ready|error|stopped`;
 `delivered`/`failed` are decimal-string **alert-entry** counts (not message or
 packet counts), retained through manager restarts within the daemon session.
 `last_drop_id` and `error` are nullable strings. No raw URL is returned.
+The three notification booleans report the manager's current policy; worker
+updates normally occur on its one-second tick. Read saved configuration for
+authoritative committed settings and do not overwrite a pending draft from status.
 The `discord` manager participates in daemon health/task supervision and
 `POST /api/v1/processes/restart {"target":"discord"}` (`system.restart`,
 normal `202` scheduling); restarting does not enable it or reset seen identities.
 
-Frontend required work: add a global toggle and password-style webhook URL
+Frontend required work: add a global toggle, independent default-off
+**Notify broadcast drops** and **Notify TCP FIN/RST/empty ACK-only drops**
+controls, and a password-style webhook URL
 input, upload privately then save the returned reference in a full candidate,
 clear the raw URL from form state after success and never cache/log it.
 Render existing-reference/replace states without trying to fetch the secret.
 Recognize `discord.write` in credential controls. Explain permanent deduplication,
-no disabled/history backfill, third-party export of drop metadata and best-effort
+no globally/category-disabled history backfill, category overlap requiring both
+switches, third-party export of drop metadata and best-effort
 delivery. Poll status only as appropriate for the settings/status view; expose
 errors and entry counts without suggesting failed tuples will be re-sent.
 Deploy the accepting backend first, preserve the private webhook/index stores,
@@ -6627,6 +6779,8 @@ interface Config {
 
 interface DiscordConfig {
   enabled: boolean;
+  notify_broadcast: boolean;
+  notify_tcp_closures: boolean;
   webhook_ref: string; // Device-local reference only; never the webhook URL.
 }
 
@@ -6904,6 +7058,7 @@ interface RuleSource {
 type FilterProtocol = "" | "tcp" | "udp" | "icmp" | "icmpv6";
 
 interface Firewall {
+  drop_logging_enabled: boolean; // Omitted input defaults to true; null is invalid.
   allow_all_icmp: boolean; // Omitted input defaults to true; null is invalid.
   policy: "accept" | "drop";
   rules: Array<RuleSource & {
@@ -6992,7 +7147,7 @@ interface Transaction {
   committed_revision: RevisionNumber | null;
   candidate: Config;
   previous: Config;
-  confirmation_deadline: Timestamp | null; // Null only for console host provisioning.
+  confirmation_deadline: Timestamp | null; // Null for local host provisioning or system conntrack ownership.
   error?: string;
   description?: string;
   submitted_at: Timestamp | null;

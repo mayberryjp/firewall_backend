@@ -92,10 +92,27 @@ pub struct SystemConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DiscordConfig {
     pub enabled: bool,
+    pub notify_broadcast: bool,
+    pub notify_tcp_closures: bool,
     pub webhook_ref: String,
 }
 
 impl DiscordConfig {
+    pub fn should_notify_drop(&self, record: &crate::DenyRecord) -> bool {
+        use crate::DenyTrafficTag;
+        self.enabled
+            && (self.notify_broadcast || !record.tags.contains(&DenyTrafficTag::Ipv4Broadcast))
+            && (self.notify_tcp_closures
+                || !record.tags.iter().any(|tag| {
+                    matches!(
+                        tag,
+                        DenyTrafficTag::TcpFinish
+                            | DenyTrafficTag::TcpReset
+                            | DenyTrafficTag::TcpAckOnly
+                    )
+                }))
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.webhook_ref.is_empty()
@@ -396,6 +413,8 @@ pub struct Route {
 #[serde(default, deny_unknown_fields)]
 pub struct Firewall {
     #[serde(default = "yes")]
+    pub drop_logging_enabled: bool,
+    #[serde(default = "yes")]
     pub allow_all_icmp: bool,
     #[serde(default = "accept")]
     pub policy: String,
@@ -409,6 +428,7 @@ pub struct Firewall {
 impl Default for Firewall {
     fn default() -> Self {
         Self {
+            drop_logging_enabled: true,
             allow_all_icmp: true,
             policy: accept(),
             rules: vec![],
@@ -1984,6 +2004,25 @@ pub fn kernel_catalog() -> Vec<KernelParameter> {
     items.sort_by_key(|p| (p.scope, p.name));
     items
 }
+/// Missing keys with valid read-validation hints, not defaults to apply.
+pub fn missing_conntrack_tunables(configured: &KernelConfig) -> KernelConfig {
+    let mut missing = KernelConfig::default();
+    for parameter in kernel_catalog()
+        .into_iter()
+        .filter(|parameter| parameter.name.starts_with("net.netfilter.nf_conntrack_"))
+    {
+        let (existing, target) = if parameter.scope == "host" {
+            (&configured.host, &mut missing.host)
+        } else {
+            (&configured.namespace, &mut missing.namespace)
+        };
+        if !existing.contains_key(parameter.name) {
+            target.insert(parameter.name.into(), parameter.min.to_string());
+        }
+    }
+    missing
+}
+
 impl KernelConfig {
     pub fn validate(&self) -> Result<()> {
         crate::validate_rps(&self.rps)?;

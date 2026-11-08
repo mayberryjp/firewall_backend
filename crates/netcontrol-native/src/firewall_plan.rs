@@ -96,7 +96,17 @@ fn ports(rule: &Value, protocol: netcontrol_core::FilterProtocol) -> Result<Vec<
     }
 }
 
+pub fn drop_logging_enabled(firewall: &Value) -> Result<bool> {
+    match firewall.get("drop_logging_enabled") {
+        None => Ok(true),
+        Some(value) => value
+            .as_bool()
+            .context("firewall drop_logging_enabled must be a boolean"),
+    }
+}
+
 pub fn compile(firewall: &Value) -> Result<Vec<Match>> {
+    drop_logging_enabled(firewall)?;
     destination_rewrites(firewall)?;
     action(string(firewall, "policy"))?;
     ensure!(
@@ -459,6 +469,26 @@ pub fn counter_layout(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn drop_logging_toggle_preserves_plans_and_counter_layout() {
+        let mut value = json!({"policy":"drop","allow_all_icmp":false,
+            "rules":[{"action":"drop"}],"nat":{"masquerade":[]},
+            "input":{"policy":"drop","interfaces":[]}});
+        assert!(drop_logging_enabled(&value).unwrap());
+        let plans = compile(&value).unwrap();
+        let input = compile_input(&value, &[]).unwrap();
+        let counters = counter_layout(&value, &[]).unwrap();
+        value["drop_logging_enabled"] = json!(false);
+        assert!(!drop_logging_enabled(&value).unwrap());
+        assert_eq!(compile(&value).unwrap(), plans);
+        assert_eq!(compile_input(&value, &[]).unwrap(), input);
+        assert_eq!(counter_layout(&value, &[]).unwrap(), counters);
+        for invalid in [Value::Null, json!("false"), json!(0)] {
+            value["drop_logging_enabled"] = invalid;
+            assert!(compile(&value).is_err());
+        }
+    }
 
     fn relay_interfaces() -> Vec<crate::model::Link> {
         serde_json::from_value(json!([{

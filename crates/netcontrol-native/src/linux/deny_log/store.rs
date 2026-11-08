@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use netcontrol_core::{DenyLogQuery, DenyRecord};
+use netcontrol_core::{DenyLogQuery, DenyRecord, DiscordConfig};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,7 +21,7 @@ pub(super) struct Store {
     records: BTreeMap<u64, DenyRecord>,
     next: u64,
     first_seen: Connection,
-    alerting: bool,
+    notifications: DiscordConfig,
 }
 
 impl Store {
@@ -44,7 +44,7 @@ impl Store {
             );
             let segment: Segment = super::super::read_json(&path)?;
             ensure!(
-                segment.schema == 1
+                segment.schema == 2
                     && !segment.records.is_empty()
                     && segment.records.len() <= RECORDS as usize,
                 "invalid deny-log segment"
@@ -144,7 +144,7 @@ impl Store {
             records,
             next,
             first_seen,
-            alerting: false,
+            notifications: DiscordConfig::default(),
         })
     }
 
@@ -155,7 +155,7 @@ impl Store {
             let slot = group % SEGMENTS;
             let first = group * RECORDS + 1;
             let mut segment = Segment {
-                schema: 1,
+                schema: 2,
                 records: self
                     .records
                     .range(first..self.next)
@@ -182,7 +182,8 @@ impl Store {
             let transaction = self.first_seen.transaction()?;
             for record in &segment.records {
                 let alert = self
-                    .alerting
+                    .notifications
+                    .should_notify_drop(record)
                     .then(|| serde_json::to_string(record))
                     .transpose()?;
                 transaction.execute(
@@ -203,9 +204,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn first_drops(&mut self, enabled: bool) -> Result<Vec<DenyRecord>> {
-        self.alerting = enabled;
-        if !enabled {
+    pub fn first_drops(&mut self, config: &DiscordConfig) -> Result<Vec<DenyRecord>> {
+        self.notifications = config.clone();
+        if !config.enabled {
             self.first_seen.execute(
                 "UPDATE first_seen SET alert=NULL WHERE alert IS NOT NULL",
                 [],
@@ -239,7 +240,10 @@ impl Store {
             )?;
         }
         transaction.commit()?;
-        Ok(records)
+        Ok(records
+            .into_iter()
+            .filter(|record| config.should_notify_drop(record))
+            .collect())
     }
 
     pub fn query(&self, query: &DenyLogQuery) -> Value {
@@ -286,6 +290,7 @@ impl Store {
 }
 
 fn validate(record: &DenyRecord) -> Result<()> {
+    record.validate_traffic()?;
     ensure!(
         matches!(record.chain.as_str(), "input" | "forward")
             && matches!(record.reason.as_str(), "rule" | "policy")
@@ -312,12 +317,154 @@ fn validate(record: &DenyRecord) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn alerts(enabled: bool) -> DiscordConfig {
+        DiscordConfig {
+            enabled,
+            notify_broadcast: true,
+            notify_tcp_closures: true,
+            ..Default::default()
+        }
+    }
+
+    fn notification_drop(port: u16, flags: Option<u8>, broadcast: bool) -> DenyRecord {
+        let mut drop = record();
+        drop.destination_port = Some(port);
+        if let Some(flags) = flags {
+            drop.protocol = 6;
+            drop.packet_length = 40;
+            drop.tcp_flags = Some(flags);
+            drop.tcp_payload_length = Some(0);
+            drop.tags = netcontrol_core::DenyTrafficTag::tcp(Some(flags), Some(0));
+        }
+        if broadcast {
+            drop.destination = "255.255.255.255".parse().unwrap();
+            drop.tags
+                .push(netcontrol_core::DenyTrafficTag::Ipv4Broadcast);
+        }
+        drop
+    }
+
+    fn notification_samples() -> Vec<DenyRecord> {
+        vec![
+            notification_drop(1001, None, false),
+            notification_drop(1002, Some(0x11), false),
+            notification_drop(1003, Some(0x14), false),
+            notification_drop(1004, Some(0x10), false),
+            notification_drop(1005, Some(0x02), false),
+            notification_drop(1006, None, true),
+            notification_drop(1007, Some(0x11), true),
+        ]
+    }
+
+    #[test]
+    fn discord_notification_flags_filter_queue_not_history_and_never_backfill() -> Result<()> {
+        for notify_broadcast in [false, true] {
+            for notify_tcp_closures in [false, true] {
+                let root = std::env::temp_dir().join(format!(
+                    "discord-flags-{}-{}",
+                    std::process::id(),
+                    time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+                ));
+                let result = (|| -> Result<()> {
+                    let config = DiscordConfig {
+                        enabled: true,
+                        notify_broadcast,
+                        notify_tcp_closures,
+                        ..Default::default()
+                    };
+                    let samples = notification_samples();
+                    let expected: std::collections::BTreeSet<_> = samples
+                        .iter()
+                        .filter(|record| config.should_notify_drop(record))
+                        .map(|record| record.destination_port)
+                        .collect();
+                    let mut store = Store::open(root.clone())?;
+                    store.first_drops(&config)?;
+                    store.append(&samples)?;
+                    let queued: i64 = store.first_seen.query_row(
+                        "SELECT COUNT(*) FROM first_seen WHERE alert IS NOT NULL",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(queued, i64::try_from(expected.len())?);
+                    let notified: std::collections::BTreeSet<_> = store
+                        .first_drops(&config)?
+                        .iter()
+                        .map(|record| record.destination_port)
+                        .collect();
+                    assert_eq!(notified, expected);
+                    assert_eq!(
+                        store.query(&DenyLogQuery::parse("limit=100")?)["records"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        7
+                    );
+                    assert_eq!(
+                        store.first_seen.query_row(
+                            "SELECT COUNT(*) FROM first_seen",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )?,
+                        7
+                    );
+                    store.first_drops(&alerts(true))?;
+                    store.append(&samples)?;
+                    assert!(store.first_drops(&alerts(true))?.is_empty());
+                    drop(store);
+                    let mut store = Store::open(root.clone())?;
+                    assert!(store.first_drops(&alerts(true))?.is_empty());
+                    store.append(&samples)?;
+                    assert!(store.first_drops(&alerts(true))?.is_empty());
+                    Ok(())
+                })();
+                std::fs::remove_dir_all(&root)?;
+                result?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn discord_notification_flags_discard_previously_queued_excluded_records() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "discord-queued-flags-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let result = (|| -> Result<()> {
+            let mut store = Store::open(root.clone())?;
+            store.first_drops(&alerts(true))?;
+            let samples = notification_samples();
+            store.append(&samples)?;
+            let config = DiscordConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let notified: std::collections::BTreeSet<_> = store
+                .first_drops(&config)?
+                .iter()
+                .map(|record| record.destination_port)
+                .collect();
+            assert_eq!(notified, [Some(1001), Some(1005)].into());
+            drop(store);
+            let mut store = Store::open(root.clone())?;
+            assert!(store.first_drops(&alerts(true))?.is_empty());
+            store.append(&samples)?;
+            assert!(store.first_drops(&alerts(true))?.is_empty());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
+    }
+
     fn record() -> DenyRecord {
         serde_json::from_value(json!({
             "id":"","timestamp_ms":1,"chain":"forward","reason":"rule","compiled_rule_index":2,
             "ruleset_id":"a".repeat(64),"source":"192.0.2.1","destination":"198.51.100.1",
             "protocol":17,"source_port":1234,"destination_port":53,
-            "ingress_index":2,"egress_index":3,"ingress":"lan0","egress":"wan0","packet_length":28
+            "ingress_index":2,"egress_index":3,"ingress":"lan0","egress":"wan0","packet_length":28,
+            "tcp_flags":null,"tcp_payload_length":null,"tags":[]
         }))
         .unwrap()
     }
@@ -333,7 +480,7 @@ mod tests {
         let result = (|| -> Result<()> {
             let mut store = Store::open(root.clone())?;
             store.append(&[record()])?;
-            assert!(store.first_drops(true)?.is_empty());
+            assert!(store.first_drops(&alerts(true))?.is_empty());
             let mut first = record();
             first.destination_port = Some(443);
             store.append(&[first.clone(), first.clone()])?;
@@ -344,11 +491,11 @@ mod tests {
             repeated.reason = "policy".into();
             repeated.compiled_rule_index = None;
             store.append(&[repeated])?;
-            let events = store.first_drops(true)?;
+            let events = store.first_drops(&alerts(true))?;
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].id, "2");
             assert_eq!(events[0].source_port, first.source_port);
-            assert!(store.first_drops(true)?.is_empty());
+            assert!(store.first_drops(&alerts(true))?.is_empty());
             for _ in 0..43 {
                 store.append(&vec![record(); 100])?;
             }
@@ -360,25 +507,25 @@ mod tests {
             );
             drop(store);
             let mut store = Store::open(root.clone())?;
-            assert!(store.first_drops(true)?.is_empty());
+            assert!(store.first_drops(&alerts(true))?.is_empty());
             store.append(&[first])?;
-            assert!(store.first_drops(true)?.is_empty());
-            assert!(store.first_drops(false)?.is_empty());
+            assert!(store.first_drops(&alerts(true))?.is_empty());
+            assert!(store.first_drops(&alerts(false))?.is_empty());
             let mut disabled = record();
             disabled.destination_port = Some(8080);
             store.append(&[disabled.clone()])?;
-            assert!(store.first_drops(true)?.is_empty());
+            assert!(store.first_drops(&alerts(true))?.is_empty());
             store.append(&[disabled])?;
-            assert!(store.first_drops(true)?.is_empty());
+            assert!(store.first_drops(&alerts(true))?.is_empty());
             let mut queued = record();
             queued.destination_port = Some(8443);
             store.append(&[queued])?;
             drop(store);
             let mut store = Store::open(root.clone())?;
-            let events = store.first_drops(true)?;
+            let events = store.first_drops(&alerts(true))?;
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].destination_port, Some(8443));
-            assert!(store.first_drops(true)?.is_empty());
+            assert!(store.first_drops(&alerts(true))?.is_empty());
             Ok(())
         })();
         std::fs::remove_dir_all(&root)?;
@@ -461,6 +608,132 @@ mod tests {
                 std::fs::read(root.join("deny-0.json"))? == b"broken",
                 "corrupt state changed"
             );
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
+    }
+
+    #[test]
+    fn deny_log_returns_all_tags_across_pages_and_preserves_discord_identity() -> Result<()> {
+        use netcontrol_core::DenyTrafficTag::*;
+        let root = std::env::temp_dir().join(format!(
+            "deny-tags-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let result = (|| -> Result<()> {
+            let mut store = Store::open(root.clone())?;
+            store.first_drops(&alerts(true))?;
+            let mut tcp = record();
+            tcp.protocol = 6;
+            tcp.packet_length = 40;
+            tcp.tcp_flags = Some(0x10);
+            tcp.tcp_payload_length = Some(0);
+            tcp.tags = vec![TcpAckOnly];
+            let mut finish = tcp.clone();
+            finish.tcp_flags = Some(0x11);
+            finish.tags = vec![TcpFinish];
+            let mut broadcast = record();
+            broadcast.destination = "255.255.255.255".parse()?;
+            broadcast.tags = vec![Ipv4Broadcast];
+            let mut reset_broadcast = finish.clone();
+            reset_broadcast.destination = broadcast.destination;
+            reset_broadcast.tcp_flags = Some(0x14);
+            reset_broadcast.tags = vec![TcpReset, Ipv4Broadcast];
+            store.append(&[
+                tcp.clone(),
+                finish.clone(),
+                broadcast.clone(),
+                tcp,
+                reset_broadcast,
+                finish,
+                broadcast,
+            ])?;
+            assert_eq!(store.first_drops(&alerts(true))?.len(), 3);
+            drop(store);
+            let mut store = Store::open(root.clone())?;
+            let page = store.query(&DenyLogQuery::parse("limit=2")?);
+            assert_eq!(page["records"][0]["id"], "7");
+            assert_eq!(page["records"][0]["tags"], json!(["ipv4_broadcast"]));
+            assert_eq!(page["records"][1]["id"], "6");
+            assert_eq!(page["records"][1]["tags"], json!(["tcp_finish"]));
+            assert_eq!(page["records"][1]["tcp_flags"], 17);
+            assert_eq!(page["records"][1]["tcp_payload_length"], 0);
+            assert_eq!(page["next_before_id"], "6");
+            assert_eq!(page["oldest_id"], "1");
+            assert_eq!(page["newest_id"], "7");
+            let page = store.query(&DenyLogQuery::parse("limit=2&before_id=6")?);
+            assert_eq!(page["records"][0]["id"], "5");
+            assert_eq!(
+                page["records"][0]["tags"],
+                json!(["tcp_reset", "ipv4_broadcast"])
+            );
+            assert_eq!(page["records"][1]["id"], "4");
+            assert_eq!(page["records"][1]["tags"], json!(["tcp_ack_only"]));
+            assert_eq!(page["next_before_id"], "4");
+            let page = store.query(&DenyLogQuery::parse("limit=3&before_id=4")?);
+            assert_eq!(
+                page["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record["id"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["3", "2", "1"]
+            );
+            assert_eq!(page["next_before_id"], Value::Null);
+            assert_eq!(
+                store.query(&DenyLogQuery::parse("")?)["records"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                7
+            );
+            store.append(&[record()])?;
+            let page = store.query(&DenyLogQuery::parse("limit=1")?);
+            assert_eq!(page["records"][0]["id"], "8");
+            assert_eq!(page["records"][0]["tags"], json!([]));
+            assert_eq!(page["next_before_id"], "8");
+            assert_eq!(
+                store.query(&DenyLogQuery::parse("")?)["records"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                8
+            );
+            let mut invalid = record();
+            invalid.tags = vec![Ipv4Broadcast, Ipv4Broadcast];
+            assert!(validate(&invalid).is_err());
+            invalid.tags = vec![TcpFinish];
+            assert!(validate(&invalid).is_err());
+            invalid.tags.clear();
+            invalid.tcp_flags = Some(1);
+            assert!(validate(&invalid).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
+    }
+
+    #[test]
+    fn deny_log_unsupported_segment_schema_is_rejected_without_reset() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "deny-schema-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let result = (|| -> Result<()> {
+            let mut store = Store::open(root.clone())?;
+            store.append(&[record()])?;
+            drop(store);
+            let path = root.join("deny-0.json");
+            let mut segment: Value = super::super::super::read_json(&path)?;
+            segment["schema"] = json!(1);
+            super::super::super::write_json(&path, &segment)?;
+            let bytes = std::fs::read(&path)?;
+            assert!(Store::open(root.clone()).is_err());
+            assert_eq!(std::fs::read(&path)?, bytes);
             Ok(())
         })();
         std::fs::remove_dir_all(&root)?;

@@ -21,7 +21,7 @@ struct Options {
     backend: String,
     #[arg(
         long,
-        help = "Enable IPv4 forwarding after native firewall reconciliation"
+        help = "Enable IPv4 forwarding after native firewall reconciliation; automatic conntrack-tuning-ownership in native host mode"
     )]
     appliance: bool,
     #[arg(long, requires_all = ["appliance", "provision_lan"], help = "One-time console-host-takeover WAN; preserve imported settings and commit without connectivity confirmation")]
@@ -431,6 +431,12 @@ async fn run(options: Options) -> Result<()> {
     } else {
         Engine::open(&options.state, backend)?
     };
+    if saved_native_startup && let Some(transaction) = engine.claim_conntrack_tunables()? {
+        tracing::info!(
+            revision = ?transaction.committed_revision,
+            "captured and took ownership of missing conntrack tuning settings"
+        );
+    }
     if let (Some(wan), Some(lan)) = (&options.provision_wan, &options.provision_lan) {
         if options.factory_reset {
             provision::factory_reset(&mut engine, wan, lan, &options.provision_lan_address)?;

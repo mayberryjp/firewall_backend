@@ -748,7 +748,7 @@ impl Native {
     }
 
     fn network_apply(
-        &self,
+        &mut self,
         before: &Value,
         after: &Value,
         mut kernel: Kernel,
@@ -778,6 +778,10 @@ impl Native {
                 || self.state.join("adoption.json").exists());
         let original_ipv6 = ownership.ipv6_original.clone();
         let takeover_network = after.clone();
+        let logging = crate::firewall_plan::drop_logging_enabled(&after.firewall)?;
+        if logging {
+            self.deny_log.configure(true)?;
+        }
         let (fingerprint, original_ipv6) = session(self.namespace.clone(), move |rt, handle| {
             let mut original_ipv6 = original_ipv6;
             if after.ipv6_enabled {
@@ -808,6 +812,9 @@ impl Native {
             ipv6::verify(after.ipv6_enabled)?;
             Ok((fingerprint, original_ipv6))
         })?;
+        if !logging {
+            self.deny_log.configure(false)?;
+        }
         ownership.ipv6_original = original_ipv6;
         drop(leases);
         if self.state.join("adoption.json").try_exists()? {
@@ -1509,9 +1516,12 @@ impl Backend for Native {
         self.check_scope()?;
         self.deny_log.snapshot(query)
     }
-    fn first_firewall_drops(&mut self, enabled: bool) -> Result<Vec<netcontrol_core::DenyRecord>> {
+    fn first_firewall_drops(
+        &mut self,
+        config: &netcontrol_core::DiscordConfig,
+    ) -> Result<Vec<netcontrol_core::DenyRecord>> {
         self.check_scope()?;
-        self.deny_log.first_drops(enabled)
+        self.deny_log.first_drops(config)
     }
     fn bgp_status(&mut self, _: &Config) -> Result<Value> {
         self.check_scope()?;
@@ -1601,7 +1611,7 @@ impl Backend for Native {
             return Ok(Config::empty());
         }
         let path = self.state.join("adoption.json");
-        let receipt: adoption::Receipt = if path.try_exists()? {
+        let mut receipt: adoption::Receipt = if path.try_exists()? {
             let receipt: adoption::Receipt = read_json(&path)?;
             ensure!(
                 receipt.scope == self.identity,
@@ -1630,12 +1640,15 @@ impl Backend for Native {
             let scope = self.identity.clone();
             let previous = serde_json::to_value(&ownership)?;
             let readonly = self.parents.keys().cloned().collect();
-            let receipt = session(self.namespace.clone(), move |rt, handle| {
+            session(self.namespace.clone(), move |rt, handle| {
                 rt.block_on(adoption::capture(handle, scope, previous, readonly))
-            })?;
-            write_json(&path, &receipt)?;
-            receipt
+            })?
         };
+        let captured = self.capture_conntrack_tunables(&receipt.config.kernel)?;
+        receipt.config.kernel.host.extend(captured.host);
+        receipt.config.kernel.namespace.extend(captured.namespace);
+        receipt.config.validate()?;
+        write_json(&path, &receipt)?;
         ensure!(
             receipt.ipv6_before.is_some(),
             "initial physical takeover requires its captured IPv6 rollback snapshot"
@@ -1668,6 +1681,9 @@ impl Backend for Native {
                     .map(|link| link.name.clone())
                     .collect();
                 ownership.committed_config = Some(receipt.config.operational_value()?);
+                ownership.kernel_baseline.capture_originals(
+                    &Network::parse(&receipt.config.operational_value()?)?.kernel,
+                );
                 ownership.boot = self.boot.clone();
                 self.save_ownership(&ownership)?;
                 Ok(())
@@ -1710,6 +1726,9 @@ impl Backend for Native {
             ownership.ethernet_originals = managed_originals;
             ownership.managed_interfaces = receipt.originals.keys().cloned().collect();
             ownership.committed_config = Some(receipt.config.operational_value()?);
+            ownership
+                .kernel_baseline
+                .capture_originals(&Network::parse(&receipt.config.operational_value()?)?.kernel);
             ownership.boot = self.boot.clone();
             self.save_ownership(&ownership)?;
             self.dhcp.configure(&receipt.config.operational_value()?)?;
@@ -1762,6 +1781,22 @@ impl Backend for Native {
             rt.block_on(capabilities::discover(handle, host_mode))
         })
     }
+    fn capture_conntrack_tunables(
+        &mut self,
+        configured: &netcontrol_core::KernelConfig,
+    ) -> Result<netcontrol_core::KernelConfig> {
+        self.check_scope()?;
+        self.path_test.ensure_idle()?;
+        ensure!(
+            self.options.namespace.is_empty(),
+            "automatic conntrack ownership requires native host mode"
+        );
+        let configured = configured.clone();
+        session(self.namespace.clone(), move |_, _| {
+            sysctl::capture_conntrack_tunables(&configured)
+        })
+    }
+
     fn scope(&self) -> Result<String> {
         self.check_scope()?;
         Ok(self.identity.clone())
@@ -2192,6 +2227,10 @@ impl Backend for Native {
         }
         {
             let network = Network::parse(&value)?;
+            let logging = crate::firewall_plan::drop_logging_enabled(&network.firewall)?;
+            if logging {
+                self.deny_log.configure(true)?;
+            }
             let captured = self.capture_kernel(&value, &value)?;
             let intent = Intent {
                 scope: self.identity.clone(),
@@ -2220,6 +2259,9 @@ impl Backend for Native {
                 );
             }
             ownership.scope = self.identity.clone();
+            if !logging {
+                self.deny_log.configure(false)?;
+            }
             ownership.firewall_config = Some(network.firewall);
             self.save_ownership(&ownership)?;
             remove_durable(&self.state.join("intent.json"))?;

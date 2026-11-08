@@ -95,6 +95,40 @@ impl Fixture {
 }
 
 #[test]
+fn drop_logging_cli_stages_commits_and_rejects_invalid_values() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    f.configure(&mut cli);
+    f.fail(&mut cli, "firewall drop-logging invalid", "enable");
+    f.ok(&mut cli, "firewall drop-logging disable");
+    let output = f.ok(&mut cli, "commit confirmed 30");
+    assert!(output.contains("confirm"), "{output}");
+    f.ok(&mut cli, "confirm");
+    assert!(
+        !f.app
+            .engine
+            .lock()
+            .unwrap()
+            .saved_configuration()
+            .firewall
+            .drop_logging_enabled
+    );
+    f.ok(&mut cli, "configure terminal");
+    f.ok(&mut cli, "firewall drop-logging enable");
+    f.ok(&mut cli, "commit confirmed 30");
+    f.ok(&mut cli, "confirm");
+    assert!(
+        f.app
+            .engine
+            .lock()
+            .unwrap()
+            .saved_configuration()
+            .firewall
+            .drop_logging_enabled
+    );
+}
+
+#[test]
 fn destination_rewrite_cli_stages_validates_commits_and_removes() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();

@@ -336,7 +336,7 @@ for service_scenario in success repeat directory_failure chmod_failure publish_f
         fi
     ); then
         [[ $service_scenario == success || $service_scenario == repeat ]] || exit 1
-        [[ $(< "$service_target") == $'[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222\nEnvironment=NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json' ]]
+        [[ $(< "$service_target") == $'[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=127.0.0.1:2222\nEnvironment=NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json' ]]
     else
         [[ $service_scenario != success && $service_scenario != repeat ]] || exit 1
         if [[ $service_scenario == *_failure ]]; then
@@ -616,7 +616,7 @@ PY
     fi
 done
 unset -f curl
-for scenario in valid wrong_version version_failure help_failure missing_option missing_takeover vlan_supported vlan_missing_parent vlan_missing_id vlan_unsupported; do
+for scenario in valid wrong_version version_failure help_failure missing_option missing_takeover missing_conntrack_ownership vlan_supported vlan_missing_parent vlan_missing_id vlan_unsupported; do
     destination="$temporary/prebuilt-$scenario"
     mkdir "$destination"
     printf '2026.11.05.2\n' > "$destination/release-version"
@@ -631,6 +631,7 @@ case $1 in
         [[ $prebuilt_scenario != help_failure ]] || exit 1
         printf '%s\n' --provision-wan NETCONTROL_ALLOW_HOST_SERVICES NETCONTROL_GATEWAY_MONITORING NETCONTROL_SSH_LISTEN NETCONTROL_UPGRADE_CONFIG
         if [[ $prebuilt_scenario != missing_takeover ]]; then printf '%s\n' console-host-takeover; fi
+        if [[ $prebuilt_scenario != missing_conntrack_ownership ]]; then printf '%s\n' conntrack-tuning-ownership; fi
         if [[ $prebuilt_scenario != missing_option ]]; then printf '%s\n' --configure-updates; fi
         if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_id ]]; then printf '%s\n' --provision-lan-parent; fi
         if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_parent ]]; then printf '%s\n' --provision-lan-vlan; fi ;;

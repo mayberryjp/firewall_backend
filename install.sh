@@ -224,10 +224,10 @@ configure_appliance_services() (
     install -d -o root -g root -m 0755 "$directory" || exit 1
     staged=$(mktemp "$directory/.appliance-services.XXXXXX") || exit 1
     trap '[[ -z $staged ]] || rm -f -- "$staged"' EXIT
-    printf '[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222\nEnvironment=NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json\n' > "$staged" || exit 1
+    printf '[Unit]\nRequires=netcontrol-syslog.socket\nAfter=netcontrol-syslog.socket systemd-journald.service\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=60s\nWatchdogSignal=SIGKILL\nTimeoutStartSec=180s\nRestart=on-failure\nRestartSec=5s\nLimitCORE=0\nSockets=netcontrol-syslog.socket\nEnvironment=NETCONTROL_ALLOW_HOST_SERVICES=true\nEnvironment=NETCONTROL_GATEWAY_MONITORING=true\nEnvironment=NETCONTROL_SSH_LISTEN=127.0.0.1:2222\nEnvironment=NETCONTROL_UPGRADE_CONFIG=/etc/netcontrol/updates.json\n' > "$staged" || exit 1
     chmod 0644 "$staged" || exit 1
     mv -fT -- "$staged" "$destination" || exit 1
-    installer_message success 'Host services, gateway monitoring and configuration SSH enabled.'
+    installer_message success 'Host services, gateway monitoring and localhost configuration SSH enabled.'
 )
 
 configure_logging_units() (
@@ -601,6 +601,7 @@ check_prebuilt() (
     help=$(./netcontrold --help) || exit 1
     if ! grep -q -- --provision-wan <<< "$help" ||
        ! grep -q console-host-takeover <<< "$help" ||
+       ! grep -q conntrack-tuning-ownership <<< "$help" ||
        ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
        ! grep -q NETCONTROL_GATEWAY_MONITORING <<< "$help" ||
        ! grep -q NETCONTROL_SSH_LISTEN <<< "$help" ||
@@ -657,10 +658,11 @@ main() {
             '' \
             'Unattended installs require --lan and --lan-address.' \
             'Imports supported host networking; disables unsupported settings and competing managers.' \
+            'Captures current conntrack tuning values into owned configuration.' \
             'No connectivity rollback. Review imported firewall rules from the console.' \
             'Disables Snap, competing syslog receivers and automatic OS updates, including security fixes.' \
             'Schedule manual OS patching. LAN clients need static addresses; no DHCP/DNS server is installed.' \
-            'Enables LAN HTTP setup, configuration SSH on TCP 2222 and startup at boot.' \
+            'Enables LAN HTTP setup, localhost configuration SSH on TCP 2222 and startup at boot.' \
             '' \
             'Output: color on terminals; NO_COLOR=1 disables it. Failed steps show diagnostics.' \
             'Details: docs/BUILD_AND_INSTALL.md'
@@ -722,7 +724,7 @@ main() {
     printf 'WAN: %s; LAN: %s (%s)\n' "$wan" "$lan" "$lan_address"
     installer_message warning 'Use a local console. Host networking will be taken over without connectivity rollback.'
     installer_message warning 'Automatic OS updates, including security fixes, and Snap will be disabled. Schedule manual patching.'
-    installer_message warning 'Competing syslog receivers will be disabled. Configuration SSH uses TCP 2222; restrict firewall access.'
+    installer_message warning 'Competing syslog receivers will be disabled. Configuration SSH listens on localhost TCP 2222 only by default.'
     systemctl is-active --quiet systemd-networkd.service || {
         installer_message error 'systemd-networkd must be running.'
         return 1
@@ -754,7 +756,7 @@ main() {
     installer_step 'Configuring system services' install_systemd_service || return 1
     installer_step 'Taking over networking and starting Netcontrol' provision_appliance /usr/local/sbin/netcontrold "$wan" "$lan" "$lan_address" || return 1
     installer_message success 'Installed. Service enabled at boot.'
-    printf 'Setup: http://%s:8080/\nSSH: TCP 2222; user apikey; use an API key created after setup.\nLogs: journalctl -u netcontrold -f\n' "${lan_address%/*}"
+    printf 'Setup: http://%s:8080/\nSSH: localhost TCP 2222; ssh -p 2222 apikey@127.0.0.1; use an API key created after setup.\nLogs: journalctl -u netcontrold -f\n' "${lan_address%/*}"
     installer_message warning 'Review imported firewall rules from the console. LAN clients need static addresses and this gateway; no DHCP/DNS server was installed.'
 }
 

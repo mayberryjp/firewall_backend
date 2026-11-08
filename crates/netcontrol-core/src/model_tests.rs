@@ -2261,3 +2261,132 @@ fn rfs_and_offloads_require_explicit_physical_targets_and_valid_dependencies() {
     let kernel = serde_json::to_value(disabled.kernel).unwrap();
     assert!(kernel.get("rfs").is_none() && kernel.get("offloads").is_none());
 }
+#[test]
+fn drop_logging_defaults_enabled_and_requires_boolean() {
+    assert!(Config::empty().firewall.drop_logging_enabled);
+    for value in [serde_json::json!({}), serde_json::json!({"firewall":{}})] {
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert!(config.firewall.drop_logging_enabled);
+        assert_eq!(
+            config.operational_value().unwrap()["firewall"]["drop_logging_enabled"],
+            true
+        );
+    }
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "firewall":{"drop_logging_enabled":false}
+    }))
+    .unwrap();
+    assert!(!config.firewall.drop_logging_enabled);
+    assert_eq!(
+        config.operational_value().unwrap()["firewall"]["drop_logging_enabled"],
+        false
+    );
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!("false"),
+        serde_json::json!(0),
+    ] {
+        assert!(
+            serde_json::from_value::<Config>(serde_json::json!({
+                "firewall":{"drop_logging_enabled":invalid}
+            }))
+            .is_err()
+        );
+    }
+}
+#[test]
+fn conntrack_ownership_missing_keys_have_exact_scopes_and_do_not_supply_defaults() {
+    let mut configured = crate::KernelConfig::default();
+    let missing = crate::missing_conntrack_tunables(&configured);
+    assert_eq!(
+        missing.host.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["net.netfilter.nf_conntrack_max"]
+    );
+    assert_eq!(missing.namespace.len(), 8);
+    missing.validate().unwrap();
+    configured
+        .host
+        .insert("net.netfilter.nf_conntrack_max".into(), "262144".into());
+    configured.namespace.insert(
+        "net.netfilter.nf_conntrack_tcp_timeout_established".into(),
+        "432000".into(),
+    );
+    let missing = crate::missing_conntrack_tunables(&configured);
+    assert!(missing.host.is_empty());
+    assert_eq!(missing.namespace.len(), 7);
+    assert!(
+        !missing
+            .namespace
+            .contains_key("net.netfilter.nf_conntrack_tcp_timeout_established")
+    );
+    assert_eq!(configured.host["net.netfilter.nf_conntrack_max"], "262144");
+    configured.namespace.extend(missing.namespace);
+    assert_eq!(
+        crate::missing_conntrack_tunables(&configured),
+        crate::KernelConfig::default()
+    );
+}
+#[test]
+fn discord_notification_flags_default_off_and_require_booleans() {
+    let default = Config::empty().discord;
+    assert!(!default.notify_broadcast && !default.notify_tcp_closures);
+    let value: Config =
+        serde_json::from_value(serde_json::json!({"discord":{"enabled":false}})).unwrap();
+    assert_eq!(value.discord, default);
+    for field in ["notify_broadcast", "notify_tcp_closures"] {
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("false"),
+            serde_json::json!(0),
+        ] {
+            let mut value = serde_json::json!({"discord":{}});
+            value["discord"][field] = invalid;
+            assert!(serde_json::from_value::<Config>(value).is_err(), "{field}");
+        }
+    }
+}
+
+#[test]
+fn discord_notification_flags_are_independent_and_include_fin_rst_empty_ack() {
+    let base: crate::DenyRecord = serde_json::from_value(serde_json::json!({
+        "id":"1","timestamp_ms":1,"chain":"forward","reason":"rule","compiled_rule_index":0,
+        "ruleset_id":"a".repeat(64),"source":"192.0.2.1","destination":"198.51.100.1",
+        "protocol":6,"source_port":1234,"destination_port":443,
+        "ingress_index":null,"egress_index":null,"ingress":null,"egress":null,"packet_length":40,
+        "tcp_flags":16,"tcp_payload_length":0,"tags":["tcp_ack_only"]
+    }))
+    .unwrap();
+    for notify_broadcast in [false, true] {
+        for notify_tcp_closures in [false, true] {
+            let mut config = crate::DiscordConfig {
+                enabled: true,
+                notify_broadcast,
+                notify_tcp_closures,
+                ..Default::default()
+            };
+            for flags in [0x11, 0x14, 0x10, 0x02, 0x18] {
+                for broadcast in [false, true] {
+                    let mut record = base.clone();
+                    record.tcp_flags = Some(flags);
+                    record.tags = crate::DenyTrafficTag::tcp(Some(flags), Some(0));
+                    if broadcast {
+                        record.destination = "255.255.255.255".parse().unwrap();
+                        record.tags.push(crate::DenyTrafficTag::Ipv4Broadcast);
+                    }
+                    record.validate_traffic().unwrap();
+                    assert_eq!(
+                        config.should_notify_drop(&record),
+                        (!broadcast || notify_broadcast)
+                            && (!matches!(flags, 0x11 | 0x14 | 0x10) || notify_tcp_closures)
+                    );
+                }
+            }
+            let mut unknown_payload = base.clone();
+            unknown_payload.tcp_payload_length = None;
+            unknown_payload.tags.clear();
+            assert!(config.should_notify_drop(&unknown_payload));
+            config.enabled = false;
+            assert!(!config.should_notify_drop(&unknown_payload));
+        }
+    }
+}

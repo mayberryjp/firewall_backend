@@ -4,6 +4,40 @@
 
 ### Added
 
+- Independent default-off `discord.notify_broadcast` and
+  `discord.notify_tcp_closures` configuration/status flags for newly seen drops.
+  The TCP bucket covers FIN, RST and known empty ACK-only packets; overlapping
+  broadcast/TCP records require both flags. Filter at enqueue and current-policy
+  delivery without changing logging, permanent identities or backfilling
+  suppressed tuples; confirmed flag changes cancel delivery/retries.
+  Release impact: additive fields, breaking default notification-policy change
+  for enabled Discord alerts; next automatic calendar version.
+  Required frontend controls/help:
+  [handoff 2026-11-08-08](docs/frontend-handoffs/2026-11-08.md#2026-11-08-08-discord-notification-category-flags).
+
+- Firewall deny records expose nullable TCP flags/payload byte counts and
+  independent FIN, RST, ACK-only, connection-attempt and IPv4 broadcast tags.
+  Recognize limited and live kernel-reported directed broadcasts rather than
+  guessing `.255`. Return all drops within ordinary pagination/selection;
+  traffic-tag filtering is frontend-only, with no backend tag query parameters.
+  Discord embeds include flags/tags without changing permanent tuple identity,
+  collection or firewall verdicts; separate Discord category switches govern
+  notification eligibility.
+  Release impact: additive HTTP metadata, breaking private deny-log
+  segment schema 2 requirement; next automatic calendar version.
+  Required frontend badges/filter controls and deployment review:
+  [handoff 2026-11-08-04](docs/frontend-handoffs/2026-11-08.md#2026-11-08-04-firewall-drop-traffic-tags)
+  and [frontend-only correction 2026-11-08-05](docs/frontend-handoffs/2026-11-08.md#2026-11-08-05-frontend-only-drop-tag-filtering).
+
+- Configurable global `firewall.drop_logging_enabled`, enabled by default for
+  new installations and factory reset. Confirmed HTTP/SSH changes stop/restart
+  drop capture and remove/restore NFLOG expressions without changing verdicts,
+  counters or retained history/first-seen identities. Disabled capture pauses
+  Discord alerts and exposes `capture.status:"disabled"`.
+  Release impact: additive configuration/status contract; next automatic
+  calendar version. Required frontend toggle/status work:
+  [handoff 2026-11-08-03](docs/frontend-handoffs/2026-11-08.md#2026-11-08-03-configurable-firewall-drop-logging).
+
 - Optional Discord first-seen firewall-drop alerts with a global enable flag
   and privately uploaded webhook URL. Deduplicate exactly source/destination IP,
   destination port and IP protocol in a durable lifetime index independent of
@@ -27,6 +61,24 @@
   [handoff 2026-11-08-01](docs/frontend-handoffs/2026-11-08.md#2026-11-08-01-conntrack-controls).
 
 ### Changed
+
+- Native host install/startup, including source and HTTPS upgrades, forcibly
+  owns all nine supported conntrack tuning settings. Durably capture current
+  values for missing keys, preserve/reapply saved values, retain native
+  originals/recovery and commit verified startup additions as a system revision.
+  Unsupported/missing/unwritable keys fail explicitly; no tuning defaults,
+  connection flush, simulator/lab auto-ownership or state reset.
+  Release impact: breaking host ownership/startup contract; next automatic
+  calendar version. Required frontend revision/default/ownership messaging:
+  [handoff 2026-11-08-07](docs/frontend-handoffs/2026-11-08.md#2026-11-08-07-mandatory-conntrack-tuning-ownership).
+
+- Ubuntu installation/full upgrade binds embedded configuration SSH to
+  `127.0.0.1:2222` instead of all IPv4 interfaces. Direct LAN/WAN SSH access
+  stops for the managed default after restart; explicit operator overrides
+  remain effective and build-only upgrades change no service settings.
+  Release impact: breaking deployment-default change; next automatic calendar
+  version. Required operator-help update:
+  [handoff 2026-11-08-06](docs/frontend-handoffs/2026-11-08.md#2026-11-08-06-localhost-only-configuration-ssh-default).
 
 - Increase firewall policy limits fivefold: 320 ordered rules per host/interface,
   20480 expanded forwarding/input rules and 320 KiB serialized policy metadata.

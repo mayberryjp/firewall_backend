@@ -52,19 +52,30 @@ does not install a cross-architecture linker.
 
 ## Firewall deny logging
 
-Native mode requires Linux `CONFIG_NF_TABLES`, `CONFIG_NETFILTER_NETLINK_LOG`
+Native firewall operation requires Linux `CONFIG_NF_TABLES`; enabled deny
+logging additionally requires `CONFIG_NETFILTER_NETLINK_LOG`
 and `CONFIG_NFT_LOG` (modules `nf_tables`, `nfnetlink_log`, `nft_log`,
 or built-in equivalents). Current kernels compile counter expressions into
 `nf_tables`; no separate `nft_counter` module or `CONFIG_NFT_COUNTER` is required.
 Standard Ubuntu installation and full source upgrades
 load all three and persist
 `/etc/modules-load.d/netcontrol-deny-log.conf`; build-only does not modify the host.
-Other deployments must provision them before starting the daemon. Missing kernel
+Other deployments must provision them before enabling logging. Missing kernel
 support, privileges or an already-owned NFLOG group 100 in the managed namespace
-causes explicit native startup failure. No external logging daemon or
+causes explicit apply/startup failure when logging is enabled. Disabled logging
+does not bind group 100 or install log expressions; nftables/counter support and
+trusted writable retained-state storage remain required. No external logging daemon or
 systemd/journald dependency is introduced; this works independently of syslog.
 
-The always-on in-process receiver runs in the managed network namespace and
+`firewall.drop_logging_enabled` defaults to true for new installations and
+omitted input. Disable it through the usual confirmed configuration transaction
+with `transactions.write` and `firewall.write`; SSH supports
+`firewall drop-logging enable|disable`. Disabling flushes pending records and
+joins the receiver, retaining history/IDs/first-seen identities and all drop
+verdicts/counters. Re-enable requires available logging kernel support and
+exclusive group 100; it cannot recover missed traffic or Discord alerts.
+
+The enabled in-process receiver runs in the managed network namespace and
 requires the existing `CAP_NET_ADMIN` and namespace-entry privileges. Do not bind
 another collector to group 100 there. Only Netcontrol's owned input/forwarding
 drops are included, not other tables, route blackholes, qdisc/checksum drops or
@@ -86,6 +97,29 @@ record-count bound, not a retention-time guarantee. Provision a writable durable
 filesystem with space for atomic staging; files are 0600 under a 0700 directory.
 No packet payload is persisted. Source/destination metadata is still sensitive:
 restrict backups, filesystem access and `firewall.logs.read` credentials.
+
+Current deny segments require **schema 2** for saved TCP flags/payload-length
+metadata and traffic tags. Schema-1 or incomplete segments fail native startup
+unchanged, even with collection disabled; no compatibility reader, conversion or
+automatic reset is provided. Before deployment, preserve a private backup and
+explicitly archive incompatible rotating segment files outside the active
+deny-log directory if starting a new current-schema history is authorized.
+Archiving is operator work, not performed by the backend or this change, and
+retained segments are not served by this API once archived. Preserve the
+`first-seen.sqlite` identity database and all configuration/journals; do not
+remove them to resolve telemetry schema errors. Incompatible queued alert JSON
+is rejected without claim when enabled delivery reads it; operator review is
+required before deployment if such pending records exist. The database tuple
+schema and deduplication behavior are unchanged.
+
+Broadcast classification reads live interface IPv4 addresses/prefixes and
+explicit broadcast attributes through
+in-process rtnetlink in the collector's namespace, initially and once per worker
+window. Prefixes /31 and /32 do not produce directed-broadcast tags.
+Read-only snapshots have a two-second timeout; snapshot failure stops capture
+and exposes an error, requiring operator repair/restart. No additional external
+program or permission is introduced. Traffic-tag filtering is frontend-only;
+the backend returns tagged drops without tag-based exclusions.
 
 At most 100 records per one-second worker window are persisted. Socket pressure,
 rate discards and malformed records are visible in the retrieval response; lost
@@ -131,9 +165,10 @@ through the managed systemd environment drop-in described
 the base unit or custom startup arguments. Build-only runs do not change it.
 They also [configure journald forwarding](#host-logging-ownership) for native syslog.
 Full install/upgrade enables the embedded configuration SSH listener on
-`0.0.0.0:2222` through `NETCONTROL_SSH_LISTEN`; no second process or OpenSSH
-package is started. Explicit `--ssh-listen` arguments take precedence. Review
-current host-input firewall reachability before upgrading; the script does not
+`127.0.0.1:2222` (localhost only) through `NETCONTROL_SSH_LISTEN`; no second
+process or OpenSSH package is started. Explicit `--ssh-listen` arguments take
+precedence. Full upgrades replace the managed wildcard default with loopback;
+review explicit overrides for host-input reachability. The script does not
 open ports or change saved input policy. See
 [SSH overrides](#optional-configuration-ssh-server) for custom binding or disable.
 Exactly one direct, absolute executable named `netcontrold` is required;
@@ -464,6 +499,33 @@ local TCP diagnostics and forwarded packet-header coverage are distinct.
 See the [canonical measurement/limits contract](../FRONTEND_SPEC.md#native-link-diagnostics).
 
 ## Conntrack host prerequisites
+
+Native host installation captures all nine supported conntrack tuning values
+into owned configuration before console takeover. Normal saved-host startup,
+including source and HTTPS upgrades, preserves/reapplies existing saved values
+and captures/claims every missing tuning key. This is mandatory ownership,
+not automatic performance tuning or replacement of operator-selected values.
+See the [scopes/ranges and startup contract](../FRONTEND_SPEC.md#conntrack-limits-and-timeouts).
+
+Captured originals remain in private native ownership state for rollback.
+Missing-key startup additions use a durable verified system transaction,
+advancing the configuration revision once with no confirmation timer.
+Repetition with all nine keys owned does not recapture or create a revision.
+Interrupted claims recover before a new claim; failures preserve the intent/
+previous configuration under existing recovery semantics. A pending transaction
+blocks a missing-key claim instead of being overwritten or confirmed.
+
+Missing, unreadable, unwritable or unsupported live tuning values abort takeover/
+startup explicitly; correct the kernel prerequisites or values from an independent
+console and retry. Do not reset state, delete history or clamp values to bypass
+failure. Build-only performs no capture or ownership changes. Simulator and
+explicit lab namespaces do not auto-own. Removing a tuning key restores its
+original, but native host restart captures/owns it again. Later external sysctl
+writes to owned values are drift, not new configuration; boot reconciliation
+reapplies saved values. No unrelated sysctl files/services are removed.
+The fresh installer verifies the downloaded daemon advertises
+`conntrack-tuning-ownership`; a release lacking this required host contract
+is rejected instead of silently installing without ownership capture.
 
 The Ubuntu fresh installer and full development upgrade load `nf_conntrack`,
 apply and read back these host-network-namespace settings before provisioning
@@ -977,7 +1039,7 @@ host networking. The unit selects `--appliance` and the LAN-address management
 listener from `/etc/netcontrol/appliance.env` (default `192.168.0.1:8080`).
 The bare unit does not enable API tunables. Install/full upgrade writes the
 managed service drop-in that enables host-service/gateway opt-ins and embedded
-configuration SSH on TCP 2222 without changing `ExecStart`. Actual protocol
+configuration SSH on localhost TCP 2222 without changing `ExecStart`. Actual protocol
 workers remain controlled by saved configuration; SSH uses the existing
 API-key authentication and device setup gate.
 
@@ -1784,7 +1846,7 @@ configuration.
 
 Ubuntu `install.sh` and full `upgrade.sh` now enable the daemon's **in-process**
 configuration SSH server by default using
-`Environment=NETCONTROL_SSH_LISTEN=0.0.0.0:2222` in the managed
+`Environment=NETCONTROL_SSH_LISTEN=127.0.0.1:2222` in the managed
 `50-netcontrol-appliance-services.conf` drop-in. This is not a separate SSH
 daemon process, system shell, SFTP server or supervised `sshd`.
 `upgrade.sh --build-only` does not change this configuration.
@@ -1794,15 +1856,16 @@ creation without a browser or restart:
 `sudo netcontrold --create-api-key console`. It prompts for a username and hidden
 password on an unclaimed device, finishes onboarding and displays the new API key
 once. Existing accounts/passwords are retained. Use that key with
-`ssh -p 2222 apikey@127.0.0.1`; the default IPv4 wildcard SSH listener includes
-localhost. The root-only `/run/netcontrol/control.sock` is independent of network
+`ssh -p 2222 apikey@127.0.0.1` from the appliance console; the default IPv4
+loopback SSH listener is not reachable through LAN/WAN addresses.
+The root-only `/run/netcontrol/control.sock` is independent of network
 listeners and must have a root-owned mode-0700 directory and mode-0600 socket.
 Bind/security failures stop startup. Custom `--control-socket PATH` must match on
 daemon and client; no local key creation is available with `--auth-file`.
 See [setup and error handling](CLI.md#browser-free-local-key-creation).
 Do not record the terminal or redirect the displayed key.
 
-For manual/OpenRC deployments, add `--ssh-listen 0.0.0.0:2222` to
+For manual/OpenRC deployments, add `--ssh-listen 127.0.0.1:2222` to
 `netcontrold_args` to enable the daemon's native SSH interpreter; add
 `--ssh-host-key /var/lib/netcontrol/ssh-host-key`
 to select a persistent private Ed25519 host-key file explicitly. Otherwise the
@@ -1831,13 +1894,17 @@ embedded SSH sessions are interrupted. Operator-owned drop-ins survive full
 upgrades. The bare daemon remains off when neither flag nor environment value
 is provided.
 
-Review host-input policy before enabling or upgrading: binding to `0.0.0.0`
-includes WAN addresses. Fresh provisioning blocks new WAN input, but upgrading
-preserves the saved firewall and adds no SSH permit or protective deny. A port
+Full upgrades replace the managed `0.0.0.0:2222` default with `127.0.0.1:2222`;
+direct remote access using that former default stops after restart. Explicit
+operator overrides remain effective: remove a non-loopback environment-file
+value or `--ssh-listen` argument to use the loopback default. Review host-input
+policy if intentionally binding a non-loopback address; wildcard binding includes
+WAN addresses. Upgrading preserves the saved firewall and adds no SSH permit or
+protective deny. A port
 collision or insecure host-key file causes startup failure, not a silent
 fallback to disabled SSH. No operating-system SSH service is changed.
 
-Connect with `ssh -p 2222 apikey@<appliance-IP>`, using an existing API key at the
+Connect locally with `ssh -p 2222 apikey@127.0.0.1`, using an existing API key at the
 password prompt after completing website onboarding. Scoped auth-file keys work
 with their existing permissions. This does not use a device-account password or
 spawn a system shell/sshd. SSH listens in the host management namespace and has

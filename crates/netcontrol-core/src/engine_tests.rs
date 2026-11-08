@@ -86,6 +86,22 @@ fn deny_log_retrieval_is_separate_authorized_validated_and_read_only() {
             "",
             200,
         ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
+            "tag=ipv4_broadcast&exclude_tags=tcp_finish,tcp_reset",
+            "",
+            400,
+        ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
+            "exclude_tags=tcp_finish,unknown",
+            "",
+            400,
+        ),
     ] {
         let reply = engine.request(
             method,
@@ -1738,6 +1754,8 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    conntrack_capture: Option<KernelConfig>,
+    conntrack_capture_calls: usize,
     vlan_prepares: usize,
     vlan_finishes: usize,
     fail_vlan_finish: bool,
@@ -1776,6 +1794,14 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn capture_conntrack_tunables(&mut self, _: &KernelConfig) -> Result<KernelConfig> {
+        let mut faults = self.0.lock().unwrap();
+        faults.conntrack_capture_calls += 1;
+        faults
+            .conntrack_capture
+            .clone()
+            .context("injected conntrack capture unavailable")
+    }
     fn prepare_vlan_adoption(
         &mut self,
         before: &Config,
@@ -4440,6 +4466,8 @@ fn discord_enable_reference_permissions_confirmation_restart_and_rollback() {
     let mut engine = fixture.engine();
     let mut config = Config::empty();
     config.discord.enabled = true;
+    config.discord.notify_broadcast = true;
+    config.discord.notify_tcp_closures = true;
     config.discord.webhook_ref = "a".repeat(32);
     assert_eq!(submit(&mut engine, config.clone()).status, 422);
     engine.configure_discord(Some([config.discord.webhook_ref.clone()].into()));
@@ -4479,6 +4507,28 @@ fn discord_enable_reference_permissions_confirmation_restart_and_rollback() {
     .unwrap();
     engine.configure_discord(Some([config.discord.webhook_ref.clone()].into()));
     assert_eq!(engine.saved_configuration().discord, config.discord);
+    for field in ["notify_broadcast", "notify_tcp_closures"] {
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["discord"][field] = json!(false);
+        let body = serde_json::to_vec(&json!({
+            "base_revision":engine.state.revision,"confirm_timeout_seconds":30,"config":value
+        }))
+        .unwrap();
+        assert_eq!(
+            engine
+                .request(
+                    "POST",
+                    "/api/v1/transactions",
+                    "",
+                    "limited",
+                    &limited,
+                    &body
+                )
+                .status,
+            403
+        );
+        assert_eq!(engine.saved_configuration().discord, config.discord);
+    }
     let disabled = submit(&mut engine, Config::empty());
     assert_eq!(disabled.status, 202);
     assert_eq!(
@@ -4501,6 +4551,234 @@ fn discord_enable_reference_permissions_confirmation_restart_and_rollback() {
         200
     );
     assert!(!engine.saved_configuration().discord.enabled);
+    assert!(!engine.saved_configuration().discord.notify_broadcast);
+    assert!(!engine.saved_configuration().discord.notify_tcp_closures);
+}
+
+#[test]
+fn drop_logging_permissions_confirmation_persistence_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    assert!(engine.saved_configuration().firewall.drop_logging_enabled);
+    let mut disabled = engine.saved_configuration().clone();
+    disabled.firewall.drop_logging_enabled = false;
+    for missing in ["transactions.write", "firewall.write"] {
+        let permissions: Vec<_> = all().into_iter().filter(|p| p != missing).collect();
+        let body = serde_json::to_vec(&json!({
+            "base_revision":engine.state.revision,"confirm_timeout_seconds":30,"config":disabled
+        }))
+        .unwrap();
+        assert_eq!(
+            engine
+                .request(
+                    "POST",
+                    "/api/v1/transactions",
+                    "",
+                    "limited",
+                    &permissions,
+                    &body
+                )
+                .status,
+            403
+        );
+    }
+    let reply = submit(&mut engine, disabled.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert!(!engine.saved_configuration().firewall.drop_logging_enabled);
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(disabled.clone()).unwrap()),
+    )
+    .unwrap();
+    assert!(!engine.saved_configuration().firewall.drop_logging_enabled);
+    let mut enabled = disabled;
+    enabled.firewall.drop_logging_enabled = true;
+    let reply = submit(&mut engine, enabled.clone());
+    assert_eq!(reply.status, 202);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                reply.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert!(!engine.saved_configuration().firewall.drop_logging_enabled);
+    let reply = submit(&mut engine, enabled);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert!(engine.saved_configuration().firewall.drop_logging_enabled);
+}
+
+fn captured_conntrack() -> KernelConfig {
+    let mut captured = crate::missing_conntrack_tunables(&KernelConfig::default());
+    captured
+        .host
+        .values_mut()
+        .for_each(|value| *value = "65536".into());
+    captured
+        .namespace
+        .values_mut()
+        .for_each(|value| *value = "120".into());
+    captured
+}
+
+#[test]
+fn conntrack_ownership_captures_missing_preserves_saved_credentials_and_is_idempotent() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    let mut before = Config::empty();
+    before
+        .kernel
+        .host
+        .insert("net.netfilter.nf_conntrack_max".into(), "131072".into());
+    before
+        .kernel
+        .namespace
+        .insert("net.core.somaxconn".into(), "2048".into());
+    before.discord.enabled = true;
+    before.discord.webhook_ref = "a".repeat(32);
+    let mut state = engine.state.clone();
+    state.desired = before.clone();
+    engine.persist(state).unwrap();
+    let mut captured = captured_conntrack();
+    captured.host.clear();
+    {
+        let mut faults = faults.lock().unwrap();
+        faults.state = before.clone();
+        faults.conntrack_capture = Some(captured.clone());
+    }
+    let transaction = engine.claim_conntrack_tunables().unwrap().unwrap();
+    assert_eq!(transaction.status, "committed");
+    assert_eq!(transaction.actor, "system-conntrack-ownership");
+    assert!(transaction.confirmation_deadline.is_none());
+    assert_eq!(transaction.previous, before);
+    let mut expected = before;
+    expected.kernel.namespace.extend(captured.namespace);
+    assert_eq!(engine.saved_configuration(), &expected);
+    assert_eq!(
+        expected.kernel.host["net.netfilter.nf_conntrack_max"],
+        "131072"
+    );
+    assert_eq!(faults.lock().unwrap().apply_count, 1);
+    let bytes = fs::read(fixture.path()).unwrap();
+    assert!(engine.claim_conntrack_tunables().unwrap().is_none());
+    assert_eq!(faults.lock().unwrap().conntrack_capture_calls, 1);
+    assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    drop(engine);
+    let mut engine =
+        Engine::open_saved(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    assert_eq!(engine.saved_configuration(), &expected);
+    assert!(engine.claim_conntrack_tunables().unwrap().is_none());
+}
+
+#[test]
+fn conntrack_ownership_capture_errors_and_partial_or_unrelated_results_do_not_write() {
+    for captured in [
+        None,
+        Some(KernelConfig::default()),
+        Some({
+            let mut value = captured_conntrack();
+            value
+                .host
+                .insert("net.core.rmem_max".into(), "1048576".into());
+            value
+        }),
+        Some({
+            let mut value = captured_conntrack();
+            value
+                .namespace
+                .insert("net.netfilter.nf_conntrack_udp_timeout".into(), "0".into());
+            value
+        }),
+    ] {
+        let fixture = Fixture::new();
+        let (mut engine, faults) = faulty(&fixture);
+        faults.lock().unwrap().conntrack_capture = captured;
+        let bytes = fs::read(fixture.path()).unwrap();
+        assert!(engine.claim_conntrack_tunables().is_err());
+        assert_eq!(faults.lock().unwrap().apply_count, 0);
+        assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn conntrack_ownership_apply_failure_rolls_back_and_retries() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    {
+        let mut faults = faults.lock().unwrap();
+        faults.conntrack_capture = Some(captured_conntrack());
+        faults.fail_applies = 1;
+    }
+    let before = engine.saved_configuration().clone();
+    assert!(engine.claim_conntrack_tunables().is_err());
+    assert_eq!(engine.saved_configuration(), &before);
+    assert_eq!(faults.lock().unwrap().state, before);
+    assert!(engine.active().is_none());
+    assert_eq!(
+        engine.state.transactions.values().next().unwrap().status,
+        "rolled_back"
+    );
+    assert_eq!(
+        engine.claim_conntrack_tunables().unwrap().unwrap().status,
+        "committed"
+    );
+}
+
+#[test]
+fn conntrack_ownership_interrupted_local_apply_recovers_before_new_capture() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    faults.lock().unwrap().conntrack_capture = Some(captured_conntrack());
+    let transaction = engine.claim_conntrack_tunables().unwrap().unwrap();
+    let expected = transaction.candidate.clone();
+    let mut state = engine.state.clone();
+    state.desired = transaction.previous;
+    state.revision = transaction.base_revision;
+    state.active_transaction = Some(transaction.id.clone());
+    let active = state.transactions.get_mut(&transaction.id).unwrap();
+    active.status = "applying_local".into();
+    active.committed_revision = None;
+    active.committed_at = None;
+    active.committed_by.clear();
+    engine.persist(state).unwrap();
+    drop(engine);
+    let mut engine =
+        Engine::open_saved(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    assert_eq!(engine.saved_configuration(), &expected);
+    assert_eq!(
+        engine.state.transactions[&transaction.id].status,
+        "committed"
+    );
+    assert!(engine.active().is_none());
+    assert!(engine.claim_conntrack_tunables().unwrap().is_none());
+    assert_eq!(faults.lock().unwrap().conntrack_capture_calls, 1);
+}
+
+#[test]
+fn conntrack_ownership_does_not_interrupt_pending_confirmation() {
+    let fixture = Fixture::new();
+    let (mut engine, faults) = faulty(&fixture);
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202);
+    let bytes = fs::read(fixture.path()).unwrap();
+    assert!(engine.claim_conntrack_tunables().is_err());
+    assert_eq!(faults.lock().unwrap().conntrack_capture_calls, 0);
+    assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
+    assert_eq!(engine.active().unwrap().status, "pending_confirmation");
 }
 
 #[test]

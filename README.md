@@ -164,9 +164,16 @@ workflow, HTTP catalog and configuration SSH commands. Own
 `net.netfilter.nf_conntrack_max` in `kernel.host` (1024..16777216 entries);
 own TCP established/close/close-wait/fin-wait/last-ack/time-wait and UDP
 unreplied/stream timeouts in `kernel.namespace` (1..604800 seconds).
-Values are canonical decimal strings; no defaults are changed automatically.
+Native host installation and every saved-host startup (including source/HTTPS
+upgrades) own all nine settings. Capture current values for missing keys into
+configuration; preserve and reapply existing saved settings, never guess values.
+Initial capture is durable before takeover; startup additions use a verified
+system transaction and advance the configuration revision once. Missing or
+unsupported kernel values fail explicitly. Simulator/lab modes do not auto-own.
+Values are canonical decimal strings; no tuning defaults are changed automatically.
 Removing a key restores its captured original, with normal persistence,
-restart repair, drift detection and rollback. Host limits require
+restart repair, drift detection and rollback, but the next native host startup
+captures/reclaims missing conntrack keys. Host limits require
 `kernel.host.write`, namespace timeouts `kernel.namespace.write`, and all
 mutations use `transactions.write`.
 
@@ -249,12 +256,30 @@ Other Linux installations must enable `CONFIG_NF_TABLES`. See the
 
 ## Firewall deny history
 
-Native Linux continuously records managed input/forwarding rule and default-policy
+`firewall.drop_logging_enabled` defaults to `true` on new installations and
+factory reset. Set it to `false` using a confirmed configuration transaction
+(`transactions.write`, `firewall.write`) or SSH `firewall drop-logging disable`
+to stop collection without changing firewall verdicts or rule counters.
+History and first-seen identities persist; the log API reports `disabled`.
+Re-enable with `true` or `firewall drop-logging enable`. Discord alerts depend
+on capture and pause while logging is disabled; missed traffic is not backfilled.
+
+When enabled, native Linux continuously records managed input/forwarding rule and default-policy
 drops in a private, persistent rotating log, separate from configuration, revisions,
 backend audit logs and syslog. Retrieve retained metadata on demand with
 `GET /api/v1/firewall/deny-log?limit=100`, using an API key granted
 `firewall.logs.read`. Filter by address, numeric IP protocol, chain and Unix
 millisecond time range; page newest-first using `next_before_id`.
+Records include nullable TCP flags/payload byte counts and independent traffic
+tags. All retained drops are returned within normal pagination and existing
+address/protocol/time/chain selection; traffic tags never exclude backend records.
+The frontend can hide FIN/RST or broadcast drops locally using each record's tags.
+No `tag` or `exclude_tags` query parameters are supported.
+Broadcast detection uses limited broadcast
+`255.255.255.255` and live kernel-reported subnet broadcasts, not a `.255` guess.
+ACK-only does not prove teardown, and no tag changes capture or firewall verdicts.
+Current deny segments require schema 2; unsupported history fails startup unchanged.
+See the deployment guide before replacing a backend with existing telemetry.
 
 Retention is at most 4096 records in eight bounded segments; collection retains
 at most 100 records/second and reports loss/error indicators. This is best-effort
@@ -269,11 +294,21 @@ Optional `discord.enabled` sends Discord webhook notifications for the first
 captured occurrence of exactly `(source IP, destination IP, destination port,
 IP protocol)`. Source ports, interfaces and reasons do not create new identities.
 A durable native index preserves seen tuples across restarts and drop-log rotation;
-there is no time-based expiry. Drops first seen while disabled are not backfilled.
+there is no time-based expiry. Drops first seen while globally or categorically
+disabled are not backfilled.
 Existing retained history seeds the index without sending messages.
 
+Independent `discord.notify_broadcast` and `discord.notify_tcp_closures` flags
+both default off. The first permits IPv4 broadcast drops; the second permits
+FIN, RST and known empty ACK-only drops. A drop in both categories requires both
+flags enabled. These observed packet tags do not prove a connection closed or
+traffic is harmless. Other newly seen drops remain eligible with global alerts
+and capture enabled. Category filters affect notifications only: history and
+permanent seen identities are retained. Queued drops are checked against current
+settings before delivery; enabling later never replays suppressed tuples.
+
 Upload the secret URL through `POST /api/v1/services/discord/webhooks`
-(`discord.write`), then save the returned `webhook_ref` and global enable flag
+(`discord.write`), then save the returned `webhook_ref` and notification flags
 through normal confirmed transactions (`transactions.write`, `discord.write`).
 Only canonical HTTPS `discord.com` webhook URLs are accepted. Raw URLs/tokens
 are private and never enter configuration exports. Read delivery/errors with
@@ -287,7 +322,7 @@ best-effort, with no replay after ambiguous failures or interrupted sends.
 The permanent identity index grows with distinct traffic; preserve private
 state and monitor disk capacity. No firewall rules are automatically opened.
 See the [complete contract](FRONTEND_SPEC.md#discord-first-seen-drop-alerts) and
-[frontend handoff](docs/frontend-handoffs/2026-11-08.md#2026-11-08-02-discord-first-seen-drop-alerts).
+[frontend handoff](docs/frontend-handoffs/2026-11-08.md#2026-11-08-08-discord-notification-category-flags).
 
 ## Sando imports
 
@@ -1006,13 +1041,13 @@ not establish device interoperability, production load or reboot acceptance.
 
 The daemon includes a Cisco-inspired CLI and an in-process Rust SSH server.
 Ubuntu `install.sh` and full `upgrade.sh` runs enable it by default on
-`0.0.0.0:2222`; no separate system `sshd` is required or launched. For a manual
+`127.0.0.1:2222` (localhost only); no separate system `sshd` is required or launched. For a manual
 daemon invocation, enable it explicitly:
 
 ```sh
 netcontrold --state state.json --credential-db credentials.json \
-  --ssh-listen 0.0.0.0:2222
-ssh -p 2222 apikey@192.0.2.10
+  --ssh-listen 127.0.0.1:2222
+ssh -p 2222 apikey@127.0.0.1
 ```
 
 Use the literal username `apikey` and your existing **API key** at the password
@@ -1020,8 +1055,10 @@ prompt. Account passwords are not networking credentials. The persistent
 Ed25519 host key defaults to `<state>.ssh-key`; preserve it and verify the host
 fingerprint. Manual invocations remain disabled unless `--ssh-listen` or
 `NETCONTROL_SSH_LISTEN` is provided; the explicit flag takes precedence.
-Review host-input firewall exposure before upgrading: the script does not
-add firewall exceptions, and wildcard binding must not expose management to WAN.
+The managed default is not reachable through LAN/WAN addresses. Full upgrades
+replace the managed wildcard default with loopback; build-only upgrades do not.
+Explicit operator overrides remain effective and require host-input exposure
+review; the script does not add firewall exceptions.
 See [deployment overrides](docs/BUILD_AND_INSTALL.md#optional-configuration-ssh-server)
 for a custom address or explicit disable.
 

@@ -4,7 +4,7 @@ mod deny_log;
 mod diagnostics;
 mod path_test;
 pub use bgp::{BGPConfig, BGPNeighbor};
-pub use deny_log::{DenyLogQuery, DenyRecord};
+pub use deny_log::{DenyLogQuery, DenyRecord, DenyTrafficTag};
 pub use path_test::{
     PATH_TEST_ARM_SECONDS, PATH_TEST_LIFETIME_SECONDS, PATH_TEST_PORT, PATH_TEST_RUN_SECONDS,
     PathTestParent, PathTestRequest,
@@ -102,7 +102,7 @@ pub trait Backend: Send {
     fn deny_log(&mut self, _query: &DenyLogQuery) -> Result<Value> {
         anyhow::bail!("firewall deny logging requires the native Linux backend")
     }
-    fn first_firewall_drops(&mut self, _enabled: bool) -> Result<Vec<DenyRecord>> {
+    fn first_firewall_drops(&mut self, _config: &DiscordConfig) -> Result<Vec<DenyRecord>> {
         anyhow::bail!("first-seen firewall drops require the native Linux backend")
     }
     fn bgp_status(&mut self, config: &Config) -> Result<Value> {
@@ -135,6 +135,9 @@ pub trait Backend: Send {
     fn scope(&self) -> Result<String>;
     fn initial_configuration(&mut self) -> Result<Config> {
         Ok(Config::empty())
+    }
+    fn capture_conntrack_tunables(&mut self, _configured: &KernelConfig) -> Result<KernelConfig> {
+        anyhow::bail!("conntrack ownership capture requires the native Linux host backend")
     }
     fn observe(&mut self, expected: &Config) -> Result<Config>;
     fn discover_interfaces(&mut self) -> Result<Value> {

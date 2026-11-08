@@ -69,6 +69,7 @@ enum ApplyMode {
     Confirmed,
     FactoryReset,
     Initial,
+    KernelOwnership,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -486,11 +487,11 @@ impl Engine {
             if t.status == "applying_local" {
                 e.backend
                     .repair(&t.candidate)
-                    .context("resume console provisioning; durable intent retained")?;
+                    .context("resume local configuration apply; durable intent retained")?;
                 let observed = e.backend.observe(&t.candidate)?;
                 ensure!(
                     observed.same_settings(&t.candidate),
-                    "console provisioning recovery verification mismatch"
+                    "local configuration recovery verification mismatch"
                 );
                 e.commit_verified(&id, &t, &t.actor, e.now())
                     .map_err(|error| anyhow::anyhow!(error.error))?;
@@ -1413,8 +1414,11 @@ impl Engine {
         self.discord_webhooks = references;
     }
 
-    pub fn first_firewall_drops(&mut self, enabled: bool) -> Result<Vec<crate::DenyRecord>> {
-        self.backend.first_firewall_drops(enabled)
+    pub fn first_firewall_drops(
+        &mut self,
+        config: &crate::DiscordConfig,
+    ) -> Result<Vec<crate::DenyRecord>> {
+        self.backend.first_firewall_drops(config)
     }
 
     /// `None` means this backend cannot manage host settings; managed values are then rejected.
@@ -1462,6 +1466,56 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!(error.error))
     }
 
+    pub fn claim_conntrack_tunables(&mut self) -> Result<Option<Transaction>> {
+        ensure!(!self.closed, "engine is shut down");
+        let missing = crate::missing_conntrack_tunables(&self.state.desired.kernel);
+        if missing.host.is_empty() && missing.namespace.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            !self.configuration_busy(),
+            "conntrack ownership requires no active configuration transaction, recovery, upgrade or restart"
+        );
+        let captured = self
+            .backend
+            .capture_conntrack_tunables(&self.state.desired.kernel)
+            .context("capture unowned conntrack tuning values")?;
+        captured.validate()?;
+        ensure!(
+            captured.host.keys().eq(missing.host.keys())
+                && captured.namespace.keys().eq(missing.namespace.keys()),
+            "conntrack capture must include exactly the missing tuning keys"
+        );
+        let allowed = KernelConfig {
+            host: captured.host.clone(),
+            namespace: captured.namespace.clone(),
+            ..Default::default()
+        };
+        ensure!(
+            captured == allowed,
+            "conntrack capture contains unrelated kernel settings"
+        );
+        let mut config = self.state.desired.clone();
+        config.kernel.host.extend(captured.host);
+        config.kernel.namespace.extend(captured.namespace);
+        validate_conntrack_ownership(&self.state.desired, &config)?;
+        let request = SubmitRequest {
+            base_revision: self.state.revision,
+            confirm_timeout_seconds: 300,
+            config,
+            description:
+                "Claim missing conntrack tuning settings using their current kernel values".into(),
+        };
+        self.submit_inner(
+            "system-conntrack-ownership",
+            request,
+            None,
+            ApplyMode::KernelOwnership,
+        )
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!(error.error))
+    }
+
     fn submit(
         &mut self,
         actor: &str,
@@ -1491,7 +1545,11 @@ impl Engine {
             return Err(ApiError::new(422, "description must not exceed 1024 bytes"));
         }
         r.config.validate().map_err(|e| ApiError::new(422, e))?;
-        if (r.config.discord.enabled || !r.config.discord.webhook_ref.is_empty())
+        // Ownership capture changes only missing kernel keys; existing private
+        // credentials are loaded by daemon managers after startup reconciliation.
+        let validate_credentials = !matches!(mode, ApplyMode::KernelOwnership);
+        if validate_credentials
+            && (r.config.discord.enabled || !r.config.discord.webhook_ref.is_empty())
             && !self
                 .discord_webhooks
                 .as_ref()
@@ -1502,7 +1560,7 @@ impl Engine {
                 "Discord backend or webhook reference is unavailable",
             ));
         }
-        for entry in &r.config.dynamic_dns {
+        for entry in r.config.dynamic_dns.iter().filter(|_| validate_credentials) {
             if !self
                 .dynamic_dns_secrets
                 .as_ref()
@@ -1514,7 +1572,7 @@ impl Engine {
                 ));
             }
         }
-        if r.config.mqtt.enabled && self.mqtt_passwords.is_none() {
+        if validate_credentials && r.config.mqtt.enabled && self.mqtt_passwords.is_none() {
             return Err(ApiError::new(
                 422,
                 "MQTT streaming is unavailable for this backend",
@@ -1540,7 +1598,8 @@ impl Engine {
                 ));
             }
         }
-        if !r.config.mqtt.password_ref.is_empty()
+        if validate_credentials
+            && !r.config.mqtt.password_ref.is_empty()
             && !self
                 .mqtt_passwords
                 .as_ref()
@@ -1588,7 +1647,7 @@ impl Engine {
         let t = Transaction {
             id: id.clone(),
             actor: actor.into(),
-            status: if matches!(mode, ApplyMode::Initial) {
+            status: if matches!(mode, ApplyMode::Initial | ApplyMode::KernelOwnership) {
                 "applying_local"
             } else {
                 "applying"
@@ -1598,7 +1657,10 @@ impl Engine {
             committed_revision: None,
             candidate: r.config,
             previous: self.state.desired.clone(),
-            confirmation_deadline: if matches!(mode, ApplyMode::Initial) {
+            confirmation_deadline: if matches!(
+                mode,
+                ApplyMode::Initial | ApplyMode::KernelOwnership
+            ) {
                 None
             } else {
                 Some(now + Duration::seconds(r.confirm_timeout_seconds))
@@ -1642,7 +1704,7 @@ impl Engine {
             })
             .transaction(t));
         }
-        if matches!(mode, ApplyMode::Initial) {
+        if matches!(mode, ApplyMode::Initial | ApplyMode::KernelOwnership) {
             return self.commit_verified(&id, &t, actor, self.now());
         }
         let mut next = self.state.clone();
@@ -2355,6 +2417,42 @@ fn validate_vlan_adoption(
     Ok(())
 }
 
+fn validate_conntrack_ownership(previous: &Config, candidate: &Config) -> Result<()> {
+    let missing = crate::missing_conntrack_tunables(&previous.kernel);
+    ensure!(
+        !missing.host.is_empty() || !missing.namespace.is_empty(),
+        "conntrack ownership transaction must claim missing keys"
+    );
+    let mut expected = previous.clone();
+    for (keys, values, target) in [
+        (
+            &missing.host,
+            &candidate.kernel.host,
+            &mut expected.kernel.host,
+        ),
+        (
+            &missing.namespace,
+            &candidate.kernel.namespace,
+            &mut expected.kernel.namespace,
+        ),
+    ] {
+        for name in keys.keys() {
+            target.insert(
+                name.clone(),
+                values
+                    .get(name)
+                    .with_context(|| format!("conntrack ownership candidate is missing {name}"))?
+                    .clone(),
+            );
+        }
+    }
+    ensure!(
+        expected == *candidate,
+        "conntrack ownership must preserve saved values and unrelated configuration"
+    );
+    Ok(())
+}
+
 fn validate_state(s: &State) -> Result<()> {
     if let Some(intent) = &s.vlan_adoption {
         ensure!(
@@ -2450,10 +2548,15 @@ fn validate_state(s: &State) -> Result<()> {
             );
         } else {
             ensure!(
-                t.actor == "local-host-takeover"
-                    && !matches!(t.status.as_str(), "applying" | "pending_confirmation"),
-                "only console provisioning may omit its confirmation deadline"
+                matches!(
+                    t.actor.as_str(),
+                    "local-host-takeover" | "system-conntrack-ownership"
+                ) && !matches!(t.status.as_str(), "applying" | "pending_confirmation"),
+                "only console provisioning or conntrack ownership may omit its confirmation deadline"
             );
+            if t.actor == "system-conntrack-ownership" {
+                validate_conntrack_ownership(&t.previous, &t.candidate)?;
+            }
         }
         ensure!(
             t.submitted_at >= s.initialized_at,

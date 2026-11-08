@@ -54,6 +54,7 @@ fn matching(
     plan: &crate::firewall_plan::Match,
     prefix: &str,
     generation: &str,
+    logging: bool,
 ) -> Result<Rule> {
     let mut rule = Rule::new(chain)?.with_userdata(crate::firewall_counters::userdata(
         generation,
@@ -124,8 +125,10 @@ fn matching(
     }
     rule = rule.with_expr(Counter::default());
     Ok(if plan.action == "drop" {
-        rule.with_expr(Log::new(Some(super::deny_log::GROUP), Some(prefix))?)
-            .drop()
+        if logging {
+            rule = rule.with_expr(Log::new(Some(super::deny_log::GROUP), Some(prefix))?);
+        }
+        rule.drop()
     } else {
         rule.accept()
     })
@@ -149,6 +152,7 @@ fn default_rule(
     action: &str,
     prefix: &str,
     generation: &str,
+    logging: bool,
 ) -> Result<Rule> {
     matching(
         chain,
@@ -159,6 +163,7 @@ fn default_rule(
         },
         prefix,
         generation,
+        logging,
     )
 }
 
@@ -204,6 +209,7 @@ pub fn remove_owned(expected: &str) -> Result<()> {
 }
 
 pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
+    let logging = crate::firewall_plan::drop_logging_enabled(value)?;
     let plans = crate::firewall_plan::compile(value)?;
     let input_plans = crate::firewall_plan::compile_input(value, interfaces)?;
     let ruleset = ruleset_id(value, interfaces)?;
@@ -241,8 +247,15 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
         if value["allow_all_icmp"] == true {
             icmp(&output, generation)?.add_to_batch(&mut batch);
         }
-        default_rule(&output, "generated/output/policy", "accept", "", generation)?
-            .add_to_batch(&mut batch);
+        default_rule(
+            &output,
+            "generated/output/policy",
+            "accept",
+            "",
+            generation,
+            logging,
+        )?
+        .add_to_batch(&mut batch);
     }
     {
         let input = Chain::new(&table)
@@ -264,6 +277,7 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
                 plan,
                 &format!("nc:input:rule:{index}:{ruleset}"),
                 generation,
+                logging,
             )?
             .add_to_batch(&mut batch);
         }
@@ -282,6 +296,7 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
             },
             &format!("nc:input:policy:0:{ruleset}"),
             generation,
+            logging,
         )?
         .add_to_batch(&mut batch);
     }
@@ -291,6 +306,7 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
             plan,
             &format!("nc:forward:rule:{index}:{ruleset}"),
             generation,
+            logging,
         )?
         .add_to_batch(&mut batch);
     }
@@ -300,6 +316,7 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
         value["policy"].as_str().unwrap_or(""),
         &format!("nc:forward:policy:0:{ruleset}"),
         generation,
+        logging,
     )?
     .add_to_batch(&mut batch);
     let rewrites = crate::firewall_plan::destination_rewrites(value)?;

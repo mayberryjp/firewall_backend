@@ -80,6 +80,106 @@ fn config(value: Value) -> Result<Config> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated Linux namespaces, conntrack procfs and host-tuning privileges"]
+fn conntrack_ownership_captures_live_timeouts_and_preserves_saved_host_key() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut options = fixture.options();
+    options.allow_host_tunables = true;
+    let mut native = Native::open(options.clone())?;
+    let before = Config::empty();
+    native.repair(&before)?;
+    let host = native
+        .read_kernel(&Kernel {
+            host: netcontrol_core::missing_conntrack_tunables(&before.kernel).host,
+            ..Default::default()
+        })?
+        .host;
+    let saved = netcontrol_core::KernelConfig {
+        host,
+        ..Default::default()
+    };
+    let saved_host = saved.host.clone();
+    let captured = session(native.namespace.clone(), move |_, _| {
+        sysctl::capture_conntrack_tunables(&saved)
+    })?;
+    ensure!(
+        captured.host.is_empty() && captured.namespace.len() == 8,
+        "incomplete live conntrack capture"
+    );
+    let mut configured = before.clone();
+    configured.kernel = captured.clone();
+    native.apply(&before, &configured)?;
+    let value = configured.operational_value()?;
+    native.verify(&value)?;
+    let ownership = native.ownership()?;
+    ensure!(
+        ownership.kernel_baseline.host == captured.host
+            && ownership.kernel_baseline.namespace == captured.namespace,
+        "conntrack originals were not captured"
+    );
+    drop(native);
+    let mut native = Native::open(options)?;
+    native.repair(&configured)?;
+    native.verify(&value)?;
+    let remaining = session(native.namespace.clone(), move |_, _| {
+        let mut configured = captured;
+        configured.host = saved_host;
+        sysctl::capture_conntrack_tunables(&configured)
+    })?;
+    ensure!(
+        remaining == netcontrol_core::KernelConfig::default(),
+        "already owned conntrack values were recaptured"
+    );
+    native.apply(&configured, &before)?;
+    native.verify(&before.operational_value()?)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and NFLOG/nftables"]
+fn drop_logging_native_apply_rollback_and_restart() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let base = Config::empty();
+    let mut native = Native::open(fixture.options())?;
+    native.repair(&base)?;
+    let query = netcontrol_core::DenyLogQuery::parse("")?;
+    let mut disabled = base.clone();
+    disabled.firewall.drop_logging_enabled = false;
+    native.apply(&base, &disabled)?;
+    ensure!(
+        native.deny_log(&query)?["capture"]["status"] == "disabled",
+        "apply did not stop logging"
+    );
+    native.verify(&disabled.operational_value()?)?;
+    native.apply(&disabled, &base)?;
+    ensure!(
+        matches!(
+            native.deny_log(&query)?["capture"]["status"].as_str(),
+            Some("starting" | "capturing")
+        ),
+        "rollback did not start logging"
+    );
+    native.apply(&base, &disabled)?;
+    drop(native);
+    let mut native = Native::open(fixture.options())?;
+    native.repair(&disabled)?;
+    ensure!(
+        native.deny_log(&query)?["capture"]["status"] == "disabled",
+        "restart enabled disabled logging"
+    );
+    native.verify(&disabled.operational_value()?)?;
+    native.apply(&disabled, &base)?;
+    ensure!(
+        matches!(
+            native.deny_log(&query)?["capture"]["status"].as_str(),
+            Some("starting" | "capturing")
+        ),
+        "re-enable after restart did not start logging"
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin and nftables"]
 fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollback() -> Result<()> {
     use futures_util::TryStreamExt;

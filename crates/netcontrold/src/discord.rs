@@ -122,6 +122,8 @@ impl Secrets {
 #[derive(Default, Serialize)]
 struct Status {
     enabled: bool,
+    notify_broadcast: bool,
+    notify_tcp_closures: bool,
     state: &'static str,
     delivered: String,
     failed: String,
@@ -140,11 +142,11 @@ impl Manager {
     pub fn open(root: &Path, engine: Arc<Mutex<Engine>>, mode: Mode) -> Result<Arc<Self>> {
         let secrets = Secrets::open(root)?;
         let references = secrets.references()?;
-        let enabled = {
+        let config = {
             let mut engine = engine
                 .lock()
                 .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
-            let config = &engine.saved_configuration().discord;
+            let config = engine.saved_configuration().discord.clone();
             ensure!(
                 config.webhook_ref.is_empty() || references.contains(&config.webhook_ref),
                 "saved Discord webhook reference is unavailable"
@@ -153,16 +155,17 @@ impl Manager {
                 !config.enabled || mode != Mode::Unsupported,
                 "Discord alerts require native Linux host mode"
             );
-            let enabled = config.enabled;
             engine.configure_discord((mode != Mode::Unsupported).then_some(references));
-            enabled
+            config
         };
         Ok(Arc::new(Self {
             secrets: Mutex::new(secrets),
             engine,
             mode,
             status: Mutex::new(Status {
-                enabled,
+                enabled: config.enabled,
+                notify_broadcast: config.notify_broadcast,
+                notify_tcp_closures: config.notify_tcp_closures,
                 state: "starting",
                 delivered: "0".into(),
                 failed: "0".into(),
@@ -188,6 +191,8 @@ impl Manager {
             .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
         Ok(json!({
             "enabled": status.enabled, "state": status.state,
+            "notify_broadcast": status.notify_broadcast,
+            "notify_tcp_closures": status.notify_tcp_closures,
             "delivered": status.delivered, "failed": status.failed,
             "last_drop_id": status.last_drop_id, "error": status.error,
             "counters_scope": "daemon_session",
@@ -248,7 +253,7 @@ impl Manager {
                     let config = engine.saved_configuration().discord.clone();
                     let hostname = engine.saved_configuration().system.hostname.clone();
                     let records = if self.mode == Mode::Native {
-                        engine.first_firewall_drops(config.enabled)?
+                        engine.first_firewall_drops(&config)?
                     } else {
                         Vec::new()
                     };
@@ -268,6 +273,8 @@ impl Manager {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
                 status.enabled = config.enabled;
+                status.notify_broadcast = config.notify_broadcast;
+                status.notify_tcp_closures = config.notify_tcp_closures;
                 status.state = if !config.enabled {
                     "disabled"
                 } else if self.mode == Mode::Simulated {
@@ -280,7 +287,11 @@ impl Manager {
                     "ready"
                 };
             }
-            if !config.enabled || records.is_empty() {
+            let records: Vec<_> = records
+                .into_iter()
+                .filter(|record| config.should_notify_drop(record))
+                .collect();
+            if records.is_empty() {
                 continue;
             }
             let url = {
@@ -445,14 +456,19 @@ fn message(hostname: &str, records: &[DenyRecord]) -> Result<Value> {
             port.map_or_else(|| address.to_string(), |port| std::net::SocketAddr::new(address, port).to_string())
         };
         let protocol = match record.protocol { 6 => "TCP", 17 => "UDP", 1 => "ICMP", 58 => "ICMPv6", _ => "IP" };
+        let flags = record.tcp_flags.map_or_else(|| "unavailable".into(), |flags| format!("0x{flags:02x}"));
+        let tags = if record.tags.is_empty() { "none".into() } else {
+            record.tags.iter().map(|tag| tag.as_str()).collect::<Vec<_>>().join(", ")
+        };
         json!({
             "title": format!("New firewall drop on {title}"),
             "description": format!(
-                "{} -> {}\nProtocol: {} ({}) | Chain: {} | Reason: {}\nIngress: {} | Egress: {}\nDrop ID: {} | UTC epoch ms: {} | Bytes: {}",
+                "{} -> {}\nProtocol: {} ({}) | Chain: {} | Reason: {}\nIngress: {} | Egress: {}\nTCP flags: {} | Tags: {}\nDrop ID: {} | UTC epoch ms: {} | Bytes: {}",
                 endpoint(record.source, record.source_port), endpoint(record.destination, record.destination_port),
                 protocol, record.protocol, record.chain, record.reason,
                 record.ingress.as_deref().unwrap_or("unavailable"),
                 record.egress.as_deref().unwrap_or("unavailable"),
+                flags, tags,
                 record.id, record.timestamp_ms, record.packet_length,
             )
         })
@@ -491,7 +507,8 @@ mod tests {
             "id":"1","timestamp_ms":1,"chain":"forward","reason":"policy","compiled_rule_index":null,
             "ruleset_id":"a".repeat(64),"source":"2001:db8::1","destination":"2001:db8::2",
             "protocol":6,"source_port":80,"destination_port":60254,
-            "ingress_index":2,"egress_index":3,"ingress":"lan0","egress":"wan0","packet_length":40
+            "ingress_index":2,"egress_index":3,"ingress":"lan0","egress":"wan0","packet_length":60,
+            "tcp_flags":17,"tcp_payload_length":0,"tags":["tcp_finish"]
         })).unwrap()
     }
 
@@ -603,6 +620,8 @@ mod tests {
         let endpoint = "/api/v1/services/discord/status";
         let (status, body) = api(&service, "GET", endpoint, "reader", Value::Null).await;
         assert_eq!(status, 200);
+        assert_eq!(body["notify_broadcast"], false);
+        assert_eq!(body["notify_tcp_closures"], false);
         assert!(!body.to_string().contains("synthetic_token"));
         assert_eq!(
             api(&service, "GET", endpoint, "reader", json!({})).await.0,
@@ -657,7 +676,22 @@ mod tests {
         let text = payload["embeds"][0]["description"].as_str().unwrap();
         assert!(text.contains("[2001:db8::1]:80 -> [2001:db8::2]:60254"));
         assert!(text.contains("Protocol: TCP (6)"));
+        assert!(text.contains("TCP flags: 0x11 | Tags: tcp_finish"));
         assert!(!text.contains("synthetic_token"));
+        let mut broadcast = record();
+        broadcast.source = "192.0.2.1".parse().unwrap();
+        broadcast.destination = "255.255.255.255".parse().unwrap();
+        broadcast.protocol = 17;
+        broadcast.tcp_flags = None;
+        broadcast.tcp_payload_length = None;
+        broadcast.tags = vec![netcontrol_core::DenyTrafficTag::Ipv4Broadcast];
+        let payload = message("", &[broadcast]).unwrap();
+        assert!(
+            payload["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("TCP flags: unavailable | Tags: ipv4_broadcast")
+        );
         assert!(message("", &[]).is_err());
         assert!(message("", &vec![record(); 11]).is_err());
         assert_eq!(
@@ -779,7 +813,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discord_confirmed_global_toggle_updates_worker_and_cancels_on_configuration_work()
+    async fn discord_confirmed_notification_flags_and_global_toggle_update_worker_and_cancel()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
         let engine = Arc::new(Mutex::new(Engine::open(
@@ -795,7 +829,11 @@ mod tests {
             .iter()
             .map(|value| value.to_string())
             .collect();
-        let submit = |enabled: bool, reference: &str| -> Result<String> {
+        let submit = |enabled: bool,
+                      reference: &str,
+                      notify_broadcast: bool,
+                      notify_tcp_closures: bool|
+         -> Result<String> {
             let mut engine = engine.lock().unwrap();
             let revision = engine
                 .request(
@@ -810,6 +848,8 @@ mod tests {
                 .clone();
             let mut config = engine.saved_configuration().clone();
             config.discord.enabled = enabled;
+            config.discord.notify_broadcast = notify_broadcast;
+            config.discord.notify_tcp_closures = notify_tcp_closures;
             config.discord.webhook_ref = reference.into();
             let body = serde_json::to_vec(
                 &json!({"base_revision":revision,"confirm_timeout_seconds":30,"config":config}),
@@ -843,7 +883,7 @@ mod tests {
             );
         };
         let reference = manager.create_webhook(&mut engine.lock().unwrap(), &webhook())?;
-        let id = submit(true, &reference)?;
+        let id = submit(true, &reference, false, false)?;
         confirm(&id);
         let original = engine.lock().unwrap().saved_configuration().discord.clone();
         let (stop, receiver) = watch::channel(false);
@@ -851,7 +891,31 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(manager.status()?["state"], "simulated");
         assert_eq!(manager.status()?["enabled"], true);
-        let id = submit(false, &reference)?;
+        assert_eq!(manager.status()?["notify_broadcast"], false);
+        assert_eq!(manager.status()?["notify_tcp_closures"], false);
+        let id = submit(true, &reference, true, false)?;
+        confirm(&id);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.configuration_changed(&original),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        assert_eq!(manager.status()?["notify_broadcast"], true);
+        assert_eq!(manager.status()?["notify_tcp_closures"], false);
+        let original = engine.lock().unwrap().saved_configuration().discord.clone();
+        let id = submit(true, &reference, false, true)?;
+        confirm(&id);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.configuration_changed(&original),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        assert_eq!(manager.status()?["notify_broadcast"], false);
+        assert_eq!(manager.status()?["notify_tcp_closures"], true);
+        let original = engine.lock().unwrap().saved_configuration().discord.clone();
+        let id = submit(false, &reference, false, false)?;
         tokio::time::timeout(
             Duration::from_secs(1),
             manager.configuration_changed(&original),
@@ -862,6 +926,8 @@ mod tests {
         let status = manager.status()?;
         assert_eq!(status["state"], "disabled");
         assert_eq!(status["enabled"], false);
+        assert_eq!(status["notify_broadcast"], false);
+        assert_eq!(status["notify_tcp_closures"], false);
         assert_eq!(status["delivered"], "0");
         stop.send(true)?;
         tokio::time::timeout(Duration::from_secs(1), running).await???;

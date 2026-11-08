@@ -2,6 +2,47 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenyTrafficTag {
+    TcpFinish,
+    TcpReset,
+    TcpAckOnly,
+    TcpConnectionAttempt,
+    Ipv4Broadcast,
+}
+
+impl DenyTrafficTag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TcpFinish => "tcp_finish",
+            Self::TcpReset => "tcp_reset",
+            Self::TcpAckOnly => "tcp_ack_only",
+            Self::TcpConnectionAttempt => "tcp_connection_attempt",
+            Self::Ipv4Broadcast => "ipv4_broadcast",
+        }
+    }
+
+    pub fn tcp(flags: Option<u8>, payload_length: Option<u32>) -> Vec<Self> {
+        let mut tags = Vec::new();
+        if let Some(flags) = flags {
+            if flags & 0x01 != 0 {
+                tags.push(Self::TcpFinish);
+            }
+            if flags & 0x04 != 0 {
+                tags.push(Self::TcpReset);
+            }
+            if flags == 0x10 && payload_length == Some(0) {
+                tags.push(Self::TcpAckOnly);
+            }
+            if flags & 0x17 == 0x02 {
+                tags.push(Self::TcpConnectionAttempt);
+            }
+        }
+        tags
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DenyRecord {
@@ -21,6 +62,31 @@ pub struct DenyRecord {
     pub ingress: Option<String>,
     pub egress: Option<String>,
     pub packet_length: u32,
+    pub tcp_flags: Option<u8>,
+    pub tcp_payload_length: Option<u32>,
+    pub tags: Vec<DenyTrafficTag>,
+}
+
+impl DenyRecord {
+    pub fn validate_traffic(&self) -> Result<()> {
+        let tcp_tags = DenyTrafficTag::tcp(self.tcp_flags, self.tcp_payload_length);
+        let broadcast = self.tags.contains(&DenyTrafficTag::Ipv4Broadcast);
+        let mut expected = tcp_tags;
+        if broadcast {
+            expected.push(DenyTrafficTag::Ipv4Broadcast);
+        }
+        ensure!(
+            (self.protocol == 6 || self.tcp_flags.is_none())
+                && self.tcp_payload_length.is_none_or(|length| {
+                    self.tcp_flags.is_some() && length <= self.packet_length
+                })
+                && (!broadcast || self.destination.is_ipv4())
+                && (!matches!(self.destination, IpAddr::V4(ip) if ip.is_broadcast()) || broadcast)
+                && self.tags == expected,
+            "invalid deny-log traffic metadata"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -154,9 +220,43 @@ mod tests {
             "limit=1&limit=2",
             "unknown=1",
             "until_ms=253402300800000",
+            "tag=unknown",
+            "tag=ipv4_broadcast",
+            "tag=",
+            "tag=tcp_reset&tag=tcp_finish",
+            "exclude_tags=",
+            "exclude_tags=tcp_finish,tcp_reset",
+            "exclude_tags=ipv4_broadcast",
+            "exclude_tags=tcp_reset,",
+            "exclude_tags=tcp_reset,tcp_reset",
+            "exclude_tags=tcp_reset,unknown",
+            "exclude_tags=tcp_reset,%20tcp_finish",
+            "exclude_tags=tcp_reset&exclude_tags=tcp_finish",
         ] {
             assert!(DenyLogQuery::parse(bad).is_err(), "{bad}");
         }
         assert!(DenyLogQuery::parse(&"a".repeat(4097)).is_err());
+    }
+
+    #[test]
+    fn deny_log_tcp_tags_describe_flags_not_connection_state() {
+        use DenyTrafficTag::*;
+        assert_eq!(DenyTrafficTag::tcp(Some(0x11), Some(0)), [TcpFinish]);
+        assert_eq!(DenyTrafficTag::tcp(Some(0x14), Some(0)), [TcpReset]);
+        assert_eq!(
+            DenyTrafficTag::tcp(Some(0x15), Some(0)),
+            [TcpFinish, TcpReset]
+        );
+        assert_eq!(DenyTrafficTag::tcp(Some(0x10), Some(0)), [TcpAckOnly]);
+        assert!(DenyTrafficTag::tcp(Some(0x10), Some(1)).is_empty());
+        assert!(DenyTrafficTag::tcp(Some(0x10), None).is_empty());
+        assert!(DenyTrafficTag::tcp(Some(0x18), Some(0)).is_empty());
+        assert!(DenyTrafficTag::tcp(Some(0x30), Some(0)).is_empty());
+        assert_eq!(
+            DenyTrafficTag::tcp(Some(0x02), Some(0)),
+            [TcpConnectionAttempt]
+        );
+        assert!(DenyTrafficTag::tcp(Some(0x12), Some(0)).is_empty());
+        assert!(DenyTrafficTag::tcp(None, None).is_empty());
     }
 }

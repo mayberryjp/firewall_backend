@@ -62,6 +62,24 @@ pub fn read_scope(
     }
     Ok(result)
 }
+
+pub fn capture_conntrack_tunables(
+    configured: &netcontrol_core::KernelConfig,
+) -> Result<netcontrol_core::KernelConfig> {
+    let missing = netcontrol_core::missing_conntrack_tunables(configured);
+    let captured = netcontrol_core::KernelConfig {
+        host: read_scope(&missing.host, "host")?,
+        namespace: read_scope(&missing.namespace, "namespace")?,
+        ..Default::default()
+    };
+    for (scope, values) in [("host", &captured.host), ("namespace", &captured.namespace)] {
+        for (name, value) in values {
+            preflight(name, scope, value)
+                .with_context(|| format!("claim conntrack tuning setting {scope}/{name}"))?;
+        }
+    }
+    Ok(captured)
+}
 pub fn verify_scope(expected: &BTreeMap<String, String>, scope: &str) -> Result<()> {
     ensure!(
         read_scope(expected, scope)? == *expected,

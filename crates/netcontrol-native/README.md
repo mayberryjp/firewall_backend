@@ -33,6 +33,13 @@ unrelated service admission is generated.
 
 ## Operator requirements
 
+- Native host installation/startup owns all nine supported conntrack tuning
+  settings. Initial takeover durably captures their current values before
+  ownership changes; startup adds missing keys through a verified core system
+  transaction, retaining existing saved values and native rollback originals.
+  Missing/unsupported/unwritable values fail explicitly. Simulator/explicit
+  lab modes do not auto-capture. See the
+  [contract](../../FRONTEND_SPEC.md#conntrack-limits-and-timeouts).
 - Linux with network namespace, dummy, VLAN, WireGuard, connection-tracking,
   nftables inet/filter/NAT/masquerade support provisioned by the operator.
 - By default the daemon's **current network namespace**, not a forced entry into
@@ -209,7 +216,15 @@ and [handoff](../../docs/frontend-handoffs/2026-11-04.md#2026-11-04-06-nic-offlo
 
 ## Firewall deny logging
 
-The owned namespace-pinned NFLOG receiver reserves group 100 and runs inside
+`firewall.drop_logging_enabled` is an enabled-by-default global boolean.
+Disabled rules retain drop verdicts and counters without NFLOG expressions.
+Confirmed apply, rollback/recovery and startup repair configure the receiver:
+start before enabling expressions, stop/join/flush after disabling them.
+Disabled capture releases group 100, retains history and first-seen identities,
+and reports `capture.status:"disabled"`. Discord capture consumption is
+unavailable until re-enabled; missed traffic is not reconstructed.
+
+When enabled, the owned namespace-pinned NFLOG receiver reserves group 100 and runs inside
 Rust; no ulogd, journal scraper or syslog dependency. Every managed input/forward
 drop expression logs before its verdict; terminal log-and-drop rules cover chain
 Drop defaults. Accept/ICMP/established precedence remains unchanged. Startup
@@ -217,7 +232,21 @@ refreshes the verified firewall compiler output through a durable recovery inten
 without allocating a configuration revision or adopting foreign rules.
 
 The receiver copies at most 128 header bytes and persists only parsed metadata.
+Metadata includes nullable low-eight-bit TCP flags and TCP payload byte counts,
+with independent FIN, RST, ACK-only, SYN-attempt and IPv4 broadcast tags.
+ACK-only requires known zero payload and flags exactly ACK; no tag proves
+teardown/safety. Limited broadcast is recognized directly; directed broadcast
+uses explicit kernel `IFA_BROADCAST` values and directed broadcasts calculated
+from live IPv4 address/prefix metadata (prefixes <=30), refreshed in the
+worker's namespace once per capture window. Read failures/timeouts stop capture
+explicitly, not with a stale or `.255`-guessed result. No firewall decisions,
+permanent Discord tuple identity or collection rates are changed by frontend
+visibility filters. Backend pagination returns tagged drops without exclusions;
+there are no traffic-tag query filters.
 Private atomic rotating segments live at `native/deny-log` below services state.
+Current segments require schema 2; incompatible segments fail startup unchanged.
+The first-seen identity database schema remains 1; incompatible queued alert JSON
+fails explicitly without a delivery claim. No history conversion/reset is added.
 At most 4096 records are retained, with a 100-record/second persistence cap;
 overflow, sequence gaps, malformed input and cap discards are exposed explicitly.
 Normal stop joins and flushes; abrupt termination can lose the current one-second
@@ -225,8 +254,9 @@ batch. Fatal I/O/capture errors stop collection and remain visible alongside
 retained history until daemon restart. Invalid/unsafe saved logs fail startup
 unchanged rather than silently resetting traffic history.
 
-Require `CONFIG_NF_TABLES`, `CONFIG_NETFILTER_NETLINK_LOG`, `CONFIG_NFT_LOG`, `CAP_NET_ADMIN`,
-exclusive group ownership and writable private storage. Standard Ubuntu
+Require `CONFIG_NF_TABLES`, `CAP_NET_ADMIN` and writable private storage;
+enabled capture additionally requires `CONFIG_NETFILTER_NETLINK_LOG`,
+`CONFIG_NFT_LOG` and exclusive group ownership. Standard Ubuntu
 install/full-upgrade loads/persists `nf_tables`, `nfnetlink_log` and `nft_log`.
 Counter expressions are included in current `nf_tables`, not a separate
 `nft_counter` module.

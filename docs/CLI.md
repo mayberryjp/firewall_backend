@@ -8,14 +8,14 @@ operating-system shell.
 ## Enable and connect
 
 SSH is independent of the HTTP listener. Ubuntu `install.sh` and full
-`upgrade.sh` enable the in-process server by default on `0.0.0.0:2222` through
+`upgrade.sh` enable the in-process server by default on `127.0.0.1:2222` (localhost only) through
 `NETCONTROL_SSH_LISTEN`. A manual daemon invocation remains opt-in:
 
 ```sh
 netcontrold --backend simulator \
   --state /var/lib/netcontrol/state.json \
   --credential-db /var/lib/netcontrol/credentials.json \
-  --ssh-listen 0.0.0.0:2222 \
+  --ssh-listen 127.0.0.1:2222 \
   --ssh-host-key /var/lib/netcontrol/ssh-host-key
 ```
 
@@ -29,9 +29,10 @@ explicitly selected. Changing a management NIC can interrupt API/SSH access.
 upgrades preserve custom startup arguments; `--build-only` changes no service
 settings. To override/disable the script-managed default, see
 [deployment overrides](BUILD_AND_INSTALL.md#optional-configuration-ssh-server).
-The scripts do not create firewall permits: restrict TCP 2222 to trusted
-management networks. The fresh appliance input policy already blocks new WAN
-connections, but an existing appliance's current policy must be reviewed.
+The default accepts connections only from the appliance itself, not LAN/WAN
+clients. Full upgrades replace the managed wildcard default with loopback.
+The scripts do not create firewall permits: if explicitly binding a management
+address instead, restrict TCP 2222 to trusted management networks.
 
 If `--ssh-host-key` is omitted, its path is `<state>.ssh-key`. The daemon creates
 an Ed25519 host key once and reuses it. Existing invalid/insecure host-key data
@@ -50,7 +51,7 @@ Create and save an **API key** using normal website onboarding or the local
 console command below, and then:
 
 ```sh
-ssh -p 2222 apikey@192.0.2.10
+ssh -p 2222 apikey@127.0.0.1
 ```
 
 Use the literal SSH username `apikey`. Enter the existing API key at the SSH
@@ -290,6 +291,7 @@ ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
 ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 no ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
 firewall policy accept|drop
+firewall drop-logging enable|disable
 firewall allow-all-icmp enable|disable
 firewall rule SOURCE|any DESTINATION|any accept|drop
 no firewall rule INDEX
@@ -478,6 +480,11 @@ TCP/UDP timeout keys in the
 (1..604800 seconds). Values are canonical decimal strings. The existing
 `show kernel` read displays configured/effective/original values.
 
+Native host installation/startup, including upgrades, captures and owns all
+nine tuning keys that are missing from configuration. Saved values remain
+authoritative. A verified startup claim advances the revision; reload state after
+an upgrade before editing. Simulator/lab modes do not automatically capture.
+
 Synthetic example retaining common values, not a capacity recommendation:
 
 ```text
@@ -494,6 +501,8 @@ Perform independent connectivity checks before `confirm`. Use
 `no kernel host net.netfilter.nf_conntrack_max` or
 `no kernel namespace KEY`, followed by the same confirmed workflow, to release
 ownership and restore the captured original rather than a hard-coded default.
+Native host startup reclaims any missing conntrack keys, so removal is not a
+permanent ownership opt-out.
 Changes require `transactions.write` and the corresponding
 `kernel.host.write`/`kernel.namespace.write`; the entry limit also requires the
 native host-tunables ownership gate. No Rust source build or external `sysctl`
@@ -514,6 +523,8 @@ through the private HTTP/local-control
 configure terminal
 set /discord/webhook_ref "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 set /discord/enabled true
+set /discord/notify_broadcast false
+set /discord/notify_tcp_closures false
 commit check
 commit confirmed 60
 confirm
@@ -521,10 +532,15 @@ confirm
 
 The reference above is synthetic; use the actual returned reference. Disabling
 uses `set /discord/enabled false` with the same confirmed workflow.
-Both changes require `transactions.write` and `discord.write`. Never put a raw
+Set either category pointer to `true` to permit broadcast or TCP FIN/RST/known
+empty ACK-only notifications respectively; both default off and a drop in both
+categories requires both flags. All notification changes require
+`transactions.write` and `discord.write`. Never put a raw
 webhook URL into the candidate, CLI command history or exported configuration.
-First-seen tuple identities survive disable/enable and daemon restart; failed
-notifications are not replayed simply by re-enabling. There is no CLI credential
+First-seen tuple identities survive disable/enable, daemon restart
+and category filtering; suppressed/failed notifications are not replayed simply
+by enabling a flag. Notification switches do not filter retained logs.
+There is no CLI credential
 upload or arbitrary Discord URL execution.
 
 All configuration surfaces, including nested fields not given a dedicated
@@ -615,7 +631,7 @@ conflict/polling/uncertain-write behavior; there is no SSH-only configuration
 database, automatic merge, notification channel or parallel commit bypass.
 
 The SSH exec facility accepts a single CLI command and returns nonzero status
-on failure, for example `ssh -p 2222 apikey@192.0.2.10 'show running-config'`.
+on failure, for example `ssh -p 2222 apikey@127.0.0.1 'show running-config'`.
 Use an interactive shell with a PTY for a multi-command candidate workflow, not
 multiline exec requests. Shell requests without a PTY are rejected; use `ssh -t`
 when your client does not automatically request one. SSH forwarding,

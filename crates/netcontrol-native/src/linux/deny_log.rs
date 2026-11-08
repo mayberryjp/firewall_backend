@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, ensure};
-use netcontrol_core::{DenyLogQuery, DenyRecord};
+use futures_util::TryStreamExt;
+use netcontrol_core::{DenyLogQuery, DenyRecord, DenyTrafficTag};
+use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     fs::File,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -30,16 +33,18 @@ struct State {
     malformed: u64,
     overflow_events: u64,
     sequence_gaps: u64,
+    broadcasts: BTreeSet<Ipv4Addr>,
 }
 
 pub(super) struct Monitor {
+    namespace: Arc<File>,
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Monitor {
-    pub fn first_drops(&self, enabled: bool) -> Result<Vec<DenyRecord>> {
+    pub fn first_drops(&self, config: &netcontrol_core::DiscordConfig) -> Result<Vec<DenyRecord>> {
         let mut state = self
             .state
             .lock()
@@ -48,22 +53,57 @@ impl Monitor {
             state.status == "capturing",
             "firewall deny capture is unavailable"
         );
-        state.store.first_drops(enabled)
+        state.store.first_drops(config)
     }
 
     pub fn new(namespace: Arc<File>, root: PathBuf) -> Result<Self> {
         let state = Arc::new(Mutex::new(State {
             store: store::Store::open(root)?,
-            status: "starting",
+            status: "disabled",
             error: None,
             discarded: 0,
             malformed: 0,
             overflow_events: 0,
             sequence_gaps: 0,
+            broadcasts: BTreeSet::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        let output = state.clone();
-        let stopping = stop.clone();
+        Ok(Self {
+            namespace,
+            state,
+            stop,
+            thread: None,
+        })
+    }
+
+    pub fn configure(&mut self, enabled: bool) -> Result<()> {
+        if !enabled {
+            self.shutdown()?;
+            self.state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deny-log state poisoned"))?
+                .status = "disabled";
+            return Ok(());
+        }
+        if let Some(thread) = &self.thread {
+            ensure!(
+                !thread.is_finished(),
+                "deny-log worker exited; restart the daemon"
+            );
+            return Ok(());
+        }
+        self.stop.store(false, Ordering::Relaxed);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deny-log state poisoned"))?;
+            state.status = "starting";
+            state.error = None;
+        }
+        let namespace = self.namespace.clone();
+        let output = self.state.clone();
+        let stopping = self.stop.clone();
         let (ready, receive) = std::sync::mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("firewall-deny-log".into())
@@ -99,15 +139,17 @@ impl Monitor {
                     }
                 }
             })?;
-        let mut monitor = Self {
-            state,
-            stop,
-            thread: Some(thread),
-        };
+        self.thread = Some(thread);
         match receive.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => Ok(monitor),
+            Ok(Ok(())) => Ok(()),
             result => {
-                monitor.shutdown()?;
+                self.shutdown()?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("deny-log state poisoned"))?;
+                state.status = "error";
+                state.error = Some(format!("start firewall deny logger: {result:?}"));
                 anyhow::bail!("start firewall deny logger: {result:?}");
             }
         }
@@ -343,11 +385,63 @@ fn frames(mut bytes: &[u8], mut visit: impl FnMut(u16, u32, &[u8]) -> Result<()>
     Ok(())
 }
 
+fn address_broadcasts(address: &AddressMessage) -> impl Iterator<Item = Ipv4Addr> + '_ {
+    let local = address
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            AddressAttribute::Local(IpAddr::V4(ip)) => Some(*ip),
+            _ => None,
+        })
+        .or_else(|| {
+            address
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    AddressAttribute::Address(IpAddr::V4(ip)) => Some(*ip),
+                    _ => None,
+                })
+        });
+    let subnet = local
+        .filter(|_| address.header.prefix_len <= 30)
+        .map(|ip| Ipv4Addr::from(u32::from(ip) | (u32::MAX >> address.header.prefix_len)));
+    address
+        .attributes
+        .iter()
+        .filter_map(|attribute| match attribute {
+            AddressAttribute::Broadcast(ip) if address.header.prefix_len <= 30 => Some(*ip),
+            _ => None,
+        })
+        .chain(subnet)
+}
+
+async fn broadcasts(handle: &rtnetlink::Handle) -> Result<BTreeSet<Ipv4Addr>> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut addresses = handle.address().get().execute();
+        let mut result = BTreeSet::new();
+        while let Some(address) = addresses.try_next().await? {
+            result.extend(address_broadcasts(&address));
+        }
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .context("deny-log broadcast address snapshot timed out")?
+}
+
 fn run(fd: &OwnedFd, output: &Mutex<State>, stop: &AtomicBool) -> Result<()> {
-    output
-        .lock()
-        .map_err(|_| anyhow::anyhow!("deny-log state poisoned"))?
-        .status = "capturing";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (connection, handle, _) = runtime.block_on(async { rtnetlink::new_connection() })?;
+    let _connection = runtime.spawn(connection);
+    {
+        let broadcasts = runtime.block_on(broadcasts(&handle))?;
+        let mut state = output
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deny-log state poisoned"))?;
+        state.broadcasts = broadcasts;
+        state.status = "capturing";
+    }
     let mut bytes = [0; 65536];
     let mut pending = Vec::new();
     let mut window = Instant::now();
@@ -404,6 +498,11 @@ fn run(fd: &OwnedFd, output: &Mutex<State>, stop: &AtomicBool) -> Result<()> {
                 .store
                 .append(&pending)?;
             pending.clear();
+            let broadcasts = runtime.block_on(broadcasts(&handle))?;
+            output
+                .lock()
+                .map_err(|_| anyhow::anyhow!("deny-log state poisoned"))?
+                .broadcasts = broadcasts;
             window = Instant::now();
         }
     }
@@ -432,6 +531,11 @@ fn collect(
             } else {
                 record.ingress = interface(record.ingress_index);
                 record.egress = interface(record.egress_index);
+                if matches!(record.destination, IpAddr::V4(ip) if state.broadcasts.contains(&ip))
+                    && !record.tags.contains(&DenyTrafficTag::Ipv4Broadcast)
+                {
+                    record.tags.push(DenyTrafficTag::Ipv4Broadcast);
+                }
                 pending.push(record);
             }
         }
@@ -518,6 +622,8 @@ fn decode(payload: &[u8]) -> Result<(DenyRecord, u32)> {
             }
             _ => anyhow::bail!("unsupported deny-log packet family"),
         };
+    let mut fragmented =
+        fragment || (source.is_ipv4() && u16::from_be_bytes(bytes[6..8].try_into()?) & 0x2000 != 0);
     if source.is_ipv6() {
         for _ in 0..8 {
             if !matches!(protocol, 0 | 43 | 44 | 51 | 60) || offset + 2 > bytes.len() {
@@ -531,6 +637,7 @@ fn decode(payload: &[u8]) -> Result<(DenyRecord, u32)> {
                     }
                     fragment =
                         u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into()?) & 0xfff8 != 0;
+                    fragmented = fragment || bytes[offset + 3] & 1 != 0;
                     8
                 }
                 51 => (usize::from(bytes[offset + 1]) + 2) * 4,
@@ -558,6 +665,27 @@ fn decode(payload: &[u8]) -> Result<(DenyRecord, u32)> {
     } else {
         None
     };
+    let tcp_flags = if protocol == 6
+        && !fragment
+        && offset + 20 <= bytes.len()
+        && offset + 20 <= length as usize
+    {
+        let header_length = usize::from(bytes[offset + 12] >> 4) * 4;
+        ensure!(
+            header_length >= 20 && (fragmented || offset + header_length <= length as usize),
+            "invalid deny-log TCP header length"
+        );
+        Some(bytes[offset + 13])
+    } else {
+        None
+    };
+    let tcp_payload_length = tcp_flags.and_then(|_| {
+        (!fragmented).then(|| length - offset as u32 - u32::from(bytes[offset + 12] >> 4) * 4)
+    });
+    let mut tags = DenyTrafficTag::tcp(tcp_flags, tcp_payload_length);
+    if matches!(destination, IpAddr::V4(ip) if ip.is_broadcast()) {
+        tags.push(DenyTrafficTag::Ipv4Broadcast);
+    }
     let index = |kind| -> Result<Option<u32>> {
         get(kind)
             .map(|v| -> Result<u32> { Ok(u32::from_be_bytes(v.try_into()?)) })
@@ -598,6 +726,9 @@ fn decode(payload: &[u8]) -> Result<(DenyRecord, u32)> {
             ingress: None,
             egress: None,
             packet_length: length,
+            tcp_flags,
+            tcp_payload_length,
+            tags,
         },
         sequence,
     ))
@@ -633,6 +764,160 @@ mod tests {
         bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
         bytes[20..24].copy_from_slice(&[0x04, 0xd2, 0, 53]);
         bytes
+    }
+
+    fn tcp(flags: u8, payload_length: u16) -> Vec<u8> {
+        let length = 40 + payload_length;
+        let mut packet = ipv4();
+        packet.resize(usize::from(length), 0);
+        packet[2..4].copy_from_slice(&length.to_be_bytes());
+        packet[9] = 6;
+        packet[32] = 0x50;
+        packet[33] = flags;
+        packet
+    }
+
+    #[test]
+    fn deny_log_tcp_metadata_handles_options_payload_fragments_and_capture_bounds() -> Result<()> {
+        use DenyTrafficTag::*;
+        for (flags, tags) in [
+            (0x11, vec![TcpFinish]),
+            (0x14, vec![TcpReset]),
+            (0x10, vec![TcpAckOnly]),
+            (0x02, vec![TcpConnectionAttempt]),
+            (0x12, vec![]),
+        ] {
+            let record = decode(&payload(&tcp(flags, 0), 1))?.0;
+            assert_eq!(record.packet_length, 40);
+            assert_eq!(record.tcp_flags, Some(flags));
+            assert_eq!(record.tcp_payload_length, Some(0));
+            assert_eq!(record.tags, tags);
+            record.validate_traffic()?;
+        }
+        let record = decode(&payload(&tcp(0x10, 10), 1))?.0;
+        assert_eq!(record.tcp_payload_length, Some(10));
+        assert!(record.tags.is_empty());
+
+        let mut packet = tcp(0x10, 20);
+        packet[32] = 0xa0;
+        let record = decode(&payload(&packet[..40], 1))?.0;
+        assert_eq!(record.tcp_payload_length, Some(0));
+        assert_eq!(record.tags, [TcpAckOnly]);
+        for size in 20..40 {
+            let record = decode(&payload(&packet[..size], 1))?.0;
+            assert_eq!(record.tcp_flags, None);
+            assert_eq!(record.tcp_payload_length, None);
+            assert!(record.tags.is_empty());
+        }
+        packet[32] = 0x40;
+        assert!(decode(&payload(&packet, 1)).is_err());
+        packet[32] = 0xf0;
+        assert!(decode(&payload(&packet, 1)).is_err());
+
+        let mut packet = tcp(0x10, 0);
+        packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        let record = decode(&payload(&packet, 1))?.0;
+        assert_eq!(record.tcp_flags, Some(0x10));
+        assert_eq!(record.tcp_payload_length, None);
+        assert!(record.tags.is_empty());
+        packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(decode(&payload(&packet, 1))?.0.tcp_flags, None);
+
+        let mut packet = tcp(0x11, 0);
+        packet.splice(20..20, [0; 4]);
+        packet[0] = 0x46;
+        packet[2..4].copy_from_slice(&44u16.to_be_bytes());
+        assert_eq!(decode(&payload(&packet, 1))?.0.tags, [TcpFinish]);
+
+        let mut packet = vec![0; 68];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&28u16.to_be_bytes());
+        packet[6] = 44;
+        packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        packet[24..40].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>()?.octets());
+        packet[40] = 6;
+        packet[60] = 0x50;
+        packet[61] = 0x10;
+        let record = decode(&payload(&packet, 1))?.0;
+        assert_eq!(record.tcp_payload_length, Some(0));
+        assert_eq!(record.tags, [TcpAckOnly]);
+        packet[43] = 1;
+        let record = decode(&payload(&packet, 1))?.0;
+        assert_eq!(record.tcp_flags, Some(0x10));
+        assert_eq!(record.tcp_payload_length, None);
+        assert!(record.tags.is_empty());
+        packet[43] = 8;
+        assert_eq!(decode(&payload(&packet, 1))?.0.tcp_flags, None);
+        packet[6] = 0;
+        packet[43] = 0;
+        assert_eq!(decode(&payload(&packet, 1))?.0.tags, [TcpAckOnly]);
+        let record = decode(&payload(&ipv4(), 1))?.0;
+        assert_eq!(record.tcp_flags, None);
+        assert!(record.tags.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn deny_log_broadcasts_use_kernel_addresses_not_last_octet_guesses() -> Result<()> {
+        let mut address = AddressMessage::default();
+        address.header.prefix_len = 24;
+        address.attributes = vec![AddressAttribute::Broadcast("10.4.30.255".parse()?)];
+        assert_eq!(
+            address_broadcasts(&address).collect::<Vec<_>>(),
+            ["10.4.30.255".parse::<Ipv4Addr>()?]
+        );
+        address.header.prefix_len = 25;
+        address.attributes = vec![AddressAttribute::Broadcast("10.4.30.127".parse()?)];
+        let broadcasts: BTreeSet<_> = address_broadcasts(&address).collect();
+        assert!(broadcasts.contains(&"10.4.30.127".parse()?));
+        assert!(!broadcasts.contains(&"10.4.30.255".parse()?));
+        address.header.prefix_len = 23;
+        address.attributes = vec![AddressAttribute::Broadcast("10.4.31.255".parse()?)];
+        let broadcasts: BTreeSet<_> = address_broadcasts(&address).collect();
+        assert!(!broadcasts.contains(&"10.4.30.255".parse()?));
+        for prefix in [31, 32] {
+            address.header.prefix_len = prefix;
+            assert_eq!(address_broadcasts(&address).count(), 0);
+        }
+        address.header.prefix_len = 24;
+        address.attributes = vec![AddressAttribute::Local("10.4.30.1".parse()?)];
+        assert_eq!(
+            address_broadcasts(&address).collect::<Vec<_>>(),
+            ["10.4.30.255".parse::<Ipv4Addr>()?]
+        );
+        address.header.prefix_len = 23;
+        assert_eq!(
+            address_broadcasts(&address).collect::<Vec<_>>(),
+            ["10.4.31.255".parse::<Ipv4Addr>()?]
+        );
+        address.header.prefix_len = 25;
+        address.attributes = vec![AddressAttribute::Address("10.4.30.1".parse()?)];
+        assert_eq!(
+            address_broadcasts(&address).collect::<Vec<_>>(),
+            ["10.4.30.127".parse::<Ipv4Addr>()?]
+        );
+        address.header.prefix_len = 31;
+        assert_eq!(address_broadcasts(&address).count(), 0);
+        let mut packet = tcp(0x11, 0);
+        packet[16..20].copy_from_slice(&Ipv4Addr::BROADCAST.octets());
+        let record = decode(&payload(&packet, 1))?.0;
+        assert_eq!(
+            record.tags,
+            [DenyTrafficTag::TcpFinish, DenyTrafficTag::Ipv4Broadcast]
+        );
+        record.validate_traffic()?;
+        Ok(())
+    }
+
+    #[test]
+    fn deny_log_broadcast_snapshot_reads_current_namespace_without_mutation() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (connection, handle, _) = runtime.block_on(async { rtnetlink::new_connection() })?;
+        let _connection = runtime.spawn(connection);
+        runtime.block_on(broadcasts(&handle))?;
+        Ok(())
     }
 
     #[test]
@@ -706,6 +991,7 @@ mod tests {
                 malformed: 0,
                 overflow_events: 0,
                 sequence_gaps: 0,
+                broadcasts: ["198.51.100.2".parse()?].into(),
             };
             let mut pending = Vec::new();
             let mut previous = Some(u32::MAX);
@@ -736,6 +1022,7 @@ mod tests {
                 "loss/error reporting"
             );
             state.store.append(&pending)?;
+            assert_eq!(pending[0].tags, [DenyTrafficTag::Ipv4Broadcast]);
             ensure!(
                 state.store.query(&DenyLogQuery::parse("limit=500")?)["records"]
                     .as_array()
@@ -886,6 +1173,7 @@ mod tests {
         ));
         let result = (|| -> Result<()> {
             let mut monitor = Monitor::new(router.clone(), root.clone())?;
+            monitor.configure(true)?;
             let receiver4 = session(router.clone(), |_, _| {
                 Ok(UdpSocket::bind("192.0.2.1:8080")?)
             })?;
@@ -971,7 +1259,7 @@ mod tests {
             );
             drop["rules"] = json!([{"source":"192.0.2.2/32","action":"drop"}]);
             drop["input"]["interfaces"] = json!([{"interface":"lan0","rules":[{"protocol":"udp","destination_ports":[8080],"action":"drop"}]}]);
-            install(drop)?;
+            install(drop.clone())?;
             sender4.send_to(b"rule", "192.0.2.1:8080")?;
             sender4.send_to(b"rule", "198.51.100.9:8080")?;
             let history = wait(&monitor, 5)?;
@@ -987,10 +1275,93 @@ mod tests {
             );
             monitor.shutdown()?;
             std::mem::drop(monitor);
-            let monitor = Monitor::new(router.clone(), root.clone())?;
+            let mut monitor = Monitor::new(router.clone(), root.clone())?;
+            monitor.configure(true)?;
             ensure!(
                 monitor.snapshot(&query)?["records"] == history["records"],
                 "history lost on restart"
+            );
+            drop["drop_logging_enabled"] = json!(false);
+            let disabled_fingerprint = install(drop.clone())?;
+            monitor.configure(false)?;
+            ensure!(monitor.thread.is_none(), "disabled collector still running");
+            let disabled = monitor.snapshot(&query)?;
+            ensure!(
+                disabled["capture"]["status"] == "disabled",
+                "disabled status missing"
+            );
+            ensure!(
+                monitor
+                    .first_drops(&netcontrol_core::DiscordConfig {
+                        enabled: true,
+                        ..Default::default()
+                    })
+                    .is_err(),
+                "disabled logging supplied alerts"
+            );
+            sender4.send_to(b"unlogged", "192.0.2.1:8080")?;
+            sender4.send_to(b"unlogged", "198.51.100.9:8080")?;
+            ensure!(
+                receiver4.recv(&mut bytes).is_err(),
+                "disabled logging changed drop verdict"
+            );
+            thread::sleep(Duration::from_millis(1100));
+            ensure!(
+                monitor.snapshot(&query)?["records"] == disabled["records"],
+                "disabled logging recorded traffic"
+            );
+            let disabled_config = drop.clone();
+            session(router.clone(), move |_, _| {
+                let rules = netfilter::rules()?;
+                for rule in rules {
+                    for (kind, data) in crate::netlink_decode::attributes(&rule[4..])? {
+                        if kind & 0x3fff == 4 {
+                            for (_, expression) in crate::netlink_decode::attributes(&data)? {
+                                for (kind, name) in crate::netlink_decode::attributes(&expression)?
+                                {
+                                    ensure!(
+                                        kind & 0x3fff != 1 || name != b"log\0",
+                                        "disabled rules contain log expressions"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                ensure!(
+                    netfilter::fingerprint()? == disabled_fingerprint,
+                    "disabled firewall drift"
+                );
+                let counters = firewall::counters(
+                    &disabled_config,
+                    &[],
+                    &Some(disabled_config.clone()),
+                    &disabled_fingerprint,
+                )?;
+                for chain in ["input", "forward"] {
+                    ensure!(
+                        counters["rules"]
+                            .as_array()
+                            .context("counter rows missing")?
+                            .iter()
+                            .any(|row| row["chain"] == chain
+                                && row["packets"]
+                                    .as_str()
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .is_some_and(|v| v >= 1)),
+                        "disabled logging stopped {chain} counters"
+                    );
+                }
+                Ok(())
+            })?;
+            monitor.configure(true)?;
+            drop["drop_logging_enabled"] = json!(true);
+            install(drop)?;
+            sender4.send_to(b"resumed", "192.0.2.1:8080")?;
+            let resumed = wait(&monitor, disabled["records"].as_array().unwrap().len() + 1)?;
+            ensure!(
+                resumed["capture"]["status"] == "capturing",
+                "capture did not resume"
             );
             ensure!(
                 install(base)? != original,
