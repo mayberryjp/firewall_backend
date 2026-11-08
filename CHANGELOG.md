@@ -62,6 +62,13 @@
 
 ### Changed
 
+- Uppercase source/destination device descriptions in Discord drop messages,
+  including Unicode case expansion. Keep stored/API descriptions and firewall
+  identity unchanged; enforce message budgets after formatting.
+  Release impact: notification presentation change; next automatic calendar
+  version. Optional frontend help:
+  [handoff 2026-11-09-05](docs/frontend-handoffs/2026-11-09.md#2026-11-09-05-uppercase-discord-device-descriptions).
+
 - Firewall deny retrieval accepts independent `include_broadcast` and
   `include_tcp_closures` boolean query flags, both default false. Exclude IPv4
   broadcast and TCP FIN/RST/known empty ACK-only drops unless requested; apply

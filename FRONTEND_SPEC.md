@@ -5775,17 +5775,20 @@ author name, with title `New firewall drop`, keeping a maximum-length full
 hostname within Discord's 256-character author limit.
 Source/destination endpoints append a device name in parentheses when an exact
 IP match has a nonblank Sando `local_description` (cached as `classification`,
-up to 512 bytes). Only that description is used: no Sando `host_name`,
+up to 512 bytes). Render the description in Unicode uppercase for Discord only;
+stored/API descriptions, IPs/ports and the firewall author name keep their
+original case. Only that description is used: no Sando `host_name`,
 DNS/DHCP/lease hostname or `firewall.policies.hosts[].name` fallback.
 Cached descriptions are used only for the current `sando.api_url`, including
 retained cache when sync is disabled or a refresh fails.
 Unknown endpoints and missing/null/blank descriptions remain IP/port only.
 No reverse DNS, external fetch or guessed
 subnet/device match occurs during delivery. For example:
-`192.0.2.10:53000 (Camera) -> 192.0.2.20:443 (Server)`.
+`192.0.2.10:53000 (CAMERA) -> 192.0.2.20:443 (SERVER)`.
 Names are reporting metadata, not part of permanent deduplication or evidence
 of device identity. Longer entries split into smaller messages within the
-6000-character total embed budget without truncating names or discarding entries.
+6000-character total embed budget after uppercasing, including character
+expansion, without truncating names or discarding entries.
 Device names are additional metadata exported to Discord.
 No packet payload, credentials or
 webhook URL are included. `allowed_mentions.parse:[]` prevents notification text

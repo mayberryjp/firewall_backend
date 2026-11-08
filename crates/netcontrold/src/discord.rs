@@ -501,7 +501,7 @@ fn message(
         let endpoint = |address: std::net::IpAddr, port: Option<u16>| {
             let endpoint = port.map_or_else(|| address.to_string(), |port| std::net::SocketAddr::new(address, port).to_string());
             if let Some(name) = names.get(&address) {
-                format!("{endpoint} ({name})")
+                format!("{endpoint} ({})", name.to_uppercase())
             } else {
                 endpoint
             }
@@ -760,7 +760,9 @@ mod tests {
         let payload = message("fw.example.test", std::slice::from_ref(&record), &names).unwrap();
         assert_eq!(payload["embeds"][0]["author"]["name"], "fw.example.test");
         let text = payload["embeds"][0]["description"].as_str().unwrap();
-        assert!(text.contains("[2001:db8::1]:80 (Camera) -> [2001:db8::2]:60254 (Remote server)"));
+        assert!(text.contains("[2001:db8::1]:80 (CAMERA) -> [2001:db8::2]:60254 (REMOTE SERVER)"));
+        assert_eq!(names[&record.source], "Camera");
+        assert_eq!(names[&record.destination], "Remote server");
         let payload = message("fw", &[record], &BTreeMap::new()).unwrap();
         assert!(
             payload["embeds"][0]["description"]
@@ -768,6 +770,22 @@ mod tests {
                 .unwrap()
                 .starts_with("[2001:db8::1]:80 -> [2001:db8::2]:60254\n")
         );
+    }
+
+    #[test]
+    fn discord_device_descriptions_use_unicode_uppercase_without_changing_firewall_name() {
+        let record = record();
+        let names = BTreeMap::from([
+            (record.source, "stra\u{df}e".into()),
+            (record.destination, "caf\u{e9} \u{fb03}".into()),
+        ]);
+        let payload = message("fw.example.test", &[record], &names).unwrap();
+        let text = payload["embeds"][0]["description"].as_str().unwrap();
+        assert!(
+            text.starts_with("[2001:db8::1]:80 (STRASSE) -> [2001:db8::2]:60254 (CAF\u{c9} FFI)\n")
+        );
+        assert_eq!(payload["embeds"][0]["author"]["name"], "fw.example.test");
+        assert_eq!(payload["embeds"][0]["title"], "New firewall drop");
     }
 
     #[test]
@@ -790,7 +808,7 @@ mod tests {
                 record.source,
                 format!("{}{}", "@everyone".repeat(56), "s".repeat(8)),
             ),
-            (record.destination, "d".repeat(512)),
+            (record.destination, format!("{}dd", "\u{fb03}".repeat(170))),
         ]);
         let hostname = format!(
             "{}.{}.{}.{}",
@@ -810,7 +828,9 @@ mod tests {
             assert!(embeds.iter().map(embed_length).sum::<usize>() <= 6000);
             assert!(embeds.iter().all(|embed| {
                 let text = embed["description"].as_str().unwrap();
-                names.values().all(|name| text.contains(name))
+                names
+                    .values()
+                    .all(|name| text.contains(&name.to_uppercase()))
             }));
             assert!(
                 embeds

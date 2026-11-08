@@ -322,8 +322,9 @@ Alerts include packet metadata, not payloads, and batch up to ten first-seen
 entries with mentions disabled. Identify the firewall as `hostname.domain` when
 both are configured, hostname alone without a domain, or `Firewall` without a
 hostname. Source/destination endpoints retain IPs/ports and append only Sando
-`local_description` labels for exact matching IPs from the current source's
-cache. Missing/null/blank descriptions leave IP/port only: no DNS/DHCP/lease
+`local_description` labels in uppercase for exact matching IPs from the current
+source's cache. This is Discord-only formatting; stored descriptions and the
+firewall name retain their case. Missing/null/blank descriptions leave IP/port only: no DNS/DHCP/lease
 hostname or configured firewall-host-name fallback. No live lookups are performed.
 Long names split messages within Discord's embed limits without truncation.
 Device names are additional metadata exported to Discord.
