@@ -50,6 +50,7 @@ impl Monitor {
                 .unwrap_or("unknown");
             let healthy = match state {
                 "running" | "current" => Some(true),
+                "ready" if component == "discord" => Some(true),
                 "error" | "stopped" | "unavailable" | "reconnecting" => Some(false),
                 _ => None,
             };
@@ -254,6 +255,63 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discord_ready_is_healthy_and_clears_observed_failure() {
+        let monitor = super::Monitor::default();
+        for state in ["error", "ready"] {
+            monitor.observe(
+                Some(&serde_json::json!({})),
+                &[("discord", serde_json::json!({"state":state,"error":null}))],
+                false,
+            );
+            let snapshot = monitor.snapshot();
+            let ready = state == "ready";
+            assert_eq!(snapshot["process_health"]["healthy"], ready);
+            assert_eq!(
+                snapshot["process_health"]["status"],
+                if ready { "healthy" } else { "unhealthy" }
+            );
+            assert_eq!(
+                snapshot["process_health"]["components"][0]["healthy"],
+                ready
+            );
+            assert_eq!(snapshot["process_health"]["components"][0]["state"], state);
+            assert_eq!(
+                snapshot["active_alerts"].as_array().unwrap().len(),
+                usize::from(!ready)
+            );
+        }
+
+        monitor.observe(
+            Some(&serde_json::json!({})),
+            &[(
+                "discord",
+                serde_json::json!({"state":"ready","error":"synthetic service warning"}),
+            )],
+            false,
+        );
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot["process_health"]["status"], "healthy");
+        assert_eq!(snapshot["active_alerts"][0]["code"], "service_warning");
+    }
+
+    #[test]
+    fn ready_is_not_assumed_healthy_for_other_components() {
+        let monitor = super::Monitor::default();
+        monitor.observe(
+            Some(&serde_json::json!({})),
+            &[("other", serde_json::json!({"state":"ready"}))],
+            false,
+        );
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot["process_health"]["status"], "unknown");
+        assert_eq!(
+            snapshot["process_health"]["components"][0]["healthy"],
+            serde_json::Value::Null
+        );
+        assert_eq!(snapshot["active_alerts"], serde_json::json!([]));
+    }
+
     #[test]
     fn udp_relay_unknown_receive_loss_is_not_a_service_failure() {
         let monitor = super::Monitor::default();

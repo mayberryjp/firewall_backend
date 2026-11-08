@@ -8,6 +8,137 @@ printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
 scenario=valid
 
+for motd_scenario in success repeat absent masked inspect_failure stop_failure mask_failure verify_failure active \
+    unsafe_parent pam_directory_symlink pam_symlink pam_failure remove_failure; do
+    motd_directory="$temporary/motd-$motd_scenario"
+    mkdir -p "$motd_directory/root"/{etc/{pam.d,default,update-motd.d,motd.d,cron.daily},run/motd.d,var/cache,usr/{lib,share}/motd.d}
+    motd_root="$motd_directory/root"
+    motd_units='motd.service motd-news.service motd-news.timer update-motd.service update-motd.timer'
+    motd_files=(
+        etc/motd etc/motd.dynamic etc/motd.d/banner etc/update-motd.d/00-header
+        etc/default/motd-news run/motd run/motd.dynamic run/motd.d/banner
+        var/cache/motd-news usr/lib/motd.d/banner usr/share/motd.d/banner etc/cron.daily/update-motd
+    )
+    for motd_file in "${motd_files[@]}"; do
+        printf 'MOTD fixture\n' > "$motd_root/$motd_file"
+    done
+    printf 'keep unrelated content\n' > "$motd_root/etc/issue"
+    printf 'external content\n' > "$motd_directory/external"
+    rm "$motd_root/etc/motd"
+    ln -s "$motd_directory/external" "$motd_root/etc/motd"
+    printf '%s\n' \
+        '# session optional pam_motd.so' \
+        '  # session optional pam_motd.so' \
+        'session required pam_unix.so' \
+        'session optional pam_motd.so motd=/run/motd.dynamic' \
+        'session optional /usr/lib/security/pam_motd.so noupdate' \
+        'session optional pam_motd.so-other' > "$motd_root/etc/pam.d/sshd"
+    chmod 0640 "$motd_root/etc/pam.d/sshd"
+    printf 'session required pam_unix.so\n' > "$motd_root/etc/pam.d/login"
+    if [[ $motd_scenario == unsafe_parent ]]; then
+        mv "$motd_root/etc/default" "$motd_directory/default"
+        ln -s "$motd_directory/default" "$motd_root/etc/default"
+    elif [[ $motd_scenario == pam_directory_symlink ]]; then
+        mv "$motd_root/etc/pam.d" "$motd_directory/pam.d"
+        ln -s "$motd_directory/pam.d" "$motd_root/etc/pam.d"
+    elif [[ $motd_scenario == pam_symlink ]]; then
+        ln -s "$motd_directory/external" "$motd_root/etc/pam.d/unsafe"
+    fi
+    if (
+        systemctl() {
+            printf '%s\n' "$*" >> "$motd_directory/commands"
+            case $1 in
+                show)
+                    case $3 in
+                        --property)
+                            case $4 in
+                                LoadState)
+                                    [[ $motd_scenario != inspect_failure ]] || { printf 'Fixture inspection failure.\n' >&2; return 1; }
+                                    case $motd_scenario in
+                                        absent) printf 'not-found\n' ;;
+                                        masked) printf 'masked\n' ;;
+                                        *) printf 'loaded\n' ;;
+                                    esac ;;
+                                ActiveState)
+                                    printf 'UnitFileState=masked\n'
+                                    if [[ $motd_scenario == active ]]; then
+                                        printf 'ActiveState=active\n'
+                                    else
+                                        printf 'ActiveState=inactive\n'
+                                    fi ;;
+                                UnitFileState)
+                                    if [[ $motd_scenario == verify_failure ]]; then
+                                        printf 'enabled\n'
+                                    else
+                                        printf 'masked\n'
+                                    fi ;;
+                                *) return 1 ;;
+                            esac ;;
+                        *) return 1 ;;
+                    esac ;;
+                disable|stop)
+                    [[ $motd_scenario != stop_failure ]] || { printf 'Fixture stop failure.\n' >&2; return 1; } ;;
+                mask)
+                    [[ $motd_scenario != mask_failure ]] || { printf 'Fixture mask failure.\n' >&2; return 1; } ;;
+                *) return 1 ;;
+            esac
+        }
+        awk() {
+            [[ $motd_scenario != pam_failure ]] || { printf 'Fixture PAM write failure.\n' >&2; return 1; }
+            command awk "$@"
+        }
+        rm() {
+            [[ $motd_scenario != remove_failure || ${*: -1} != "$motd_root/etc/motd" ]] || {
+                printf 'Fixture removal failure.\n' >&2
+                return 1
+            }
+            command rm "$@"
+        }
+        configure_motd "$motd_root" || exit 1
+        if [[ $motd_scenario == repeat ]]; then configure_motd "$motd_root" || exit 1; fi
+    ) > "$motd_directory/stdout" 2> "$motd_directory/stderr"; then
+        [[ $motd_scenario == success || $motd_scenario == repeat ||
+           $motd_scenario == absent || $motd_scenario == masked ]] || exit 1
+        for motd_file in "${motd_files[@]}"; do
+            [[ ! -e $motd_root/$motd_file && ! -L $motd_root/$motd_file ]]
+        done
+        for motd_file in etc/motd.d etc/update-motd.d run/motd.d usr/lib/motd.d usr/share/motd.d; do
+            [[ ! -e $motd_root/$motd_file ]]
+        done
+        [[ $(stat -c %a "$motd_root/etc/pam.d/sshd") == 640 ]]
+        [[ $(< "$motd_root/etc/pam.d/sshd") == $'# session optional pam_motd.so\n  # session optional pam_motd.so\nsession required pam_unix.so\nsession optional pam_motd.so-other' ]]
+        grep -Fxq "mask $motd_units" "$motd_directory/commands"
+        if [[ $motd_scenario == absent ]]; then
+            ! grep -Eq '^(disable|stop) ' "$motd_directory/commands"
+        elif [[ $motd_scenario == masked ]]; then
+            for motd_unit in $motd_units; do
+                grep -Fxq "stop $motd_unit" "$motd_directory/commands"
+            done
+        else
+            grep -Fxq "disable --now $motd_units" "$motd_directory/commands"
+        fi
+    else
+        [[ $motd_scenario != success && $motd_scenario != repeat &&
+           $motd_scenario != absent && $motd_scenario != masked ]] || {
+            cat "$motd_directory/stderr" >&2
+            exit 1
+        }
+        [[ -s $motd_directory/stderr ]] || {
+            printf 'MOTD failure lacked diagnostics: %s\n' "$motd_scenario" >&2
+            exit 1
+        }
+        [[ -L $motd_root/etc/motd ]]
+        if [[ $motd_scenario == unsafe_parent || $motd_scenario == pam_directory_symlink ]]; then
+            [[ ! -e $motd_directory/commands ]]
+        fi
+    fi
+    [[ $(< "$motd_directory/external") == 'external content' ]]
+    [[ $(< "$motd_root/etc/issue") == 'keep unrelated content' ]]
+    [[ $(< "$motd_root/etc/pam.d/login") == 'session required pam_unix.so' ]]
+    [[ -z $(find "$motd_root/etc/pam.d" -name '*.motd.*' -print) ]]
+done
+printf 'MOTD service masks, login suppression, file/generator removal, repeat cleanup, symlink safety and failure tests passed (mocked systemd).\n'
+
 (
     export TMPDIR="$temporary/output-logs"
     mkdir "$TMPDIR"
@@ -666,10 +797,11 @@ configure_appliance_services() { trace+=' appliance-services;'; }
 configure_logging_units() { trace+=' logging-units;'; }
 configure_host_logging() { trace+=' host-logging;'; }
 configure_snap() { trace+=' snap;'; }
+configure_motd() { trace+=' motd;'; }
 configure_os_updates() { trace+=' os-updates;'; }
 configure_upgrade_settings() { trace+=' upgrade-settings;'; }
 install_systemd_service
-[[ $trace == ' os-updates; snap;'* ]]
+[[ $trace == ' os-updates; snap; motd;'* ]]
 [[ $trace == *'install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys;'* ]]
 [[ $trace == *'install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service;'* ]]
 [[ $trace == *'systemctl daemon-reload;'* ]]
@@ -680,7 +812,7 @@ trace=''
 check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
-for failure_stage in os_updates snap upgrade_settings service_setup logging_units reload logging; do
+for failure_stage in os_updates snap motd upgrade_settings service_setup logging_units reload logging; do
     trace=''
     check_systemd_unit() { return 0; }
     configure_upgrade_settings() { trace+=' upgrade-settings;'; [[ $failure_stage != upgrade_settings ]]; }
@@ -689,6 +821,7 @@ for failure_stage in os_updates snap upgrade_settings service_setup logging_unit
     systemctl() { trace+=" systemctl $*;"; [[ $failure_stage != reload ]]; }
     configure_host_logging() { trace+=' host-logging;'; return 1; }
     configure_snap() { trace+=' snap;'; [[ $failure_stage != snap ]]; }
+    configure_motd() { trace+=' motd;'; [[ $failure_stage != motd ]]; }
     configure_os_updates() { trace+=' os-updates;'; [[ $failure_stage != os_updates ]]; }
     if install_systemd_service; then exit 1; fi
     if [[ $failure_stage == os_updates ]]; then
@@ -697,6 +830,10 @@ for failure_stage in os_updates snap upgrade_settings service_setup logging_unit
     fi
     if [[ $failure_stage == snap ]]; then
         [[ $trace == ' os-updates; snap;' ]]
+        continue
+    fi
+    if [[ $failure_stage == motd ]]; then
+        [[ $trace == ' os-updates; snap; motd;' ]]
         continue
     fi
     if [[ $failure_stage == upgrade_settings ]]; then
@@ -788,7 +925,7 @@ for deployment_scenario in success setup_failure deploy_failure; do
         : > "$deployment_trace"
         root_command() {
             [[ $# -eq 5 && $1 == bash && $2 == -c &&
-                $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
+                $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
             printf 'setup;' >> "$deployment_trace"
             [[ $deployment_scenario != setup_failure ]]
         }
@@ -824,6 +961,10 @@ configure_deny_logging() {
     printf 'deny-log\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != deny_log_failure ]]
 }
+configure_motd() {
+    printf 'motd\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != motd_failure ]]
+}
 configure_appliance_services() {
     printf 'services\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != services_failure ]]
@@ -838,7 +979,7 @@ systemctl() {
     [[ $SETUP_SCENARIO != reload_failure ]]
 }
 EOF
-for setup_scenario in success conntrack_failure diagnostics_failure deny_log_failure services_failure logging_units_failure reload_failure; do
+for setup_scenario in success conntrack_failure diagnostics_failure deny_log_failure motd_failure services_failure logging_units_failure reload_failure; do
     (
         export SETUP_SCENARIO=$setup_scenario SETUP_TRACE="$temporary/setup-$setup_scenario.trace"
         root_command() { "$@"; }
@@ -849,13 +990,14 @@ for setup_scenario in success conntrack_failure diagnostics_failure deny_log_fai
             [[ $setup_scenario != success ]] || exit 1
         fi
         case $setup_scenario in
-            success) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices\nlogging-units\nreload\ndeploy' ;;
+            success) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices\nlogging-units\nreload\ndeploy' ;;
             conntrack_failure) expected=conntrack ;;
             diagnostics_failure) expected=$'conntrack\nlink-diagnostics' ;;
             deny_log_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log' ;;
-            services_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices' ;;
-            logging_units_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices\nlogging-units' ;;
-            reload_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nservices\nlogging-units\nreload' ;;
+            motd_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd' ;;
+            services_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices' ;;
+            logging_units_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices\nlogging-units' ;;
+            reload_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices\nlogging-units\nreload' ;;
         esac
         [[ $(< "$SETUP_TRACE") == "$expected" ]]
     )
@@ -923,7 +1065,7 @@ for scenario in success fail_stage fail_bootstrap fail_logging fail_restart fail
                         grep -q "^systemctl stop netcontrold.service$" "$UPGRADE_TEST_DIRECTORY/commands" || return 1
                         [[ $UPGRADE_TEST_SCENARIO != fail_logging ]]
                     else
-                        [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
+                        [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
                     fi ;;
                 install)
                     printf "routine deployment stdout\n"

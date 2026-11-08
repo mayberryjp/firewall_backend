@@ -5,7 +5,7 @@ use netcontrol_core::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -239,6 +239,27 @@ impl Manager {
 
     pub(crate) fn mqtt_status(&self, config: &netcontrol_core::SandoConfig) -> Result<Value> {
         self.status_for(config, false)
+    }
+
+    pub(crate) fn local_descriptions(
+        &self,
+        config: &netcontrol_core::SandoConfig,
+    ) -> Result<BTreeMap<IpAddr, String>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
+        let mut names = BTreeMap::new();
+        if state.snapshot.source_url == config.api_url {
+            for host in &state.snapshot.hosts {
+                if let Some(name) = &host.classification {
+                    for address in &host.addresses {
+                        names.insert(*address, name.clone());
+                    }
+                }
+            }
+        }
+        Ok(names)
     }
 
     fn status_for(
@@ -512,6 +533,48 @@ mod tests {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[test]
+    fn cached_local_descriptions_match_current_source_and_preserve_disabled_cache() {
+        let (_directory, manager) = fixture();
+        let (hosts, _) = project(&inventory()).unwrap();
+        manager.state.lock().unwrap().snapshot = Snapshot {
+            source_url: "https://sando.example.test".into(),
+            hosts: hosts.clone(),
+            ..Default::default()
+        };
+        let mut config = netcontrol_core::SandoConfig {
+            api_url: "https://sando.example.test".into(),
+            ..Default::default()
+        };
+        let names = manager.local_descriptions(&config).unwrap();
+        for address in &hosts[0].addresses {
+            assert_eq!(names[address], "Camera");
+        }
+        assert_eq!(hosts[0].host_name.as_deref(), Some("camera.test"));
+        config.api_url = "https://other.example.test".into();
+        assert!(manager.local_descriptions(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_local_descriptions_never_fall_back_to_hostnames() {
+        let (_directory, manager) = fixture();
+        let (hosts, _) = project(&serde_json::to_vec(&json!([
+            {"ip_address":"192.0.2.10","dns_hostname":"dns.test","local_description":"Device label"},
+            {"ip_address":"192.0.2.11","dns_hostname":"dns-only.test"},
+            {"ip_address":"192.0.2.12","dhcp_hostname":"dhcp.test","local_description":null},
+            {"ip_address":"192.0.2.13","lease_hostname":"lease.test","local_description":""},
+            {"ip_address":"192.0.2.14","dns_hostname":"blank.test","local_description":"   "}
+        ])).unwrap()).unwrap();
+        manager.state.lock().unwrap().snapshot.hosts = hosts;
+        let names = manager
+            .local_descriptions(&netcontrol_core::SandoConfig::default())
+            .unwrap();
+        assert_eq!(
+            names,
+            BTreeMap::from([("192.0.2.10".parse().unwrap(), "Device label".into())])
+        );
     }
 
     #[test]

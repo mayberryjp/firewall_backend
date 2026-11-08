@@ -62,6 +62,27 @@
 
 ### Changed
 
+- Discord drop alerts append only current-source Sando `local_description`
+  labels to exact-IP matching source/destination endpoints. Missing descriptions
+  leave IP/port only, without DNS/DHCP/lease or configured-host-name fallback.
+  Show the firewall's configured `hostname.domain` (hostname alone
+  without a domain; `Firewall` without a hostname) as the embed author.
+  Split long named entries within Discord's limits without losing entries.
+  No live lookups, API/schema or deduplication changes.
+  Release impact: additive notification metadata; next automatic calendar
+  version. Optional frontend export/help wording:
+  [handoff 2026-11-09-02](docs/frontend-handoffs/2026-11-09.md#2026-11-09-02-discord-device-names-and-full-firewall-name)
+  and [label-policy correction 2026-11-09-03](docs/frontend-handoffs/2026-11-09.md#2026-11-09-03-discord-local-description-only-labels).
+
+- Ubuntu fresh installation and full source upgrades remove standard MOTD
+  files/generators/cache, disable PAM MOTD output and stop/persistently mask
+  standard MOTD services/timers. Delete targeted custom MOTD content; fail
+  deployment explicitly on cleanup errors. Build-only and HTTP/automatic HTTPS
+  self-upgrades are unchanged; no package purge or saved-firewall/API changes.
+  Release impact: breaking deployment policy; next automatic calendar version.
+  Required operator-help review:
+  [handoff 2026-11-09-01](docs/frontend-handoffs/2026-11-09.md#2026-11-09-01-install-and-source-upgrade-motd-cleanup).
+
 - Native host install/startup, including source and HTTPS upgrades, forcibly
   owns all nine supported conntrack tuning settings. Durably capture current
   values for missing keys, preserve/reapply saved values, retain native
@@ -176,6 +197,12 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Classify Discord's operational `ready` state as healthy in platform health
+  instead of making an otherwise healthy appliance report `unknown` with no
+  alerts. Preserve actual worker failures, service warnings and unknown states
+  for other components. Release impact: health-classification fix; next automatic
+  calendar version. No frontend changes or HTTP/schema changes required.
 
 - Repair CI fixtures after the APT policy and IPv6-default changes: validate
   root-owned APT directory-install arguments without requiring fixture chown,

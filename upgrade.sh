@@ -135,7 +135,7 @@ deploy_upgrade() {
     installer_message warning 'Use a local console or independent OS SSH session. Restarting may interrupt connectivity.'
     installer_message warning 'Configuration SSH defaults to localhost TCP 2222 only; explicit overrides are kept. Competing syslog receivers will be disabled.'
     installer_message warning 'Startup owns missing conntrack tuning settings using current values; existing saved tuning is kept.'
-    installer_step 'Configuring kernel modules and system services' root_command bash -c 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_appliance_services && configure_logging_units && systemctl daemon-reload' bash "$installer" || return 1
+    installer_step 'Configuring kernel modules and system services' root_command bash -c 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_appliance_services && configure_logging_units && systemctl daemon-reload' bash "$installer" || return 1
     upgrade_binary "$binary" "$destination" "$installer"
 }
 
@@ -151,6 +151,7 @@ main() {
             'Keeps custom startup arguments and saved networking; startup owns missing conntrack tuning values.' \
             'Enables host services, gateway monitoring, configuration SSH and journald forwarding.' \
             'Disables competing syslog receivers. SSH defaults to localhost TCP 2222 only; explicit overrides are kept.' \
+            'Removes MOTD login messages/generators and stops/masks MOTD services.' \
             'Use a local console or independent OS SSH session. Review firewall access.' \
             'No provisioning, reset, git pull, prerequisite installation or boot enablement.' \
             '' \

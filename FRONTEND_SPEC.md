@@ -445,6 +445,19 @@ instructions must require planned manual OS patching and must not describe
 disabled automatic security patching as a security improvement.
 This host policy adds no API fields, permissions or web action and does not
 change the saved firewall configuration.
+Fresh installation and full source `upgrade.sh` deployments also remove standard
+Ubuntu MOTD files, generator directories and cached messages, remove active
+`pam_motd.so` lines from regular PAM configuration files, and stop/disable and
+persistently mask standard MOTD services/timers (including masks for absent units).
+Custom content in these targeted locations is deleted. Inspection, unit-control,
+PAM-write and removal failures abort deployment; completed host cleanup is not
+rolled back with the daemon binary. Authentication modules/credentials, firewall
+state, `/etc/issue`, SSH `Banner` settings and embedded configuration SSH greetings
+are unchanged. Build-only runs and HTTP/automatic HTTPS self-upgrades do **not**
+apply MOTD cleanup. No HTTP methods/paths, schemas, permissions or status codes
+change. Update operator installation/source-upgrade help, not API client types;
+see [exact cleanup scope](docs/BUILD_AND_INSTALL.md#motd-cleanup) and
+[handoff 2026-11-09-01](docs/frontend-handoffs/2026-11-09.md#2026-11-09-01-install-and-source-upgrade-motd-cleanup).
 Interactive installs prompt for missing LAN interface and IPv4
 host/prefix, suggesting the second physical port and `192.168.0.1/24`.
 `--wan` overrides WAN independently; `--lan` and `--lan-address` skip their
@@ -2901,7 +2914,10 @@ The monitor samples approximately every two seconds after completed engine
 deadline ticks. `process_health.status` is `healthy`, `unhealthy` or `unknown`;
 `healthy` is respectively `true`, `false` or `null`. Known component states
 `running`/`current` are healthy, `error`/`stopped`/`unavailable`/`reconnecting`
-are unhealthy. Disabled/simulated/waiting/unmanaged components are not failures;
+are unhealthy. Discord's `ready` state is also healthy: the notification worker
+is operational, not proof that any particular webhook delivery succeeded.
+The `ready` classification is specific to Discord, not other components.
+Disabled/simulated/waiting/unmanaged components are not failures;
 other unmeasured states make the aggregate unknown. Missing native runtime
 makes the aggregate unknown and preserves previously observed native failures
 until a successful observation can clear them. This is local execution/status
@@ -5743,9 +5759,28 @@ already accepted by Discord cannot be withdrawn by disabling or rollback.
 
 Messages batch at most ten first-seen entries, within Discord's 6000-character
 embed budget, with normal polling once per second. Each entry includes configured
-firewall hostname (or `Firewall`), source/destination and nullable ports, protocol,
+firewall identity (`system.hostname.system.domain` when both are set, hostname
+alone without a domain, or `Firewall` without a hostname), source/destination
+and nullable ports, protocol,
 input/forward chain, drop reason, interfaces, drop ID, timestamp in UTC epoch
-milliseconds and IP packet length in bytes. No packet payload, credentials or
+milliseconds and IP packet length in bytes. Firewall identity is the embed
+author name, with title `New firewall drop`, keeping a maximum-length full
+hostname within Discord's 256-character author limit.
+Source/destination endpoints append a device name in parentheses when an exact
+IP match has a nonblank Sando `local_description` (cached as `classification`,
+up to 512 bytes). Only that description is used: no Sando `host_name`,
+DNS/DHCP/lease hostname or `firewall.policies.hosts[].name` fallback.
+Cached descriptions are used only for the current `sando.api_url`, including
+retained cache when sync is disabled or a refresh fails.
+Unknown endpoints and missing/null/blank descriptions remain IP/port only.
+No reverse DNS, external fetch or guessed
+subnet/device match occurs during delivery. For example:
+`192.0.2.10:53000 (Camera) -> 192.0.2.20:443 (Server)`.
+Names are reporting metadata, not part of permanent deduplication or evidence
+of device identity. Longer entries split into smaller messages within the
+6000-character total embed budget without truncating names or discarding entries.
+Device names are additional metadata exported to Discord.
+No packet payload, credentials or
 webhook URL are included. `allowed_mentions.parse:[]` prevents notification text
 from pinging users/roles. HTTPS certificate verification, fixed provider
 validation, no redirects, 5-second connect/10-second total timeouts apply.

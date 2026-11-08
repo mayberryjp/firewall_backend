@@ -181,6 +181,79 @@ configure_snap() {
     configure_masked_units Snap snapd.service snapd.socket
 }
 
+configure_motd() (
+    set -euo pipefail
+    local root=${1:-/} relative path parent configuration staged='' unit status
+    local -a units=(motd.service motd-news.service motd-news.timer update-motd.service update-motd.timer)
+    [[ $root == /* && -d $root && ! -L $root ]] || {
+        printf 'Refusing unsafe MOTD cleanup root: %s\n' "$root" >&2
+        exit 1
+    }
+    root=${root%/}
+    local -a targets=(
+        etc/motd etc/motd.dynamic etc/motd.d etc/update-motd.d etc/default/motd-news
+        run/motd run/motd.dynamic run/motd.d var/cache/motd-news
+        usr/lib/motd.d usr/share/motd.d etc/cron.daily/update-motd
+    )
+    for relative in "${targets[@]}" etc/pam.d; do
+        parent=${relative%/*}
+        while [[ $parent != . && $parent != "$relative" ]]; do
+            path="$root/$parent"
+            [[ ! -L $path && ( ! -e $path || -d $path ) ]] || {
+                printf 'Refusing unsafe MOTD parent directory: %s\n' "$path" >&2
+                exit 1
+            }
+            relative=$parent
+            parent=${relative%/*}
+        done
+    done
+    [[ ! -L $root/etc/pam.d && ( ! -e $root/etc/pam.d || -d $root/etc/pam.d ) ]] || {
+        printf 'Refusing unsafe PAM directory: %s/etc/pam.d\n' "$root" >&2
+        exit 1
+    }
+    configure_masked_units MOTD "${units[@]}" || exit 1
+    # Mask absent standard units too, so package reinstalls cannot enable them.
+    systemctl mask "${units[@]}" || exit 1
+    for unit in "${units[@]}"; do
+        status=$(systemctl show "$unit" --property UnitFileState --value) || exit 1
+        [[ $status == masked ]] || {
+            printf 'MOTD unit %s is not persistently masked.\n' "$unit" >&2
+            exit 1
+        }
+    done
+    for path in "$root"/etc/pam.d/*; do
+        [[ -e $path || -L $path ]] || continue
+        [[ -f $path && ! -L $path ]] || {
+            printf 'Refusing non-regular PAM configuration: %s\n' "$path" >&2
+            exit 1
+        }
+        if grep -Eq '^[[:space:]]*[^#[:space:]].*[[:space:]/]pam_motd\.so([[:space:]]|$)' "$path"; then
+            configuration=$path
+            staged=$(mktemp "${configuration}.motd.XXXXXX") || exit 1
+            trap '[[ -z $staged ]] || rm -f -- "$staged"' EXIT
+            cp -p -- "$configuration" "$staged" || exit 1
+            awk '!/^[[:space:]]*#/ && /(^|[[:space:]\/])pam_motd\.so([[:space:]]|$)/ { next } { print }' \
+                "$configuration" > "$staged" || exit 1
+            mv -fT -- "$staged" "$configuration" || exit 1
+            staged=''
+        else
+            [[ $? -eq 1 ]] || {
+                printf 'Cannot inspect PAM MOTD configuration: %s\n' "$path" >&2
+                exit 1
+            }
+        fi
+    done
+    for relative in "${targets[@]}"; do
+        path="$root/$relative"
+        rm -rf -- "$path" || exit 1
+        [[ ! -e $path && ! -L $path ]] || {
+            printf 'MOTD cleanup did not remove %s.\n' "$path" >&2
+            exit 1
+        }
+    done
+    installer_message success 'MOTD services, login messages and generators removed.'
+)
+
 configure_os_updates() (
     set -euo pipefail
     local directory=${1:-/etc/apt/apt.conf.d} staged='' configuration key
@@ -334,6 +407,7 @@ install_systemd_service() {
     check_systemd_unit || return 1
     configure_os_updates || return 1
     configure_snap || return 1
+    configure_motd || return 1
     install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys || return 1
     install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service || return 1
     configure_upgrade_settings || return 1
@@ -661,6 +735,7 @@ main() {
             'Captures current conntrack tuning values into owned configuration.' \
             'No connectivity rollback. Review imported firewall rules from the console.' \
             'Disables Snap, competing syslog receivers and automatic OS updates, including security fixes.' \
+            'Removes MOTD login messages/generators and stops/masks MOTD services.' \
             'Schedule manual OS patching. LAN clients need static addresses; no DHCP/DNS server is installed.' \
             'Enables LAN HTTP setup, localhost configuration SSH on TCP 2222 and startup at boot.' \
             '' \

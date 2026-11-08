@@ -317,7 +317,15 @@ simulator mode never posts. The worker is supervised and can be restarted with
 the existing managed-process action without resetting identities.
 
 Alerts include packet metadata, not payloads, and batch up to ten first-seen
-entries with mentions disabled. Respect Discord rate limits; delivery remains
+entries with mentions disabled. Identify the firewall as `hostname.domain` when
+both are configured, hostname alone without a domain, or `Firewall` without a
+hostname. Source/destination endpoints retain IPs/ports and append only Sando
+`local_description` labels for exact matching IPs from the current source's
+cache. Missing/null/blank descriptions leave IP/port only: no DNS/DHCP/lease
+hostname or configured firewall-host-name fallback. No live lookups are performed.
+Long names split messages within Discord's embed limits without truncation.
+Device names are additional metadata exported to Discord.
+Respect Discord rate limits; delivery remains
 best-effort, with no replay after ambiguous failures or interrupted sends.
 The permanent identity index grows with distinct traffic; preserve private
 state and monitor disk capacity. No firewall rules are automatically opened.
@@ -397,6 +405,11 @@ syslog receiver at `/run/systemd/journal/syslog`, stopping/masking competing
 syslog receivers. Journald keeps `/dev/log`, kernel capture and the local journal.
 Review [logging ownership and recovery](docs/BUILD_AND_INSTALL.md#host-logging-ownership);
 saved syslog settings are not enabled automatically.
+Fresh installation and full source upgrades also remove standard Ubuntu MOTD
+files/generators, disable PAM MOTD output and stop/persistently mask MOTD units.
+Custom content in the targeted MOTD locations is deleted. Build-only and
+HTTP/automatic HTTPS self-upgrades do not apply this cleanup. See
+[MOTD cleanup](docs/BUILD_AND_INSTALL.md#motd-cleanup).
 
 Native Linux mode continuously collects [link diagnostics](FRONTEND_SPEC.md#native-link-diagnostics):
 qdisc backlog/drops, interface errors, local TCP RTT/retransmissions/congestion

@@ -511,6 +511,7 @@ async fn run(options: Options) -> Result<()> {
         &appended(&options.state, ".discord"),
         engine.clone(),
         dynamic_dns_mode,
+        sando.clone(),
     )?;
     App::attach_discord(&mut app, discord.clone())?;
     let system_mode = if mqtt_mode == netcontrold::mqtt::Mode::Simulated {

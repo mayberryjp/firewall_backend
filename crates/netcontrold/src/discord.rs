@@ -5,8 +5,9 @@ use reqwest::{Client, Url};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -134,12 +135,18 @@ struct Status {
 pub struct Manager {
     secrets: Mutex<Secrets>,
     engine: Arc<Mutex<Engine>>,
+    sando: Arc<crate::sando::Manager>,
     status: Mutex<Status>,
     mode: Mode,
 }
 
 impl Manager {
-    pub fn open(root: &Path, engine: Arc<Mutex<Engine>>, mode: Mode) -> Result<Arc<Self>> {
+    pub fn open(
+        root: &Path,
+        engine: Arc<Mutex<Engine>>,
+        mode: Mode,
+        sando: Arc<crate::sando::Manager>,
+    ) -> Result<Arc<Self>> {
         let secrets = Secrets::open(root)?;
         let references = secrets.references()?;
         let config = {
@@ -161,6 +168,7 @@ impl Manager {
         Ok(Arc::new(Self {
             secrets: Mutex::new(secrets),
             engine,
+            sando,
             mode,
             status: Mutex::new(Status {
                 enabled: config.enabled,
@@ -234,7 +242,7 @@ impl Manager {
                 status.failed.parse::<u64>()?,
             )
         };
-        loop {
+        'worker: loop {
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = tick.tick() => {}
@@ -242,7 +250,7 @@ impl Manager {
             if *stop.borrow() {
                 break;
             }
-            let config: Option<(DiscordConfig, String, Vec<DenyRecord>)> = {
+            let snapshot = {
                 let mut engine = self
                     .engine
                     .lock()
@@ -251,16 +259,18 @@ impl Manager {
                     None
                 } else {
                     let config = engine.saved_configuration().discord.clone();
-                    let hostname = engine.saved_configuration().system.hostname.clone();
                     let records = if self.mode == Mode::Native {
                         engine.first_firewall_drops(&config)?
                     } else {
                         Vec::new()
                     };
-                    Some((config, hostname, records))
+                    let saved = engine.saved_configuration();
+                    let hostname = firewall_name(&saved.system);
+                    let names = self.sando.local_descriptions(&saved.sando)?;
+                    Some((config, hostname, names, records))
                 }
             };
-            let Some((config, hostname, records)) = config else {
+            let Some((config, hostname, names, records)) = snapshot else {
                 self.status
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?
@@ -300,39 +310,60 @@ impl Manager {
                     .map_err(|_| anyhow::anyhow!("Discord private store unavailable"))?
                     .get(&config.webhook_ref)?
             };
-            let payload = message(&hostname, &records)?;
-            let delivery_stop = stop.clone();
-            let outcome = tokio::select! {
-                _ = stop.changed() => break,
-                _ = self.configuration_changed(&config) => Outcome::Failed("Discord configuration changed during delivery; batch was not replayed".into()),
-                result = deliver(&client, &url, &payload, delivery_stop) => result?,
-            };
-            let error = match outcome {
-                Outcome::Delivered => None,
-                Outcome::Stopped => break,
-                Outcome::Failed(error) => Some(error),
-            };
-            let count = u64::try_from(records.len())?;
-            let mut status = self
-                .status
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
-            status.last_drop_id = records.last().map(|record| record.id.clone());
-            if let Some(error) = error {
-                failed = failed
-                    .checked_add(count)
-                    .context("Discord failure counter exhausted")?;
-                status.failed = failed.to_string();
-                status.state = "error";
-                tracing::warn!(%error, "first-seen firewall drops could not be delivered to Discord");
-                status.error = Some(error);
-            } else {
-                delivered = delivered
-                    .checked_add(count)
-                    .context("Discord delivery counter exhausted")?;
-                status.delivered = delivered.to_string();
-                status.state = "ready";
-                status.error = None;
+            let payloads = messages(&hostname, &records, &names)?;
+            let mut offset = 0;
+            for payload in payloads {
+                let batch = payload["embeds"]
+                    .as_array()
+                    .context("Discord embeds unavailable")?
+                    .len();
+                let delivery_stop = stop.clone();
+                let outcome = if self.configuration_is_changed(&config) {
+                    Outcome::Failed(
+                        "Discord configuration changed before delivery; batch was not replayed"
+                            .into(),
+                    )
+                } else {
+                    tokio::select! {
+                        _ = stop.changed() => Outcome::Stopped,
+                        _ = self.configuration_changed(&config) => Outcome::Failed("Discord configuration changed during delivery; batch was not replayed".into()),
+                        result = deliver(&client, &url, &payload, delivery_stop) => result?,
+                    }
+                };
+                let error = match outcome {
+                    Outcome::Delivered => None,
+                    Outcome::Stopped => break 'worker,
+                    Outcome::Failed(error) => Some(error),
+                };
+                let count = if error.is_some() {
+                    records.len() - offset
+                } else {
+                    batch
+                };
+                offset += count;
+                let count = u64::try_from(count)?;
+                let mut status = self
+                    .status
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
+                status.last_drop_id = Some(records[offset - 1].id.clone());
+                if let Some(error) = error {
+                    failed = failed
+                        .checked_add(count)
+                        .context("Discord failure counter exhausted")?;
+                    status.failed = failed.to_string();
+                    status.state = "error";
+                    tracing::warn!(%error, "first-seen firewall drops could not be delivered to Discord");
+                    status.error = Some(error);
+                    break;
+                } else {
+                    delivered = delivered
+                        .checked_add(count)
+                        .context("Discord delivery counter exhausted")?;
+                    status.delivered = delivered.to_string();
+                    status.state = "ready";
+                    status.error = None;
+                }
             }
         }
         self.status
@@ -345,15 +376,18 @@ impl Manager {
     async fn configuration_changed(&self, original: &DiscordConfig) {
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let changed = match self.engine.lock() {
-                Ok(engine) => {
-                    engine.configuration_busy() || &engine.saved_configuration().discord != original
-                }
-                Err(_) => true,
-            };
-            if changed {
+            if self.configuration_is_changed(original) {
                 return;
             }
+        }
+    }
+
+    fn configuration_is_changed(&self, original: &DiscordConfig) -> bool {
+        match self.engine.lock() {
+            Ok(engine) => {
+                engine.configuration_busy() || &engine.saved_configuration().discord != original
+            }
+            Err(_) => true,
         }
     }
 }
@@ -362,6 +396,14 @@ enum Outcome {
     Delivered,
     Failed(String),
     Stopped,
+}
+
+fn firewall_name(system: &netcontrol_core::SystemConfig) -> String {
+    match (system.hostname.as_str(), system.domain.as_str()) {
+        ("", _) => "Firewall".to_owned(),
+        (hostname, "") => hostname.to_owned(),
+        (hostname, domain) => format!("{hostname}.{domain}"),
+    }
 }
 
 async fn deliver(
@@ -441,7 +483,11 @@ fn retry_delay(bytes: &[u8]) -> Result<Duration> {
     Ok(Duration::from_secs_f64(response.retry_after.max(0.001)))
 }
 
-fn message(hostname: &str, records: &[DenyRecord]) -> Result<Value> {
+fn message(
+    hostname: &str,
+    records: &[DenyRecord],
+    names: &BTreeMap<IpAddr, String>,
+) -> Result<Value> {
     ensure!(
         !records.is_empty() && records.len() <= 10,
         "invalid Discord drop batch"
@@ -453,7 +499,12 @@ fn message(hostname: &str, records: &[DenyRecord]) -> Result<Value> {
     };
     let embeds: Vec<_> = records.iter().map(|record| {
         let endpoint = |address: std::net::IpAddr, port: Option<u16>| {
-            port.map_or_else(|| address.to_string(), |port| std::net::SocketAddr::new(address, port).to_string())
+            let endpoint = port.map_or_else(|| address.to_string(), |port| std::net::SocketAddr::new(address, port).to_string());
+            if let Some(name) = names.get(&address) {
+                format!("{endpoint} ({name})")
+            } else {
+                endpoint
+            }
         };
         let protocol = match record.protocol { 6 => "TCP", 17 => "UDP", 1 => "ICMP", 58 => "ICMPv6", _ => "IP" };
         let flags = record.tcp_flags.map_or_else(|| "unavailable".into(), |flags| format!("0x{flags:02x}"));
@@ -461,7 +512,8 @@ fn message(hostname: &str, records: &[DenyRecord]) -> Result<Value> {
             record.tags.iter().map(|tag| tag.as_str()).collect::<Vec<_>>().join(", ")
         };
         json!({
-            "title": format!("New firewall drop on {title}"),
+            "title": "New firewall drop",
+            "author": {"name": title},
             "description": format!(
                 "{} -> {}\nProtocol: {} ({}) | Chain: {} | Reason: {}\nIngress: {} | Egress: {}\nTCP flags: {} | Tags: {}\nDrop ID: {} | UTC epoch ms: {} | Bytes: {}",
                 endpoint(record.source, record.source_port), endpoint(record.destination, record.destination_port),
@@ -474,21 +526,50 @@ fn message(hostname: &str, records: &[DenyRecord]) -> Result<Value> {
         })
     }).collect();
     ensure!(
-        embeds
-            .iter()
-            .map(|embed| {
-                embed["title"]
-                    .as_str()
-                    .map_or(0, |value| value.chars().count())
-                    + embed["description"]
-                        .as_str()
-                        .map_or(0, |value| value.chars().count())
-            })
-            .sum::<usize>()
-            <= 6000,
+        embeds.iter().map(embed_length).sum::<usize>() <= 6000,
         "Discord message exceeds embed limits"
     );
     Ok(json!({"embeds":embeds,"allowed_mentions":{"parse":[]}}))
+}
+
+fn embed_length(embed: &Value) -> usize {
+    ["title", "description"]
+        .iter()
+        .map(|field| {
+            embed[field]
+                .as_str()
+                .map_or(0, |value| value.chars().count())
+        })
+        .sum::<usize>()
+        + embed["author"]["name"]
+            .as_str()
+            .map_or(0, |value| value.chars().count())
+}
+
+fn messages(
+    hostname: &str,
+    records: &[DenyRecord],
+    names: &BTreeMap<IpAddr, String>,
+) -> Result<Vec<Value>> {
+    let mut payloads = Vec::new();
+    let mut embeds = Vec::new();
+    let mut length = 0;
+    for record in records {
+        let payload = message(hostname, std::slice::from_ref(record), names)?;
+        let embed = payload["embeds"][0].clone();
+        let size = embed_length(&embed);
+        if embeds.len() == 10 || length + size > 6000 {
+            payloads.push(json!({"embeds":embeds,"allowed_mentions":{"parse":[]}}));
+            embeds = Vec::new();
+            length = 0;
+        }
+        embeds.push(embed);
+        length += size;
+    }
+    if !embeds.is_empty() {
+        payloads.push(json!({"embeds":embeds,"allowed_mentions":{"parse":[]}}));
+    }
+    Ok(payloads)
 }
 
 #[cfg(test)]
@@ -553,6 +634,7 @@ mod tests {
             &directory.path().join("discord"),
             engine.clone(),
             Mode::Simulated,
+            crate::sando::Manager::open(&directory.path().join("sando"), engine.clone())?,
         )?;
         let mut app = App::new(
             engine,
@@ -669,8 +751,86 @@ mod tests {
     }
 
     #[test]
+    fn discord_device_descriptions_use_exact_addresses_or_leave_endpoints_unlabelled() {
+        let record = record();
+        let names = BTreeMap::from([
+            (record.source, "Camera".into()),
+            (record.destination, "Remote server".into()),
+        ]);
+        let payload = message("fw.example.test", std::slice::from_ref(&record), &names).unwrap();
+        assert_eq!(payload["embeds"][0]["author"]["name"], "fw.example.test");
+        let text = payload["embeds"][0]["description"].as_str().unwrap();
+        assert!(text.contains("[2001:db8::1]:80 (Camera) -> [2001:db8::2]:60254 (Remote server)"));
+        let payload = message("fw", &[record], &BTreeMap::new()).unwrap();
+        assert!(
+            payload["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("[2001:db8::1]:80 -> [2001:db8::2]:60254\n")
+        );
+    }
+
+    #[test]
+    fn discord_firewall_name_uses_domain_only_with_a_hostname() {
+        let mut system = netcontrol_core::SystemConfig::default();
+        assert_eq!(firewall_name(&system), "Firewall");
+        system.domain = "example.test".into();
+        assert_eq!(firewall_name(&system), "Firewall");
+        system.hostname = "fw".into();
+        assert_eq!(firewall_name(&system), "fw.example.test");
+        system.domain.clear();
+        assert_eq!(firewall_name(&system), "fw");
+    }
+
+    #[test]
+    fn discord_named_messages_split_without_losing_entries_or_exceeding_limits() {
+        let record = record();
+        let names = BTreeMap::from([
+            (
+                record.source,
+                format!("{}{}", "@everyone".repeat(56), "s".repeat(8)),
+            ),
+            (record.destination, "d".repeat(512)),
+        ]);
+        let hostname = format!(
+            "{}.{}.{}.{}",
+            "f".repeat(63),
+            "d".repeat(63),
+            "d".repeat(63),
+            "d".repeat(61)
+        );
+        let records = vec![record; 10];
+        let payloads = messages(&hostname, &records, &names).unwrap();
+        assert!(payloads.len() > 1);
+        let mut count = 0;
+        for payload in payloads {
+            assert_eq!(payload["allowed_mentions"]["parse"], json!([]));
+            let embeds = payload["embeds"].as_array().unwrap();
+            assert!(embeds.len() <= 10);
+            assert!(embeds.iter().map(embed_length).sum::<usize>() <= 6000);
+            assert!(embeds.iter().all(|embed| {
+                let text = embed["description"].as_str().unwrap();
+                names.values().all(|name| text.contains(name))
+            }));
+            assert!(
+                embeds
+                    .iter()
+                    .all(|embed| embed["title"].as_str().unwrap().chars().count() <= 256)
+            );
+            count += embeds.len();
+        }
+        assert_eq!(count, records.len());
+        assert_eq!(
+            messages("fw", &vec![records[0].clone(); 11], &BTreeMap::new())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn discord_messages_are_bounded_and_disable_mentions() {
-        let payload = message("@everyone", &vec![record(); 10]).unwrap();
+        let payload = message("@everyone", &vec![record(); 10], &BTreeMap::new()).unwrap();
         assert_eq!(payload["allowed_mentions"]["parse"], json!([]));
         assert_eq!(payload["embeds"].as_array().unwrap().len(), 10);
         let text = payload["embeds"][0]["description"].as_str().unwrap();
@@ -685,15 +845,15 @@ mod tests {
         broadcast.tcp_flags = None;
         broadcast.tcp_payload_length = None;
         broadcast.tags = vec![netcontrol_core::DenyTrafficTag::Ipv4Broadcast];
-        let payload = message("", &[broadcast]).unwrap();
+        let payload = message("", &[broadcast], &BTreeMap::new()).unwrap();
         assert!(
             payload["embeds"][0]["description"]
                 .as_str()
                 .unwrap()
                 .contains("TCP flags: unavailable | Tags: ipv4_broadcast")
         );
-        assert!(message("", &[]).is_err());
-        assert!(message("", &vec![record(); 11]).is_err());
+        assert!(message("", &[], &BTreeMap::new()).is_err());
+        assert!(message("", &vec![record(); 11], &BTreeMap::new()).is_err());
         assert_eq!(
             retry_delay(br#"{"retry_after":0.01,"global":false}"#).unwrap(),
             Duration::from_millis(10)
@@ -746,7 +906,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let (_stop, receiver) = watch::channel(false);
-        let payload = message("firewall-test", &[record()])?;
+        let payload = message("firewall-test", &[record()], &BTreeMap::new())?;
         let result = deliver(&client, &url, &payload, receiver).await;
         server.abort();
         let _ = server.await;
@@ -781,7 +941,13 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, service).await });
         let (stop, receiver) = watch::channel(false);
         let task = tokio::spawn(async move {
-            deliver(&Client::new(), &url, &message("", &[record()])?, receiver).await
+            deliver(
+                &Client::new(),
+                &url,
+                &message("", &[record()], &BTreeMap::new())?,
+                receiver,
+            )
+            .await
         });
         tokio::time::timeout(Duration::from_secs(2), received.notified()).await?;
         stop.send(true)?;
@@ -800,7 +966,13 @@ mod tests {
             &directory.path().join("state.json"),
             Box::new(netcontrol_core::Simulator::new()),
         )?));
-        let manager = Manager::open(&directory.path().join("discord"), engine, Mode::Simulated)?;
+        let sando = crate::sando::Manager::open(&directory.path().join("sando"), engine.clone())?;
+        let manager = Manager::open(
+            &directory.path().join("discord"),
+            engine,
+            Mode::Simulated,
+            sando,
+        )?;
         let (stop, receiver) = watch::channel(false);
         let running = tokio::spawn(manager.clone().run(receiver));
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -824,6 +996,7 @@ mod tests {
             &directory.path().join("discord"),
             engine.clone(),
             Mode::Simulated,
+            crate::sando::Manager::open(&directory.path().join("sando"), engine.clone())?,
         )?;
         let permissions: Vec<_> = netcontrol_core::PERMISSIONS
             .iter()

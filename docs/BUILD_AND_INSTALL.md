@@ -164,6 +164,8 @@ through the managed systemd environment drop-in described
 [below](#enabling-gateway-monitoring-on-an-installed-appliance), without rewriting
 the base unit or custom startup arguments. Build-only runs do not change it.
 They also [configure journald forwarding](#host-logging-ownership) for native syslog.
+Fresh installation and full source upgrades also perform
+[MOTD cleanup](#motd-cleanup); build-only runs leave the host unchanged.
 Full install/upgrade enables the embedded configuration SSH listener on
 `127.0.0.1:2222` (localhost only) through `NETCONTROL_SSH_LISTEN`; no second
 process or OpenSSH package is started. Explicit `--ssh-listen` arguments take
@@ -950,6 +952,42 @@ Before provisioning, it applies the persistent
 [conntrack host prerequisites](#conntrack-host-prerequisites). The downloaded
 installer remains self-contained; no checkout or extra helper script is needed.
 
+### MOTD cleanup
+
+Fresh [installation](../install.sh) and full [source upgrade](../upgrade.sh)
+remove standard Ubuntu message-of-the-day output before provisioning or binary
+replacement. This is a mandatory host policy, including deletion of custom
+content in the targeted locations. Review/save any wanted banners independently
+before running either script.
+
+- Stop/disable and persistently mask present `motd.service`, `motd-news.service`,
+  `motd-news.timer`, `update-motd.service` and `update-motd.timer`. Already-masked
+  units are stopped too; absent standard units are masked to prevent later
+  package installs from starting them. Verify inactive/failed state for present
+  units and persistent masks for every listed unit. Distribution-owned unit
+  definitions and packages are not purged.
+- Remove active `pam_motd.so` lines from regular files in `/etc/pam.d`, preserving
+  comments, unrelated authentication/session modules and file ownership/mode.
+  This disables PAM MOTD display and login-time generation, not OS SSH itself.
+- Remove `/etc/motd`, `/etc/motd.dynamic`, `/etc/motd.d`, `/etc/update-motd.d`,
+  `/etc/default/motd-news`, `/etc/cron.daily/update-motd`, `/run/motd`,
+  `/run/motd.dynamic`, `/run/motd.d`, `/var/cache/motd-news`, `/usr/lib/motd.d`
+  and `/usr/share/motd.d`, including generator/directory contents. Leaf symlinks
+  are unlinked without removing their targets; unsafe parent-directory symlinks
+  and non-regular/symlink PAM files cause explicit failures.
+
+Cleanup is repeatable. Inspection, stop/mask, PAM writes or removal failures
+abort deployment; host cleanup already performed is not rolled back by binary
+recovery. It does not touch firewall state, credentials, `/etc/issue`, SSH
+`Banner` settings or the embedded configuration SSH greeting.
+
+Scope is **only the install and full source-upgrade scripts**. Build-only runs,
+HTTP/automatic HTTPS self-upgrades, signed-package installation and standalone
+hardening/reset do not add this policy. Later package/operator changes can
+recreate PAM configuration or MOTD files; the next full script deployment cleans
+them again. Arbitrarily named custom services or banners outside these standard
+locations are not discovered or deleted.
+
 ### Initial appliance provisioning
 
 Use a local console. Initial provisioning aggressively takes ownership of the
@@ -1727,7 +1765,9 @@ The scripts verify these effective values using `apt-config dump`; conflicting
 later settings or inspection failures are errors, not success. No APT or
 unattended-upgrades package is removed by this policy. The unattended-upgrades
 shutdown watcher may remain running; its install-on-shutdown setting is disabled.
-Cached login update notices can remain. This covers standard Ubuntu APT periodic
+Hardening alone can leave cached login update notices; fresh installation and
+full source upgrades separately apply [MOTD cleanup](#motd-cleanup).
+The APT policy covers standard Ubuntu APT periodic
 and unattended shutdown automation, not arbitrary third-party schedulers or
 graphical updaters. Netcontrol's own daily release checks are unchanged.
 
