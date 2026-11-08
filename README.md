@@ -413,6 +413,14 @@ files/generators, disable PAM MOTD output and stop/persistently mask MOTD units.
 Custom content in the targeted MOTD locations is deleted. Build-only and
 HTTP/automatic HTTPS self-upgrades do not apply this cleanup. See
 [MOTD cleanup](docs/BUILD_AND_INSTALL.md#motd-cleanup).
+These scripts also stop/disable and persistently mask standard OS NTP clients,
+including timesyncd, chrony, ntpd and one-shot NTP services/timers. They verify
+stopped/persistently masked units and reject remaining known NTP processes.
+Netcontrol's saved NTP settings are preserved: with NTP disabled there is no
+managed network clock synchronization; enabling it polls only configured servers.
+Existing appliances need the revised full source upgrade to establish these masks;
+binary-only self-upgrades retain but do not create them. See
+[NTP ownership](docs/BUILD_AND_INSTALL.md#ntp-ownership).
 
 Native Linux mode continuously collects [link diagnostics](FRONTEND_SPEC.md#native-link-diagnostics):
 qdisc backlog/drops, interface errors, local TCP RTT/retransmissions/congestion

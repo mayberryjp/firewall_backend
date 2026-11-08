@@ -2680,6 +2680,20 @@ servers and preserving the actual complete network configuration.
   or NTS. Each correction is bounded to +/-500 ms, with continued polling for
   larger residual offsets. Running is not synchronized. Rollback restores
   settings, not time. No server-consensus/falseticker algorithm is provided.
+  Ubuntu fresh installation and full source upgrades now stop/disable and
+  persistently mask standard OS NTP clients and one-shot services/timers,
+  including absent units, with stopped/persistent-mask verification and remaining
+  known-client checks. Failures abort deployment. Saved `ntp.enabled` and
+  `ntp.servers` remain unchanged; disabled means no managed network time sync,
+  not fallback to timesyncd/chrony. Enabled polls configured servers only, with
+  no implicit public pool. Disabling does not restore OS clients. Arbitrarily
+  named custom clients/cron launchers require operator removal. Existing hosts
+  need the revised full source upgrade; HTTP/automatic binary self-upgrades
+  retain existing masks but do not establish them. No API/client-type changes;
+  update NTP/operator help for the clock-drift/TLS implications and
+  [deployment scope](docs/BUILD_AND_INSTALL.md#ntp-ownership).
+  [Handoff 2026-11-09-06](docs/frontend-handoffs/2026-11-09.md#2026-11-09-06-exclusive-os-ntp-ownership)
+  is pending frontend review.
 - Syslog editor: enabled toggle and 0..8 unique `(host, port, transport)` rows;
   enabling requires at least one. Explicit `udp`/`tcp`/`tls`, integer port
   1..65535, canonical IP or lowercase DNS host. TLS uses verified operator trust;

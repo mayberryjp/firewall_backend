@@ -990,6 +990,68 @@ recreate PAM configuration or MOTD files; the next full script deployment cleans
 them again. Arbitrarily named custom services or banners outside these standard
 locations are not discovered or deleted.
 
+### NTP ownership
+
+Fresh [installation](../install.sh) and full [source upgrade](../upgrade.sh)
+take ownership of standard OS network time synchronization before provisioning
+or replacing the daemon. This applies even when Netcontrol NTP is disabled.
+The shared installer helper stops/disables present units, stops already-masked
+units, and creates persistent masks for all of these names, including absent units:
+
+- `systemd-timesyncd.service`, `chrony.service`, `chronyd.service`;
+- `ntp.service`, `ntpd.service`, `ntpsec.service`, `openntpd.service`,
+  `busybox-ntpd.service`;
+- `ntpdate.service`, `ntpdate.timer`, `ntpdate-debian.service`;
+- `sntp.service`, `sntp.timer`, `ntpdig.service`, `ntpdig.timer`.
+
+Each unit must report inactive/failed and `UnitFileState=masked`, not merely a
+runtime mask. Package installation or reboot cannot start these masked units
+unless an operator explicitly removes the masks. NTP packages, configuration,
+drift files and firewall saved state are not deleted.
+
+After stopping units, `pgrep` checks for remaining known timesyncd, chronyd,
+ntpd, ntpsec, openntpd, ntpdate, ntpdate-debian, sntp and ntpdig processes.
+It uses timesyncd's truncated Linux process name `systemd-timesyn`.
+A remaining client, inspection failure, stop/disable failure, mask failure or
+failed verification aborts deployment with diagnostics. Unmanaged clients are
+not forcibly killed: disable their custom service, cron job or launcher and
+retry. Arbitrarily named custom clients/launchers are not discovered or blocked;
+operators must disable those independently. This is service ownership, not an
+outbound UDP/123 filter, and does not restrict forwarded LAN NTP traffic.
+
+Netcontrol `ntp.enabled` and `ntp.servers` are **not changed automatically**.
+All integrations still default disabled. With NTP disabled there is no managed
+network clock synchronization, which can affect TLS and other time-sensitive
+operations as the clock drifts. Explicitly enable NTP and configure the intended
+servers through normal confirmed configuration; the Rust client has no implicit
+public pool/fallback and queries only those servers. Running does not prove
+synchronization. Configuration rollback restores settings, not clock time.
+Disabling Netcontrol NTP does not unmask or restart OS clients.
+
+Fresh install supplies `procps` for `pgrep`; full source upgrades require it
+already installed. Host masks remain in place after a later deployment failure
+or binary rollback. The setup is repeatable and reapplies masks on the next full
+script deployment.
+
+`upgrade.sh --build-only`, HTTP/automatic HTTPS binary self-upgrades,
+signed-package installation, manual/OpenRC deployments and standalone
+hardening/reset do not establish this systemd policy. Existing appliances must
+run the revised full source upgrade; binary self-upgrades retain masks already
+installed. Other deployment paths require explicit operator takeover.
+
+Verify on the actual appliance after deployment and reboot:
+
+```sh
+systemctl show systemd-timesyncd.service chrony.service chronyd.service ntp.service ntpd.service ntpsec.service openntpd.service busybox-ntpd.service ntpdate.service ntpdate.timer ntpdate-debian.service sntp.service sntp.timer ntpdig.service ntpdig.timer --property ActiveState --property UnitFileState;
+pgrep -l -x 'systemd-timesyn|chronyd|ntpd|ntpsec|openntpd|ntpdate|ntpdate-debian|sntp|ntpdig';
+```
+
+The process check should print nothing and exit 1; other errors require
+investigation. Confirm Netcontrol settings/status and capture host-originated
+UDP/123 traffic separately: disabled means no managed NTP queries, enabled means
+only configured endpoints. Distinguish forwarded clients from host traffic.
+Mocked installer tests do not prove production packet behavior.
+
 ### Initial appliance provisioning
 
 Use a local console. Initial provisioning aggressively takes ownership of the

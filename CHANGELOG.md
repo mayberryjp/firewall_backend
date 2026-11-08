@@ -62,6 +62,16 @@
 
 ### Changed
 
+- Fresh installation and full source upgrades stop/disable and persistently mask
+  standard OS NTP clients and one-shot services/timers, including absent units.
+  Verify stopped/persistent masks and reject remaining known competing clients;
+  takeover failures abort deployment. Preserve Netcontrol NTP settings, with no
+  automatic enablement or public-server fallback. Binary-only self-upgrades retain
+  but do not establish the masks; custom launchers require operator removal.
+  Release impact: fix with breaking deployment policy; next automatic calendar
+  version. Required NTP/operator-help review:
+  [handoff 2026-11-09-06](docs/frontend-handoffs/2026-11-09.md#2026-11-09-06-exclusive-os-ntp-ownership).
+
 - Uppercase source/destination device descriptions in Discord drop messages,
   including Unicode case expansion. Keep stored/API descriptions and firewall
   identity unchanged; enforce message budgets after formatting.

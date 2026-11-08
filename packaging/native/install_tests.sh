@@ -8,6 +8,111 @@ printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
 scenario=valid
 
+for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_failure unknown_state \
+    disable_failure stop_failure mask_failure verify_failure still_active runtime_only \
+    unmanaged process_failure; do
+    (
+        ntp_directory="$temporary/ntp-$ntp_scenario"
+        mkdir "$ntp_directory"
+        ntp_units=(
+            systemd-timesyncd.service chrony.service chronyd.service
+            ntp.service ntpd.service ntpsec.service openntpd.service busybox-ntpd.service
+            ntpdate.service ntpdate.timer ntpdate-debian.service
+            sntp.service sntp.timer ntpdig.service ntpdig.timer
+        )
+        systemctl() {
+            printf '%s\n' "$*" >> "$ntp_directory/commands"
+            local operation=$1 unit=$2
+            shift
+            if [[ $operation == show ]]; then
+                [[ " ${ntp_units[*]} " == *" $unit "* ]] || return 1
+                if [[ $3 == LoadState ]]; then
+                    case $ntp_scenario in
+                        inspect_failure) printf 'Fixture inspection failure.\n' >&2; return 1 ;;
+                        unknown_state) printf 'error\n'; return 0 ;;
+                        absent) printf 'not-found\n'; return 4 ;;
+                        mixed)
+                            if [[ $unit == ntpdate.timer ]]; then printf 'not-found\n'; return 4; fi ;;
+                    esac
+                    if [[ -e $ntp_directory/$unit.masked || $ntp_scenario == masked ||
+                          $ntp_scenario == runtime_mask || $ntp_scenario == stop_failure ]]; then
+                        printf 'masked\n'
+                    else
+                        printf 'loaded\n'
+                    fi
+                else
+                    [[ $ntp_scenario != verify_failure ]] || { printf 'Fixture verification failure.\n' >&2; return 1; }
+                    if [[ -e $ntp_directory/$unit.stopped || $ntp_scenario == absent ||
+                          $ntp_scenario == mixed && $unit == ntpdate.timer ]]; then
+                        if [[ $ntp_scenario == still_active ]]; then printf 'ActiveState=active\n'; else printf 'ActiveState=inactive\n'; fi
+                    else
+                        printf 'ActiveState=active\n'
+                    fi
+                    if [[ -e $ntp_directory/$unit.masked ]]; then
+                        if [[ $ntp_scenario == runtime_only ]]; then printf 'UnitFileState=masked-runtime\n'; else printf 'UnitFileState=masked\n'; fi
+                    else
+                        printf 'UnitFileState=enabled\n'
+                    fi
+                fi
+                return
+            fi
+            if [[ $operation == disable ]]; then
+                [[ $1 == --now ]] || return 1
+                shift
+            fi
+            for unit in "$@"; do
+                [[ " ${ntp_units[*]} " == *" $unit "* ]] || return 1
+                case $operation in
+                    disable|stop)
+                        [[ $ntp_scenario != "${operation}_failure" ]] || { printf 'Fixture %s failure.\n' "$operation" >&2; return 1; }
+                        : > "$ntp_directory/$unit.stopped" ;;
+                    mask)
+                        [[ $ntp_scenario != mask_failure ]] || { printf 'Fixture mask failure.\n' >&2; return 1; }
+                        : > "$ntp_directory/$unit.masked" ;;
+                    *) return 1 ;;
+                esac
+            done
+        }
+        pgrep() {
+            printf '%s\n' "$*" >> "$ntp_directory/processes"
+            [[ $1 == -x ]] || return 2
+            if [[ $ntp_scenario == unmanaged && $2 == systemd-timesyn ]]; then return 0; fi
+            if [[ $ntp_scenario == process_failure ]]; then return 2; fi
+            return 1
+        }
+        if configure_ntp > "$ntp_directory/stdout" 2> "$ntp_directory/stderr"; then
+            case $ntp_scenario in success|repeat|absent|masked|runtime_mask|mixed) ;; *) exit 1 ;; esac
+            if [[ $ntp_scenario == repeat ]]; then configure_ntp || exit 1; fi
+            for ntp_unit in "${ntp_units[@]}"; do
+                [[ -e $ntp_directory/$ntp_unit.masked ]]
+            done
+            grep -Fxq "mask ${ntp_units[*]}" "$ntp_directory/commands"
+            if [[ $ntp_scenario == absent ]]; then
+                ! grep -Eq '^(disable|stop) ' "$ntp_directory/commands"
+            elif [[ $ntp_scenario == masked || $ntp_scenario == runtime_mask ]]; then
+                for ntp_unit in "${ntp_units[@]}"; do
+                    grep -Fxq "stop $ntp_unit" "$ntp_directory/commands"
+                done
+            fi
+            for ntp_process in systemd-timesyn chronyd ntpd ntpsec openntpd ntpdate ntpdate-debian sntp ntpdig; do
+                grep -Fxq -- "-x $ntp_process" "$ntp_directory/processes"
+            done
+        else
+            case $ntp_scenario in success|repeat|absent|masked|runtime_mask|mixed) cat "$ntp_directory/stderr" >&2; exit 1 ;; esac
+            [[ -s $ntp_directory/stderr ]]
+            if [[ $ntp_scenario == inspect_failure || $ntp_scenario == unknown_state ]]; then
+                ! grep -Eq '^(disable|stop|mask) ' "$ntp_directory/commands"
+            fi
+            if [[ $ntp_scenario == unmanaged ]]; then
+                grep -Fq 'Competing NTP process systemd-timesyn is still running' "$ntp_directory/stderr"
+            elif [[ $ntp_scenario == process_failure ]]; then
+                grep -Fq 'pgrep exit 2' "$ntp_directory/stderr"
+            fi
+        fi
+    )
+done
+printf 'NTP stop/disable/persistent masks, absent units, repeats, runtime masks, residual clients and failure tests passed (mocked systemd/processes).\n'
+
 for motd_scenario in success repeat absent masked inspect_failure stop_failure mask_failure verify_failure active \
     unsafe_parent pam_directory_symlink pam_symlink pam_failure remove_failure; do
     motd_directory="$temporary/motd-$motd_scenario"
@@ -798,10 +903,11 @@ configure_logging_units() { trace+=' logging-units;'; }
 configure_host_logging() { trace+=' host-logging;'; }
 configure_snap() { trace+=' snap;'; }
 configure_motd() { trace+=' motd;'; }
+configure_ntp() { trace+=' ntp;'; }
 configure_os_updates() { trace+=' os-updates;'; }
 configure_upgrade_settings() { trace+=' upgrade-settings;'; }
 install_systemd_service
-[[ $trace == ' os-updates; snap; motd;'* ]]
+[[ $trace == ' os-updates; snap; motd; ntp;'* ]]
 [[ $trace == *'install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys;'* ]]
 [[ $trace == *'install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service;'* ]]
 [[ $trace == *'systemctl daemon-reload;'* ]]
@@ -812,7 +918,7 @@ trace=''
 check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
-for failure_stage in os_updates snap motd upgrade_settings service_setup logging_units reload logging; do
+for failure_stage in os_updates snap motd ntp upgrade_settings service_setup logging_units reload logging; do
     trace=''
     check_systemd_unit() { return 0; }
     configure_upgrade_settings() { trace+=' upgrade-settings;'; [[ $failure_stage != upgrade_settings ]]; }
@@ -822,6 +928,7 @@ for failure_stage in os_updates snap motd upgrade_settings service_setup logging
     configure_host_logging() { trace+=' host-logging;'; return 1; }
     configure_snap() { trace+=' snap;'; [[ $failure_stage != snap ]]; }
     configure_motd() { trace+=' motd;'; [[ $failure_stage != motd ]]; }
+    configure_ntp() { trace+=' ntp;'; [[ $failure_stage != ntp ]]; }
     configure_os_updates() { trace+=' os-updates;'; [[ $failure_stage != os_updates ]]; }
     if install_systemd_service; then exit 1; fi
     if [[ $failure_stage == os_updates ]]; then
@@ -834,6 +941,10 @@ for failure_stage in os_updates snap motd upgrade_settings service_setup logging
     fi
     if [[ $failure_stage == motd ]]; then
         [[ $trace == ' os-updates; snap; motd;' ]]
+        continue
+    fi
+    if [[ $failure_stage == ntp ]]; then
+        [[ $trace == ' os-updates; snap; motd; ntp;' ]]
         continue
     fi
     if [[ $failure_stage == upgrade_settings ]]; then
@@ -925,7 +1036,7 @@ for deployment_scenario in success setup_failure deploy_failure; do
         : > "$deployment_trace"
         root_command() {
             [[ $# -eq 5 && $1 == bash && $2 == -c &&
-                $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
+                $3 == 'source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_ntp && configure_appliance_services && configure_logging_units && systemctl daemon-reload' && $4 == bash && $5 == "$PWD/install.sh" ]] || return 1
             printf 'setup;' >> "$deployment_trace"
             [[ $deployment_scenario != setup_failure ]]
         }
@@ -965,6 +1076,10 @@ configure_motd() {
     printf 'motd\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != motd_failure ]]
 }
+configure_ntp() {
+    printf 'ntp\n' >> "$SETUP_TRACE"
+    [[ $SETUP_SCENARIO != ntp_failure ]]
+}
 configure_appliance_services() {
     printf 'services\n' >> "$SETUP_TRACE"
     [[ $SETUP_SCENARIO != services_failure ]]
@@ -979,7 +1094,7 @@ systemctl() {
     [[ $SETUP_SCENARIO != reload_failure ]]
 }
 EOF
-for setup_scenario in success conntrack_failure diagnostics_failure deny_log_failure motd_failure services_failure logging_units_failure reload_failure; do
+for setup_scenario in success conntrack_failure diagnostics_failure deny_log_failure motd_failure ntp_failure services_failure logging_units_failure reload_failure; do
     (
         export SETUP_SCENARIO=$setup_scenario SETUP_TRACE="$temporary/setup-$setup_scenario.trace"
         root_command() { "$@"; }
@@ -990,14 +1105,15 @@ for setup_scenario in success conntrack_failure diagnostics_failure deny_log_fai
             [[ $setup_scenario != success ]] || exit 1
         fi
         case $setup_scenario in
-            success) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices\nlogging-units\nreload\ndeploy' ;;
+            success) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nntp\nservices\nlogging-units\nreload\ndeploy' ;;
             conntrack_failure) expected=conntrack ;;
             diagnostics_failure) expected=$'conntrack\nlink-diagnostics' ;;
             deny_log_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log' ;;
             motd_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd' ;;
-            services_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices' ;;
-            logging_units_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices\nlogging-units' ;;
-            reload_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nservices\nlogging-units\nreload' ;;
+            ntp_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nntp' ;;
+            services_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nntp\nservices' ;;
+            logging_units_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nntp\nservices\nlogging-units' ;;
+            reload_failure) expected=$'conntrack\nlink-diagnostics\ndeny-log\nmotd\nntp\nservices\nlogging-units\nreload' ;;
         esac
         [[ $(< "$SETUP_TRACE") == "$expected" ]]
     )
@@ -1065,7 +1181,7 @@ for scenario in success fail_stage fail_bootstrap fail_logging fail_restart fail
                         grep -q "^systemctl stop netcontrold.service$" "$UPGRADE_TEST_DIRECTORY/commands" || return 1
                         [[ $UPGRADE_TEST_SCENARIO != fail_logging ]]
                     else
-                        [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
+                        [[ $3 == '\''source "$1"; configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_ntp && configure_appliance_services && configure_logging_units && systemctl daemon-reload'\'' ]]
                     fi ;;
                 install)
                     printf "routine deployment stdout\n"

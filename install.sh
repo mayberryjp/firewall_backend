@@ -181,6 +181,45 @@ configure_snap() {
     configure_masked_units Snap snapd.service snapd.socket
 }
 
+configure_ntp() (
+    set -euo pipefail
+    local unit status process
+    local -a units=(
+        systemd-timesyncd.service chrony.service chronyd.service
+        ntp.service ntpd.service ntpsec.service openntpd.service busybox-ntpd.service
+        ntpdate.service ntpdate.timer ntpdate-debian.service
+        sntp.service sntp.timer ntpdig.service ntpdig.timer
+    )
+    command -v pgrep >/dev/null || {
+        printf 'Missing pgrep; install procps before taking ownership of NTP.\n' >&2
+        exit 1
+    }
+    configure_masked_units NTP "${units[@]}" || exit 1
+    systemctl mask "${units[@]}" || exit 1
+    for unit in "${units[@]}"; do
+        status=$(systemctl show "$unit" --property ActiveState --property UnitFileState) || exit 1
+        if ! grep -Fxq 'UnitFileState=masked' <<< "$status" ||
+           ! grep -Eq '^ActiveState=(inactive|failed)$' <<< "$status"; then
+            printf 'NTP unit %s is not stopped and persistently masked.\n' "$unit" >&2
+            exit 1
+        fi
+    done
+    # pgrep uses the kernel's 15-character comm name, including truncated timesyncd.
+    for process in systemd-timesyn chronyd ntpd ntpsec openntpd ntpdate ntpdate-debian sntp ntpdig; do
+        if pgrep -x "$process" >/dev/null; then
+            printf 'Competing NTP process %s is still running; disable its custom service, cron job or launcher before retrying.\n' "$process" >&2
+            exit 1
+        else
+            status=$?
+            [[ $status -eq 1 ]] || {
+                printf 'Cannot inspect competing NTP process %s (pgrep exit %s).\n' "$process" "$status" >&2
+                exit 1
+            }
+        fi
+    done
+    installer_message success 'OS NTP clients stopped and persistently masked; Netcontrol NTP settings preserved.'
+)
+
 configure_motd() (
     set -euo pipefail
     local root=${1:-/} relative path parent configuration staged='' unit status
@@ -408,6 +447,7 @@ install_systemd_service() {
     configure_os_updates || return 1
     configure_snap || return 1
     configure_motd || return 1
+    configure_ntp || return 1
     install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys || return 1
     install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service || return 1
     configure_upgrade_settings || return 1
@@ -736,6 +776,7 @@ main() {
             'No connectivity rollback. Review imported firewall rules from the console.' \
             'Disables Snap, competing syslog receivers and automatic OS updates, including security fixes.' \
             'Removes MOTD login messages/generators and stops/masks MOTD services.' \
+            'Stops/masks OS NTP clients; Netcontrol NTP remains disabled until explicitly configured.' \
             'Schedule manual OS patching. LAN clients need static addresses; no DHCP/DNS server is installed.' \
             'Enables LAN HTTP setup, localhost configuration SSH on TCP 2222 and startup at boot.' \
             '' \
@@ -800,6 +841,7 @@ main() {
     installer_message warning 'Use a local console. Host networking will be taken over without connectivity rollback.'
     installer_message warning 'Automatic OS updates, including security fixes, and Snap will be disabled. Schedule manual patching.'
     installer_message warning 'Competing syslog receivers will be disabled. Configuration SSH listens on localhost TCP 2222 only by default.'
+    installer_message warning 'OS NTP clients will be stopped and masked. Configure Netcontrol NTP explicitly to synchronize the clock.'
     systemctl is-active --quiet systemd-networkd.service || {
         installer_message error 'systemd-networkd must be running.'
         return 1
