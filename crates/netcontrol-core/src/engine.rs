@@ -31,6 +31,7 @@ pub const PERMISSIONS: &[&str] = &[
     "syslog.write",
     "vnstat.write",
     "mqtt.write",
+    "discord.write",
     "system.write",
     "sando.write",
     "dynamic_dns.write",
@@ -303,6 +304,7 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
         ("syslog.write", a.syslog != b.syslog),
         ("vnstat.write", a.vnstat != b.vnstat),
         ("mqtt.write", a.mqtt != b.mqtt),
+        ("discord.write", a.discord != b.discord),
         ("system.write", a.system != b.system),
         ("sando.write", a.sando != b.sando),
         ("dynamic_dns.write", a.dynamic_dns != b.dynamic_dns),
@@ -361,6 +363,7 @@ pub struct Engine {
     restarting: bool,
     mqtt_passwords: Option<BTreeSet<String>>,
     dynamic_dns_secrets: Option<BTreeSet<String>>,
+    discord_webhooks: Option<BTreeSet<String>>,
     timezone_check: Option<TimezoneCheck>,
     #[cfg(test)]
     now: Option<DateTime<Utc>>,
@@ -459,6 +462,7 @@ impl Engine {
             restarting: false,
             mqtt_passwords: None,
             dynamic_dns_secrets: None,
+            discord_webhooks: None,
             timezone_check: None,
             #[cfg(test)]
             now: None,
@@ -1405,6 +1409,14 @@ impl Engine {
         self.dynamic_dns_secrets = references;
     }
 
+    pub fn configure_discord(&mut self, references: Option<BTreeSet<String>>) {
+        self.discord_webhooks = references;
+    }
+
+    pub fn first_firewall_drops(&mut self, enabled: bool) -> Result<Vec<crate::DenyRecord>> {
+        self.backend.first_firewall_drops(enabled)
+    }
+
     /// `None` means this backend cannot manage host settings; managed values are then rejected.
     pub fn configure_system(&mut self, timezone_check: Option<TimezoneCheck>) {
         self.timezone_check = timezone_check;
@@ -1479,6 +1491,17 @@ impl Engine {
             return Err(ApiError::new(422, "description must not exceed 1024 bytes"));
         }
         r.config.validate().map_err(|e| ApiError::new(422, e))?;
+        if (r.config.discord.enabled || !r.config.discord.webhook_ref.is_empty())
+            && !self
+                .discord_webhooks
+                .as_ref()
+                .is_some_and(|references| references.contains(&r.config.discord.webhook_ref))
+        {
+            return Err(ApiError::new(
+                422,
+                "Discord backend or webhook reference is unavailable",
+            ));
+        }
         for entry in &r.config.dynamic_dns {
             if !self
                 .dynamic_dns_secrets

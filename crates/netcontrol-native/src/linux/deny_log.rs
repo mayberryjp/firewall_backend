@@ -39,6 +39,18 @@ pub(super) struct Monitor {
 }
 
 impl Monitor {
+    pub fn first_drops(&self, enabled: bool) -> Result<Vec<DenyRecord>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("deny-log state poisoned"))?;
+        ensure!(
+            state.status == "capturing",
+            "firewall deny capture is unavailable"
+        );
+        state.store.first_drops(enabled)
+    }
+
     pub fn new(namespace: Arc<File>, root: PathBuf) -> Result<Self> {
         let state = Arc::new(Mutex::new(State {
             store: store::Store::open(root)?,

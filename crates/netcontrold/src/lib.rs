@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod discord;
 pub mod dynamic_dns;
 pub mod health;
 pub mod host_system;

@@ -506,6 +506,27 @@ Rollback restores values, not expired connections.
 
 ## Complete-schema JSON editing
 
+Discord alerts use ordinary candidate JSON editing after uploading the webhook
+through the private HTTP/local-control
+[webhook endpoint](../FRONTEND_SPEC.md#discord-first-seen-drop-alerts):
+
+```text
+configure terminal
+set /discord/webhook_ref "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+set /discord/enabled true
+commit check
+commit confirmed 60
+confirm
+```
+
+The reference above is synthetic; use the actual returned reference. Disabling
+uses `set /discord/enabled false` with the same confirmed workflow.
+Both changes require `transactions.write` and `discord.write`. Never put a raw
+webhook URL into the candidate, CLI command history or exported configuration.
+First-seen tuple identities survive disable/enable and daemon restart; failed
+notifications are not replayed simply by re-enabling. There is no CLI credential
+upload or arbitrary Discord URL execution.
+
 All configuration surfaces, including nested fields not given a dedicated
 shortcut, are available through typed JSON-pointer editing:
 

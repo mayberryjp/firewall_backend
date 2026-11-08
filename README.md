@@ -263,6 +263,32 @@ traffic, other firewall owners and non-firewall drops are excluded.
 See the [API contract](FRONTEND_SPEC.md#firewall-deny-log) and
 [kernel/storage prerequisites](docs/BUILD_AND_INSTALL.md#firewall-deny-logging).
 
+## Discord first-seen drop alerts
+
+Optional `discord.enabled` sends Discord webhook notifications for the first
+captured occurrence of exactly `(source IP, destination IP, destination port,
+IP protocol)`. Source ports, interfaces and reasons do not create new identities.
+A durable native index preserves seen tuples across restarts and drop-log rotation;
+there is no time-based expiry. Drops first seen while disabled are not backfilled.
+Existing retained history seeds the index without sending messages.
+
+Upload the secret URL through `POST /api/v1/services/discord/webhooks`
+(`discord.write`), then save the returned `webhook_ref` and global enable flag
+through normal confirmed transactions (`transactions.write`, `discord.write`).
+Only canonical HTTPS `discord.com` webhook URLs are accepted. Raw URLs/tokens
+are private and never enter configuration exports. Read delivery/errors with
+`GET /api/v1/services/discord/status` (`state.read`). Native host mode only;
+simulator mode never posts. The worker is supervised and can be restarted with
+the existing managed-process action without resetting identities.
+
+Alerts include packet metadata, not payloads, and batch up to ten first-seen
+entries with mentions disabled. Respect Discord rate limits; delivery remains
+best-effort, with no replay after ambiguous failures or interrupted sends.
+The permanent identity index grows with distinct traffic; preserve private
+state and monitor disk capacity. No firewall rules are automatically opened.
+See the [complete contract](FRONTEND_SPEC.md#discord-first-seen-drop-alerts) and
+[frontend handoff](docs/frontend-handoffs/2026-11-08.md#2026-11-08-02-discord-first-seen-drop-alerts).
+
 ## Sando imports
 
 One-time Sando imports are frontend-driven. The backend saves `config.sando`

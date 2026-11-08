@@ -4435,6 +4435,75 @@ fn revision_pagination_and_strict_queries() {
     }
 }
 #[test]
+fn discord_enable_reference_permissions_confirmation_restart_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut config = Config::empty();
+    config.discord.enabled = true;
+    config.discord.webhook_ref = "a".repeat(32);
+    assert_eq!(submit(&mut engine, config.clone()).status, 422);
+    engine.configure_discord(Some([config.discord.webhook_ref.clone()].into()));
+    let limited: Vec<_> = all()
+        .into_iter()
+        .filter(|permission| permission != "discord.write")
+        .collect();
+    let body = serde_json::to_vec(&json!({
+        "base_revision":engine.state.revision,"confirm_timeout_seconds":30,"config":config
+    }))
+    .unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "limited",
+                &limited,
+                &body
+            )
+            .status,
+        403
+    );
+    let reply = submit(&mut engine, config.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert_eq!(engine.saved_configuration().discord, config.discord);
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(config.clone()).unwrap()),
+    )
+    .unwrap();
+    engine.configure_discord(Some([config.discord.webhook_ref.clone()].into()));
+    assert_eq!(engine.saved_configuration().discord, config.discord);
+    let disabled = submit(&mut engine, Config::empty());
+    assert_eq!(disabled.status, 202);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                disabled.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.saved_configuration().discord, config.discord);
+    let disabled = submit(&mut engine, Config::empty());
+    assert_eq!(
+        confirm(&mut engine, disabled.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert!(!engine.saved_configuration().discord.enabled);
+}
+
+#[test]
 fn conntrack_controls_use_existing_permissions_persistence_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

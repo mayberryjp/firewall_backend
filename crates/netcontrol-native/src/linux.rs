@@ -1509,6 +1509,10 @@ impl Backend for Native {
         self.check_scope()?;
         self.deny_log.snapshot(query)
     }
+    fn first_firewall_drops(&mut self, enabled: bool) -> Result<Vec<netcontrol_core::DenyRecord>> {
+        self.check_scope()?;
+        self.deny_log.first_drops(enabled)
+    }
     fn bgp_status(&mut self, _: &Config) -> Result<Value> {
         self.check_scope()?;
         let mut value = self.bgp.snapshot()?;

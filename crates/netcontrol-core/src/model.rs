@@ -29,6 +29,7 @@ pub struct Config {
     pub udp_broadcast_relay: crate::UDPBroadcastRelayConfig,
     pub bgp: crate::BGPConfig,
     pub mqtt: MQTTConfig,
+    pub discord: DiscordConfig,
     pub system: SystemConfig,
     pub sando: crate::SandoConfig,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -85,6 +86,32 @@ pub struct SystemConfig {
     /// Display/reporting domain: never applied to the host, resolver or search domains.
     pub domain: String,
     pub timezone: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscordConfig {
+    pub enabled: bool,
+    pub webhook_ref: String,
+}
+
+impl DiscordConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.webhook_ref.is_empty()
+                || (self.webhook_ref.len() == 32
+                    && self
+                        .webhook_ref
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+            "Discord webhook_ref must be empty or a 32-character lowercase hexadecimal reference"
+        );
+        ensure!(
+            !self.enabled || !self.webhook_ref.is_empty(),
+            "enabled Discord alerts require webhook_ref"
+        );
+        Ok(())
+    }
 }
 
 impl SystemConfig {
@@ -961,6 +988,7 @@ impl Config {
             value["mdns"]["publishing"]["hostname"] = serde_json::json!(self.system.hostname);
         }
         value.as_object_mut().unwrap().remove("mqtt");
+        value.as_object_mut().unwrap().remove("discord");
         value.as_object_mut().unwrap().remove("software");
         value.as_object_mut().unwrap().remove("system");
         value.as_object_mut().unwrap().remove("dynamic_dns");
@@ -1065,6 +1093,7 @@ impl Config {
         self.mdns.validate(self)?;
         self.udp_broadcast_relay.validate(self)?;
         crate::dynamic_dns::validate(self)?;
+        self.discord.validate()?;
         self.system.validate()?;
         let mqtt = &self.mqtt;
         ensure!(

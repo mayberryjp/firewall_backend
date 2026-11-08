@@ -102,6 +102,9 @@ pub trait Backend: Send {
     fn deny_log(&mut self, _query: &DenyLogQuery) -> Result<Value> {
         anyhow::bail!("firewall deny logging requires the native Linux backend")
     }
+    fn first_firewall_drops(&mut self, _enabled: bool) -> Result<Vec<DenyRecord>> {
+        anyhow::bail!("first-seen firewall drops require the native Linux backend")
+    }
     fn bgp_status(&mut self, config: &Config) -> Result<Value> {
         let runtime = self.runtime(config)?;
         runtime

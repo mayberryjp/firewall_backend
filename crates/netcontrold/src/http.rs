@@ -97,6 +97,7 @@ pub struct App {
     sando: Option<Arc<crate::sando::Manager>>,
     mqtt: Option<Arc<crate::mqtt::Manager>>,
     dynamic_dns: Option<Arc<crate::dynamic_dns::Manager>>,
+    discord: Option<Arc<crate::discord::Manager>>,
     system: Option<Arc<crate::host_system::Manager>>,
     processes: std::collections::BTreeMap<String, Arc<crate::processes::Control>>,
     daemon_restart: Option<tokio::sync::watch::Sender<bool>>,
@@ -115,6 +116,7 @@ impl App {
             sando: None,
             mqtt: None,
             dynamic_dns: None,
+            discord: None,
             system: None,
             processes: Default::default(),
             daemon_restart: None,
@@ -198,6 +200,10 @@ impl App {
         for (name, status) in [
             ("mqtt", self.mqtt.as_ref().map(|manager| manager.status())),
             (
+                "discord",
+                self.discord.as_ref().map(|manager| manager.status()),
+            ),
+            (
                 "dynamic_dns",
                 self.dynamic_dns.as_ref().map(|manager| manager.status()),
             ),
@@ -231,6 +237,15 @@ impl App {
         Arc::get_mut(app)
             .context("application is already shared")?
             .dynamic_dns = Some(manager);
+        Ok(())
+    }
+    pub fn attach_discord(
+        app: &mut Arc<Self>,
+        manager: Arc<crate::discord::Manager>,
+    ) -> Result<()> {
+        Arc::get_mut(app)
+            .context("application is already shared")?
+            .discord = Some(manager);
         Ok(())
     }
     pub fn attach_system(
@@ -807,7 +822,7 @@ fn api(
                     Err(error) => fail(503, &error.to_string(), true),
                 };
             }
-            if ["mqtt", "dynamic-dns", "system"].contains(&input.target.as_str()) {
+            if ["mqtt", "dynamic-dns", "discord", "system"].contains(&input.target.as_str()) {
                 return fail(503, "managed task is unavailable", true);
             }
             let reply = engine.restart_process(&input.target);
@@ -856,6 +871,65 @@ fn api(
             Ok(()) => (),
             Err(_) => return fail(503, "upgrade state unavailable", true),
         }
+    }
+    if matches!(
+        path,
+        "/api/v1/services/discord/status" | "/api/v1/services/discord/webhooks"
+    ) {
+        let upload = path.ends_with("/webhooks");
+        let permission = if upload {
+            "discord.write"
+        } else {
+            "state.read"
+        };
+        if !credential
+            .permissions
+            .iter()
+            .any(|value| value == permission)
+        {
+            return fail(403, "insufficient Discord permission", true);
+        }
+        if method != if upload { "POST" } else { "GET" } {
+            return fail(405, "unsupported Discord method", true);
+        }
+        if !query.is_empty() || (!upload && !body.is_empty()) {
+            return fail(400, "Discord endpoint accepts no query or GET body", true);
+        }
+        let Some(manager) = &app.discord else {
+            return fail(503, "Discord manager unavailable", true);
+        };
+        if !upload {
+            return match manager.status() {
+                Ok(status) => response(200, status),
+                Err(_) => fail(503, "Discord status unavailable", true),
+            };
+        }
+        if engine.configuration_busy() {
+            return fail(409, "configuration transaction or upgrade is active", true);
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WebhookRequest {
+            webhook_url: String,
+        }
+        let Ok(input) = serde_json::from_slice::<WebhookRequest>(&body) else {
+            return fail(400, "expected JSON object with webhook_url string", true);
+        };
+        let value = zeroize::Zeroizing::new(input.webhook_url);
+        if let Err(error) = crate::discord::validate_webhook(&value) {
+            return fail(400, &error.to_string(), true);
+        }
+        return match manager.create_webhook(&mut engine, &value) {
+            Ok(reference) => response(201, json!({"webhook_ref":reference})),
+            Err(error) => {
+                tracing::error!(%error, "Discord webhook could not be stored");
+                fail(
+                    503,
+                    "Discord webhook storage failed; check private storage and its 256-webhook limit",
+                    true,
+                )
+            }
+        };
     }
     if matches!(
         path,

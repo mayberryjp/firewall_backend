@@ -501,6 +501,12 @@ async fn run(options: Options) -> Result<()> {
         dynamic_dns_mode,
     )?;
     App::attach_dynamic_dns(&mut app, dynamic_dns.clone())?;
+    let discord = netcontrold::discord::Manager::open(
+        &appended(&options.state, ".discord"),
+        engine.clone(),
+        dynamic_dns_mode,
+    )?;
+    App::attach_discord(&mut app, discord.clone())?;
     let system_mode = if mqtt_mode == netcontrold::mqtt::Mode::Simulated {
         netcontrold::host_system::Mode::Simulated
     } else if mqtt_mode == netcontrold::mqtt::Mode::Native {
@@ -513,7 +519,7 @@ async fn run(options: Options) -> Result<()> {
     let watchdog = Arc::new(netcontrold::watchdog::Watchdog::from_environment()?);
     let (restart_tx, restart_rx) = tokio::sync::watch::channel(false);
     let restart_requested = restart_rx.clone();
-    let controls: std::collections::BTreeMap<_, _> = ["mqtt", "dynamic-dns", "system"]
+    let controls: std::collections::BTreeMap<_, _> = ["mqtt", "dynamic-dns", "discord", "system"]
         .into_iter()
         .map(|name| {
             (
@@ -557,6 +563,15 @@ async fn run(options: Options) -> Result<()> {
             .await
     });
     let (mqtt_stop, mqtt_receiver) = tokio::sync::watch::channel(false);
+    let (discord_stop, discord_receiver) = tokio::sync::watch::channel(false);
+    let discord_control = controls["discord"].clone();
+    let discord_task = tokio::spawn(async move {
+        discord_control
+            .run(discord_receiver, move |receiver| {
+                discord.clone().run(receiver)
+            })
+            .await
+    });
     let (release_stop, release_receiver) = tokio::sync::watch::channel(false);
     let (sando_stop, sando_receiver) = tokio::sync::watch::channel(false);
     let sando_task = tokio::spawn(sando.run(sando_receiver));
@@ -612,6 +627,7 @@ async fn run(options: Options) -> Result<()> {
     let task_handles = [
         ("mqtt", mqtt_task.abort_handle()),
         ("dynamic_dns", dynamic_dns_task.abort_handle()),
+        ("discord", discord_task.abort_handle()),
         ("system", system_task.abort_handle()),
         ("release_check", release_task.abort_handle()),
         ("sando_sync", sando_task.abort_handle()),
@@ -762,11 +778,15 @@ async fn run(options: Options) -> Result<()> {
     let _ = stop_tx.send(true);
     let _ = mqtt_stop.send(true);
     let _ = dynamic_dns_stop.send(true);
+    let _ = discord_stop.send(true);
     let _ = system_stop.send(true);
     let _ = release_stop.send(true);
     let _ = sando_stop.send(true);
     signals.abort();
     mqtt_task.await.context("MQTT worker shutdown failed")??;
+    discord_task
+        .await
+        .context("Discord worker shutdown failed")??;
     system_task
         .await
         .context("host system worker shutdown failed")??;

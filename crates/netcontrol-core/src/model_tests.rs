@@ -10,6 +10,31 @@ fn candidate() -> Config {
 }
 
 #[test]
+fn discord_configuration_is_disabled_by_default_and_accepts_only_private_references() {
+    let empty = Config::empty();
+    assert_eq!(empty.discord, DiscordConfig::default());
+    for value in [
+        json!({"enabled":true}),
+        json!({"enabled":true,"webhook_ref":"https://discord.com/api/webhooks/123/not-a-reference"}),
+        json!({"enabled":false,"webhook_ref":"A".repeat(32)}),
+    ] {
+        let config: DiscordConfig = serde_json::from_value(value).unwrap();
+        assert!(config.validate().is_err());
+    }
+    for value in [
+        json!({"enabled":null}),
+        json!({"enabled":"true"}),
+        json!({"webhook_ref":null}),
+        json!({"webhook_url":"not-exportable"}),
+    ] {
+        assert!(serde_json::from_value::<DiscordConfig>(value).is_err());
+    }
+    let config: DiscordConfig =
+        serde_json::from_value(json!({"enabled":true,"webhook_ref":"a".repeat(32)})).unwrap();
+    config.validate().unwrap();
+}
+
+#[test]
 fn loopback_role_and_addressing_are_readonly_inventory_only() {
     for kind in ["ethernet", "dummy", "wireguard", "vlan"] {
         let mut config = candidate();
@@ -1756,7 +1781,7 @@ fn all_current_example_feature_schemas_validate() {
     fn annotate(value: &mut Value, path: &str, paths: &mut Vec<String>) {
         if matches!(
             path,
-            "/mqtt" | "/system" | "/mdns/reflection" | "/mdns/publishing"
+            "/mqtt" | "/discord" | "/system" | "/mdns/reflection" | "/mdns/publishing"
         ) {
             return;
         }
@@ -1818,6 +1843,7 @@ fn all_current_example_feature_schemas_validate() {
         assert!(!paths.is_empty());
         assert!(annotated["kernel"].get("metadata").is_none());
         assert!(annotated["mqtt"].get("metadata").is_none());
+        assert!(annotated["discord"].get("metadata").is_none());
         assert!(annotated["system"].get("metadata").is_none());
         let described: Config = serde_json::from_value(annotated.clone()).unwrap();
         described.validate().unwrap();

@@ -4,6 +4,18 @@
 
 ### Added
 
+- Optional Discord first-seen firewall-drop alerts with a global enable flag
+  and privately uploaded webhook URL. Deduplicate exactly source/destination IP,
+  destination port and IP protocol in a durable lifetime index independent of
+  rotating history; suppress repeated/source-port-only changes and disabled
+  history backfill. Add scoped credential/configuration permissions, status,
+  supervised shutdown/restart, bounded message batches and Discord rate-limit
+  handling. No packet payload/secret export or automatic firewall permits.
+  Delivery is best-effort, not guaranteed exactly once.
+  Release impact: additive contract and private-state deployment requirement;
+  next automatic calendar version.
+  [Handoff 2026-11-08-02](docs/frontend-handoffs/2026-11-08.md#2026-11-08-02-discord-first-seen-drop-alerts).
+
 - Advanced conntrack controls through existing kernel HTTP/SSH configuration:
   host-global entry limits, namespace TCP established/closing-state and UDP
   unreplied/stream timeouts. Publish scope, bounded canonical-string values and

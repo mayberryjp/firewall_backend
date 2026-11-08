@@ -713,7 +713,8 @@ revoke it; use device key management (or operator edits/restart in legacy mode).
 
 All reads require `state.read`. POST actions require `transactions.write`, except
 the per-interface DHCP retry action (`interfaces.write`), MQTT password upload
-(`mqtt.write`) and software upgrade submission (`system.upgrade`).
+(`mqtt.write`), Discord webhook upload (`discord.write`) and software upgrade
+submission (`system.upgrade`).
 Operational restart requires `system.restart`; an on-demand DNS lookup requires
 `diagnostics.run`, not `transactions.write` or `state.read`. These permissions
 do not grant configuration editing. Paired path-test start/cancel requires
@@ -744,6 +745,7 @@ Configuration changes additionally require permissions for every changed area:
 | Whole-appliance syslog/remote destinations | `syslog.write` |
 | Host plus managed-namespace native traffic accounting | `vnstat.write` |
 | MQTT streaming configuration | `mqtt.write` |
+| Discord alert configuration and private webhook upload | `discord.write` |
 | Host name and time zone (`system`) | `system.write` |
 | Sando URL and frontend-reported import state (`sando`) | `sando.write` |
 | Azure Dynamic DNS configuration and secret upload | `dynamic_dns.write` |
@@ -806,7 +808,7 @@ characters. Exact supported identifiers:
 | `dhcp-client:INTERFACE` | One configured DHCP client on an up interface |
 | `dhcp-gateway-monitors` | Shared DHCP-derived monitor manager; at least one enabled DHCP-mode monitor |
 | `link-diagnostics` | Native link diagnostic collector |
-| `mqtt`, `dynamic-dns`, `system` | Daemon-owned async manager runner; restarting an idle/disabled runner does not enable its configuration |
+| `mqtt`, `dynamic-dns`, `discord`, `system` | Daemon-owned async manager runner; restarting an idle/disabled runner does not enable its configuration |
 | `netcontrold` | Entire daemon, including HTTP/SSH; supervised native host-mode systemd/watchdog deployment only |
 
 Unknown/unconfigured targets return `404`; disabled native service targets return
@@ -5521,7 +5523,120 @@ and kernel-buffered records. Metadata remains sensitive: do not persist it in
 browser storage, analytics or config exports. Retention and capture errors never
 clear drafts or change policies.
 
-Frontend action: recognize the new permission and distinguish unsupported,
+#### Discord first-seen drop alerts
+
+Optional Discord notification settings are a nonnull top-level
+`discord:{enabled:boolean,webhook_ref:string}` object. Omission/default is
+`{"enabled":false,"webhook_ref":""}`. Enabled alerts require an existing private
+webhook reference. References are device-local 32-character lowercase hexadecimal
+strings; empty means unconfigured. Unknown fields, nulls and wrong types reject
+with `400`; invalid/missing references or enabling an unavailable backend reject
+with `422`. Changes, confirmation, rollback and revision restore require
+`transactions.write` and new **`discord.write`**, plus other changed-resource
+permissions. Use the existing full candidate and confirmed transaction workflow.
+No webhook URL/token is accepted inside networking configuration or exports.
+
+Create the reference with **`POST /api/v1/services/discord/webhooks`**, API key
+and `discord.write`, no query, using a JSON object containing only
+`webhook_url:string`. It must be a canonical
+`https://discord.com/api/webhooks/ID/TOKEN` URL, maximum 512 bytes, with a
+nonzero digit ID of at most 20 characters and a 16..256-character token made
+of ASCII letters/digits/underscore/hyphen. Other origins, HTTP, credentials,
+explicit ports, escaped path components, query strings and fragments are rejected.
+Do not echo the URL in UI validation messages or logs.
+
+Synthetic example only; the token is not an actual credential:
+
+```json
+{"webhook_url":"https://discord.com/api/webhooks/123456789012345678/synthetic_test_token_that_is_not_a_real_discord_credential"}
+```
+
+Success: **`201 {"webhook_ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`** (synthetic
+reference; use the actual returned reference). Authentication/permission failures
+`401`/`403`; wrong method `405`; invalid JSON/URL/query `400`; active transaction
+or upgrade `409`; unavailable manager, private storage failure or the
+256-webhook storage limit `503`. The URL is stored only in daemon-owned private
+storage with the existing credential-store safety checks. There is no URL read,
+delete, test-send or arbitrary webhook endpoint. Uploading does not enable alerts,
+send a message or create a configuration revision. Use HTTPS management or the
+protected local control path; a webhook URL is a secret bearer credential.
+
+**Identity is exactly `(source IP, destination IP, destination port, numeric IP
+protocol)`**. Source port, chain, reason, ingress/egress and ruleset are ignored.
+Absent destination port is distinct from numeric zero. One newly observed tuple
+produces one alert entry, not one entry per packet. The native logger maintains a
+private, durable SQLite first-seen index independent of the rotating drop table;
+seen tuples are never expired by time, rotation, disable/enable or restart.
+First observation while disabled still marks the tuple seen and is not backfilled
+after enabling. Enabling never sends retained history. On first feature startup,
+existing retained records seed the index without alerts; pre-feature records
+already rotated out cannot be reconstructed.
+
+The index stores exact identities (not probabilistic hashes) and queued first
+records. It grows with lifetime distinct tuples and outstanding alerts; there
+is no automatic eviction or clear endpoint. Preserve it with private state
+backups. Native storage/schema/corruption failures are explicit capture/worker
+errors, not permission to reset the index or repeatedly notify old tuples.
+The existing 100-record/second capture limit and kernel losses still apply:
+uncaptured packets cannot generate notifications. Normal rotating-history
+retention/counts do not include the separate lifetime index.
+
+Delivery uses committed settings, pauses during active configuration/upgrade
+work, and runs only in the native Linux host backend. Simulator mode reports
+simulated/disabled and never posts; unsupported mode cannot be enabled.
+Pending alerts survive normal restart; disabling clears pending delivery without
+forgetting identities. A queued record is claimed durably before HTTP delivery
+to prevent duplicate posts after uncertain results or crashes. Delivery is
+best-effort, **not exactly-once guaranteed**: transport failures, non-rate-limit
+HTTP failures, interrupted in-flight requests or configuration changes are not
+replayed for the same tuple. HTTP `429` alone permits up to three attempts,
+respecting the provider's bounded `retry_after` (0..86400 seconds); malformed or
+oversized rate-limit replies stop the worker explicitly. Retry waits and HTTP
+requests are cancelled promptly on shutdown or configuration changes. A message
+already accepted by Discord cannot be withdrawn by disabling or rollback.
+
+Messages batch at most ten first-seen entries, within Discord's 6000-character
+embed budget, with normal polling once per second. Each entry includes configured
+firewall hostname (or `Firewall`), source/destination and nullable ports, protocol,
+input/forward chain, drop reason, interfaces, drop ID, timestamp in UTC epoch
+milliseconds and IP packet length in bytes. No packet payload, credentials or
+webhook URL are included. `allowed_mentions.parse:[]` prevents notification text
+from pinging users/roles. HTTPS certificate verification, fixed provider
+validation, no redirects, 5-second connect/10-second total timeouts apply.
+No firewall permit, forwarding/NAT or unrelated packet behavior is changed.
+
+**`GET /api/v1/services/discord/status`** requires API key and `state.read`,
+no query/body, other methods `405`; authentication/permissions `401`/`403`,
+invalid query/body `400`, unavailable manager/status `503`. Response:
+
+```json
+{"enabled":false,"state":"disabled","delivered":"0","failed":"0","last_drop_id":null,"error":null,"counters_scope":"daemon_session","deduplication":["source","destination","destination_port","protocol"]}
+```
+
+`state` is `starting|disabled|simulated|unavailable|paused|ready|error|stopped`;
+`delivered`/`failed` are decimal-string **alert-entry** counts (not message or
+packet counts), retained through manager restarts within the daemon session.
+`last_drop_id` and `error` are nullable strings. No raw URL is returned.
+The `discord` manager participates in daemon health/task supervision and
+`POST /api/v1/processes/restart {"target":"discord"}` (`system.restart`,
+normal `202` scheduling); restarting does not enable it or reset seen identities.
+
+Frontend required work: add a global toggle and password-style webhook URL
+input, upload privately then save the returned reference in a full candidate,
+clear the raw URL from form state after success and never cache/log it.
+Render existing-reference/replace states without trying to fetch the secret.
+Recognize `discord.write` in credential controls. Explain permanent deduplication,
+no disabled/history backfill, third-party export of drop metadata and best-effort
+delivery. Poll status only as appropriate for the settings/status view; expose
+errors and entry counts without suggesting failed tuples will be re-sent.
+Deploy the accepting backend first, preserve the private webhook/index stores,
+and verify DNS/routes/outbound HTTPS to Discord from the firewall. No automatic
+port opening, external program or operator-provided signing key is required.
+Register both new routes in the API Explorer.
+
+#### Deny-log viewer requirements
+
+Frontend action: recognize `firewall.logs.read` and distinguish unsupported,
 unauthorized, healthy-empty, capture-error, rate-loss and retention-gap states.
 A dedicated **Deny log** viewer with refresh, filters and Load older is optional;
 if implemented, use this endpoint only while visible/on explicit request rather
@@ -6382,6 +6497,8 @@ Paths below are relative to `/api/v1`.
 | GET | `/services/softflowd` | Observed `SoftflowdConfig[]` |
 | GET | `/services/softflowd/status` | `{ "instances": SoftflowdStatus[], "error": string }` |
 | GET | `/services/dhcp-relay/status` | `{ "interfaces": DHCPRelayStatus[], "error": string }` |
+| POST | `/services/discord/webhooks` | Private `{webhook_url}` upload -> `201 {webhook_ref}`; `discord.write` |
+| GET | `/services/discord/status` | First-seen alert delivery state/counts, no secret; `state.read` |
 | GET | `/gateway-monitors` | Observed `GatewayMonitor[]` metadata |
 | GET | `/statistics/gateways` | `{sample, monitors: GatewayMonitorStatistics[]}` |
 | GET | `/statistics/gateways/{name}` | `{sample, monitor: GatewayMonitorStatistics}` |
@@ -6497,6 +6614,7 @@ interface Config {
   vnstat: VNStatConfig;
   mdns: MDNSConfig; // always serialized; see section 6.1.7
   system: SystemConfig; // see section 6.1.6
+  discord: DiscordConfig;
   dynamic_dns: DynamicDNSConfig[];
   interfaces: ManagedInterface[];
   dhcp_clients?: Record<string, DHCPClientConfig>;
@@ -6505,6 +6623,11 @@ interface Config {
   firewall: Firewall;
   softflowd: SoftflowdConfig[];
   gateway_monitors: GatewayMonitor[];
+}
+
+interface DiscordConfig {
+  enabled: boolean;
+  webhook_ref: string; // Device-local reference only; never the webhook URL.
 }
 
 interface SoftwareMetadata {
