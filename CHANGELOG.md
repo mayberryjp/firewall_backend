@@ -18,8 +18,8 @@
 - Firewall deny records expose nullable TCP flags/payload byte counts and
   independent FIN, RST, ACK-only, connection-attempt and IPv4 broadcast tags.
   Recognize limited and live kernel-reported directed broadcasts rather than
-  guessing `.255`. Return all drops within ordinary pagination/selection;
-  traffic-tag filtering is frontend-only, with no backend tag query parameters.
+  guessing `.255`. Retrieval now uses the server-side category flags documented
+  below, superseding the earlier frontend-only filtering decision.
   Discord embeds include flags/tags without changing permanent tuple identity,
   collection or firewall verdicts; separate Discord category switches govern
   notification eligibility.
@@ -27,7 +27,7 @@
   segment schema 2 requirement; next automatic calendar version.
   Required frontend badges/filter controls and deployment review:
   [handoff 2026-11-08-04](docs/frontend-handoffs/2026-11-08.md#2026-11-08-04-firewall-drop-traffic-tags)
-  and [frontend-only correction 2026-11-08-05](docs/frontend-handoffs/2026-11-08.md#2026-11-08-05-frontend-only-drop-tag-filtering).
+  and [server-side filtering 2026-11-09-04](docs/frontend-handoffs/2026-11-09.md#2026-11-09-04-server-side-drop-category-filtering).
 
 - Configurable global `firewall.drop_logging_enabled`, enabled by default for
   new installations and factory reset. Confirmed HTTP/SSH changes stop/restart
@@ -61,6 +61,16 @@
   [handoff 2026-11-08-01](docs/frontend-handoffs/2026-11-08.md#2026-11-08-01-conntrack-controls).
 
 ### Changed
+
+- Firewall deny retrieval accepts independent `include_broadcast` and
+  `include_tcp_closures` boolean query flags, both default false. Exclude IPv4
+  broadcast and TCP FIN/RST/known empty ACK-only drops unless requested; apply
+  saved-tag selection before pagination, requiring both flags for overlapping
+  records. Capture, retention and Discord notification policy remain unchanged.
+  Release impact: breaking retrieval-default change with additive queries;
+  next automatic calendar version. Required frontend query controls and
+  selection/cursor reset:
+  [handoff 2026-11-09-04](docs/frontend-handoffs/2026-11-09.md#2026-11-09-04-server-side-drop-category-filtering).
 
 - Discord drop alerts append only current-source Sando `local_description`
   labels to exact-IP matching source/destination endpoints. Missing descriptions

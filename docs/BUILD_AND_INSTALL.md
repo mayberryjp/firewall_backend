@@ -118,8 +118,10 @@ in-process rtnetlink in the collector's namespace, initially and once per worker
 window. Prefixes /31 and /32 do not produce directed-broadcast tags.
 Read-only snapshots have a two-second timeout; snapshot failure stops capture
 and exposes an error, requiring operator repair/restart. No additional external
-program or permission is introduced. Traffic-tag filtering is frontend-only;
-the backend returns tagged drops without tag-based exclusions.
+program or permission is introduced. Retrieval filters saved traffic tags
+server-side: broadcast and TCP FIN/RST/known empty ACK-only drops are excluded
+unless requested with `include_broadcast=true` and/or
+`include_tcp_closures=true`. This changes neither stored history nor collection.
 
 At most 100 records per one-second worker window are persisted. Socket pressure,
 rate discards and malformed records are visible in the retrieval response; lost

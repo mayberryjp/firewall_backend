@@ -5515,7 +5515,13 @@ It takes no body; other methods return `405`. Query parameters:
 | `address` | optional string | Canonical IPv4/IPv6 literal, matches source OR destination |
 | `protocol` | optional decimal integer | IP protocol number 0..255; e.g. TCP 6, UDP 17, ICMP 1, ICMPv6 58 |
 | `chain` | optional string | Exactly `input` or `forward` |
+| `include_broadcast` | boolean string, `false` | Exactly `true` or `false`; include records tagged `ipv4_broadcast` when true |
+| `include_tcp_closures` | boolean string, `false` | Exactly `true` or `false`; include records tagged `tcp_finish`, `tcp_reset` or `tcp_ack_only` when true |
 
+Both categories are excluded when their flags are omitted or false. True includes
+that category alongside other matching drops; it is not a category-only selector.
+Records tagged with both categories require both flags true. Filtering uses saved
+tags before page limits/cursor selection, not current interface reclassification.
 Filters combine with AND. Query maximum 4096 bytes; unknown/duplicate parameters,
 noncanonical numbers (including leading zeros/signs), invalid IPs/ranges and
 bodies return `400`. Authentication/permission errors are `401`/`403`.
@@ -5606,23 +5612,24 @@ No inference is made for remote/unknown subnet broadcasts. For example,
 `10.4.30.127` can be broadcast on a `/25`. `/31` and `/32` do not add directed
 broadcasts. Empty tags mean no recognized observation, not verified unicast/safety.
 
-Add opt-in **Hide TCP FIN/RST drops** and **Hide IPv4 broadcast drops** controls,
-initially off, filtering locally by each record's `tags` array. The backend
-returns all retained drops within normal pagination and existing
-address/protocol/time/chain selection, regardless of traffic tags.
+Add initially-off **Include TCP FIN/RST/ACK-only drops** and
+**Include IPv4 broadcast drops** controls mapped to `include_tcp_closures` and
+`include_broadcast`. Filtering is server-side. For all categories request, for
+example, `GET /api/v1/firewall/deny-log?limit=100&include_broadcast=true&include_tcp_closures=true`.
 `tag` and `exclude_tags` are unsupported query parameters and return `400`.
-Keep the fetched records in memory and toggle visibility without discarding them
-or resetting the backend cursor. Page using the original `next_before_id`, never
-the last visible record's ID. A page with no locally visible rows is not the end
-of history: keep Load more available while the backend cursor is nonnull.
-Distinguish no visible matches in loaded pages from exhausted retained history;
-if loading more pages to fill the view, stop on a null cursor or user cancellation.
-Existing backend filters still combine with AND and require resetting pagination
-when their selection changes.
-Do not automatically exclude ACK-only or call FIN/RST traffic harmless/confirmed
-closing. Render readable flag names plus raw bits and independent tag badges.
+Reset loaded pages and the cursor when either category flag or another backend
+filter changes; refetch from the newest page and retain the same selection on
+every subsequent page. Discard late responses from an older selection rather
+than mixing them with the new results. Use the original `next_before_id`, not a
+locally computed cursor. A null cursor means no older retained matching record.
+Retained boundary IDs remain global and may identify excluded records.
+Describe empty results as no retained matching drops, not no captured traffic.
+Unknown TCP flags and ACK packets with unknown/nonzero payload are not excluded
+as ACK-only; only the saved `tcp_ack_only` tag qualifies.
+Do not call FIN/RST/ACK-only traffic harmless or confirmed closing. Render
+readable flag names plus raw bits and independent tag badges.
 Filtering does not stop capture, change verdicts, erase records, or suppress
-Discord notifications.
+Discord notifications. These request flags are independent of Discord settings.
 
 Deployment contract: private deny-log segments now require **schema 2**, including
 required tags and current traffic metadata. Unsupported segments are rejected

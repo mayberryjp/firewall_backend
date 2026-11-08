@@ -271,9 +271,11 @@ backend audit logs and syslog. Retrieve retained metadata on demand with
 `firewall.logs.read`. Filter by address, numeric IP protocol, chain and Unix
 millisecond time range; page newest-first using `next_before_id`.
 Records include nullable TCP flags/payload byte counts and independent traffic
-tags. All retained drops are returned within normal pagination and existing
-address/protocol/time/chain selection; traffic tags never exclude backend records.
-The frontend can hide FIN/RST or broadcast drops locally using each record's tags.
+tags. Retrieval excludes IPv4 broadcast and TCP FIN/RST/known empty ACK-only drops
+by default. Request `include_broadcast=true` and/or `include_tcp_closures=true`
+to include those categories; overlapping records require both flags. Filters apply
+server-side before pagination and combine with address/protocol/time/chain selection.
+Use both flags to retrieve all categories; keep flags unchanged while paging.
 No `tag` or `exclude_tags` query parameters are supported.
 Broadcast detection uses limited broadcast
 `255.255.255.255` and live kernel-reported subnet broadcasts, not a `.255` guess.

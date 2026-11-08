@@ -1024,7 +1024,9 @@ mod tests {
             state.store.append(&pending)?;
             assert_eq!(pending[0].tags, [DenyTrafficTag::Ipv4Broadcast]);
             ensure!(
-                state.store.query(&DenyLogQuery::parse("limit=500")?)["records"]
+                state.store.query(&DenyLogQuery::parse(
+                    "limit=500&include_broadcast=true&include_tcp_closures=true"
+                )?)["records"]
                     .as_array()
                     .unwrap()
                     .len()
@@ -1202,7 +1204,8 @@ mod tests {
                 "accept behavior changed"
             );
             thread::sleep(Duration::from_millis(1100));
-            let query = DenyLogQuery::parse("limit=500")?;
+            let query =
+                DenyLogQuery::parse("limit=500&include_broadcast=true&include_tcp_closures=true")?;
             ensure!(
                 monitor.snapshot(&query)?["records"] == json!([]),
                 "accepted packets logged as denied"

@@ -68,6 +68,23 @@ pub struct DenyRecord {
 }
 
 impl DenyRecord {
+    pub fn matches_traffic_categories(
+        &self,
+        include_broadcast: bool,
+        include_tcp_closures: bool,
+    ) -> bool {
+        (include_broadcast || !self.tags.contains(&DenyTrafficTag::Ipv4Broadcast))
+            && (include_tcp_closures
+                || !self.tags.iter().any(|tag| {
+                    matches!(
+                        tag,
+                        DenyTrafficTag::TcpFinish
+                            | DenyTrafficTag::TcpReset
+                            | DenyTrafficTag::TcpAckOnly
+                    )
+                }))
+    }
+
     pub fn validate_traffic(&self) -> Result<()> {
         let tcp_tags = DenyTrafficTag::tcp(self.tcp_flags, self.tcp_payload_length);
         let broadcast = self.tags.contains(&DenyTrafficTag::Ipv4Broadcast);
@@ -99,6 +116,8 @@ struct Parameters {
     address: Option<String>,
     protocol: Option<String>,
     chain: Option<String>,
+    include_broadcast: Option<String>,
+    include_tcp_closures: Option<String>,
 }
 
 #[derive(Debug)]
@@ -110,6 +129,8 @@ pub struct DenyLogQuery {
     pub address: Option<IpAddr>,
     pub protocol: Option<u8>,
     pub chain: Option<String>,
+    pub include_broadcast: bool,
+    pub include_tcp_closures: bool,
 }
 
 fn number(value: &str, maximum: u64) -> Result<u64> {
@@ -184,6 +205,18 @@ impl DenyLogQuery {
             address,
             protocol,
             chain: fields.chain,
+            include_broadcast: fields
+                .include_broadcast
+                .as_deref()
+                .map(str::parse::<bool>)
+                .transpose()?
+                .unwrap_or(false),
+            include_tcp_closures: fields
+                .include_tcp_closures
+                .as_deref()
+                .map(str::parse::<bool>)
+                .transpose()?
+                .unwrap_or(false),
         })
     }
 
@@ -195,6 +228,7 @@ impl DenyLogQuery {
                 .is_none_or(|v| record.source == v || record.destination == v)
             && self.protocol.is_none_or(|v| record.protocol == v)
             && self.chain.as_ref().is_none_or(|v| &record.chain == v)
+            && record.matches_traffic_categories(self.include_broadcast, self.include_tcp_closures)
     }
 }
 
@@ -205,6 +239,18 @@ mod tests {
     #[test]
     fn deny_log_query_is_bounded_and_strict() {
         assert_eq!(DenyLogQuery::parse("").unwrap().limit, 100);
+        let defaults = DenyLogQuery::parse("").unwrap();
+        assert!(!defaults.include_broadcast && !defaults.include_tcp_closures);
+        for include_broadcast in [false, true] {
+            for include_tcp_closures in [false, true] {
+                let query = DenyLogQuery::parse(&format!(
+                    "include_broadcast={include_broadcast}&include_tcp_closures={include_tcp_closures}"
+                ))
+                .unwrap();
+                assert_eq!(query.include_broadcast, include_broadcast);
+                assert_eq!(query.include_tcp_closures, include_tcp_closures);
+            }
+        }
         let query = DenyLogQuery::parse("limit=500&before_id=18446744073709551615&since_ms=0&until_ms=1&address=2001%3Adb8%3A%3A1&protocol=17&chain=forward").unwrap();
         assert_eq!(query.before_id, Some(u64::MAX));
         for bad in [
@@ -232,10 +278,75 @@ mod tests {
             "exclude_tags=tcp_reset,unknown",
             "exclude_tags=tcp_reset,%20tcp_finish",
             "exclude_tags=tcp_reset&exclude_tags=tcp_finish",
+            "include_broadcast=",
+            "include_broadcast=1",
+            "include_broadcast=True",
+            "include_broadcast=false&include_broadcast=true",
+            "include_tcp_closures=",
+            "include_tcp_closures=0",
+            "include_tcp_closures=FALSE",
+            "include_tcp_closures=%20true",
+            "include_tcp_closures=true&include_tcp_closures=true",
         ] {
             assert!(DenyLogQuery::parse(bad).is_err(), "{bad}");
         }
         assert!(DenyLogQuery::parse(&"a".repeat(4097)).is_err());
+    }
+
+    #[test]
+    fn deny_log_category_filters_combine_with_existing_selection() {
+        let base: DenyRecord = serde_json::from_value(serde_json::json!({
+            "id":"1","timestamp_ms":10,"chain":"forward","reason":"rule","compiled_rule_index":0,
+            "ruleset_id":"a".repeat(64),"source":"192.0.2.1","destination":"198.51.100.1",
+            "protocol":6,"source_port":1234,"destination_port":443,
+            "ingress_index":null,"egress_index":null,"ingress":null,"egress":null,"packet_length":40,
+            "tcp_flags":16,"tcp_payload_length":0,"tags":["tcp_ack_only"]
+        }))
+        .unwrap();
+        for include_broadcast in [false, true] {
+            for include_tcp_closures in [false, true] {
+                let query = DenyLogQuery::parse(&format!(
+                    "include_broadcast={include_broadcast}&include_tcp_closures={include_tcp_closures}&protocol=6&chain=forward&address=192.0.2.1&since_ms=10&until_ms=10"
+                ))
+                .unwrap();
+                for flags in [0x11, 0x14, 0x15, 0x10, 0x02, 0x18] {
+                    for broadcast in [false, true] {
+                        let mut record = base.clone();
+                        record.tcp_flags = Some(flags);
+                        record.tags = DenyTrafficTag::tcp(Some(flags), Some(0));
+                        if broadcast {
+                            record.destination = "255.255.255.255".parse().unwrap();
+                            record.tags.push(DenyTrafficTag::Ipv4Broadcast);
+                        }
+                        record.validate_traffic().unwrap();
+                        assert_eq!(
+                            query.matches(&record),
+                            (!broadcast || include_broadcast)
+                                && (!matches!(flags, 0x11 | 0x14 | 0x15 | 0x10)
+                                    || include_tcp_closures)
+                        );
+                    }
+                }
+                for (flags, payload) in [(Some(0x10), None), (Some(0x10), Some(1)), (None, None)] {
+                    let mut record = base.clone();
+                    record.tcp_flags = flags;
+                    record.tcp_payload_length = payload;
+                    record.tags = DenyTrafficTag::tcp(flags, payload);
+                    assert!(query.matches(&record));
+                    record.timestamp_ms = 11;
+                    assert!(!query.matches(&record));
+                    record.timestamp_ms = 10;
+                    record.chain = "input".into();
+                    assert!(!query.matches(&record));
+                    record.chain = "forward".into();
+                    record.source = "192.0.2.2".parse().unwrap();
+                    assert!(!query.matches(&record));
+                    record.source = base.source;
+                    record.protocol = 17;
+                    assert!(!query.matches(&record));
+                }
+            }
+        }
     }
 
     #[test]

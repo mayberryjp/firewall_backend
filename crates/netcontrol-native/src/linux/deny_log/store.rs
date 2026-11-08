@@ -394,7 +394,9 @@ mod tests {
                         .collect();
                     assert_eq!(notified, expected);
                     assert_eq!(
-                        store.query(&DenyLogQuery::parse("limit=100")?)["records"]
+                        store.query(&DenyLogQuery::parse(
+                            "limit=100&include_broadcast=true&include_tcp_closures=true"
+                        )?)["records"]
                             .as_array()
                             .unwrap()
                             .len(),
@@ -615,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn deny_log_returns_all_tags_across_pages_and_preserves_discord_identity() -> Result<()> {
+    fn deny_log_filters_categories_before_paging_and_preserves_discord_identity() -> Result<()> {
         use netcontrol_core::DenyTrafficTag::*;
         let root = std::env::temp_dir().join(format!(
             "deny-tags-{}-{}",
@@ -653,7 +655,9 @@ mod tests {
             assert_eq!(store.first_drops(&alerts(true))?.len(), 3);
             drop(store);
             let mut store = Store::open(root.clone())?;
-            let page = store.query(&DenyLogQuery::parse("limit=2")?);
+            let page = store.query(&DenyLogQuery::parse(
+                "limit=2&include_broadcast=true&include_tcp_closures=true",
+            )?);
             assert_eq!(page["records"][0]["id"], "7");
             assert_eq!(page["records"][0]["tags"], json!(["ipv4_broadcast"]));
             assert_eq!(page["records"][1]["id"], "6");
@@ -663,7 +667,9 @@ mod tests {
             assert_eq!(page["next_before_id"], "6");
             assert_eq!(page["oldest_id"], "1");
             assert_eq!(page["newest_id"], "7");
-            let page = store.query(&DenyLogQuery::parse("limit=2&before_id=6")?);
+            let page = store.query(&DenyLogQuery::parse(
+                "limit=2&before_id=6&include_broadcast=true&include_tcp_closures=true",
+            )?);
             assert_eq!(page["records"][0]["id"], "5");
             assert_eq!(
                 page["records"][0]["tags"],
@@ -672,7 +678,9 @@ mod tests {
             assert_eq!(page["records"][1]["id"], "4");
             assert_eq!(page["records"][1]["tags"], json!(["tcp_ack_only"]));
             assert_eq!(page["next_before_id"], "4");
-            let page = store.query(&DenyLogQuery::parse("limit=3&before_id=4")?);
+            let page = store.query(&DenyLogQuery::parse(
+                "limit=3&before_id=4&include_broadcast=true&include_tcp_closures=true",
+            )?);
             assert_eq!(
                 page["records"]
                     .as_array()
@@ -684,24 +692,75 @@ mod tests {
             );
             assert_eq!(page["next_before_id"], Value::Null);
             assert_eq!(
-                store.query(&DenyLogQuery::parse("")?)["records"]
+                store.query(&DenyLogQuery::parse(
+                    "include_broadcast=true&include_tcp_closures=true"
+                )?)["records"]
                     .as_array()
                     .unwrap()
                     .len(),
                 7
             );
             store.append(&[record()])?;
-            let page = store.query(&DenyLogQuery::parse("limit=1")?);
+            let page = store.query(&DenyLogQuery::parse(
+                "limit=1&include_broadcast=true&include_tcp_closures=true",
+            )?);
             assert_eq!(page["records"][0]["id"], "8");
             assert_eq!(page["records"][0]["tags"], json!([]));
             assert_eq!(page["next_before_id"], "8");
             assert_eq!(
-                store.query(&DenyLogQuery::parse("")?)["records"]
+                store.query(&DenyLogQuery::parse(
+                    "include_broadcast=true&include_tcp_closures=true"
+                )?)["records"]
                     .as_array()
                     .unwrap()
                     .len(),
                 8
             );
+            for (query, expected) in [
+                ("", vec!["8"]),
+                (
+                    "include_broadcast=false&include_tcp_closures=false",
+                    vec!["8"],
+                ),
+                ("include_broadcast=true", vec!["8", "7", "3"]),
+                ("include_tcp_closures=true", vec!["8", "6", "4", "2", "1"]),
+                (
+                    "include_broadcast=true&include_tcp_closures=true",
+                    vec!["8", "7", "6", "5", "4", "3", "2", "1"],
+                ),
+            ] {
+                let page = store.query(&DenyLogQuery::parse(query)?);
+                assert_eq!(
+                    page["records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|record| record["id"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(page["next_before_id"], Value::Null);
+                assert_eq!(page["oldest_id"], "1");
+                assert_eq!(page["newest_id"], "8");
+            }
+            assert!(store.first_drops(&alerts(false))?.is_empty());
+            let mut hidden = record();
+            hidden.protocol = 6;
+            hidden.packet_length = 40;
+            hidden.tcp_flags = Some(0x10);
+            hidden.tcp_payload_length = Some(0);
+            hidden.tags = vec![TcpAckOnly];
+            store.append(&[hidden.clone(), record(), hidden, record()])?;
+            for (query, id, next) in [
+                ("limit=1", "12", json!("12")),
+                ("limit=1&before_id=12", "10", json!("10")),
+                ("limit=1&before_id=10", "8", Value::Null),
+            ] {
+                let page = store.query(&DenyLogQuery::parse(query)?);
+                assert_eq!(page["records"].as_array().unwrap().len(), 1);
+                assert_eq!(page["records"][0]["id"], id);
+                assert_eq!(page["next_before_id"], next);
+            }
             let mut invalid = record();
             invalid.tags = vec![Ipv4Broadcast, Ipv4Broadcast];
             assert!(validate(&invalid).is_err());

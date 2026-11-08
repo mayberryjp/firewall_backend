@@ -90,6 +90,30 @@ fn deny_log_retrieval_is_separate_authorized_validated_and_read_only() {
             "logger",
             vec!["firewall.logs.read".into()],
             "GET",
+            "include_broadcast=true&include_tcp_closures=true",
+            "",
+            200,
+        ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
+            "include_broadcast=false&include_tcp_closures=false",
+            "",
+            200,
+        ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
+            "include_tcp_closures=1",
+            "",
+            400,
+        ),
+        (
+            "logger",
+            vec!["firewall.logs.read".into()],
+            "GET",
             "tag=ipv4_broadcast&exclude_tags=tcp_finish,tcp_reset",
             "",
             400,
@@ -116,7 +140,7 @@ fn deny_log_retrieval_is_separate_authorized_validated_and_read_only() {
             assert_eq!(reply.body, expected);
         }
     }
-    assert_eq!(faults.lock().unwrap().deny_log_calls, 1);
+    assert_eq!(faults.lock().unwrap().deny_log_calls, 3);
     assert_eq!(fs::read(fixture.path()).unwrap(), bytes);
     faults.lock().unwrap().deny_log_response = None;
     assert_eq!(

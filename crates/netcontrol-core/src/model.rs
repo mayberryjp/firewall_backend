@@ -99,18 +99,8 @@ pub struct DiscordConfig {
 
 impl DiscordConfig {
     pub fn should_notify_drop(&self, record: &crate::DenyRecord) -> bool {
-        use crate::DenyTrafficTag;
         self.enabled
-            && (self.notify_broadcast || !record.tags.contains(&DenyTrafficTag::Ipv4Broadcast))
-            && (self.notify_tcp_closures
-                || !record.tags.iter().any(|tag| {
-                    matches!(
-                        tag,
-                        DenyTrafficTag::TcpFinish
-                            | DenyTrafficTag::TcpReset
-                            | DenyTrafficTag::TcpAckOnly
-                    )
-                }))
+            && record.matches_traffic_categories(self.notify_broadcast, self.notify_tcp_closures)
     }
 
     pub fn validate(&self) -> Result<()> {
