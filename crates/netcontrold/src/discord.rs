@@ -132,6 +132,18 @@ struct Status {
     error: Option<String>,
 }
 
+impl Status {
+    fn delivery_failed(&mut self, error: String) {
+        self.state = "ready";
+        self.error = Some(error);
+    }
+
+    fn delivery_succeeded(&mut self) {
+        self.state = "ready";
+        self.error = None;
+    }
+}
+
 pub struct Manager {
     secrets: Mutex<Secrets>,
     engine: Arc<Mutex<Engine>>,
@@ -291,8 +303,6 @@ impl Manager {
                     "simulated"
                 } else if self.mode == Mode::Unsupported {
                     "unavailable"
-                } else if status.error.is_some() {
-                    "error"
                 } else {
                     "ready"
                 };
@@ -352,17 +362,15 @@ impl Manager {
                         .checked_add(count)
                         .context("Discord failure counter exhausted")?;
                     status.failed = failed.to_string();
-                    status.state = "error";
                     tracing::warn!(%error, "first-seen firewall drops could not be delivered to Discord");
-                    status.error = Some(error);
+                    status.delivery_failed(error);
                     break;
                 } else {
                     delivered = delivered
                         .checked_add(count)
                         .context("Discord delivery counter exhausted")?;
                     status.delivered = delivered.to_string();
-                    status.state = "ready";
-                    status.error = None;
+                    status.delivery_succeeded();
                 }
             }
         }
@@ -432,19 +440,14 @@ async fn deliver(
         match response.status().as_u16() {
             200 | 204 => return Ok(Outcome::Delivered),
             429 => {
-                let mut bytes = Vec::new();
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|error| error.without_url())?
-                {
-                    ensure!(
-                        bytes.len() + chunk.len() <= 4096,
-                        "oversized Discord rate-limit response"
-                    );
-                    bytes.extend_from_slice(&chunk);
-                }
-                let delay = retry_delay(&bytes)?;
+                let delay = match rate_limit_delay(&mut response).await {
+                    Ok(delay) => delay,
+                    Err(error) => {
+                        return Ok(Outcome::Failed(format!(
+                            "Discord rate-limit response failed: {error:#}"
+                        )));
+                    }
+                };
                 tracing::warn!(
                     retry_after_seconds = delay.as_secs_f64(),
                     "Discord rate limited first-seen drop notifications"
@@ -467,6 +470,22 @@ async fn deliver(
         }
     }
     unreachable!("bounded Discord delivery loop returns")
+}
+
+async fn rate_limit_delay(response: &mut reqwest::Response) -> Result<Duration> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| error.without_url())?
+    {
+        ensure!(
+            bytes.len() + chunk.len() <= 4096,
+            "oversized Discord rate-limit response"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    retry_delay(&bytes)
 }
 
 fn retry_delay(bytes: &[u8]) -> Result<Duration> {
@@ -575,6 +594,29 @@ fn messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discord_delivery_failure_reports_warning_without_stopping_the_worker() {
+        let mut status = Status::default();
+        status.delivery_failed("synthetic delivery error".into());
+        let monitor = crate::health::Monitor::default();
+        monitor.observe(
+            Some(&json!({})),
+            &[("discord", serde_json::to_value(&status).unwrap())],
+            false,
+        );
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot["process_health"]["status"], "healthy");
+        assert_eq!(snapshot["process_health"]["components"][0]["healthy"], true);
+        assert_eq!(snapshot["active_alerts"][0]["code"], "service_warning");
+        status.delivery_succeeded();
+        monitor.observe(
+            Some(&json!({})),
+            &[("discord", serde_json::to_value(&status).unwrap())],
+            false,
+        );
+        assert_eq!(monitor.snapshot()["active_alerts"], json!([]));
+    }
 
     fn webhook() -> String {
         format!(
@@ -935,6 +977,30 @@ mod tests {
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0], payload);
         assert_eq!(captured[1], payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_rate_limit_is_a_delivery_failure_not_a_worker_failure() -> Result<()> {
+        use axum::{Router, http::StatusCode, routing::post};
+        let service = Router::new().route(
+            "/webhook",
+            post(|| async { (StatusCode::TOO_MANY_REQUESTS, "invalid response") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/webhook", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, service).await });
+        let (_stop, receiver) = watch::channel(false);
+        let outcome = deliver(&Client::new(), &url, &json!({}), receiver).await?;
+        server.abort();
+        let _ = server.await;
+        match outcome {
+            Outcome::Failed(error) => {
+                assert!(error.contains("invalid Discord rate-limit response"));
+                assert!(!error.contains(&url));
+            }
+            _ => panic!("expected a delivery failure"),
+        }
         Ok(())
     }
 

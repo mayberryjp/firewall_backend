@@ -50,13 +50,14 @@ impl Monitor {
                 .unwrap_or("unknown");
             let healthy = match state {
                 "running" | "current" => Some(true),
-                "ready" if component == "discord" => Some(true),
+                "ready" | "paused" if component == "discord" => Some(true),
                 "error" | "stopped" | "unavailable" | "reconnecting" => Some(false),
                 _ => None,
             };
-            let retrying = row["retrying"]
-                .as_bool()
-                .unwrap_or(matches!(state, "reconnecting" | "connecting"));
+            let retrying = row["retrying"].as_bool().unwrap_or(
+                matches!(state, "reconnecting" | "connecting")
+                    || (component == "dynamic_dns" && state == "error"),
+            );
             components.push(json!({"id":id,"component":component,"resource":resource,"state":state,"healthy":healthy,"retrying":retrying,"collected_at":timestamp}));
             let failed = healthy == Some(false);
             let inactive = matches!(state, "disabled" | "simulated");
@@ -183,7 +184,12 @@ impl Monitor {
                 }
             }
             components.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
-            let unhealthy = components.iter().any(|row| row["healthy"] == false);
+            let unhealthy = components
+                .iter()
+                .any(|row| row["healthy"] == false && row["retrying"] != true);
+            let degraded = components
+                .iter()
+                .any(|row| row["healthy"] == false && row["retrying"] == true);
             let unknown = components.iter().any(|row| {
                 row["healthy"].is_null()
                     && !matches!(
@@ -191,14 +197,21 @@ impl Monitor {
                         Some("disabled" | "simulated" | "waiting" | "unmanaged")
                     )
             });
-            let healthy = if runtime.is_none() {
-                None
+            let status = if runtime.is_none() {
+                "unknown"
             } else if unhealthy {
-                Some(false)
-            } else if !unknown {
-                Some(true)
+                "unhealthy"
+            } else if unknown {
+                "unknown"
+            } else if degraded {
+                "degraded"
             } else {
-                None
+                "healthy"
+            };
+            let healthy = match status {
+                "healthy" => Some(true),
+                "unhealthy" => Some(false),
+                _ => None,
             };
             let previous: BTreeMap<_, _> = snapshot.value["active_alerts"]
                 .as_array()
@@ -216,7 +229,7 @@ impl Monitor {
                 }
             }
             snapshot.value = json!({"active_alerts":alerts.into_values().collect::<Vec<_>>(),
-                "process_health":{"status":match healthy {Some(true)=>"healthy",Some(false)=>"unhealthy",None=>"unknown"},"healthy":healthy,"collected_at":timestamp,"runtime_available":runtime.is_some(),"components":components,
+                "process_health":{"status":status,"healthy":healthy,"collected_at":timestamp,"runtime_available":runtime.is_some(),"components":components,
                 "daemon":{"pid":std::process::id(),"state":"running","healthy":true,"uptime_seconds":self.started.elapsed().as_secs(),"watchdog_enabled":watchdog}}});
             snapshot.sampled = Some(Instant::now());
             snapshot.stale_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(15))
@@ -313,6 +326,50 @@ mod tests {
     }
 
     #[test]
+    fn retrying_failures_are_degraded_without_hiding_permanent_failures_or_unknowns() {
+        let monitor = super::Monitor::default();
+        let runtime = serde_json::json!({"appliance_services":[
+            {"name":"ntp","state":"error","retrying":true}
+        ]});
+        let dns = [(
+            "dynamic_dns",
+            serde_json::json!({"entries":[
+                {"name":"example","state":"error","error":"provider unavailable"}
+            ]}),
+        )];
+        monitor.observe(Some(&runtime), &dns, false);
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot["process_health"]["status"], "degraded");
+        assert!(snapshot["process_health"]["healthy"].is_null());
+        assert_eq!(snapshot["active_alerts"].as_array().unwrap().len(), 2);
+        assert!(
+            snapshot["active_alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["retrying"] == true)
+        );
+
+        monitor.observe(
+            Some(&runtime),
+            &[("system", serde_json::json!({"state":"error"}))],
+            false,
+        );
+        assert_eq!(monitor.snapshot()["process_health"]["status"], "unhealthy");
+        monitor.observe(
+            Some(&runtime),
+            &[("other", serde_json::json!({"state":"starting"}))],
+            false,
+        );
+        assert_eq!(monitor.snapshot()["process_health"]["status"], "unknown");
+        monitor.observe(None, &dns, false);
+        assert_eq!(monitor.snapshot()["process_health"]["status"], "unknown");
+        monitor.observe(Some(&serde_json::json!({})), &[], false);
+        assert_eq!(monitor.snapshot()["process_health"]["status"], "healthy");
+        assert_eq!(monitor.snapshot()["active_alerts"], serde_json::json!([]));
+    }
+
+    #[test]
     fn udp_relay_unknown_receive_loss_is_not_a_service_failure() {
         let monitor = super::Monitor::default();
         let mut row = serde_json::json!({
@@ -347,7 +404,7 @@ mod tests {
             false,
         );
         let snapshot = monitor.snapshot();
-        assert_eq!(snapshot["process_health"]["status"], "unhealthy");
+        assert_eq!(snapshot["process_health"]["status"], "degraded");
         assert_eq!(snapshot["active_alerts"][0]["code"], "worker_unavailable");
         assert_eq!(snapshot["active_alerts"][0]["retrying"], true);
     }
@@ -444,7 +501,7 @@ mod tests {
         runtime["appliance_services"][0] = json!({"name":"ntp","state":"error","retrying":true});
         monitor.observe(Some(&runtime), &[], true);
         let failed = monitor.snapshot();
-        assert_eq!(failed["process_health"]["status"], "unhealthy");
+        assert_eq!(failed["process_health"]["status"], "degraded");
         assert_eq!(failed["active_alerts"][0]["retrying"], true);
         monitor.observe(None, &[], true);
         let unavailable = monitor.snapshot();

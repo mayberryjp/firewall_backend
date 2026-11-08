@@ -2925,12 +2925,21 @@ successful configuration reads. Service reconcile responses need not contain
 the daemon-enriched fields; the GET responses above do.
 
 The monitor samples approximately every two seconds after completed engine
-deadline ticks. `process_health.status` is `healthy`, `unhealthy` or `unknown`;
-`healthy` is respectively `true`, `false` or `null`. Known component states
+deadline ticks. `process_health.status` is `healthy`, `degraded`, `unhealthy`
+or `unknown`; `healthy` is respectively `true`, `null`, `false` or `null`.
+Use `status` to distinguish a known degraded condition from unknown health.
+Known component states
 `running`/`current` are healthy, `error`/`stopped`/`unavailable`/`reconnecting`
-are unhealthy. Discord's `ready` state is also healthy: the notification worker
-is operational, not proof that any particular webhook delivery succeeded.
-The `ready` classification is specific to Discord, not other components.
+are unhealthy at the component level. Discord's `ready` and `paused` states are
+also healthy: the notification worker is operational, not proof that any
+particular webhook delivery succeeded. These classifications are specific to
+Discord, not other components. A failed component with `retrying:true` produces
+aggregate `degraded`, rather than `unhealthy`, unless another non-retrying
+component has failed. Dynamic DNS update failures are retrying because the
+running manager schedules the next update; a stopped manager is reported
+separately. Unknown component states take precedence over degraded; a failed
+non-retrying component takes precedence over both. Missing native runtime or a
+stale sample still makes the aggregate unknown.
 Disabled/simulated/waiting/unmanaged components are not failures;
 other unmeasured states make the aggregate unknown. Missing native runtime
 makes the aggregate unknown and preserves previously observed native failures
@@ -3319,7 +3328,7 @@ Publisher and deployment contract:
     Existing host/NetFlow caps and the overall payload/entity limits also apply.
 - The complete MQTT state payload carries the exact shared `process_health` object
   and `active_alerts` array. Home Assistant sensor metrics/discovery add
-  `process_health` (`healthy|unhealthy|unknown`) and numeric `active_alert_count`.
+  `process_health` (`healthy|degraded|unhealthy|unknown`) and numeric `active_alert_count`.
   Alerts do not change MQTT transport availability: a connected publisher can
   publish unhealthy or unknown platform state. Broker disconnection still uses
   the existing offline last will; it cannot deliver alerts while disconnected.
@@ -5822,6 +5831,12 @@ invalid query/body `400`, unavailable manager/status `503`. Response:
 `delivered`/`failed` are decimal-string **alert-entry** counts (not message or
 packet counts), retained through manager restarts within the daemon session.
 `last_drop_id` and `error` are nullable strings. No raw URL is returned.
+Delivery failures leave the active worker `ready` with a nonnull `error`, a
+failure count and a `service_warning` health alert; a later successful delivery
+clears the error. A failed delivery is not proof that the worker stopped and is
+not replayed. A malformed or unreadable rate-limit response is a delivery
+failure, not a reason to stop the worker. `error` state still indicates a
+stopped worker that requires the separately reported manager recovery.
 The three notification booleans report the manager's current policy; worker
 updates normally occur on its one-second tick. Read saved configuration for
 authoritative committed settings and do not overwrite a pending draft from status.
@@ -7237,7 +7252,7 @@ interface ActiveAlert {
   last_seen_at: Timestamp | null;
 }
 interface ProcessHealth {
-  status: "healthy" | "unhealthy" | "unknown";
+  status: "healthy" | "degraded" | "unhealthy" | "unknown";
   healthy: boolean | null;
   collected_at: Timestamp | null;
   stale: boolean;

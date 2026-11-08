@@ -1847,7 +1847,7 @@ mod tests {
             state["active_alerts"],
             manager.health.snapshot()["active_alerts"]
         );
-        assert_eq!(state["metrics"]["process_health"], "unhealthy");
+        assert_eq!(state["metrics"]["process_health"], "degraded");
         assert_eq!(state["metrics"]["active_alert_count"], 1);
         assert_eq!(
             discovery["components"]["process_health"]["platform"],
@@ -2626,7 +2626,7 @@ mod tests {
                         }
                         if topic.ends_with("/availability") && payload == b"online" {
                             ensure!(sample["metrics"]["revision"] == serde_json::json!(test_revision(1)), "unconfirmed or wrong revision published");
-                            ensure!(sample["process_health"]["status"] == "unhealthy" && sample["active_alerts"][0]["retrying"] == true, "health/alerts were not published");
+                            ensure!(sample["process_health"]["status"] == "degraded" && sample["active_alerts"][0]["retrying"] == true, "health/alerts were not published");
                             ensure!(sample["metrics"].get("memory_used_bytes").is_some_and(Value::is_null), "host sensor missing or fabricated by the simulator");
                             ensure!(sample["metrics"][metric_key("software", "release", "check_state")] == "disabled", "release summary missing from broker payload");
                             ensure!(sample["metrics"].get(metric_key("firewall", "accounting", "dropped_packets")).is_some_and(Value::is_null), "unmeasured firewall drops missing or fabricated");

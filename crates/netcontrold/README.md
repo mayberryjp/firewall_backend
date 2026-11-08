@@ -49,7 +49,9 @@ See [deployment details](../../docs/BUILD_AND_INSTALL.md#ubuntu-systemd-service)
 HTTP state/runtime reads include shared observational `process_health` and
 `active_alerts`; authenticated `GET /api/v1/platform/status` reads that cache
 without acquiring the networking engine. Health samples approximately every
-two seconds; after 15 seconds without collection it is unknown/stale. Alerts
+two seconds; retrying component failures yield degraded rather than unhealthy
+aggregate status, and after 15 seconds without collection it is unknown/stale.
+Discord delivery failures remain visible as warnings while its worker runs. Alerts
 deduplicate and clear on observed recovery, are not persisted configuration,
 and never create write locks or stop services. MQTT publishes the same objects
 and Home Assistant health/alert-count sensors, including partial samples when

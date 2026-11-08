@@ -62,6 +62,15 @@
 
 ### Changed
 
+- Retrying component failures now report aggregate `degraded` rather than
+  `unhealthy`; component errors and alerts remain visible. Discord delivery
+  failures remain warnings while the worker is running, including malformed
+  rate-limit responses. Health observations never gate configuration writes,
+  confirmation or rollback; structural recovery and authorization guards remain.
+  Release impact: additive status value and fix; next automatic calendar version.
+  Required frontend status and editing handling:
+  [handoff 2026-11-09-07](docs/frontend-handoffs/2026-11-09.md#2026-11-09-07-transient-service-failures-and-configuration-access).
+
 - Fresh installation and full source upgrades stop/disable and persistently mask
   standard OS NTP clients and one-shot services/timers, including absent units.
   Verify stopped/persistent masks and reject remaining known competing clients;

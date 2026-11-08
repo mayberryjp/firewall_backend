@@ -111,6 +111,120 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn configuration_transactions_remain_available_during_service_failures() {
+    use netcontrold::http::Credential;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".test-data")
+        .join(secret("").unwrap());
+    fs::create_dir_all(&path).unwrap();
+    let engine = Engine::open(&path.join("state.json"), Box::new(Simulator::new())).unwrap();
+    let app = App::new(
+        Arc::new(Mutex::new(engine)),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "operator".into(),
+                token_sha256: netcontrold::identity::digest("operator"),
+                permissions: vec![
+                    "state.read".into(),
+                    "transactions.write".into(),
+                    "sando.write".into(),
+                ],
+            },
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+        ]),
+        false,
+    );
+    app.health.observe(
+        Some(&json!({"appliance_services":[{"name":"ntp","state":"error","retrying":true}]})),
+        &[(
+            "discord",
+            json!({"state":"ready","error":"delivery failed"}),
+        )],
+        false,
+    );
+    assert_eq!(
+        app.health.snapshot()["process_health"]["status"],
+        "degraded"
+    );
+    let fixture = Fixture {
+        path,
+        router: router(app.clone()),
+    };
+    let latest = fixture
+        .request("GET", "/api/v1/revisions/latest", "", "", "operator", "")
+        .await;
+    assert_eq!(latest.0, 200);
+    let mut config = latest.2["config"].clone();
+    config["sando"]["api_url"] = json!("http://sando.example.invalid:8044");
+    let body =
+        json!({"base_revision":latest.2["revision"],"confirm_timeout_seconds":30,"config":config})
+            .to_string();
+    assert_eq!(
+        fixture
+            .request("POST", "/api/v1/transactions", &body, "", "reader", "")
+            .await
+            .0,
+        403
+    );
+    let pending = fixture
+        .request("POST", "/api/v1/transactions", &body, "", "operator", "")
+        .await;
+    assert_eq!(pending.0, 202, "{}", pending.2);
+    app.health.observe(
+        Some(&json!({})),
+        &[("system", json!({"state":"error"}))],
+        false,
+    );
+    assert_eq!(
+        app.health.snapshot()["process_health"]["status"],
+        "unhealthy"
+    );
+    let confirm = format!(
+        "/api/v1/transactions/{}/confirm",
+        pending.2["id"].as_str().unwrap()
+    );
+    let confirmed = fixture
+        .request("POST", &confirm, "", "", "operator", "")
+        .await;
+    assert_eq!(confirmed.0, 200, "{}", confirmed.2);
+    let saved = fixture
+        .request("GET", "/api/v1/revisions/latest", "", "", "operator", "")
+        .await;
+    assert_eq!(
+        saved.2["config"]["sando"]["api_url"],
+        "http://sando.example.invalid:8044"
+    );
+    let mut config = saved.2["config"].clone();
+    config["sando"]["api_url"] = json!("http://other.example.invalid:8044");
+    let body =
+        json!({"base_revision":saved.2["revision"],"confirm_timeout_seconds":30,"config":config})
+            .to_string();
+    let pending = fixture
+        .request("POST", "/api/v1/transactions", &body, "", "operator", "")
+        .await;
+    assert_eq!(pending.0, 202, "{}", pending.2);
+    let rollback = format!(
+        "/api/v1/transactions/{}/rollback",
+        pending.2["id"].as_str().unwrap()
+    );
+    let rolled_back = fixture
+        .request("POST", &rollback, "", "", "operator", "")
+        .await;
+    assert_eq!(rolled_back.0, 200, "{}", rolled_back.2);
+    let saved = fixture
+        .request("GET", "/api/v1/revisions/latest", "", "", "operator", "")
+        .await;
+    assert_eq!(
+        saved.2["config"]["sando"]["api_url"],
+        "http://sando.example.invalid:8044"
+    );
+}
+
+#[tokio::test]
 async fn capabilities_http_refresh_and_persisted_read_contract() {
     use netcontrold::http::Credential;
     let directory = tempfile::tempdir().unwrap();
