@@ -278,6 +278,11 @@
 
 ### Fixed
 
+- AppArmor installer regression fixtures now mock root ownership locally so the
+  shell suite runs as CI's unprivileged user. Preserve real file/mode operations
+  and cover directory, GRUB drop-in and APT pin persistence failures. Test-only
+  fix; no runtime, deployment or frontend contract change.
+
 - Make the privileged LAN spoof-block fixture's IPv6 addresses usable before
   socket binding by disabling DAD on its isolated veth endpoints, matching other
   native packet fixtures instead of relying on a post-bind sleep. Fixes the

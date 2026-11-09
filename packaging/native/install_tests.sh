@@ -11,6 +11,7 @@ scenario=valid
 for apparmor_scenario in success repeat absent reboot unknown_kernel missing_parameter active_lsm \
     query_failure protected incomplete simulation_failure collateral installs unrecognized \
     grub_failure bad_grub conflicting_grub missing_grub symlink_grub symlink_pin symlink_profiles \
+    directory_failure grub_write_failure pin_write_failure \
     mask_failure verify_failure purge_failure residual pin_failure candidate_failure remove_failure; do
     (
         apparmor_directory="$temporary/apparmor-$apparmor_scenario"
@@ -112,6 +113,24 @@ for apparmor_scenario in success repeat absent reboot unknown_kernel missing_par
             }
             command rm "$@"
         }
+        install() {
+            case $apparmor_scenario:${*: -1} in
+                directory_failure:"$apparmor_root/etc/default/grub.d"|\
+                grub_write_failure:"$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg"|\
+                pin_write_failure:"$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor")
+                    printf 'Fixture AppArmor persistence failure.\n' >&2; return 1 ;;
+            esac
+            local -a arguments=()
+            while [[ $# -gt 0 ]]; do
+                case $1 in
+                    -o|-g)
+                        [[ ${2:-} == root ]] || { printf 'Expected root ownership.\n' >&2; return 1; }
+                        shift 2 ;;
+                    *) arguments+=("$1"); shift ;;
+                esac
+            done
+            command install "${arguments[@]}"
+        }
         if configure_apparmor "$apparmor_root" > "$apparmor_directory/stdout" 2> "$apparmor_directory/stderr"; then
             case $apparmor_scenario in success|repeat|absent) ;; *) printf 'Unexpected AppArmor success: %s\n' "$apparmor_scenario" >&2; exit 1 ;; esac
             if [[ $apparmor_scenario == repeat ]]; then configure_apparmor "$apparmor_root" || exit 1; fi
@@ -119,6 +138,8 @@ for apparmor_scenario in success repeat absent reboot unknown_kernel missing_par
             grep -Fxq 'Pin-Priority: -1' "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor"
             grep -Fxq 'systemctl mask apparmor.service' "$apparmor_directory/commands"
             [[ -f $apparmor_directory/masked ]]
+            [[ $(stat -c %a "$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg") == 644 ]]
+            [[ $(stat -c %a "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor") == 644 ]]
             if [[ $apparmor_scenario == absent ]]; then ! grep -q '^apt ' "$apparmor_directory/commands"; fi
         else
             case $apparmor_scenario in success|repeat|absent) cat "$apparmor_directory/stderr" >&2; exit 1 ;; esac
