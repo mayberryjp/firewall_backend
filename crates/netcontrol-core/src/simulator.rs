@@ -264,6 +264,7 @@ impl Backend for Simulator {
         Ok(
             json!({"bgp":bgp,"appliance_services":appliance,"gateway_monitors":gateway_samples(config),"dhcp_relay":relays,"parent_interfaces":[],"softflowd":softflowd,
             "ipv6":{"enabled":config.ipv6_enabled,"status":"simulated","disable_ipv6":null,"drift":null},
+            "rpf":{"mode":config.firewall.rpf_mode,"family":"ipv4","status":"simulated","rp_filter":null,"drift":null},
             "kernel_tunables":{"desired":config.kernel,"configured":config.kernel,"effective":self.live,"observed":self.live,
                 "captured_original":self.original,"drift":false}}),
         )

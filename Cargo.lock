@@ -1888,7 +1888,6 @@ dependencies = [
  "chrono",
  "fs2",
  "hex",
- "ipnet",
  "rand 0.8.8",
  "serde",
  "serde_json",

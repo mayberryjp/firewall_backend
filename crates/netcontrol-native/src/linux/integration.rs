@@ -476,12 +476,7 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
             .as_str()
             .context("missing input drops")?
             .parse::<u64>()?
-            >= 5
-            && firewall_counter(&snapshot, "input_spoof_block:/firewall/spoof_block")?["packets"]
-                .as_str()
-                .context("missing spoof block drops")?
-                .parse::<u64>()?
-                >= 2
+            >= 7
         {
             break snapshot;
         }
@@ -504,14 +499,7 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
             .as_str()
             .context("missing input drops")?
             .parse::<u64>()?
-            >= 5
-    );
-    assert!(
-        firewall_counter(&snapshot, "input_spoof_block:/firewall/spoof_block")?["packets"]
-            .as_str()
-            .context("missing spoof block drops")?
-            .parse::<u64>()?
-            >= 2
+            >= 7
     );
     exchange(5, &upstream, "10.4.30.1")?;
     let mut renewal = wire[..300].to_vec();

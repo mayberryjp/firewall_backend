@@ -377,8 +377,7 @@ fn filter_protocol_api_validation_persistence_and_restart_rollback() {
             200
         );
         assert_eq!(engine.saved_configuration().firewall, saved.firewall);
-        let mut firewall = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body;
-        firewall.as_object_mut().unwrap().remove("system_policies");
+        let firewall = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body;
         assert_eq!(firewall, json!(saved.firewall));
         for (protocol, ports, status) in [
             (json!("icmp"), json!([80]), 422),
@@ -4646,7 +4645,7 @@ fn drop_logging_permissions_confirmation_persistence_and_rollback() {
 }
 
 #[test]
-fn spoof_block_system_policy_api_authorization_candidate_and_rollback() {
+fn rpf_mode_api_authorization_candidate_and_rollback_without_generated_policies() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
     let initial = config();
@@ -4673,26 +4672,21 @@ fn spoof_block_system_policy_api_authorization_candidate_and_rollback() {
         );
         assert_eq!(reply.status, status, "{}", reply.body);
         if status == 200 {
-            assert_eq!(reply.body["system_policies"][0]["enabled"], true);
-            assert_eq!(
-                reply.body["system_policies"][0]["chains"][0]["rules"][0]["matches"]["source"],
-                "192.0.2.0/24"
-            );
+            assert_eq!(reply.body["rpf_mode"], "disabled");
+            assert!(reply.body.get("system_policies").is_none());
+            assert!(reply.body.get("spoof_block").is_none());
         }
     }
     assert_eq!(fs::read(fixture.path()).unwrap(), persisted);
     assert_eq!(engine.committed_revision(), revision);
     let original = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body;
     let mut changed = initial.clone();
-    changed.interfaces[0].addresses = vec!["198.51.100.1/24".into()];
+    changed.firewall.rpf_mode = crate::RpfMode::Loose;
     let pending = submit(&mut engine, changed);
     assert_eq!(pending.status, 202, "{}", pending.body);
     let applied = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null);
     assert_eq!(applied.status, 200);
-    assert_eq!(
-        applied.body["system_policies"][0]["chains"][0]["rules"][0]["matches"]["source"],
-        "198.51.100.0/24"
-    );
+    assert_eq!(applied.body["rpf_mode"], "loose");
     assert_eq!(engine.saved_configuration().interfaces, initial.interfaces);
     let rollback = request(
         &mut engine,
@@ -4708,13 +4702,13 @@ fn spoof_block_system_policy_api_authorization_candidate_and_rollback() {
         request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body,
         original
     );
-    let mut disabled = initial;
-    disabled.firewall.spoof_block = false;
-    let pending = submit(&mut engine, disabled);
+    let mut strict = initial;
+    strict.firewall.rpf_mode = crate::RpfMode::Strict;
+    let pending = submit(&mut engine, strict);
     assert_eq!(pending.status, 202, "{}", pending.body);
     let applied = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null);
-    assert_eq!(applied.body["system_policies"][0]["enabled"], false);
-    assert_eq!(applied.body["system_policies"][0]["chains"], json!([]));
+    assert_eq!(applied.body["rpf_mode"], "strict");
+    assert!(applied.body.get("system_policies").is_none());
     assert_eq!(
         confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
         200
@@ -4723,32 +4717,58 @@ fn spoof_block_system_policy_api_authorization_candidate_and_rollback() {
     let mut engine = fixture.engine();
     let reopened = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null);
     assert_eq!(reopened.status, 200, "{}", reopened.body);
-    assert_eq!(
-        reopened.body["system_policies"],
-        applied.body["system_policies"]
-    );
+    assert_eq!(reopened.body["rpf_mode"], applied.body["rpf_mode"]);
     assert!(
         serde_json::to_value(engine.saved_configuration()).unwrap()["firewall"]
             .get("system_policies")
             .is_none()
     );
+    let runtime = request(&mut engine, "GET", "/api/v1/runtime", Value::Null);
+    assert_eq!(runtime.status, 200);
+    assert_eq!(
+        runtime.body["rpf"],
+        json!({
+            "mode":"strict","family":"ipv4","status":"simulated","rp_filter":null,"drift":null
+        })
+    );
+    let revision = engine.committed_revision();
+    for fields in [
+        json!({"rpf_mode":null}),
+        json!({"rpf_mode":"invalid"}),
+        json!({"rpf_mode":1}),
+        json!({"spoof_block":true}),
+        json!({"system_policies":[]}),
+    ] {
+        let mut candidate = serde_json::to_value(engine.saved_configuration()).unwrap();
+        candidate["firewall"] = fields;
+        let reply = request(
+            &mut engine,
+            "POST",
+            "/api/v1/transactions",
+            json!({
+                "base_revision":revision,"confirm_timeout_seconds":30,"config":candidate
+            }),
+        );
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert_eq!(engine.committed_revision(), revision);
+    }
 }
 
 #[test]
-fn spoof_block_permissions_confirmation_persistence_and_rollback() {
+fn rpf_mode_permissions_confirmation_persistence_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
     let original = engine.saved_configuration().clone();
-    assert!(original.firewall.spoof_block);
-    let mut disabled = original.clone();
-    disabled.firewall.spoof_block = false;
+    assert_eq!(original.firewall.rpf_mode, crate::RpfMode::Disabled);
+    let mut strict = original.clone();
+    strict.firewall.rpf_mode = crate::RpfMode::Strict;
     for missing in ["transactions.write", "firewall.write"] {
         let permissions: Vec<_> = all()
             .into_iter()
             .filter(|permission| permission != missing)
             .collect();
         let body = serde_json::to_vec(&json!({
-            "base_revision":engine.state.revision,"confirm_timeout_seconds":30,"config":disabled
+            "base_revision":engine.state.revision,"confirm_timeout_seconds":30,"config":strict
         }))
         .unwrap();
         assert_eq!(
@@ -4765,7 +4785,7 @@ fn spoof_block_permissions_confirmation_persistence_and_rollback() {
             403
         );
     }
-    let reply = submit(&mut engine, disabled.clone());
+    let reply = submit(&mut engine, strict.clone());
     assert_eq!(reply.status, 202, "{}", reply.body);
     assert_eq!(
         confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
@@ -4774,10 +4794,13 @@ fn spoof_block_permissions_confirmation_persistence_and_rollback() {
     drop(engine);
     let mut engine = Engine::open(
         &fixture.path(),
-        Box::new(Simulator::with_config(disabled.clone()).unwrap()),
+        Box::new(Simulator::with_config(strict.clone()).unwrap()),
     )
     .unwrap();
-    assert!(!engine.saved_configuration().firewall.spoof_block);
+    assert_eq!(
+        engine.saved_configuration().firewall.rpf_mode,
+        crate::RpfMode::Strict
+    );
     let reply = submit(&mut engine, original);
     assert_eq!(reply.status, 202, "{}", reply.body);
     assert_eq!(
@@ -4793,7 +4816,7 @@ fn spoof_block_permissions_confirmation_persistence_and_rollback() {
         .status,
         200
     );
-    assert_eq!(engine.saved_configuration(), &disabled);
+    assert_eq!(engine.saved_configuration(), &strict);
 }
 
 fn captured_conntrack() -> KernelConfig {
@@ -5246,14 +5269,13 @@ fn rule_origins_tag_generated_counter_rows_and_keep_configured_ownership() {
         {"config_path":"/firewall/input/interfaces/0/rules/0"},
         {"config_path":"/firewall/policy"},
         {"config_path":"/firewall/allow_all_icmp"},
-        {"config_path":"/firewall/spoof_block"},
         {"config_path":null}
     ]});
     annotate_rule_origins(&mut response, &config).unwrap();
     assert_eq!(response["rules"][0]["origin"], "import");
     assert_eq!(response["rules"][0]["import_source"], "sando");
     assert_eq!(response["rules"][1]["origin"], "manual");
-    for index in 2..6 {
+    for index in 2..5 {
         assert_eq!(response["rules"][index]["origin"], "system");
         assert!(response["rules"][index]["import_source"].is_null());
     }

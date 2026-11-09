@@ -292,7 +292,7 @@ ipv6 route PREFIX INTERFACE GATEWAY|direct TABLE METRIC
 no ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
 firewall policy accept|drop
 firewall drop-logging enable|disable
-firewall spoof-block enable|disable
+firewall rpf disabled|loose|strict
 firewall allow-all-icmp enable|disable
 firewall rule SOURCE|any DESTINATION|any accept|drop
 no firewall rule INDEX

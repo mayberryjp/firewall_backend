@@ -3,19 +3,18 @@ use netcontrol_core::FIREWALL_EXPANSION_LIMIT;
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr};
 
-pub use netcontrol_core::CompiledFirewallMatch as Match;
-
-pub fn compile_spoof_block(
-    firewall: &Value,
-    interfaces: &[crate::model::Link],
-) -> Result<Vec<Match>> {
-    netcontrol_core::compile_spoof_block(
-        firewall,
-        interfaces
-            .iter()
-            .filter(|link| link.role == "lan")
-            .map(|link| (link.name.as_str(), link.addresses.as_slice())),
-    )
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Match {
+    pub counter_key: String,
+    pub source: String,
+    pub destination: String,
+    pub ingress: String,
+    pub egress: String,
+    pub protocol: String,
+    pub port: u16,
+    pub source_port: u16,
+    pub action: String,
+    pub established_related: bool,
 }
 
 pub fn destination_rewrites(
@@ -406,7 +405,6 @@ fn expand(
                     source_port: 0,
                     action: string(rule, "action").into(),
                     established_related: false,
-                    ..Match::default()
                 });
                 ensure!(
                     output.len() <= FIREWALL_EXPANSION_LIMIT,
@@ -454,14 +452,6 @@ pub fn counter_layout(
             add(chain, "/firewall/allow_all_icmp");
         }
     }
-    let guard = compile_spoof_block(firewall, interfaces)?;
-    if !guard.is_empty() {
-        for chain in ["input", "forward"] {
-            for plan in &guard {
-                add(&format!("{chain}_spoof_block"), &plan.counter_key);
-            }
-        }
-    }
     add("output", "generated/output/policy");
     for (index, _) in array(&firewall["nat"], "masquerade")?.iter().enumerate() {
         add("postrouting", &format!("/firewall/nat/masquerade/{index}"));
@@ -484,33 +474,6 @@ pub fn counter_layout(
 mod tests {
     use super::*;
 
-    #[test]
-    fn spoof_block_native_adapter_uses_shared_plan_and_only_lan_interfaces() {
-        let links: Vec<crate::model::Link> = serde_json::from_value(serde_json::json!([
-            {"name":"lan0","role":"lan","kind":"dummy","mtu":1500,"up":false,
-             "addresses":["192.0.2.1/24","2001:db8:1::1/64"]},
-            {"name":"wan0","role":"wan","kind":"dummy","mtu":1500,"up":true,
-             "addresses":["198.51.100.1/24"]},
-            {"name":"unused0","role":"unassigned","kind":"dummy","mtu":1500,"up":true,
-             "addresses":[]}
-        ]))
-        .unwrap();
-        let firewall = serde_json::json!({"spoof_block":true});
-        let plans = compile_spoof_block(&firewall, &links).unwrap();
-        let shared = netcontrol_core::compile_spoof_block(
-            &firewall,
-            [("lan0", links[0].addresses.as_slice())],
-        )
-        .unwrap();
-        assert_eq!(plans, shared);
-        assert_eq!(plans.len(), 28);
-        assert!(plans.iter().all(|plan| plan.ingress == "lan0"));
-        assert!(
-            compile_spoof_block(&serde_json::json!({"spoof_block":false}), &links)
-                .unwrap()
-                .is_empty()
-        );
-    }
     use serde_json::json;
 
     #[test]

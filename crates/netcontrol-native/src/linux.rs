@@ -66,6 +66,7 @@ mod netfilter;
 mod networking;
 mod offloads;
 mod path_test;
+mod rpf;
 mod rps;
 mod rps_recommendations;
 mod sysctl;
@@ -424,6 +425,10 @@ impl Native {
                 .context("restore managed-interface networkd handover before native recovery")?;
         }
         native.recover()?;
+        if let Some(config) = native.ownership()?.committed_config {
+            let mode = serde_json::from_value::<Config>(config)?.firewall.rpf_mode;
+            session(native.namespace.clone(), move |_, _| rpf::set(mode))?;
+        }
         Ok(native)
     }
 
@@ -800,6 +805,9 @@ impl Native {
                 ipv6::set(false)?;
             }
             sysctl::write_scope(&namespace_values, "namespace")?;
+            let mode = serde_json::from_value::<netcontrol_core::Firewall>(after.firewall.clone())?
+                .rpf_mode;
+            rpf::set(mode)?;
             firewall::apply(&after.firewall, &after.interfaces)?;
             let fingerprint = netfilter::fingerprint()?;
             // Verify the result rather than interpreting a netlink ACK as convergence.
@@ -1870,6 +1878,10 @@ impl Backend for Native {
                     .context("native drift guard: committed configuration differs from kernel"));
             }
             if before == after && ownership.committed_config.is_some() {
+                let mode = serde_json::from_value::<Config>(after.clone())?
+                    .firewall
+                    .rpf_mode;
+                session(self.namespace.clone(), move |_, _| rpf::set(mode))?;
                 self.verify_services(&after)?;
                 return Ok(());
             }
@@ -2035,6 +2047,8 @@ impl Backend for Native {
         value["wireguard_dns"] = self.wireguard_dns.snapshot()?;
         let enabled = config.ipv6_enabled;
         value["ipv6"] = session(self.namespace.clone(), move |_, _| ipv6::status(enabled))?;
+        let mode = config.firewall.rpf_mode;
+        value["rpf"] = session(self.namespace.clone(), move |_, _| rpf::status(mode))?;
         let desired = Network::parse(&config.operational_value()?)?.kernel;
         let baseline = self.ownership()?.kernel_baseline;
         let mut effective = baseline.clone();
@@ -2252,6 +2266,11 @@ impl Backend for Native {
                 let target = network.clone();
                 ownership.firewall_fingerprint = Some(
                     session(self.namespace.clone(), move |_, _| {
+                        let mode = serde_json::from_value::<netcontrol_core::Firewall>(
+                            target.firewall.clone(),
+                        )?
+                        .rpf_mode;
+                        rpf::set(mode)?;
                         firewall::apply(&target.firewall, &target.interfaces)?;
                         netfilter::fingerprint()
                     })

@@ -12,7 +12,7 @@
       {"enabled": true, "destination": "0.0.0.0/0", "gateway": "198.51.100.1", "interface": "wan", "table": 254, "metric": 100}
     ],
     "firewall": {
-      "spoof_block": true,
+      "rpf_mode": "disabled",
       "allow_all_icmp": true,
       "policy": "drop",
       "rules": [],

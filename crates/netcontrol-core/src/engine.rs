@@ -184,9 +184,7 @@ fn annotate_rule_origins(response: &mut Value, config: &Config) -> Result<()> {
             let rule = configured
                 .pointer(path)
                 .context("counter config_path not found")?;
-            if matches!(path, "/firewall/allow_all_icmp" | "/firewall/spoof_block")
-                || path.ends_with("/policy")
-            {
+            if path == "/firewall/allow_all_icmp" || path.ends_with("/policy") {
                 (json!("system"), Value::Null)
             } else {
                 (
@@ -272,7 +270,21 @@ fn prune_unknown<T: serde::de::DeserializeOwned>(
 fn parse_submit(body: &[u8]) -> ApiResult<(SubmitRequest, Vec<String>)> {
     let mut request: Value = parse(body)?;
     let ignored = match request.get_mut("config") {
-        Some(config) => prune_unknown::<Config>(config, "/config")?,
+        Some(config) => {
+            if let Some(firewall) = config.get("firewall").and_then(Value::as_object) {
+                for field in ["spoof_block", "system_policies"] {
+                    if firewall.contains_key(field) {
+                        return Err(ApiError::new(
+                            400,
+                            format!(
+                                "removed firewall field {field}; configure firewall.rpf_mode instead"
+                            ),
+                        ));
+                    }
+                }
+            }
+            prune_unknown::<Config>(config, "/config")?
+        }
         None => Vec::new(),
     };
     let request = serde_json::from_value(request)
@@ -2202,9 +2214,7 @@ impl Engine {
             "/api/v1/services/ntp" => value(observed.ntp),
             "/api/v1/services/syslog" => value(observed.syslog),
             "/api/v1/services/vnstat" => value(observed.vnstat),
-            "/api/v1/firewall/rules" => {
-                crate::firewall_view::firewall_view(&observed).map_err(service_error)
-            }
+            "/api/v1/firewall/rules" => value(observed.firewall),
             "/api/v1/firewall/nat" => value(observed.firewall.nat),
             "/api/v1/firewall/hosts" => value(
                 observed

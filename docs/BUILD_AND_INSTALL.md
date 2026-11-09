@@ -50,6 +50,35 @@ Use an aarch64 Linux host and the aarch64 target for ARM64 builds unless an
 appropriate cross-linker is explicitly configured. Merely adding a Rust target
 does not install a cross-architecture linker.
 
+## Kernel IPv4 reverse-path filtering
+
+The daemon takes over Linux `net.ipv4.conf.all.rp_filter`,
+`net.ipv4.conf.default.rp_filter` and every existing interface's `rp_filter`
+in its managed namespace. `firewall.rpf_mode` defaults to `"disabled"` (kernel 0);
+`"loose"` uses 2 and `"strict"` uses 1. Takeover includes WAN, LAN,
+unassigned/unmanaged/down links and loopback; new interfaces inherit the default.
+Conflicting existing values are overwritten, not ownership conflicts.
+Missing/unwritable procfs controls or failed readback are explicit failures.
+
+Fresh installation, daemon startup/restart, upgrades and explicit reconciliation
+apply the selected mode. Explicit saved selections, including loose/strict,
+are retained on upgrade; they are not reset to disabled. Build-only does not change host RPF settings.
+External changes are visible as runtime drift and reclaimed on apply/reconcile/
+restart, not used to block unrelated valid configuration transactions.
+
+Strict mode can disrupt asymmetric multi-WAN/VPN routing; review routing and
+keep independent console access before deploying. This is **IPv4 only** and
+uses kernel reverse routes, not a local-subnet allowlist. It does not create
+nftables rules, exemption/override policies or IPv6 source guards.
+RPF drops do not appear in firewall-rule counters, NFLOG deny history,
+MQTT firewall-drop totals or Discord first-seen notifications.
+
+Use the current configuration schema: `firewall.rpf_mode`, not the removed
+`spoof_block` or `system_policies` fields. Removed fields are rejected, not
+silently converted or discarded; no saved state is reset/deleted. See the
+[frontend contract](../FRONTEND_SPEC.md#kernel-reverse-path-filtering) and
+[handoff](frontend-handoffs/2026-11-09.md#2026-11-09-10-kernel-ipv4-reverse-path-filtering).
+
 ## Firewall deny logging
 
 Native firewall operation requires Linux `CONFIG_NF_TABLES`; enabled deny

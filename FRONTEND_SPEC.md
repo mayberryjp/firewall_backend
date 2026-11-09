@@ -127,7 +127,8 @@ zero values and subsequently failing semantic validation. Required fields:
 | Flow exporter | All configuration fields except `capture_filter`, `timeouts`, `metadata` |
 | Gateway monitor | Identity/enabled/interface/target; explicit mode also needs source/gateway/table; timing fields remain defaultable |
 
-`firewall.spoof_block` and `firewall.allow_all_icmp` default to true only when omitted; explicit null is
+`firewall.rpf_mode` defaults to `"disabled"` when omitted; explicit null or an
+unknown mode is `400`. `firewall.allow_all_icmp` defaults to true only when omitted; explicit null is
 `400`. An omitted firewall/policy defaults to `"accept"`. Invalid semantic values
 still return `422`.
 
@@ -198,6 +199,11 @@ JSON, oversized bodies and semantic validation failures still return `400`/`422`
 `POST /api/v1/revisions/{revision}/restore` is unchanged and its response has no
 `ignored_fields`. Saved journal/history, native ownership, credentials and signed
 packages still reject unknown fields.
+
+Exception: removed `firewall.spoof_block` and `firewall.system_policies`
+fields are rejected with `400` before pruning; use `firewall.rpf_mode`.
+This prevents old source-guard submissions silently substituting the RPF
+default. Other unknown-field handling remains unchanged.
 
 A dropped key is a silent no-op for the field you meant: a misspelled
 `firewall.allow_all_icmp` or an inline secret such as `mqtt.password` is ignored,
@@ -5341,177 +5347,87 @@ conversion endpoint, browser repair action or permissive startup fallback.
 
 ### 6.6 Firewall forwarding
 
-#### Spoof Block
+#### Kernel reverse-path filtering
 
-Provide a global **Spoof Block** toggle bound to `config.firewall.spoof_block`:
-a nonnull boolean, **default true** for omitted input, new installations and
-factory reset. Preserve explicit false in drafts, full-candidate writes,
-history/restore and restart. Changes use existing confirmed transactions with
-`transactions.write` and `firewall.write`; wrong types/null return `400`.
-There is no per-interface override, extra endpoint, mode selector or uRPF
-setting. The normalized Firewall/configuration always exposes the boolean.
+Provide a global **IPv4 reverse-path filtering** mode selector bound to
+`config.firewall.rpf_mode`: `"disabled"`, `"loose"` or `"strict"`.
+Omitted input, new installs and factory reset default to **disabled**.
+Null, booleans, numeric values and unknown/case-mismatched strings are `400`.
+Every explicit saved mode, including loose/strict, survives restart and upgrade.
+Use normal confirmed transactions with `transactions.write` and `firewall.write`;
+no additional kernel-tuning permission is required for this firewall control.
+SSH uses `firewall rpf disabled|loose|strict`.
+
+This is the Linux IPv4 `rp_filter` feature, not an nftables source guard:
+
+| Mode | Kernel value | Source validation |
+| --- | --- | --- |
+| disabled | 0 | Disable reverse-path filtering |
+| loose | 2 | Require a reverse route to the source via any interface |
+| strict | 1 | Require the reverse route to use the ingress interface |
+
+Kernel routing/policy-routing semantics apply, including available default
+routes. This is not a local-subnet allowlist, device-identity check or IPv6
+protection. Strict mode can reject legitimate asymmetric multi-WAN/VPN traffic;
+warn before deployment/mode changes and recommend console/independent access.
+Passing RPF does not bypass normal firewall rules. No generated DHCP, IPv6,
+ICMP, diagnostic or established-flow exceptions/overrides are installed.
+
+Netcontrol aggressively owns **all/default and every existing IPv4 interface
+control in its managed namespace**, including WAN, LAN, unassigned/unmanaged,
+down interfaces and loopback. `all` and every per-link value are set to the
+same selected value because Linux uses their numeric maximum; `default` gives
+new interfaces the selected mode. Existing conflicting values are overwritten,
+not treated as an ownership conflict or reason to refuse configuration changes.
+Startup, normal apply, explicit reconciliation and interrupted recovery reassert
+the selected mode. Actual missing/unwritable controls or failed exact readback
+remain explicit backend errors; there is no success-shaped fallback.
+RPF drift is reported in runtime and does not gate unrelated transactions.
+Direct external changes are reclaimed on the next apply/reconcile/restart;
+there is no continuous external-writer suppression.
 
 `GET /api/v1/firewall/rules` (`state.read`, API-key authentication) returns
-`FirewallView`: the existing observed Firewall fields plus a read-only
-`system_policies` array. The array currently contains one policy with
-`id:"spoof_block"`, `origin:"system"`, `read_only:true`,
-`config_path:"/firewall/spoof_block"` and `enabled:boolean`. This is a response
-projection, **not configuration**: desired state, runtime configuration,
-revision/export payloads and editable interface policies remain unchanged.
-Never copy `system_policies` into a transaction candidate; unknown configuration
-fields are rejected with `400`. Continue editing only `firewall.spoof_block`
-through normal confirmed transactions.
+the observed `Firewall` with `rpf_mode`, without `spoof_block`,
+`system_policies`, generated matches or override policies. Configuration/state/
+revision reads and full candidates use the same mode field. Removed fields are
+unknown configuration fields and are rejected with `400`; no aliases,
+migration, compatibility window or state reset is provided.
 
-The policy's `chains` array exposes the exact compiled source guard, in
-`input`, then `forward` hook order. Each chain has `name` (`input_spoof_block`
-or `forward_spoof_block`), `hook`, `priority:-1`, `policy:"accept"` and ordered
-`rules`. A chain's accept policy means **continue to later hook chains**, not
-final packet authorization. Each rule contains:
-
-- `id:string` (`<chain>:<order>`) and zero-based `order:integer`. These are
-  positional identities within this response, not persisted rule identifiers;
-  refresh after configuration changes and do not retain selection by position.
-- `action:"return"|"drop"`, `counter_id:string` matching a statistics row ID,
-  and `config_path:string|null`: `/firewall/spoof_block` for terminal drops,
-  otherwise null.
-- `matches`: `family:"ipv4"|"ipv6"`, `ingress_interface:string`,
-  `source:string|null` and `destination:string|null` (canonical CIDR, null
-  means unrestricted), `protocol:"any"|"udp"|"icmpv6"`,
-  `source_port:number|null`, `destination_port:number|null` (UDP ports,
-  1-65535), `icmp_type:number|null`, `icmp_code:number|null` (0-255),
-  and `hop_limit:number|null` (0-255). Null means no constraint, not zero;
-  generated ICMPv6 exceptions explicitly match code 0.
-
-All rules are returned, including zero-hit rules, exact DHCP destinations,
-each IPv6 exception and both per-interface terminal family drops. Rules use
-the same compiler as native enforcement, not a second frontend approximation.
-The response describes the observed applied configuration, including a pending
-transaction's candidate, and returns to the previous rules after rollback.
-Existing observation/backend failures remain explicit `503`; no incomplete
-or empty-success substitute is returned for a compilation failure. Existing
-authentication, permission and method handling is unchanged.
-
-When disabled, the policy remains present with `enabled:false, chains:[]`.
-Enabled with no managed LANs returns `enabled:true, chains:[]`; it does not
-imply any installed guard chain. Counter joins are **many-to-one**: terminal
-drop counters aggregate all LANs/families per chain, and generated return
-counters group matches by interface/category. Never display aggregate counters
-as distinct measured per-rule/per-interface hits or sum repeated `counter_id`s.
-Render policies/rules as system-owned, non-editable details alongside user
-policies; the global toggle remains the only Spoof Block control.
-
-Synthetic shortened response fragment (other Firewall fields and rules omitted):
+`GET /api/v1/runtime` (`state.read`) adds `rpf`:
 
 ```json
 {
-  "spoof_block": true,
-  "system_policies": [{
-    "id": "spoof_block",
-    "origin": "system",
-    "read_only": true,
-    "config_path": "/firewall/spoof_block",
-    "enabled": true,
-    "chains": [{
-      "name": "input_spoof_block",
-      "hook": "input",
-      "priority": -1,
-      "policy": "accept",
-      "rules": [{
-        "id": "input_spoof_block:0",
-        "order": 0,
-        "counter_id": "input_spoof_block:generated/spoof_block/lan0/local",
-        "config_path": null,
-        "action": "return",
-        "matches": {
-          "family": "ipv4",
-          "ingress_interface": "lan0",
-          "source": "192.0.2.0/24",
-          "destination": null,
-          "protocol": "any",
-          "source_port": null,
-          "destination_port": null,
-          "icmp_type": null,
-          "icmp_code": null,
-          "hop_limit": null
-        }
-      }]
-    }]
-  }]
+  "rpf": {
+    "mode": "strict",
+    "family": "ipv4",
+    "status": "measured",
+    "rp_filter": {"all":"1","default":"1","lo":"1","lan0":"1","wan0":"1"},
+    "drift": false
+  }
 }
 ```
 
-Required system-policy rendering is tracked in
-[handoff 2026-11-09-09](docs/frontend-handoffs/2026-11-09.md#2026-11-09-09-read-only-spoof-block-system-policy-details).
+Synthetic shortened runtime fragment. `mode` is the currently applied
+configuration's mode, including provisional transactions. `rp_filter` maps
+kernel control/interface names to canonical strings `"0"`, `"1"` or `"2"`;
+it includes non-managed links. `drift:boolean` reports any value differing
+from the mode. Simulator responses use `status:"simulated"`, `rp_filter:null`
+and `drift:null`; they are not kernel measurements. Read/observation failures
+retain normal `503` handling. Authentication/method/permission behavior and
+transaction status codes are unchanged.
 
-Enabled enforcement covers IPv4 and IPv6 entering every managed interface with
-`role:"lan"` (Ethernet, VLAN, dummy or WireGuard), including configured down
-LANs once traffic can enter them. WAN, unassigned/adopted-only links, loopback
-and local output are not source-guarded. Each LAN's permitted source prefixes
-are its own configured interface addresses truncated to their network prefix,
-not host inventory, other LANs, live unmanaged addresses, routes, BGP or
-WireGuard `allowed_ips`. Multiple prefixes are a union; duplicate subnets are
-deduplicated. A LAN without a source prefix for a family drops ordinary traffic
-of that family. Changing addresses/roles updates enforcement transactionally,
-including restart, confirmed changes and rollback.
+No RPF entries are returned by `GET /api/v1/statistics/firewall`: RPF drops
+are kernel routing drops, not nft rule hits. They do not generate deny-log
+records, MQTT firewall-drop totals or Discord first-seen notifications.
+Previously retained deny history is not deleted or rewritten; historical
+`reason:"spoof_block"` events may still appear, but this implementation emits
+none. Normal firewall rule accounting/logging remains unchanged.
 
-The owned `input_spoof_block` and `forward_spoof_block` filter chains run at
-hook priority -1, before the normal priority-0 input/forward chains. Invalid
-sources are terminal drops even for established/related packets, global IPv4
-ICMP bypass, temporary diagnostic permits and ordinary allow rules. Valid
-sources return through this guard's policy and **continue to normal rules**;
-they are not automatically authorized. The guard does not alter forwarding,
-NAT, conntrack state/timeouts, routes or Linux `rp_filter`.
-
-Exceptions bypass only this source guard and never grant a final accept:
-
-- IPv4 DHCP bootstrap: `0.0.0.0`, UDP source 68/destination 67, addressed to
-  `255.255.255.255` or an exact configured IPv4 address on the ingress LAN.
-- DHCPv6: `fe80::/10`, UDP source 546/destination 547, addressed to
-  `ff02::1:2` or `fe80::/10`.
-- ICMPv6 code 0 neighbor discovery: link-local source `fe80::/10`, types
-  133/134/135/136, hop limit 255, destination link-local (`fe80::/10`),
-  link-scope multicast (`ff02::/16`) or an ingress LAN's configured IPv6 subnet.
-- Unspecified IPv6 source `::`: code 0 RS type 133 to `ff02::2`, or DAD NS
-  type 135 to solicited-node multicast `ff02::1:ff00:0/104`, hop limit 255.
-- MLD: link-local source, types 130/131/132/143, code 0, hop limit 1,
-  destination `ff02::/16`; unspecified source is permitted only for reports
-  131/143 with those same destination/code/hop constraints.
-
-Keep normal DHCP/IPv6 input permits; otherwise these packets can still be
-dropped by later policy. This is not an RA guard or same-subnet device identity
-check. It intentionally blocks routed downstream/VPN/relay sources outside the
-ingress LAN's own subnets, even when a route exists. Explicitly disable the
-global setting when that topology is intended; never silently add routes,
-prefixes, exemptions or auto-disable it. A `/0` interface subnet naturally
-permits every source of that family and should be shown as ineffective source
-restriction. Enabling may immediately interrupt off-subnet active sessions.
-This feature does not fix WAN return drops or identify connection state.
-
-Show system-owned terminal drop counters at
-`input_spoof_block:/firewall/spoof_block` and
-`forward_spoof_block:/firewall/spoof_block`, with config path
-`/firewall/spoof_block`, aggregating both families/all LANs. Guard return
-counters have null config paths and generated keys
-`generated/spoof_block/<interface>/local`, `/bootstrap`, `/ipv6_control`
-in each guard chain. Returns are not firewall accepts/drops; summed rule-match
-counters can count a packet again in normal rules. Disabled/no-LAN enforcement
-has no guard chains/rows. Guard plans are bounded to 20480 rules per chain and
-the complete instrumented ruleset to 81920 physical rules; excess native
-preflight/apply is an explicit error, not partial enforcement.
-
-Deny history adds `reason:"spoof_block"` with `compiled_rule_index:null`;
-its `chain` remains `"input"` or `"forward"`, not the auxiliary chain name.
-Normal logging, retention, category selection, permanent tuple deduplication and
-Discord eligibility remain unchanged. Do not treat source-guard drops as a new
-notification category or automatically allow their source. Refresh ruleset
-identity/counter baselines when LAN addresses/roles or this setting change.
-
-Deployment impact: default-on enforcement is a breaking policy change on the
-first application/startup of the new compiler; explicit saved false remains
-authoritative. Review routed LAN/relay/VPN topology before deployment, using
-console/independent operator access and normal confirmed-change recovery.
-There is no compatibility window, migration or state reset. Required frontend
-work is detailed in [handoff 2026-11-09-08](docs/frontend-handoffs/2026-11-09.md#2026-11-09-08-default-on-lan-spoof-block).
+Deployment is breaking: enabled kernel RPF covers WAN as well as LAN and the
+old IPv6/local-subnet guards and generated-policy response are removed. Review
+asymmetric routing and the current configuration schema before upgrading.
+Required frontend changes supersede the earlier Spoof Block work:
+[handoff 2026-11-09-10](docs/frontend-handoffs/2026-11-09.md#2026-11-09-10-kernel-ipv4-reverse-path-filtering).
 
 #### Global logging and ICMP
 
@@ -5531,7 +5447,7 @@ required to change it. It defaults to `true` when omitted; null returns `400`. N
 reads return a boolean. Preserve explicit `false` in full-package submissions,
 revision restore, and draft editing; do not use a truthy fallback.
 
-When enabled, an implicit accept exception runs after Spoof Block but before other owned forward rules
+When enabled, an implicit accept exception runs before other owned forward rules
 in both policy modes, including host/interface drops and the global default.
 It also accepts protocol 1 in owned input/output chains. It applies to every
 interface in the managed namespace, including loopback, adopted parents, and
@@ -5585,8 +5501,7 @@ A separate **Interface overrides** view configures ordered rules for an ingress
 interface (managed draft link or adopted parent). There is no interface default.
 Display the effective precedence prominently:
 
-0. Spoof Block drops off-subnet LAN sources; valid/exempt sources fall through.
-   If Allow all IPv4 ICMP is enabled, remaining IPv4 protocol 1 is accepted.
+0. If Allow all IPv4 ICMP is enabled, IPv4 protocol 1 is accepted.
 1. Established/related traffic is accepted, including existing connections.
 2. First matching ingress-interface rule wins, overriding host policy.
 3. Otherwise evaluate the source host's ordered rules, then its default.
@@ -5595,8 +5510,8 @@ Display the effective precedence prominently:
 The destination host's own outbound policy is not evaluated. Interface allows
 override host drops as well as interface drops overriding host allows. Warn about
 interface catch-alls that shadow all host policies. Existing connections can
-survive a newly applied ordinary rule block until conntrack expires; Spoof Block
-still checks their LAN source before established/related acceptance. Explicit
+survive a newly applied ordinary rule block until conntrack expires. Kernel RPF
+is separate IPv4 route validation, not an override rule in this ordering. Explicit
 [connection state deletion](#connection-state-deletion) is separately authorized
 and never performed automatically by rule changes. `firewall.policies`
 host/interface rules apply only to forwarded traffic,
@@ -5839,8 +5754,9 @@ Preserve private history/index/configuration and follow the
 [operator requirements](docs/BUILD_AND_INSTALL.md#firewall-deny-logging)
 before deployment; new frontend controls require the accepting backend.
 
-`reason` is `rule`, `policy` or `spoof_block`; `policy` means a chain default
-Drop and `spoof_block` means the LAN source guard. Both have
+`reason` is `rule` or `policy` for newly captured records; `policy` means a chain
+default Drop. Retained historical `spoof_block` records identify the removed
+LAN source guard, not current kernel RPF drops. Policy and historical guard records have
 `compiled_rule_index:null`. A generated host default is a `rule` drop.
 Rule indexes are zero-based **compiled** positions (including generated rules),
 not user-facing array indexes/stable IDs. Show them only alongside the 64-character
@@ -6169,7 +6085,7 @@ all instrumented logical rows, including measured zeros, ordered by chain/key.
 `sample.scope` is opaque; timestamps are UTC RFC3339 and bracket collection,
 not an atomic global measurement instant. `ruleset_id` is the lowercase SHA-256
 of the applied operational firewall and compiled input plan, including
-interface-derived DHCP relay permissions and Spoof Block plans, matching deny-log ruleset identity.
+interface-derived DHCP relay permissions, matching deny-log ruleset identity.
 Treat it as opaque; changing LAN addresses/roles or relay settings can change this ID even when saved
 firewall JSON is unchanged.
 `generation` is a lowercase SHA-256 token incorporating a fresh ruleset-installation
@@ -6202,9 +6118,7 @@ Supported configured paths:
   `/firewall/nat/destination_rewrite/{index}` (`destination_rewrite`).
 - The IPv4 ICMP exception has `/firewall/allow_all_icmp` in each of
   `forward`, `input` and `output` when enabled. Distinguish these by chain/ID.
-- Spoof Block terminal drops have `/firewall/spoof_block` in
-  `input_spoof_block` and `forward_spoof_block`. Their generated return rows and
-  fallthrough semantics are defined in [Spoof Block](#spoof-block).
+- Kernel RPF does not install firewall rules and has no rule-counter rows.
 
 Generated keys have `config_path:null`: `generated/forward/established_related`
 in host-policy mode, `generated/input/loopback` and
@@ -6895,7 +6809,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/routes/bgp/advertised` | Exact established-session advertised prefixes per neighbor; not peer acceptance |
 | GET | `/services/bgp` | Committed `BGPConfig` |
 | GET | `/services/bgp/status` | Applied BGP worker and neighbor summary |
-| GET | `/firewall/rules` | Observed `FirewallView`: Firewall fields plus read-only compiled `system_policies` |
+| GET | `/firewall/rules` | Entire observed `Firewall`, including `rpf_mode`, policy and NAT; no generated system policies |
 | GET | `/firewall/deny-log` | Filtered persistent deny history, capture/loss/retention status; `firewall.logs.read` |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
@@ -7312,7 +7226,7 @@ interface RuleSource {
 type FilterProtocol = "" | "tcp" | "udp" | "icmp" | "icmpv6";
 
 interface Firewall {
-  spoof_block: boolean; // Default true when omitted; null is invalid.
+  rpf_mode: "disabled" | "loose" | "strict"; // Default disabled; null is invalid.
   drop_logging_enabled: boolean; // Omitted input defaults to true; null is invalid.
   allow_all_icmp: boolean; // Omitted input defaults to true; null is invalid.
   policy: "accept" | "drop";
@@ -7328,42 +7242,12 @@ interface Firewall {
   input?: InputFirewall | null;
 }
 
-// GET /firewall/rules only; never submit system_policies as configuration.
-interface FirewallView extends Firewall {
-  system_policies: SystemFirewallPolicy[];
-}
-
-interface SystemFirewallPolicy {
-  id: "spoof_block";
-  origin: "system";
-  read_only: true;
-  config_path: "/firewall/spoof_block";
-  enabled: boolean;
-  chains: Array<{
-    name: "input_spoof_block" | "forward_spoof_block";
-    hook: "input" | "forward";
-    priority: -1;
-    policy: "accept";
-    rules: Array<{
-      id: string;
-      order: number;
-      counter_id: string;
-      config_path: "/firewall/spoof_block" | null;
-      action: "return" | "drop";
-      matches: {
-        family: "ipv4" | "ipv6";
-        ingress_interface: string;
-        source: string | null;
-        destination: string | null;
-        protocol: "any" | "udp" | "icmpv6";
-        source_port: number | null;
-        destination_port: number | null;
-        icmp_type: number | null;
-        icmp_code: number | null;
-        hop_limit: number | null;
-      };
-    }>;
-  }>;
+interface RpfRuntime {
+  mode: "disabled" | "loose" | "strict";
+  family: "ipv4";
+  status: "measured" | "simulated";
+  rp_filter: Record<string, "0" | "1" | "2"> | null;
+  drift: boolean | null;
 }
 
 interface InputFirewall {
@@ -7516,6 +7400,7 @@ interface SoftflowdStatus {
 }
 
 interface RuntimeState {
+  rpf: RpfRuntime;
   host_takeover?: HostTakeover | null; // Native host takeover only.
   process_health?: ProcessHealth; // Always present on HTTP GET /runtime; absent from some core action responses.
   active_alerts?: ActiveAlert[];

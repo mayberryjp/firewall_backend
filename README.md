@@ -234,35 +234,29 @@ NAT destination rewriting remains TCP/UDP only; no port ranges, arbitrary
 numeric protocols or ICMP type/code selectors were added.
 See the [filter contract](FRONTEND_SPEC.md#66-firewall-forwarding).
 
-## Spoof Block
+## Kernel reverse-path filtering
 
-Global `firewall.spoof_block` is **enabled by default**, including omitted input
-and factory reset. On every managed LAN interface, IPv4/IPv6 source addresses
-must belong to a subnet derived from that interface's configured addresses.
-WAN/unassigned interfaces and local output are unaffected. Addressless LANs
-fail closed for ordinary IP traffic; routes and WireGuard peer prefixes do not
-extend the permitted source networks.
+`firewall.rpf_mode` selects Linux IPv4 `rp_filter`: **disabled** (default),
+**loose**, or **strict**. Strict requires the reverse route through the ingress
+interface; loose requires a reverse route through any interface. This is routing
+validation, not a LAN-subnet allowlist, and does not protect IPv6.
 
-Earlier-priority input/forward checks drop off-subnet sources before ICMP,
-established/related, diagnostic permits and configured rules. Valid sources
-continue through existing policy; this is not an automatic allow. Narrow DHCP
-bootstrap and IPv6 neighbor-discovery/multicast-listener exceptions bypass only
-Spoof Block, so existing DHCP/IPv6 service permissions are still required.
-Drops report `reason:"spoof_block"` and use normal logging/Discord policies.
+Netcontrol takes over `all`, `default` and every interface's RPF setting in its
+managed namespace, including WAN, LAN, unmanaged/down links and loopback.
+Existing values are overwritten without ownership-conflict refusal.
+Install/startup/upgrade and reconciliation apply the selected mode; explicitly
+saved modes are preserved. New links inherit the owned default.
+Strict mode can disrupt asymmetric multi-WAN/VPN traffic: review topology and
+retain console access. Changes use confirmed firewall transactions or
+`firewall rpf disabled|loose|strict`.
 
-`GET /api/v1/firewall/rules` exposes read-only `system_policies` with each
-LAN-specific compiled match, DHCP/IPv6 exception, chain priority, action and
-counter ID. These details share the native compiler and reflect the applied
-candidate during confirmed transactions. They are not editable configuration;
-do not include them in transaction candidates. Counter IDs can be shared by
-multiple matches and do not provide distinct per-interface drop totals.
-
-Disable explicitly through a confirmed firewall transaction or
-`firewall spoof-block disable` when intentionally routing nonlocal sources
-through a LAN. This is not Linux uRPF and does not change `rp_filter`, resolve
-WAN return drops, or prevent impersonating another device in the same subnet.
-See the [exact contract](FRONTEND_SPEC.md#spoof-block) and
-[frontend handoff](docs/frontend-handoffs/2026-11-09.md#2026-11-09-08-default-on-lan-spoof-block).
+There are no generated spoof-block rules, exceptions or `system_policies`.
+The firewall API returns only the mode and ordinary configuration; runtime
+reports measured RPF values and drift. RPF drops are not nftables counters,
+deny-log events, MQTT firewall-drop totals or Discord notifications. Retained
+historical deny records are preserved.
+See the [contract](FRONTEND_SPEC.md#kernel-reverse-path-filtering) and
+[handoff](docs/frontend-handoffs/2026-11-09.md#2026-11-09-10-kernel-ipv4-reverse-path-filtering).
 
 ## Firewall rule accounting
 

@@ -4,26 +4,21 @@
 
 ### Added
 
-- `GET /api/v1/firewall/rules` now includes read-only, system-owned Spoof Block
-  policies with exact LAN/family matches, DHCP/IPv6 exceptions, chain ordering,
-  actions and counter links. Share the source-guard compiler with native
-  enforcement; keep generated details out of editable/persisted configuration
-  and preserve aggregate counter semantics. Release impact: additive read API;
-  next automatic calendar version. Required frontend rendering:
-  [handoff 2026-11-09-09](docs/frontend-handoffs/2026-11-09.md#2026-11-09-09-read-only-spoof-block-system-policy-details).
-
-- Default-on global `firewall.spoof_block` rejects off-subnet IPv4/IPv6 sources
-  on managed LAN interfaces before normal input/forward rules, ICMP,
-  established/related acceptance and temporary diagnostic permits. Derive the
-  source-network union from each interface's own addresses; WAN/output are
-  unchanged and addressless LAN families fail closed. Narrow DHCP/IPv6 control
-  exceptions fall through to existing policy rather than granting access.
-  Wire confirmed HTTP/SSH configuration, persistence/rollback, counters, MQTT
-  drop accounting, normal capture and `reason:"spoof_block"` notifications.
-  No uRPF/sysctl change or claim to repair WAN return traffic.
-  Release impact: additive configuration/telemetry, breaking default firewall
-  policy; next automatic calendar version. Required frontend/deployment review:
-  [handoff 2026-11-09-08](docs/frontend-handoffs/2026-11-09.md#2026-11-09-08-default-on-lan-spoof-block).
+- Kernel IPv4 reverse-path filtering through `firewall.rpf_mode`:
+  default `disabled`, `loose` or `strict`. Aggressively own all/default and
+  every interface control, including WAN and unmanaged links, without refusing
+  preexisting conflicting settings. Apply on install/startup/upgrade and
+  confirmed changes/recovery; preserve explicit saved modes on upgrade.
+  Runtime exposes measured values/drift. Replace the generated IPv4/IPv6
+  subnet guards: remove their rules, exceptions, policy API output and
+  counter/MQTT contributions; RPF drops are not NFLOG/Discord events.
+  Retained historical deny records are preserved. Release impact: breaking
+  configuration, read API and default enforcement; next automatic calendar
+  version. Required frontend/operator review:
+  [handoff 2026-11-09-10](docs/frontend-handoffs/2026-11-09.md#2026-11-09-10-kernel-ipv4-reverse-path-filtering).
+  The disabled default supersedes the earlier strict-default decision;
+  explicit saved modes remain authoritative. Required default-selection update:
+  [handoff 2026-11-09-11](docs/frontend-handoffs/2026-11-09.md#2026-11-09-11-rpf-default-disabled).
 
 - Independent default-off `discord.notify_broadcast` and
   `discord.notify_tcp_closures` configuration/status flags for newly seen drops.

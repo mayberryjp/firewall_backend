@@ -402,8 +402,7 @@ pub struct Route {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Firewall {
-    #[serde(default = "yes")]
-    pub spoof_block: bool,
+    pub rpf_mode: RpfMode,
     #[serde(default = "yes")]
     pub drop_logging_enabled: bool,
     #[serde(default = "yes")]
@@ -420,7 +419,7 @@ pub struct Firewall {
 impl Default for Firewall {
     fn default() -> Self {
         Self {
-            spoof_block: true,
+            rpf_mode: RpfMode::default(),
             drop_logging_enabled: true,
             allow_all_icmp: true,
             policy: accept(),
@@ -431,6 +430,25 @@ impl Default for Firewall {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpfMode {
+    #[default]
+    Disabled,
+    Loose,
+    Strict,
+}
+
+impl RpfMode {
+    pub fn kernel_value(self) -> &'static str {
+        match self {
+            Self::Disabled => "0",
+            Self::Strict => "1",
+            Self::Loose => "2",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct NAT {

@@ -169,22 +169,24 @@ fn destination_rewrite_cli_stages_validates_commits_and_removes() {
 }
 
 #[test]
-fn spoof_block_cli_defaults_enabled_and_commits_both_states() {
+fn rpf_cli_defaults_disabled_and_commits_all_modes() {
     let f = Fixture::new(PERMISSIONS);
     let mut cli = CliSession::new();
-    assert!(
+    assert_eq!(
         f.app
             .engine
             .lock()
             .unwrap()
             .saved_configuration()
             .firewall
-            .spoof_block
+            .rpf_mode,
+        netcontrol_core::RpfMode::Disabled
     );
     f.configure(&mut cli);
-    f.fail(&mut cli, "firewall spoof-block invalid", "enable");
-    for (command, expected) in [("disable", false), ("enable", true)] {
-        f.ok(&mut cli, &format!("firewall spoof-block {command}"));
+    f.fail(&mut cli, "firewall rpf invalid", "variant");
+    for command in ["disabled", "loose", "strict"] {
+        let expected: netcontrol_core::RpfMode = serde_json::from_value(json!(command)).unwrap();
+        f.ok(&mut cli, &format!("firewall rpf {command}"));
         f.ok(&mut cli, "commit confirmed 30");
         f.ok(&mut cli, "confirm");
         assert_eq!(
@@ -194,10 +196,10 @@ fn spoof_block_cli_defaults_enabled_and_commits_both_states() {
                 .unwrap()
                 .saved_configuration()
                 .firewall
-                .spoof_block,
+                .rpf_mode,
             expected
         );
-        if !expected {
+        if command != "strict" {
             f.ok(&mut cli, "configure terminal");
         }
     }

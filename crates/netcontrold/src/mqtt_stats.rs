@@ -766,14 +766,7 @@ pub fn firewall(
                     "MQTT firewall counter path invalid"
                 );
                 let path = path.as_str();
-                // Spoof Block is terminal; generated checks/returns are not drops.
-                let drop = if path == Some("/firewall/spoof_block") {
-                    ensure!(
-                        configuration["firewall"]["spoof_block"] == true,
-                        "MQTT spoof block counters present while disabled"
-                    );
-                    true
-                } else if let Some(path) = path.filter(|path| {
+                let drop = if let Some(path) = path.filter(|path| {
                     *path != "/firewall/allow_all_icmp" && !path.starts_with("/firewall/nat/")
                 }) {
                     let configured = configuration
@@ -1167,7 +1160,6 @@ pub(crate) mod tests {
             ("/firewall/input/interfaces/0/rules/0", 11),
             ("/firewall/policies/interfaces/0/rules/1", 13),
             ("/firewall/allow_all_icmp", 17),
-            ("/firewall/spoof_block", 31),
             ("/firewall/nat/masquerade/0", 19),
         ].into_iter().map(|(path, packets)| json!({"config_path":path,"packets":packets.to_string(),"bytes":(packets * 10).to_string()}))
             .chain([json!({"config_path":null,"packets":"23","bytes":"230"})]).collect();
@@ -1175,11 +1167,11 @@ pub(crate) mod tests {
         let out = firewall(Some(&snapshot), &configuration).unwrap();
         assert_eq!(
             sensor(&out, "firewall", "accounting", "dropped_packets").value,
-            "60"
+            "29"
         );
         assert_eq!(
             sensor(&out, "firewall", "accounting", "dropped_bytes").value,
-            "600"
+            "290"
         );
         assert_eq!(
             sensor(&out, "firewall", "accounting", "dropped_packets").class,

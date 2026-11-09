@@ -629,6 +629,7 @@ mod tests {
         let mut saved = initial();
         saved.ipv6_enabled = true;
         saved.firewall.allow_all_icmp = false;
+        saved.firewall.rpf_mode = netcontrol_core::RpfMode::Strict;
         saved.dhcp_clients.insert("lan0".into(), Default::default());
         saved.interfaces.push(
             serde_json::from_value(json!({"name":"wifi0", "kind":"ethernet",
@@ -677,6 +678,10 @@ mod tests {
         assert_eq!(lan.role, "lan");
         assert_eq!(lan.addresses, ["192.168.0.1/24"]);
         assert!(factory.firewall.allow_all_icmp);
+        assert_eq!(
+            factory.firewall.rpf_mode,
+            netcontrol_core::RpfMode::Disabled
+        );
         assert_eq!(factory.firewall.nat.masquerade[0].source, "192.168.0.0/24");
     }
 
@@ -694,6 +699,7 @@ mod tests {
         );
         assert_eq!(config.firewall.policy, "drop");
         assert!(config.firewall.allow_all_icmp);
+        assert_eq!(config.firewall.rpf_mode, netcontrol_core::RpfMode::Disabled);
         assert_eq!(
             config.firewall.policies.unwrap().interfaces[0].rules[0].out_interface,
             ""

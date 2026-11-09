@@ -2296,26 +2296,38 @@ fn drop_logging_defaults_enabled_and_requires_boolean() {
     }
 }
 #[test]
-fn spoof_block_defaults_enabled_and_requires_boolean() {
-    assert!(Config::empty().firewall.spoof_block);
+fn rpf_mode_defaults_disabled_and_rejects_obsolete_or_invalid_fields() {
+    assert_eq!(RpfMode::default(), RpfMode::Disabled);
+    assert_eq!(Config::empty().firewall.rpf_mode, RpfMode::Disabled);
     for value in [json!({}), json!({"firewall":{}})] {
         let config: Config = serde_json::from_value(value).unwrap();
-        assert!(config.firewall.spoof_block);
+        assert_eq!(config.firewall.rpf_mode, RpfMode::Disabled);
         assert_eq!(
-            config.operational_value().unwrap()["firewall"]["spoof_block"],
-            true
+            config.operational_value().unwrap()["firewall"]["rpf_mode"],
+            "disabled"
         );
     }
-    let config: Config = serde_json::from_value(json!({"firewall":{"spoof_block":false}})).unwrap();
-    assert!(!config.firewall.spoof_block);
-    assert_eq!(
-        config.operational_value().unwrap()["firewall"]["spoof_block"],
-        false
-    );
-    for invalid in [Value::Null, json!("true"), json!(1)] {
-        assert!(
-            serde_json::from_value::<Config>(json!({"firewall":{"spoof_block":invalid}})).is_err()
+    for (mode, expected) in [("strict", "1"), ("loose", "2"), ("disabled", "0")] {
+        let config: Config = serde_json::from_value(json!({"firewall":{"rpf_mode":mode}})).unwrap();
+        assert_eq!(config.firewall.rpf_mode.kernel_value(), expected);
+        assert_eq!(
+            config.operational_value().unwrap()["firewall"]["rpf_mode"],
+            mode
         );
+    }
+    for invalid in [
+        Value::Null,
+        json!("true"),
+        json!(1),
+        json!(false),
+        json!("Strict"),
+    ] {
+        assert!(
+            serde_json::from_value::<Config>(json!({"firewall":{"rpf_mode":invalid}})).is_err()
+        );
+    }
+    for obsolete in [json!({"spoof_block":true}), json!({"system_policies":[]})] {
+        assert!(serde_json::from_value::<Config>(json!({"firewall":obsolete})).is_err());
     }
 }
 
