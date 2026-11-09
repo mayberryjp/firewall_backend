@@ -108,6 +108,8 @@ fn native_spoof_block_enforces_lan_input_forward_fallthrough_restart_and_rollbac
                 .veth("lan0".into(), "peer0".into())
                 .execute()
                 .await?;
+            // These isolated, uniquely addressed links do not test DAD.
+            std::fs::write("/proc/sys/net/ipv6/conf/lan0/accept_dad", "0")?;
             let link = handle
                 .link()
                 .get()
@@ -127,6 +129,7 @@ fn native_spoof_block_enforces_lan_input_forward_fallthrough_restart_and_rollbac
     })?;
     session(peer_ns.clone(), |rt, handle| {
         rt.block_on(async {
+            std::fs::write("/proc/sys/net/ipv6/conf/peer0/accept_dad", "0")?;
             let link = handle
                 .link()
                 .get()
@@ -219,8 +222,6 @@ fn native_spoof_block_enforces_lan_input_forward_fallthrough_restart_and_rollbac
         }
         Ok((v4, v6))
     })?;
-    // Wait for ordinary kernel DAD before testing globally addressed UDP.
-    std::thread::sleep(Duration::from_secs(2));
     let sources = [
         "192.0.2.2:0",
         "203.0.113.2:0",

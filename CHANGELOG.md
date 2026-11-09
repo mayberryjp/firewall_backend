@@ -247,6 +247,13 @@
 
 ### Fixed
 
+- Make the privileged LAN spoof-block fixture's IPv6 addresses usable before
+  socket binding by disabling DAD on its isolated veth endpoints, matching other
+  native packet fixtures instead of relying on a post-bind sleep. Fixes the
+  Ubuntu CI `Cannot assign requested address` failure without changing production
+  networking, firewall policy or frontend contracts.
+  Release impact: none (test-only fix); normal commit-derived version progression.
+
 - Classify Discord's operational `ready` state as healthy in platform health
   instead of making an otherwise healthy appliance report `unknown` with no
   alerts. Preserve actual worker failures, service warnings and unknown states
