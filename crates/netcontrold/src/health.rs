@@ -87,6 +87,9 @@ impl Monitor {
             }
         };
         if let Some(runtime) = runtime {
+            if runtime["kernel_panic"].is_object() {
+                inspect("kernel_panic", "host", &runtime["kernel_panic"]);
+            }
             for group in [
                 "appliance_services",
                 "dhcp_relay",
@@ -268,6 +271,40 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panic_reboot_enforcement_failure_and_recovery_are_visible() {
+        let monitor = super::Monitor::default();
+        for state in ["error", "running"] {
+            monitor.observe(
+                Some(&serde_json::json!({"kernel_panic":{"state":state,"retrying":true}})),
+                &[],
+                false,
+            );
+            let snapshot = monitor.snapshot();
+            assert_eq!(
+                snapshot["process_health"]["status"],
+                if state == "error" {
+                    "degraded"
+                } else {
+                    "healthy"
+                }
+            );
+            assert_eq!(
+                snapshot["active_alerts"].as_array().unwrap().len(),
+                usize::from(state == "error")
+            );
+            assert_eq!(
+                snapshot["process_health"]["components"][0]["component"],
+                "kernel_panic"
+            );
+        }
+        monitor.observe(Some(&serde_json::json!({"kernel_panic":null})), &[], false);
+        assert_eq!(
+            monitor.snapshot()["process_health"]["components"],
+            serde_json::json!([])
+        );
+    }
+
     #[test]
     fn discord_ready_is_healthy_and_clears_observed_failure() {
         let monitor = super::Monitor::default();

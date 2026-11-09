@@ -181,6 +181,160 @@ configure_snap() {
     configure_masked_units Snap snapd.service snapd.socket
 }
 
+configure_apparmor() (
+    set -euo pipefail
+    local root=${1:-/} path parent work previous=false information package status essential protected
+    local operation remainder simulation removals=0 enabled candidate selected allowed
+    local grub="$root/etc/default/grub.d/99-netcontrol-apparmor.cfg"
+    local generated="$root/boot/grub/grub.cfg"
+    local pin="$root/etc/apt/preferences.d/99-netcontrol-no-apparmor"
+    local -a packages=() targets=(
+        etc/apparmor etc/apparmor.d etc/default/apparmor etc/init.d/apparmor
+        var/cache/apparmor var/lib/apparmor usr/lib/apparmor usr/share/apparmor
+    )
+    [[ $root == /* && -d $root && ! -L $root ]] || {
+        printf 'Refusing unsafe AppArmor configuration root: %s\n' "$root" >&2; exit 1;
+    }
+    for path in update-grub apt-get apt-cache dpkg-query systemctl; do
+        command -v "$path" >/dev/null || {
+            printf 'AppArmor removal requires %s and a supported GRUB installation.\n' "$path" >&2; exit 1;
+        }
+    done
+    for path in etc/default/grub.d etc/apt/preferences.d boot/grub sys/module/apparmor/parameters "${targets[@]}"; do
+        parent="$root/$path"
+        while [[ $parent != "$root" && $parent != / ]]; do
+            [[ ! -L $parent && ( ! -e $parent || -d $parent || $parent == "$root/$path" ) ]] || {
+                printf 'Refusing unsafe AppArmor path: %s\n' "$parent" >&2; exit 1;
+            }
+            parent=$(dirname -- "$parent")
+        done
+    done
+    for path in "$root/etc/default/grub" "$generated"; do
+        [[ -f $path && ! -L $path ]] || {
+            printf 'AppArmor removal requires a regular GRUB configuration: %s\n' "$path" >&2; exit 1;
+        }
+    done
+    for path in "$grub" "$pin"; do
+        [[ ! -L $path && ( ! -e $path || -f $path ) ]] || {
+            printf 'Refusing non-regular AppArmor configuration: %s\n' "$path" >&2; exit 1;
+        }
+    done
+    work=$(mktemp -d) || exit 1
+    trap 'rm -rf -- "$work"' EXIT
+    information=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\t${Essential}\t${Protected}\n') || exit 1
+    while read -r package status essential protected; do
+        case ${package%%:*} in
+            apparmor|apparmor-*|python3-apparmor|python3-libapparmor|libpam-apparmor) ;;
+            *) continue ;;
+        esac
+        case $status in
+            installed|config-files) ;;
+            not-installed) continue ;;
+            *) printf 'Repair incomplete package %s (%s) before deployment.\n' "$package" "$status" >&2; exit 1 ;;
+        esac
+        [[ $essential != yes && $protected != yes ]] || {
+            printf 'Refusing essential/protected AppArmor package: %s\n' "$package" >&2; exit 1;
+        }
+        packages+=("$package")
+    done <<< "$information"
+    if [[ ${#packages[@]} -gt 0 ]]; then
+        simulation=$(LC_ALL=C apt-get --simulate -o APT::Get::AutomaticRemove=false purge -- "${packages[@]}") || exit 1
+        while read -r operation package remainder; do
+            case $operation in
+                Remv|Purg)
+                    allowed=false
+                    for selected in "${packages[@]}"; do
+                        if [[ ${selected%%:*} == "${package%%:*}" ]]; then allowed=true; break; fi
+                    done
+                    [[ $allowed == true ]] || {
+                        printf 'Refusing collateral AppArmor dependency removal: %s\n' "$package" >&2; exit 1;
+                    }
+                    removals=$((removals + 1)) ;;
+                Inst) printf 'Refusing AppArmor purge plan that installs %s.\n' "$package" >&2; exit 1 ;;
+            esac
+        done <<< "$simulation"
+        [[ $removals -gt 0 ]] || {
+            printf 'Unrecognized AppArmor purge plan; refusing changes.\n' >&2; exit 1;
+        }
+    fi
+    install -d -o root -g root -m 0755 "$root/etc/default/grub.d" || exit 1
+    if [[ -e $grub ]]; then
+        cp -a -- "$grub" "$work/grub.previous" || exit 1
+        previous=true
+    fi
+    printf 'GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} apparmor=0"\n' > "$work/grub" || exit 1
+    install -o root -g root -m 0644 "$work/grub" "$grub" || exit 1
+    if ! update-grub || ! awk '
+        $1 ~ /^(linux|linuxefi|linux16)$/ {
+            found=1; last=""
+            for (i=3; i<=NF; i++) if ($i ~ /^apparmor=/) last=$i
+            if (last != "apparmor=0") invalid=1
+        }
+        END { exit (!found || invalid) }
+    ' "$generated"; then
+        if [[ $previous == true ]]; then
+            cp -a -- "$work/grub.previous" "$grub" || exit 1
+        else
+            rm -- "$grub" || exit 1
+        fi
+        printf 'AppArmor GRUB generation/verification failed; drop-in restored. Inspect generated boot configuration before rebooting.\n' >&2
+        exit 1
+    fi
+    if [[ -e $root/sys/module/apparmor/parameters/enabled ]]; then
+        enabled=$(cat -- "$root/sys/module/apparmor/parameters/enabled") || exit 1
+        case $enabled in
+            N|0) ;;
+            Y|1)
+                printf 'AppArmor is still enabled in the running kernel. Boot disable is prepared; reboot manually from a local console, then rerun the same install.sh or upgrade.sh command. Deployment has not continued; no packages/profiles were purged.\n' >&2
+                exit 1 ;;
+            *) printf 'Cannot verify running AppArmor state: %s\n' "$enabled" >&2; exit 1 ;;
+        esac
+    elif [[ -e $root/sys/module/apparmor ]]; then
+        printf 'Cannot verify running AppArmor state: enabled parameter is missing.\n' >&2; exit 1
+    fi
+    if [[ -e $root/sys/kernel/security/lsm ]]; then
+        enabled=$(cat -- "$root/sys/kernel/security/lsm") || exit 1
+        if [[ ,$enabled, == *,apparmor,* ]]; then
+            printf 'AppArmor remains in the active kernel LSM list; reboot into apparmor=0 before deployment.\n' >&2; exit 1
+        fi
+    fi
+    configure_masked_units AppArmor apparmor.service || exit 1
+    install -d -o root -g root -m 0755 "$root/etc/apt/preferences.d" || exit 1
+    printf 'Package: apparmor apparmor-* python3-apparmor python3-libapparmor libpam-apparmor\nPin: version *\nPin-Priority: -1\n' > "$work/pin" || exit 1
+    install -o root -g root -m 0644 "$work/pin" "$pin" || exit 1
+    if [[ ${#packages[@]} -gt 0 ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get --assume-yes -o APT::Get::AutomaticRemove=false purge -- "${packages[@]}" || exit 1
+    fi
+    information=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n') || exit 1
+    while read -r package status; do
+        case ${package%%:*} in
+            apparmor|apparmor-*|python3-apparmor|python3-libapparmor|libpam-apparmor)
+                [[ $status == not-installed ]] || {
+                    printf 'AppArmor package remains after purge: %s (%s)\n' "$package" "$status" >&2; exit 1;
+                } ;;
+        esac
+    done <<< "$information"
+    systemctl mask apparmor.service || exit 1
+    status=$(systemctl show apparmor.service --property ActiveState --property UnitFileState) || exit 1
+    grep -Fxq 'UnitFileState=masked' <<< "$status" &&
+        grep -Eq '^ActiveState=(inactive|failed)$' <<< "$status" || {
+            printf 'AppArmor service is not stopped and persistently masked after purge.\n' >&2; exit 1;
+        }
+    for package in "${packages[@]}" apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra apparmor-notify apparmor-easyprof python3-apparmor python3-libapparmor libpam-apparmor; do
+        candidate=$(LC_ALL=C apt-cache policy "$package") || exit 1
+        [[ -z $candidate ]] || grep -Fxq '  Candidate: (none)' <<< "$candidate" || {
+            printf 'AppArmor package %s still has an APT candidate; inspect pin precedence.\n' "$package" >&2; exit 1;
+        }
+    done
+    for path in "${targets[@]}"; do
+        rm -rf -- "$root/$path" || exit 1
+        [[ ! -e $root/$path && ! -L $root/$path ]] || {
+            printf 'AppArmor cleanup did not remove %s.\n' "$path" >&2; exit 1;
+        }
+    done
+    installer_message success 'AppArmor disabled in the running kernel and GRUB; policy/tooling purged, service masked and APT reinstallation pinned out. Required libraries/kernel code retained.'
+)
+
 configure_ntp() (
     set -euo pipefail
     local unit status process
@@ -777,6 +931,8 @@ main() {
             'Disables Snap, competing syslog receivers and automatic OS updates, including security fixes.' \
             'Removes MOTD login messages/generators and stops/masks MOTD services.' \
             'Stops/masks OS NTP clients; Netcontrol NTP remains disabled until explicitly configured.' \
+            'Disables AppArmor via GRUB; if active, stops for manual reboot/rerun before proceeding.' \
+            'Purges AppArmor policy/tooling, masks its service and pins out reinstall; required libraries/kernel code remain.' \
             'Schedule manual OS patching. LAN clients need static addresses; no DHCP/DNS server is installed.' \
             'Enables LAN HTTP setup, localhost configuration SSH on TCP 2222 and startup at boot.' \
             '' \
@@ -842,6 +998,7 @@ main() {
     installer_message warning 'Automatic OS updates, including security fixes, and Snap will be disabled. Schedule manual patching.'
     installer_message warning 'Competing syslog receivers will be disabled. Configuration SSH listens on localhost TCP 2222 only by default.'
     installer_message warning 'OS NTP clients will be stopped and masked. Configure Netcontrol NTP explicitly to synchronize the clock.'
+    installer_message warning 'AppArmor confinement will be removed. GRUB is required; active AppArmor requires a manual reboot and installer rerun.'
     systemctl is-active --quiet systemd-networkd.service || {
         installer_message error 'systemd-networkd must be running.'
         return 1
@@ -852,6 +1009,7 @@ main() {
     }
     installer_step 'Refreshing package lists' apt-get update || return 1
     installer_step 'Installing prerequisites' apt-get install --no-install-recommends -y ca-certificates python3 procps kmod curl || return 1
+    installer_step 'Disabling and removing AppArmor' configure_apparmor || return 1
     if pgrep -x netcontrold >/dev/null; then
         printf 'Stop the running netcontrold before installing; networking will not be stopped automatically.\n' >&2
         return 1

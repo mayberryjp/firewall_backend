@@ -451,6 +451,32 @@ instructions must require planned manual OS patching and must not describe
 disabled automatic security patching as a security improvement.
 This host policy adds no API fields, permissions or web action and does not
 change the saved firewall configuration.
+Fresh installation additionally requires AppArmor disabled before downloading/
+provisioning Netcontrol. It writes/verifies a GRUB `apparmor=0` drop-in; active
+AppArmor stops deployment for a manual console reboot and rerun, not a
+successful install or automatic reboot. Once the live kernel is verified
+disabled, it stops/disables and persistently masks `apparmor.service` (including
+absent units), purges AppArmor policy/tooling and residual configuration, removes
+standard profile/cache directories, and pins those packages to APT priority -1,
+checking no normal package candidate remains. Required libraries and built-in
+kernel support remain; collateral dependency removals are refused. This removes
+confinement protection and must not be described as a security improvement.
+GRUB, package/control/file errors and indeterminate kernel state abort deployment;
+completed host changes are not rolled back. Do not promise absolute absence,
+prevention of deliberate root overrides or an immediately disabled running
+kernel before reboot. Required frontend work is installation/reboot/operator-help
+disclosure, including deletion of custom profiles, not API forms/types/polling.
+Full source `upgrade.sh` now applies the same shared policy after build and
+before other host setup, old-daemon shutdown or binary replacement. If AppArmor
+is enabled, prepare boot disablement and stop with manual reboot/upgrade-rerun
+instructions; never claim live disablement from a stopped service. Existing
+AppArmor-disabled hosts still verify/purge/mask/pin. Requires supported GRUB and
+existing package tooling; full source upgrades do not install prerequisites.
+`--build-only`, HTTP/automatic binary self-upgrades, signed packages, reset and
+standalone hardening do not establish this policy.
+See [scope](docs/BUILD_AND_INSTALL.md#fresh-install-apparmor-removal) and
+[initial handoff 2026-11-10-02](docs/frontend-handoffs/2026-11-10.md#2026-11-10-02-fresh-install-apparmor-removal)
+and [source-upgrade extension 2026-11-10-03](docs/frontend-handoffs/2026-11-10.md#2026-11-10-03-source-upgrade-apparmor-removal).
 Fresh installation and full source `upgrade.sh` deployments also remove standard
 Ubuntu MOTD files, generator directories and cached messages, remove active
 `pam_motd.so` lines from regular PAM configuration files, and stop/disable and
@@ -587,7 +613,9 @@ targeted. The full footprint/purge profile is not automatically run during
 installation/upgrade/reset and adds
 no HTTP endpoint, browser action, permissions or schema fields. mDNS discovery
 may disappear, so operator instructions should use the appliance IP.
-AppArmor remains enabled by default. `--disable-apparmor` explicitly opts out of
+On existing hosts, standalone hardening leaves AppArmor unchanged by default;
+fresh installation instead applies the mandatory removal policy above.
+Hardening `--disable-apparmor` explicitly opts out of
 that protection, with `--apply`, via a GRUB `apparmor=0` boot drop-in and disabled
 service. GRUB is required, packages are retained, and kernel enforcement changes
 only after a manual reboot. Do not present the opt-out as a security improvement
@@ -5347,6 +5375,54 @@ conversion endpoint, browser repair action or permissive startup fallback.
 
 ### 6.6 Firewall forwarding
 
+#### Mandatory host panic reboot
+
+Native host mode now mandatorily enforces `kernel.panic=10`: Linux attempts
+reboot ten seconds after a kernel panic. Startup claims the setting and persists
+`/etc/sysctl.d/99-netcontrol-panic.conf`; an in-process worker reclaims runtime
+and owned-file drift every second. Initial failures abort native startup;
+later failures are logged/retried and reported as a `kernel_panic` component
+in existing platform process health/alerts. They do not block unrelated valid
+configuration transactions. This policy is not editable configuration and
+configuration rollback does not restore an earlier foreign value.
+
+`GET /api/v1/runtime` (`state.read`) adds `kernel_panic` in native mode:
+
+```json
+{
+  "kernel_panic": {
+    "state": "running",
+    "retrying": true,
+    "error": null,
+    "reboot_after_seconds": 10,
+    "observed_seconds": 10,
+    "drift": false,
+    "enforcement_interval_seconds": 1,
+    "persistence_file": "/etc/sysctl.d/99-netcontrol-panic.conf"
+  }
+}
+```
+
+`state` is `running` only while the worker is alive, its latest enforcement
+succeeded and a fresh control read equals 10; otherwise `error`.
+`retrying` indicates that the worker is alive. `observed_seconds` is the live
+signed integer or null on read failure; `drift` is null when unmeasured, otherwise
+whether it differs from 10. `error` is nullable diagnostic text for read or
+enforcement failure; observed drift or an exited worker can have null error.
+Native lab mode returns null, including with host-tunable opt-in; simulator
+omits the field. No request fields, new methods/paths, authentication changes
+or editable kernel catalog entries are added.
+
+Required frontend work is operator-help disclosure of mandatory automatic
+reboot/deployment requirements; optionally render measured policy/drift and the
+existing platform alert. Do not offer a delay/disable control or treat null/
+absent observations as enforced. Panic-on-oops/warnings and watchdog/NMI panic
+triggers are unchanged. Existing conflicting files are not removed; boot
+ordering and competing writers can override the value until the next daemon
+claim. Stopping the daemon stops reclamation, not the saved/live policy.
+See [deployment details](docs/BUILD_AND_INSTALL.md#kernel-panic-reboot-ownership)
+and [handoff](docs/frontend-handoffs/2026-11-10.md#2026-11-10-01-mandatory-panic-reboot).
+
 #### Kernel reverse-path filtering
 
 Provide a global **IPv4 reverse-path filtering** mode selector bound to
@@ -7399,7 +7475,19 @@ interface SoftflowdStatus {
   malformed_packets?: number;
 }
 
+interface KernelPanicRuntime {
+  state: "running" | "error";
+  retrying: boolean;
+  error: string | null;
+  reboot_after_seconds: 10;
+  observed_seconds: number | null;
+  drift: boolean | null;
+  enforcement_interval_seconds: 1;
+  persistence_file: "/etc/sysctl.d/99-netcontrol-panic.conf";
+}
+
 interface RuntimeState {
+  kernel_panic?: KernelPanicRuntime | null; // Native host only; null in native lab mode, absent in simulator.
   rpf: RpfRuntime;
   host_takeover?: HostTakeover | null; // Native host takeover only.
   process_health?: ProcessHealth; // Always present on HTTP GET /runtime; absent from some core action responses.

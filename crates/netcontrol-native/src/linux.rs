@@ -65,6 +65,7 @@ mod link_monitor;
 mod netfilter;
 mod networking;
 mod offloads;
+mod panic_reboot;
 mod path_test;
 mod rpf;
 mod rps;
@@ -89,6 +90,7 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 }
 
 pub struct Native {
+    panic_reboot: Option<panic_reboot::Guard>,
     path_test: path_test::Manager,
     performance: crate::performance::Monitor,
     bgp: bgp::Manager,
@@ -356,6 +358,7 @@ impl Native {
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
         let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
+            panic_reboot: None,
             path_test: path_test::Manager::new(
                 namespace.clone(),
                 state.clone(),
@@ -428,6 +431,9 @@ impl Native {
         if let Some(config) = native.ownership()?.committed_config {
             let mode = serde_json::from_value::<Config>(config)?.firewall.rpf_mode;
             session(native.namespace.clone(), move |_, _| rpf::set(mode))?;
+        }
+        if host_mode {
+            native.panic_reboot = Some(panic_reboot::Guard::new()?);
         }
         Ok(native)
     }
@@ -2049,6 +2055,10 @@ impl Backend for Native {
         value["ipv6"] = session(self.namespace.clone(), move |_, _| ipv6::status(enabled))?;
         let mode = config.firewall.rpf_mode;
         value["rpf"] = session(self.namespace.clone(), move |_, _| rpf::status(mode))?;
+        value["kernel_panic"] = match &self.panic_reboot {
+            Some(guard) => guard.status()?,
+            None => Value::Null,
+        };
         let desired = Network::parse(&config.operational_value()?)?.kernel;
         let baseline = self.ownership()?.kernel_baseline;
         let mut effective = baseline.clone();

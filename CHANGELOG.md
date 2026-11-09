@@ -4,6 +4,16 @@
 
 ### Added
 
+- Mandatory native-host `kernel.panic=10` ownership: attempt reboot ten seconds
+  after a kernel panic, overwrite conflicts at startup, durably persist the boot
+  setting and reclaim live/owned-file drift every second in Rust. Expose measured
+  runtime status and enforcement failures in platform health; leave panic
+  triggers, simulator and native lab namespaces unchanged. Initial takeover
+  errors abort startup. Release impact: breaking host deployment policy with
+  additive runtime metadata; next automatic calendar version.
+  Required operator-help review:
+  [handoff 2026-11-10-01](docs/frontend-handoffs/2026-11-10.md#2026-11-10-01-mandatory-panic-reboot).
+
 - Kernel IPv4 reverse-path filtering through `firewall.rpf_mode`:
   default `disabled`, `loose` or `strict`. Aggressively own all/default and
   every interface control, including WAN and unmanaged links, without refusing
@@ -77,6 +87,19 @@
   [handoff 2026-11-08-01](docs/frontend-handoffs/2026-11-08.md#2026-11-08-01-conntrack-controls).
 
 ### Changed
+
+- Fresh installation and full source upgrades require kernel AppArmor disablement
+  via verified GRUB boot settings, stopping for manual reboot/rerun when active. Then purge
+  policy/tooling and standard profile/cache data, persistently mask its service
+  and pin out normal APT reinstallation; preserve required libraries/kernel code
+  and reject collateral dependency removal. Source upgrades stop before
+  old-daemon shutdown/binary replacement on failure or reboot requirement.
+  Build-only, HTTP/automatic binary upgrades, signed packages, reset and
+  standalone hardening do not establish this policy. Release impact: breaking
+  installation/security policy; next automatic calendar version.
+  Required operator/reboot-help review:
+  [handoff 2026-11-10-02](docs/frontend-handoffs/2026-11-10.md#2026-11-10-02-fresh-install-apparmor-removal)
+  and [scope extension 2026-11-10-03](docs/frontend-handoffs/2026-11-10.md#2026-11-10-03-source-upgrade-apparmor-removal).
 
 - Repository Copilot instructions now require copyable, single-physical-line
   shell commands without prompts or history numbers, using semicolons where

@@ -50,6 +50,38 @@ Use an aarch64 Linux host and the aarch64 target for ARM64 builds unless an
 appropriate cross-linker is explicitly configured. Merely adding a Rust target
 does not install a cross-architecture linker.
 
+## Kernel panic reboot ownership
+
+Native **host mode** always takes over host-global `kernel.panic=10`, causing
+Linux to attempt reboot ten seconds after a kernel panic. There is no editable
+configuration, permission opt-in or original-value restoration. Startup
+overwrites zero (disabled), negative (immediate reboot) and other delays, checks
+exact readback and writes root-owned mode-0644
+`/etc/sysctl.d/99-netcontrol-panic.conf`. A Rust worker checks and reclaims the
+live control and its owned boot file every second, without rewriting unchanged
+files. Conflicting foreign sysctl files are not deleted or edited. Their boot
+ordering can override this file until daemon startup reclaims the live value;
+kernel command-line panic policy before sysctl/daemon startup is unchanged.
+
+This applies when the native host daemon starts during installation, upgrades
+(including binary-only self-upgrades), restart and boot. It requires writable
+procfs and a trusted root-owned `/etc/sysctl.d`. Missing/unwritable controls,
+unsafe file targets or failed readback abort initial takeover. Later failures
+are logged, retried and exposed through `GET /api/v1/runtime` and platform
+health/alerts; they do not gate unrelated configuration transactions.
+Do not run competing writers: periodic reclamation is not an exclusive kernel
+lock, and an external writer can change the value between checks.
+
+Only the reboot delay is changed: panic-on-oops, panic-on-warning, lockup/NMI
+panic triggers and hardware watchdog policy remain untouched. Existing external
+panic triggers are not disabled. No panic is deliberately induced for validation;
+some catastrophic failures cannot execute the kernel reboot path.
+Stopping Netcontrol leaves the live setting and boot file in place, but stops
+periodic reclamation. Configuration rollback does not undo this appliance policy.
+Simulator, build-only and native lab namespace mode (even with host-tunable
+opt-in) do not take control of this setting. Deployment needs console access and
+explicit operator acceptance of automatic reboots after genuine kernel panics.
+
 ## Kernel IPv4 reverse-path filtering
 
 The daemon takes over Linux `net.ipv4.conf.all.rp_filter`,
@@ -197,6 +229,13 @@ the base unit or custom startup arguments. Build-only runs do not change it.
 They also [configure journald forwarding](#host-logging-ownership) for native syslog.
 Fresh installation and full source upgrades also perform
 [MOTD cleanup](#motd-cleanup); build-only runs leave the host unchanged.
+Full source upgrades first apply the shared
+[AppArmor disablement/removal policy](#fresh-install-apparmor-removal).
+If enabled, prepare GRUB boot disablement and stop for manual reboot/rerun
+before stopping the old daemon or replacing its binary. Once disabled, purge
+policy/tooling and custom profiles, enforce service masks and APT pins.
+GRUB and existing package/tool prerequisites are required; upgrades do not
+install missing prerequisites. HTTP/automatic binary self-upgrades are excluded.
 Full install/upgrade enables the embedded configuration SSH listener on
 `127.0.0.1:2222` (localhost only) through `NETCONTROL_SSH_LISTEN`; no second
 process or OpenSSH package is started. Explicit `--ssh-listen` arguments take
@@ -849,6 +888,69 @@ boot/power-loss, authenticated release-download and frontend acceptance still
 require a disposable Ubuntu VM; container build/unit/filesystem tests do not
 prove these behaviors. See the [current journal](journal/2026-10-29.md#automatic-github-https-updates)
 and [original recovery design](journal/2026-10-24.md#signed-ubuntu-self-upgrade).
+
+## Fresh-install AppArmor removal
+
+Fresh `install.sh` requires AppArmor disabled before downloading the release
+or provisioning Netcontrol. Full source `upgrade.sh` uses the same policy after
+building and before kernel/service setup, old-daemon shutdown or binary replacement.
+This deliberately removes mandatory-access-control
+confinement, not a security improvement. Use a local console and take a protected
+snapshot first. Required AppArmor libraries (such as `libapparmor1`) and kernel
+code remain; no custom kernel or unrelated dependency removal is attempted.
+
+The installer requires a supported GRUB layout: `update-grub`, regular
+`/etc/default/grub` and `/boot/grub/grub.cfg`, and non-symlink configuration/
+cleanup paths. It writes root-owned mode-0644
+`/etc/default/grub.d/99-netcontrol-apparmor.cfg`, appending `apparmor=0` to
+`GRUB_CMDLINE_LINUX`, runs `update-grub` and checks every generated
+`linux`/`linuxefi`/`linux16` command ends its explicit AppArmor parameters with
+`apparmor=0`. A generation/readback failure restores the prior drop-in (or removes
+the new one) and aborts; inspect generated GRUB output before rebooting.
+
+If `/sys/module/apparmor/parameters/enabled` reports enabled, either deployment script
+**stops with an error requiring manual reboot and rerun**. It does not reboot
+automatically, purge profiles/packages or claim existing kernel enforcement
+is off. For fresh installs this occurs after ordinary prerequisite installation
+but before release download, network takeover or daemon provisioning; source
+upgrades stop before AppArmor purge, old-daemon shutdown and binary replacement.
+Rerun the same `install.sh` or `upgrade.sh` command after the console reboot.
+The live
+parameter must report `N`/`0`, or the AppArmor module must be absent; unknown/
+missing module parameters fail. A readable kernel LSM list must not include
+AppArmor. Unsupported boot layouts and indeterminate state fail explicitly.
+
+After confirming kernel disablement, both scripts use the shared preparation:
+
+- Stops/disables and persistently masks `apparmor.service`, including an absent
+  unit, verifying inactive/failed state and persistent `masked` enablement.
+- Purges installed and residual-config packages matching `apparmor`, `apparmor-*`,
+  `python3-apparmor`, `python3-libapparmor` and `libpam-apparmor`. Essential/
+  protected or incomplete packages, dependency removals outside the selected
+  list, installs in the purge plan and unrecognized plans are errors.
+  No autoremove or removal of `libapparmor1`/unrelated packages.
+- Writes root-owned mode-0644
+  `/etc/apt/preferences.d/99-netcontrol-no-apparmor` with those package selectors,
+  `Pin: version *` and `Pin-Priority: -1`; verifies no normal APT candidate for
+  the purged packages and standard AppArmor tools. Ordinary manual APT
+  reinstallation is blocked, not deliberate privileged pin/version overrides.
+- Removes remaining custom content under exactly `/etc/apparmor`,
+  `/etc/apparmor.d`, `/etc/default/apparmor`, `/etc/init.d/apparmor`,
+  `/var/cache/apparmor`, `/var/lib/apparmor`, `/usr/lib/apparmor` and
+  `/usr/share/apparmor`. Save wanted policies elsewhere before installation.
+  Symlink paths/parents are refused rather than following them.
+
+Each error aborts deployment. Completed boot/service/package/file changes
+are not transactionally rolled back; purged custom profiles have no automatic
+backup. Review collateral-dependency errors explicitly rather than forcing
+package removal. Repeating preparation is supported; an already-disabled kernel
+does not bypass mask/pin/package verification.
+Build-only runs, HTTP/automatic HTTPS upgrades, signed packages, reset and
+standalone hardening do not establish this policy. The persisted pin/mask/GRUB
+setting remains across ordinary reboots, but a root user, direct package
+installation, custom boot entries or a replacement bootloader can override it.
+There is no daemon-wide AppArmor-removal worker or absolute guarantee that
+AppArmor artifacts can never be reintroduced.
 
 ## Ubuntu prebuilt installation (amd64)
 
@@ -1883,7 +1985,10 @@ apt-config dump | grep -E '^(APT::Periodic::(Enable|Update-Package-Lists|Downloa
 ### Optional AppArmor Protection Opt-Out
 
 Disabling AppArmor removes mandatory access-control protection; it is not itself
-a security improvement. For the requested opt-out, preview and then apply:
+a security improvement. This standalone hardening option is separate from
+[mandatory fresh-install removal](#fresh-install-apparmor-removal): it retains
+packages and does not undo fresh-install masks, pins or purges.
+On an existing host, preview and then apply:
 
 ```sh
 sudo bash hardening.sh --disable-apparmor

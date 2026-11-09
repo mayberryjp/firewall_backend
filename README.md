@@ -12,6 +12,15 @@ process or simulator result is not evidence that real networking works.
 
 ## Rust-only architecture
 
+Native host mode mandatorily owns `kernel.panic=10`: reboot ten seconds after a
+kernel panic. Startup overwrites conflicting values, persists
+`/etc/sysctl.d/99-netcontrol-panic.conf`, and a Rust worker reclaims runtime and
+owned-file drift every second. Errors are explicit in runtime/platform health;
+startup takeover failures abort startup. This does not enable panic-on-oops,
+panic-on-warning or watchdog-triggered panics. Simulator and lab namespace modes
+never claim this host-global setting. See the
+[operator contract](docs/BUILD_AND_INSTALL.md#kernel-panic-reboot-ownership).
+
 | Component | Responsibility |
 | --- | --- |
 | [netcontrold](crates/netcontrold) | HTTP listener, device account, API keys, sessions, embedded UI |
@@ -565,8 +574,19 @@ and Netcontrol release checks remain available; operators must schedule OS
 patching. Running APT jobs are never forcibly stopped; wait for completion and
 retry if verification fails. Binary/source upgrades alone do not apply these
 host policies; existing hosts can use the reviewed hardening workflow.
-AppArmor remains enabled unless `--disable-apparmor` is explicitly
-selected; that protection opt-out requires GRUB and a later manual reboot.
+Fresh installation and full source upgrades require AppArmor disabled: they
+prepare a GRUB `apparmor=0` boot setting and, if AppArmor is active, stop for a
+manual reboot and rerun before provisioning or binary replacement. Once
+verified disabled, the shared preparation purges
+AppArmor policy/tooling, removes standard profile/cache directories, persistently
+masks its service and pins out normal APT reinstallation. Required libraries and
+built-in kernel support remain. This removes confinement protection; it is not
+a security improvement or a guarantee against deliberate root overrides.
+Build-only, HTTP/automatic binary upgrades, signed packages and reset do not
+establish this policy.
+The separate hardening workflow still requires explicit `--disable-apparmor`
+and retains packages; it does not apply the fresh-install removal policy.
+See [fresh-install AppArmor removal](docs/BUILD_AND_INSTALL.md#fresh-install-apparmor-removal).
 See [scope and recovery](docs/BUILD_AND_INSTALL.md#ubuntu-os-footprint-reduction).
 
 ## Destination rewrite
