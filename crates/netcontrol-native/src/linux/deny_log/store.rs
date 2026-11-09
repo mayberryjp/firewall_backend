@@ -293,7 +293,7 @@ fn validate(record: &DenyRecord) -> Result<()> {
     record.validate_traffic()?;
     ensure!(
         matches!(record.chain.as_str(), "input" | "forward")
-            && matches!(record.reason.as_str(), "rule" | "policy")
+            && matches!(record.reason.as_str(), "rule" | "policy" | "spoof_block")
             && (record.reason == "rule") == record.compiled_rule_index.is_some()
             && record.compiled_rule_index.is_none_or(|v| v <= 4096)
             && record.ruleset_id.len() == 64
@@ -469,6 +469,34 @@ mod tests {
             "tcp_flags":null,"tcp_payload_length":null,"tags":[]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn spoof_block_records_survive_storage_and_reject_rule_indices() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "spoof-drop-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let result = (|| -> Result<()> {
+            let mut spoof = record();
+            spoof.reason = "spoof_block".into();
+            spoof.compiled_rule_index = None;
+            validate(&spoof)?;
+            let mut store = Store::open(root.clone())?;
+            store.append(&[spoof])?;
+            drop(store);
+            let store = Store::open(root.clone())?;
+            let records = store.query(&DenyLogQuery::parse("")?)["records"].clone();
+            assert_eq!(records[0]["reason"], "spoof_block");
+            assert!(records[0]["compiled_rule_index"].is_null());
+            let mut invalid = record();
+            invalid.reason = "spoof_block".into();
+            assert!(validate(&invalid).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
     }
 
     #[test]

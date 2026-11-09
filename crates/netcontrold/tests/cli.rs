@@ -169,6 +169,41 @@ fn destination_rewrite_cli_stages_validates_commits_and_removes() {
 }
 
 #[test]
+fn spoof_block_cli_defaults_enabled_and_commits_both_states() {
+    let f = Fixture::new(PERMISSIONS);
+    let mut cli = CliSession::new();
+    assert!(
+        f.app
+            .engine
+            .lock()
+            .unwrap()
+            .saved_configuration()
+            .firewall
+            .spoof_block
+    );
+    f.configure(&mut cli);
+    f.fail(&mut cli, "firewall spoof-block invalid", "enable");
+    for (command, expected) in [("disable", false), ("enable", true)] {
+        f.ok(&mut cli, &format!("firewall spoof-block {command}"));
+        f.ok(&mut cli, "commit confirmed 30");
+        f.ok(&mut cli, "confirm");
+        assert_eq!(
+            f.app
+                .engine
+                .lock()
+                .unwrap()
+                .saved_configuration()
+                .firewall
+                .spoof_block,
+            expected
+        );
+        if !expected {
+            f.ok(&mut cli, "configure terminal");
+        }
+    }
+}
+
+#[test]
 fn link_diagnostics_show_is_read_only_and_permission_checked() {
     let f = Fixture::new(&["state.read"]);
     let mut cli = CliSession::new();

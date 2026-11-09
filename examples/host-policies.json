@@ -5,13 +5,14 @@
   "config": {
     "ipv6_enabled": true,
     "interfaces": [
-      {"name": "lan", "kind": "dummy", "role": "lan", "mtu": 1500, "up": true, "addresses": ["192.0.2.1/24"]},
+      {"name": "lan", "kind": "dummy", "role": "lan", "mtu": 1500, "up": true, "addresses": ["192.0.2.1/24", "2001:db8::1/64"]},
       {"name": "wan", "kind": "dummy", "role": "wan", "mtu": 1500, "up": true, "addresses": ["198.51.100.2/24"]}
     ],
     "routes": [
       {"enabled": true, "destination": "0.0.0.0/0", "gateway": "198.51.100.1", "interface": "wan", "table": 254, "metric": 100}
     ],
     "firewall": {
+      "spoof_block": true,
       "allow_all_icmp": true,
       "policy": "drop",
       "rules": [],

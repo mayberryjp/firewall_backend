@@ -2272,6 +2272,7 @@ fn drop_logging_defaults_enabled_and_requires_boolean() {
             true
         );
     }
+
     let config: Config = serde_json::from_value(serde_json::json!({
         "firewall":{"drop_logging_enabled":false}
     }))
@@ -2294,6 +2295,30 @@ fn drop_logging_defaults_enabled_and_requires_boolean() {
         );
     }
 }
+#[test]
+fn spoof_block_defaults_enabled_and_requires_boolean() {
+    assert!(Config::empty().firewall.spoof_block);
+    for value in [json!({}), json!({"firewall":{}})] {
+        let config: Config = serde_json::from_value(value).unwrap();
+        assert!(config.firewall.spoof_block);
+        assert_eq!(
+            config.operational_value().unwrap()["firewall"]["spoof_block"],
+            true
+        );
+    }
+    let config: Config = serde_json::from_value(json!({"firewall":{"spoof_block":false}})).unwrap();
+    assert!(!config.firewall.spoof_block);
+    assert_eq!(
+        config.operational_value().unwrap()["firewall"]["spoof_block"],
+        false
+    );
+    for invalid in [Value::Null, json!("true"), json!(1)] {
+        assert!(
+            serde_json::from_value::<Config>(json!({"firewall":{"spoof_block":invalid}})).is_err()
+        );
+    }
+}
+
 #[test]
 fn conntrack_ownership_missing_keys_have_exact_scopes_and_do_not_supply_defaults() {
     let mut configured = crate::KernelConfig::default();

@@ -234,6 +234,29 @@ NAT destination rewriting remains TCP/UDP only; no port ranges, arbitrary
 numeric protocols or ICMP type/code selectors were added.
 See the [filter contract](FRONTEND_SPEC.md#66-firewall-forwarding).
 
+## Spoof Block
+
+Global `firewall.spoof_block` is **enabled by default**, including omitted input
+and factory reset. On every managed LAN interface, IPv4/IPv6 source addresses
+must belong to a subnet derived from that interface's configured addresses.
+WAN/unassigned interfaces and local output are unaffected. Addressless LANs
+fail closed for ordinary IP traffic; routes and WireGuard peer prefixes do not
+extend the permitted source networks.
+
+Earlier-priority input/forward checks drop off-subnet sources before ICMP,
+established/related, diagnostic permits and configured rules. Valid sources
+continue through existing policy; this is not an automatic allow. Narrow DHCP
+bootstrap and IPv6 neighbor-discovery/multicast-listener exceptions bypass only
+Spoof Block, so existing DHCP/IPv6 service permissions are still required.
+Drops report `reason:"spoof_block"` and use normal logging/Discord policies.
+
+Disable explicitly through a confirmed firewall transaction or
+`firewall spoof-block disable` when intentionally routing nonlocal sources
+through a LAN. This is not Linux uRPF and does not change `rp_filter`, resolve
+WAN return drops, or prevent impersonating another device in the same subnet.
+See the [exact contract](FRONTEND_SPEC.md#spoof-block) and
+[frontend handoff](docs/frontend-handoffs/2026-11-09.md#2026-11-09-08-default-on-lan-spoof-block).
+
 ## Firewall rule accounting
 
 `GET /api/v1/statistics/firewall` (`state.read`, no query/body) reads live

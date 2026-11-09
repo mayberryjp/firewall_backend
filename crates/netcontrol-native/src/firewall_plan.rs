@@ -3,6 +3,9 @@ use netcontrol_core::FIREWALL_EXPANSION_LIMIT;
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr};
 
+mod spoof_block;
+pub use spoof_block::compile as compile_spoof_block;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Match {
     pub counter_key: String,
@@ -15,6 +18,9 @@ pub struct Match {
     pub source_port: u16,
     pub action: String,
     pub established_related: bool,
+    pub family: Option<bool>,
+    pub icmpv6_type: Option<u8>,
+    pub hop_limit: Option<u8>,
 }
 
 pub fn destination_rewrites(
@@ -405,6 +411,7 @@ fn expand(
                     source_port: 0,
                     action: string(rule, "action").into(),
                     established_related: false,
+                    ..Match::default()
                 });
                 ensure!(
                     output.len() <= FIREWALL_EXPANSION_LIMIT,
@@ -452,6 +459,14 @@ pub fn counter_layout(
             add(chain, "/firewall/allow_all_icmp");
         }
     }
+    let guard = compile_spoof_block(firewall, interfaces)?;
+    if !guard.is_empty() {
+        for chain in ["input", "forward"] {
+            for plan in &guard {
+                add(&format!("{chain}_spoof_block"), &plan.counter_key);
+            }
+        }
+    }
     add("output", "generated/output/policy");
     for (index, _) in array(&firewall["nat"], "masquerade")?.iter().enumerate() {
         add("postrouting", &format!("/firewall/nat/masquerade/{index}"));
@@ -462,6 +477,11 @@ pub fn counter_layout(
             &format!("/firewall/nat/destination_rewrite/{index}"),
         );
     }
+    ensure!(
+        layout.values().sum::<usize>() <= crate::firewall_counters::SNAPSHOT_RULE_LIMIT,
+        "firewall instrumentation exceeds {} kernel rules",
+        crate::firewall_counters::SNAPSHOT_RULE_LIMIT
+    );
     Ok(layout)
 }
 

@@ -3,17 +3,20 @@ use rustables::{
     Batch, Chain, ChainPolicy, ChainType, Hook, HookClass, MsgType, Protocol, ProtocolFamily, Rule,
     Table,
     expr::{
-        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter, Log, Masquerade,
-        Meta, MetaType,
+        Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter, HighLevelPayload,
+        IPv6HeaderField, Immediate, Log, Masquerade, Meta, MetaType, NetworkHeaderField, Payload,
+        Register, VerdictKind,
     },
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const TABLE: &str = "netcontrol";
+#[cfg(test)]
+mod tests;
+
 pub fn validate(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
-    crate::firewall_plan::compile(value)?;
-    crate::firewall_plan::compile_input(value, interfaces)?;
+    crate::firewall_plan::counter_layout(value, interfaces)?;
     Ok(())
 }
 
@@ -60,6 +63,18 @@ fn matching(
         generation,
         &plan.counter_key,
     )?);
+    if let Some(ipv4) = plan.family {
+        rule = rule
+            .with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(
+                CmpOp::Eq,
+                [if ipv4 {
+                    libc::NFPROTO_IPV4
+                } else {
+                    libc::NFPROTO_IPV6
+                } as u8],
+            ));
+    }
     if plan.established_related {
         rule = rule
             .with_expr(Conntrack::new(ConntrackKey::State))
@@ -123,12 +138,33 @@ fn matching(
         );
         rule = rule.sport(plan.source_port, Protocol::UDP);
     }
+    if let Some(kind) = plan.icmpv6_type {
+        rule = rule
+            .with_expr(
+                Payload::default()
+                    .with_base(rustables::sys::NFT_PAYLOAD_TRANSPORT_HEADER)
+                    .with_offset(0u32)
+                    .with_len(2u32)
+                    .with_dreg(Register::Reg1),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, [kind, 0]));
+    }
+    if let Some(limit) = plan.hop_limit {
+        rule = rule
+            .with_expr(
+                HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::HopLimit))
+                    .build(),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, [limit]));
+    }
     rule = rule.with_expr(Counter::default());
     Ok(if plan.action == "drop" {
         if logging {
             rule = rule.with_expr(Log::new(Some(super::deny_log::GROUP), Some(prefix))?);
         }
         rule.drop()
+    } else if plan.action == "return" {
+        rule.with_expr(Immediate::new_verdict(VerdictKind::Return))
     } else {
         rule.accept()
     })
@@ -171,6 +207,7 @@ fn ruleset_id(value: &Value, interfaces: &[crate::model::Link]) -> Result<String
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
         value,
         crate::firewall_plan::compile_input(value, interfaces)?,
+        crate::firewall_plan::compile_spoof_block(value, interfaces)?,
     ))?)))
 }
 
@@ -209,9 +246,11 @@ pub fn remove_owned(expected: &str) -> Result<()> {
 }
 
 pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
+    validate(value, interfaces)?;
     let logging = crate::firewall_plan::drop_logging_enabled(value)?;
     let plans = crate::firewall_plan::compile(value)?;
     let input_plans = crate::firewall_plan::compile_input(value, interfaces)?;
+    let spoof_plans = crate::firewall_plan::compile_spoof_block(value, interfaces)?;
     let ruleset = ruleset_id(value, interfaces)?;
     let generation = std::fs::read_to_string("/proc/sys/kernel/random/uuid")?;
     let generation = generation.trim();
@@ -224,6 +263,33 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
     batch.add(&table, MsgType::Add);
     batch.add(&table, MsgType::Del);
     batch.add(&table, MsgType::Add);
+    for parent in ["input", "forward"] {
+        if !spoof_plans.is_empty() {
+            let guard = Chain::new(&table)
+                .with_name(format!("{parent}_spoof_block"))
+                .with_type(ChainType::Filter)
+                .with_hook(Hook::new(
+                    if parent == "input" {
+                        HookClass::In
+                    } else {
+                        HookClass::Forward
+                    },
+                    -1,
+                ))
+                .with_policy(ChainPolicy::Accept)
+                .add_to_batch(&mut batch);
+            for plan in &spoof_plans {
+                matching(
+                    &guard,
+                    plan,
+                    &format!("nc:{parent}:spoof_block:0:{ruleset}"),
+                    generation,
+                    logging,
+                )?
+                .add_to_batch(&mut batch);
+            }
+        }
+    }
     let forward = Chain::new(&table)
         .with_name("forward")
         .with_type(ChainType::Filter)

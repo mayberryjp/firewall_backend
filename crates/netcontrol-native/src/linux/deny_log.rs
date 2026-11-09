@@ -576,13 +576,13 @@ fn decode(payload: &[u8]) -> Result<(DenyRecord, u32)> {
         fields.len() == 5
             && fields[0] == "nc"
             && matches!(fields[1], "input" | "forward")
-            && matches!(fields[2], "rule" | "policy"),
+            && matches!(fields[2], "rule" | "policy" | "spoof_block"),
         "unrecognized deny-log prefix"
     );
     let index: u32 = fields[3].parse()?;
     ensure!(
         index <= 4096
-            && (fields[2] != "policy" || index == 0)
+            && (fields[2] == "rule" || index == 0)
             && fields[4].len() == 64
             && fields[4]
                 .bytes()
@@ -739,12 +739,16 @@ mod tests {
     use super::*;
 
     fn payload(packet: &[u8], sequence: u32) -> Vec<u8> {
+        payload_with_reason(packet, sequence, "rule", 2)
+    }
+
+    fn payload_with_reason(packet: &[u8], sequence: u32, reason: &str, index: u32) -> Vec<u8> {
         let mut bytes = vec![libc::AF_INET as u8, 0];
         bytes.extend(GROUP.to_be_bytes());
         bytes.extend(attribute(9, packet));
         bytes.extend(attribute(
             10,
-            format!("nc:input:rule:2:{}\0", "a".repeat(64)).as_bytes(),
+            format!("nc:input:{reason}:{index}:{}\0", "a".repeat(64)).as_bytes(),
         ));
         bytes.extend(attribute(12, &sequence.to_be_bytes()));
         bytes.extend(attribute(4, &2u32.to_be_bytes()));
@@ -764,6 +768,16 @@ mod tests {
         bytes[16..20].copy_from_slice(&[198, 51, 100, 2]);
         bytes[20..24].copy_from_slice(&[0x04, 0xd2, 0, 53]);
         bytes
+    }
+
+    #[test]
+    fn spoof_block_drop_reason_is_decoded_without_a_configured_rule_index() -> Result<()> {
+        let (record, _) = decode(&payload_with_reason(&ipv4(), 1, "spoof_block", 0))?;
+        assert_eq!(record.reason, "spoof_block");
+        assert_eq!(record.chain, "input");
+        assert!(record.compiled_rule_index.is_none());
+        assert!(decode(&payload_with_reason(&ipv4(), 1, "spoof_block", 1)).is_err());
+        Ok(())
     }
 
     fn tcp(flags: u8, payload_length: u16) -> Vec<u8> {

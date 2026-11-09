@@ -4,6 +4,19 @@
 
 ### Added
 
+- Default-on global `firewall.spoof_block` rejects off-subnet IPv4/IPv6 sources
+  on managed LAN interfaces before normal input/forward rules, ICMP,
+  established/related acceptance and temporary diagnostic permits. Derive the
+  source-network union from each interface's own addresses; WAN/output are
+  unchanged and addressless LAN families fail closed. Narrow DHCP/IPv6 control
+  exceptions fall through to existing policy rather than granting access.
+  Wire confirmed HTTP/SSH configuration, persistence/rollback, counters, MQTT
+  drop accounting, normal capture and `reason:"spoof_block"` notifications.
+  No uRPF/sysctl change or claim to repair WAN return traffic.
+  Release impact: additive configuration/telemetry, breaking default firewall
+  policy; next automatic calendar version. Required frontend/deployment review:
+  [handoff 2026-11-09-08](docs/frontend-handoffs/2026-11-09.md#2026-11-09-08-default-on-lan-spoof-block).
+
 - Independent default-off `discord.notify_broadcast` and
   `discord.notify_tcp_closures` configuration/status flags for newly seen drops.
   The TCP bucket covers FIN, RST and known empty ACK-only packets; overlapping

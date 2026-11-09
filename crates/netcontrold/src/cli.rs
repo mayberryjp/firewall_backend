@@ -38,6 +38,7 @@ Configuration commands:
   no ip route PREFIX INTERFACE GATEWAY|direct|dhcp TABLE METRIC
   firewall policy accept|drop / firewall allow-all-icmp enable|disable
   firewall drop-logging enable|disable
+  firewall spoof-block enable|disable
   firewall rule SOURCE|any DESTINATION|any accept|drop / no firewall rule INDEX
   firewall host JSON / firewall interface-policy JSON
   nat masquerade ipv4|ipv6 INTERFACE [SOURCE] / no nat masquerade INDEX
@@ -934,6 +935,9 @@ fn edit_global(config: &mut Value, line: &str, words: &[&str]) -> Result<()> {
         }
         ["firewall", "drop-logging", state] => {
             config["firewall"]["drop_logging_enabled"] = json!(enabled(state)?)
+        }
+        ["firewall", "spoof-block", state] => {
+            config["firewall"]["spoof_block"] = json!(enabled(state)?)
         }
         ["firewall", "rule", source, destination, action]
             if matches!(*action, "accept" | "drop") =>

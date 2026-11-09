@@ -4646,6 +4646,68 @@ fn drop_logging_permissions_confirmation_persistence_and_rollback() {
     assert!(engine.saved_configuration().firewall.drop_logging_enabled);
 }
 
+#[test]
+fn spoof_block_permissions_confirmation_persistence_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let original = engine.saved_configuration().clone();
+    assert!(original.firewall.spoof_block);
+    let mut disabled = original.clone();
+    disabled.firewall.spoof_block = false;
+    for missing in ["transactions.write", "firewall.write"] {
+        let permissions: Vec<_> = all()
+            .into_iter()
+            .filter(|permission| permission != missing)
+            .collect();
+        let body = serde_json::to_vec(&json!({
+            "base_revision":engine.state.revision,"confirm_timeout_seconds":30,"config":disabled
+        }))
+        .unwrap();
+        assert_eq!(
+            engine
+                .request(
+                    "POST",
+                    "/api/v1/transactions",
+                    "",
+                    "limited",
+                    &permissions,
+                    &body
+                )
+                .status,
+            403
+        );
+    }
+    let reply = submit(&mut engine, disabled.clone());
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let mut engine = Engine::open(
+        &fixture.path(),
+        Box::new(Simulator::with_config(disabled.clone()).unwrap()),
+    )
+    .unwrap();
+    assert!(!engine.saved_configuration().firewall.spoof_block);
+    let reply = submit(&mut engine, original);
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                reply.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(engine.saved_configuration(), &disabled);
+}
+
 fn captured_conntrack() -> KernelConfig {
     let mut captured = crate::missing_conntrack_tunables(&KernelConfig::default());
     captured
@@ -5096,13 +5158,14 @@ fn rule_origins_tag_generated_counter_rows_and_keep_configured_ownership() {
         {"config_path":"/firewall/input/interfaces/0/rules/0"},
         {"config_path":"/firewall/policy"},
         {"config_path":"/firewall/allow_all_icmp"},
+        {"config_path":"/firewall/spoof_block"},
         {"config_path":null}
     ]});
     annotate_rule_origins(&mut response, &config).unwrap();
     assert_eq!(response["rules"][0]["origin"], "import");
     assert_eq!(response["rules"][0]["import_source"], "sando");
     assert_eq!(response["rules"][1]["origin"], "manual");
-    for index in 2..5 {
+    for index in 2..6 {
         assert_eq!(response["rules"][index]["origin"], "system");
         assert!(response["rules"][index]["import_source"].is_null());
     }

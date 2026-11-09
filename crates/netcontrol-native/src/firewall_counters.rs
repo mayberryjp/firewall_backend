@@ -8,7 +8,7 @@ use std::{
 };
 
 const PREFIX: &str = "netcontrol-counter-v1";
-const SNAPSHOT_RULE_LIMIT: usize = 81_920;
+pub(crate) const SNAPSHOT_RULE_LIMIT: usize = 81_920;
 
 fn ranges(bytes: &[u8]) -> Result<Vec<(u16, Range<usize>)>> {
     let mut offset = 0;

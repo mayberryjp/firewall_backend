@@ -184,7 +184,9 @@ fn annotate_rule_origins(response: &mut Value, config: &Config) -> Result<()> {
             let rule = configured
                 .pointer(path)
                 .context("counter config_path not found")?;
-            if path == "/firewall/allow_all_icmp" || path.ends_with("/policy") {
+            if matches!(path, "/firewall/allow_all_icmp" | "/firewall/spoof_block")
+                || path.ends_with("/policy")
+            {
                 (json!("system"), Value::Null)
             } else {
                 (

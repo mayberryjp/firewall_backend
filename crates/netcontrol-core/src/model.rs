@@ -403,6 +403,8 @@ pub struct Route {
 #[serde(default, deny_unknown_fields)]
 pub struct Firewall {
     #[serde(default = "yes")]
+    pub spoof_block: bool,
+    #[serde(default = "yes")]
     pub drop_logging_enabled: bool,
     #[serde(default = "yes")]
     pub allow_all_icmp: bool,
@@ -418,6 +420,7 @@ pub struct Firewall {
 impl Default for Firewall {
     fn default() -> Self {
         Self {
+            spoof_block: true,
             drop_logging_enabled: true,
             allow_all_icmp: true,
             policy: accept(),
