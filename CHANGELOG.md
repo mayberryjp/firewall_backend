@@ -89,17 +89,17 @@
 ### Changed
 
 - Fresh installation and full source upgrades require kernel AppArmor disablement
-  via verified GRUB boot settings, stopping for manual reboot/rerun when active. Then purge
-  policy/tooling and standard profile/cache data, persistently mask its service
-  and pin out normal APT reinstallation; preserve required libraries/kernel code
-  and reject collateral dependency removal. Source upgrades stop before
+  via verified GRUB boot settings, stopping for manual reboot/rerun when active.
+  Persistently mask its service while preserving all packages (including Ubuntu
+  metapackages), profiles, caches and APT preferences. No AppArmor purge,
+  autoremove or pin writing; supersedes the earlier removal policy and avoids
+  `ubuntu-server-minimal` dependency-removal failures. Source upgrades stop before
   old-daemon shutdown/binary replacement on failure or reboot requirement.
   Build-only, HTTP/automatic binary upgrades, signed packages, reset and
   standalone hardening do not establish this policy. Release impact: breaking
   installation/security policy; next automatic calendar version.
   Required operator/reboot-help review:
-  [handoff 2026-11-10-02](docs/frontend-handoffs/2026-11-10.md#2026-11-10-02-fresh-install-apparmor-removal)
-  and [scope extension 2026-11-10-03](docs/frontend-handoffs/2026-11-10.md#2026-11-10-03-source-upgrade-apparmor-removal).
+  [disable-only handoff 2026-11-10-04](docs/frontend-handoffs/2026-11-10.md#2026-11-10-04-apparmor-disable-only).
 
 - Repository Copilot instructions now require copyable, single-physical-line
   shell commands without prompts or history numbers, using semicolons where

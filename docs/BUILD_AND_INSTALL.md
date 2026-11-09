@@ -230,7 +230,7 @@ They also [configure journald forwarding](#host-logging-ownership) for native sy
 Fresh installation and full source upgrades also perform
 [MOTD cleanup](#motd-cleanup); build-only runs leave the host unchanged.
 Full source upgrades first apply the shared
-[AppArmor disablement/removal policy](#fresh-install-apparmor-removal).
+[AppArmor disablement policy](#apparmor-disablement).
 If enabled, prepare GRUB boot disablement and stop for manual reboot/rerun
 before stopping the old daemon or replacing its binary. Once disabled, purge
 policy/tooling and custom profiles, enforce service masks and APT pins.
@@ -889,15 +889,15 @@ require a disposable Ubuntu VM; container build/unit/filesystem tests do not
 prove these behaviors. See the [current journal](journal/2026-10-29.md#automatic-github-https-updates)
 and [original recovery design](journal/2026-10-24.md#signed-ubuntu-self-upgrade).
 
-## Fresh-install AppArmor removal
+## AppArmor disablement
 
 Fresh `install.sh` requires AppArmor disabled before downloading the release
 or provisioning Netcontrol. Full source `upgrade.sh` uses the same policy after
 building and before kernel/service setup, old-daemon shutdown or binary replacement.
 This deliberately removes mandatory-access-control
 confinement, not a security improvement. Use a local console and take a protected
-snapshot first. Required AppArmor libraries (such as `libapparmor1`) and kernel
-code remain; no custom kernel or unrelated dependency removal is attempted.
+snapshot first. All packages, profiles and caches remain, including AppArmor,
+`ubuntu-server-minimal` and required libraries. No custom kernel is installed.
 
 The installer requires a supported GRUB layout: `update-grub`, regular
 `/etc/default/grub` and `/boot/grub/grub.cfg`, and non-symlink configuration/
@@ -913,7 +913,7 @@ If `/sys/module/apparmor/parameters/enabled` reports enabled, either deployment 
 automatically, purge profiles/packages or claim existing kernel enforcement
 is off. For fresh installs this occurs after ordinary prerequisite installation
 but before release download, network takeover or daemon provisioning; source
-upgrades stop before AppArmor purge, old-daemon shutdown and binary replacement.
+upgrades stop before old-daemon shutdown and binary replacement.
 Rerun the same `install.sh` or `upgrade.sh` command after the console reboot.
 The live
 parameter must report `N`/`0`, or the AppArmor module must be absent; unknown/
@@ -924,33 +924,24 @@ After confirming kernel disablement, both scripts use the shared preparation:
 
 - Stops/disables and persistently masks `apparmor.service`, including an absent
   unit, verifying inactive/failed state and persistent `masked` enablement.
-- Purges installed and residual-config packages matching `apparmor`, `apparmor-*`,
-  `python3-apparmor`, `python3-libapparmor` and `libpam-apparmor`. Essential/
-  protected or incomplete packages, dependency removals outside the selected
-  list, installs in the purge plan and unrecognized plans are errors.
-  No autoremove or removal of `libapparmor1`/unrelated packages.
-- Writes root-owned mode-0644
-  `/etc/apt/preferences.d/99-netcontrol-no-apparmor` with those package selectors,
-  `Pin: version *` and `Pin-Priority: -1`; verifies no normal APT candidate for
-  the purged packages and standard AppArmor tools. Ordinary manual APT
-  reinstallation is blocked, not deliberate privileged pin/version overrides.
-- Removes remaining custom content under exactly `/etc/apparmor`,
-  `/etc/apparmor.d`, `/etc/default/apparmor`, `/etc/init.d/apparmor`,
-  `/var/cache/apparmor`, `/var/lib/apparmor`, `/usr/lib/apparmor` and
-  `/usr/share/apparmor`. Save wanted policies elsewhere before installation.
-  Symlink paths/parents are refused rather than following them.
+- Preserves all packages, profiles, caches and APT preferences. AppArmor setup
+  performs no package queries, purge, autoremove, pin writing or profile cleanup.
+  Existing APT preferences are left untouched, including any previously created
+  `99-netcontrol-no-apparmor` file. No APT/dpkg tools are required by this helper.
 
 Each error aborts deployment. Completed boot/service/package/file changes
-are not transactionally rolled back; purged custom profiles have no automatic
-backup. Review collateral-dependency errors explicitly rather than forcing
-package removal. Repeating preparation is supported; an already-disabled kernel
-does not bypass mask/pin/package verification.
+are not transactionally rolled back. Repeating preparation is supported; an
+already-disabled kernel does not bypass boot/live-state and mask verification.
+An earlier installer that reports `Refusing collateral AppArmor dependency
+removal: ubuntu-server-minimal` has stopped before purge, boot preparation and
+binary replacement. Use the updated disable-only scripts rather than forcing
+package removal; a reboot may then be required before rerunning deployment.
 Build-only runs, HTTP/automatic HTTPS upgrades, signed packages, reset and
-standalone hardening do not establish this policy. The persisted pin/mask/GRUB
+standalone hardening do not establish this policy. The persisted mask/GRUB
 setting remains across ordinary reboots, but a root user, direct package
 installation, custom boot entries or a replacement bootloader can override it.
-There is no daemon-wide AppArmor-removal worker or absolute guarantee that
-AppArmor artifacts can never be reintroduced.
+There is no daemon-wide AppArmor worker or guarantee against privileged overrides.
+This is disablement, not removal or an absolute promise of permanent absence.
 
 ## Ubuntu prebuilt installation (amd64)
 
@@ -1986,8 +1977,9 @@ apt-config dump | grep -E '^(APT::Periodic::(Enable|Update-Package-Lists|Downloa
 
 Disabling AppArmor removes mandatory access-control protection; it is not itself
 a security improvement. This standalone hardening option is separate from
-[mandatory fresh-install removal](#fresh-install-apparmor-removal): it retains
-packages and does not undo fresh-install masks, pins or purges.
+[mandatory deployment disablement](#apparmor-disablement): it also retains
+packages and does not undo deployment masks or verify live kernel disablement
+before reporting its own completion.
 On an existing host, preview and then apply:
 
 ```sh

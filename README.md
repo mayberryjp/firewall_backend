@@ -577,16 +577,16 @@ host policies; existing hosts can use the reviewed hardening workflow.
 Fresh installation and full source upgrades require AppArmor disabled: they
 prepare a GRUB `apparmor=0` boot setting and, if AppArmor is active, stop for a
 manual reboot and rerun before provisioning or binary replacement. Once
-verified disabled, the shared preparation purges
-AppArmor policy/tooling, removes standard profile/cache directories, persistently
-masks its service and pins out normal APT reinstallation. Required libraries and
-built-in kernel support remain. This removes confinement protection; it is not
+verified disabled, the shared preparation persistently masks its service.
+All packages (including Ubuntu metapackages), profiles, caches and APT preferences
+are preserved; no AppArmor purge, autoremove or package pin is performed.
+This disables confinement protection; it is not
 a security improvement or a guarantee against deliberate root overrides.
 Build-only, HTTP/automatic binary upgrades, signed packages and reset do not
 establish this policy.
 The separate hardening workflow still requires explicit `--disable-apparmor`
-and retains packages; it does not apply the fresh-install removal policy.
-See [fresh-install AppArmor removal](docs/BUILD_AND_INSTALL.md#fresh-install-apparmor-removal).
+and retains packages; it does not apply the mandatory deployment verification.
+See [AppArmor disablement](docs/BUILD_AND_INSTALL.md#apparmor-disablement).
 See [scope and recovery](docs/BUILD_AND_INSTALL.md#ubuntu-os-footprint-reduction).
 
 ## Destination rewrite

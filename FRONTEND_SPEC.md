@@ -456,27 +456,25 @@ provisioning Netcontrol. It writes/verifies a GRUB `apparmor=0` drop-in; active
 AppArmor stops deployment for a manual console reboot and rerun, not a
 successful install or automatic reboot. Once the live kernel is verified
 disabled, it stops/disables and persistently masks `apparmor.service` (including
-absent units), purges AppArmor policy/tooling and residual configuration, removes
-standard profile/cache directories, and pins those packages to APT priority -1,
-checking no normal package candidate remains. Required libraries and built-in
-kernel support remain; collateral dependency removals are refused. This removes
+absent units). All packages, including Ubuntu metapackages, profiles, caches and
+APT preferences are preserved. No package queries, purge, autoremove, pin writing
+or profile cleanup is performed by AppArmor preparation. This disables
 confinement protection and must not be described as a security improvement.
-GRUB, package/control/file errors and indeterminate kernel state abort deployment;
+GRUB, service-control/file errors and indeterminate kernel state abort deployment;
 completed host changes are not rolled back. Do not promise absolute absence,
 prevention of deliberate root overrides or an immediately disabled running
 kernel before reboot. Required frontend work is installation/reboot/operator-help
-disclosure, including deletion of custom profiles, not API forms/types/polling.
+disclosure, including preservation of custom profiles, not API forms/types/polling.
 Full source `upgrade.sh` now applies the same shared policy after build and
 before other host setup, old-daemon shutdown or binary replacement. If AppArmor
 is enabled, prepare boot disablement and stop with manual reboot/upgrade-rerun
 instructions; never claim live disablement from a stopped service. Existing
-AppArmor-disabled hosts still verify/purge/mask/pin. Requires supported GRUB and
-existing package tooling; full source upgrades do not install prerequisites.
+AppArmor-disabled hosts still verify boot/live state and mask the service.
+Requires supported GRUB and systemd; full source upgrades do not install prerequisites.
 `--build-only`, HTTP/automatic binary self-upgrades, signed packages, reset and
 standalone hardening do not establish this policy.
-See [scope](docs/BUILD_AND_INSTALL.md#fresh-install-apparmor-removal) and
-[initial handoff 2026-11-10-02](docs/frontend-handoffs/2026-11-10.md#2026-11-10-02-fresh-install-apparmor-removal)
-and [source-upgrade extension 2026-11-10-03](docs/frontend-handoffs/2026-11-10.md#2026-11-10-03-source-upgrade-apparmor-removal).
+See [scope](docs/BUILD_AND_INSTALL.md#apparmor-disablement) and
+[disable-only handoff 2026-11-10-04](docs/frontend-handoffs/2026-11-10.md#2026-11-10-04-apparmor-disable-only).
 Fresh installation and full source `upgrade.sh` deployments also remove standard
 Ubuntu MOTD files, generator directories and cached messages, remove active
 `pam_motd.so` lines from regular PAM configuration files, and stop/disable and

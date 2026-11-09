@@ -8,11 +8,9 @@ printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
 scenario=valid
 
-for apparmor_scenario in success repeat absent reboot unknown_kernel missing_parameter active_lsm \
-    query_failure protected incomplete simulation_failure collateral installs unrecognized \
+for apparmor_scenario in success repeat absent existing_pin reboot unknown_kernel missing_parameter active_lsm \
     grub_failure bad_grub conflicting_grub missing_grub symlink_grub symlink_pin symlink_profiles \
-    directory_failure grub_write_failure pin_write_failure \
-    mask_failure verify_failure purge_failure residual pin_failure candidate_failure remove_failure; do
+    directory_failure grub_write_failure disable_failure mask_failure verify_failure; do
     (
         apparmor_directory="$temporary/apparmor-$apparmor_scenario"
         apparmor_root="$apparmor_directory/root"
@@ -27,8 +25,12 @@ for apparmor_scenario in success repeat absent reboot unknown_kernel missing_par
         printf 'N\n' > "$apparmor_root/sys/module/apparmor/parameters/enabled"
         printf 'capability,landlock,yama\n' > "$apparmor_root/sys/kernel/security/lsm"
         printf 'custom profile\n' > "$apparmor_root/etc/apparmor.d/custom"
+        for apparmor_data in var/cache/apparmor var/lib/apparmor usr/share/apparmor; do
+            printf 'retained state\n' > "$apparmor_root/$apparmor_data/custom"
+        done
         printf 'retained\n' > "$apparmor_root/etc/apt/preferences.d/10-unrelated"
         case $apparmor_scenario in
+            existing_pin) printf 'existing preferences\n' > "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor" ;;
             reboot) printf 'Y\n' > "$apparmor_root/sys/module/apparmor/parameters/enabled" ;;
             unknown_kernel) printf 'unknown\n' > "$apparmor_root/sys/module/apparmor/parameters/enabled" ;;
             missing_parameter) rm "$apparmor_root/sys/module/apparmor/parameters/enabled" ;;
@@ -40,43 +42,23 @@ for apparmor_scenario in success repeat absent reboot unknown_kernel missing_par
                 ln -s "$apparmor_root/etc/default/grub" "$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg" ;;
             symlink_pin) ln -s 10-unrelated "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor" ;;
             symlink_profiles)
-                rm -r "$apparmor_root/etc/apparmor.d"
-                ln -s "$apparmor_root/usr/share/apparmor" "$apparmor_root/etc/apparmor.d" ;;
+                mv "$apparmor_root/etc/apparmor.d" "$apparmor_directory/profiles"
+                ln -s "$apparmor_directory/profiles" "$apparmor_root/etc/apparmor.d" ;;
         esac
         dpkg-query() {
             printf 'query\n' >> "$apparmor_directory/commands"
-            [[ $apparmor_scenario != query_failure ]] || { printf 'Fixture query failure.\n' >&2; return 1; }
-            printf 'libapparmor1:amd64\tinstalled\tno\tno\nsystemd\tinstalled\tyes\tyes\n'
-            [[ $apparmor_scenario != absent ]] || return 0
-            if [[ ! -e $apparmor_directory/purged || $apparmor_scenario == residual ]]; then
-                case $apparmor_scenario in
-                    protected) printf 'apparmor\tinstalled\tyes\tno\n' ;;
-                    incomplete) printf 'apparmor\thalf-configured\tno\tno\n' ;;
-                    *) printf 'apparmor:amd64\tinstalled\tno\tno\napparmor-utils\tconfig-files\tno\tno\n' ;;
-                esac
-            fi
+            printf 'Unexpected package query during AppArmor disablement.\n' >&2
+            return 1
         }
         apt-get() {
             printf 'apt %s\n' "$*" >> "$apparmor_directory/commands"
-            if [[ $1 == --simulate ]]; then
-                case $apparmor_scenario in
-                    simulation_failure) printf 'Fixture simulation failure.\n' >&2; return 1 ;;
-                    collateral) printf 'Remv systemd [1]\n' ;;
-                    installs) printf 'Inst unexpected [1]\n' ;;
-                    unrecognized) printf 'unrecognized plan\n' ;;
-                    *) printf 'Remv apparmor [1]\nPurg apparmor-utils [1]\n' ;;
-                esac
-            else
-                [[ $1 == --assume-yes && $2 == -o && $3 == APT::Get::AutomaticRemove=false && $4 == purge && $5 == -- ]] || return 1
-                [[ $apparmor_scenario != purge_failure ]] || { printf 'Fixture purge failure.\n' >&2; return 1; }
-                command rm -f -- "$apparmor_directory/masked"
-                : > "$apparmor_directory/purged"
-            fi
+            printf 'Unexpected package operation during AppArmor disablement.\n' >&2
+            return 1
         }
         apt-cache() {
-            [[ $1 == policy ]] || return 1
-            [[ $apparmor_scenario != candidate_failure ]] || { printf 'Fixture candidate failure.\n' >&2; return 1; }
-            if [[ $apparmor_scenario == pin_failure ]]; then printf '  Candidate: 1.0\n'; else printf '  Candidate: (none)\n'; fi
+            printf 'candidate\n' >> "$apparmor_directory/commands"
+            printf 'Unexpected APT policy query during AppArmor disablement.\n' >&2
+            return 1
         }
         update-grub() {
             printf 'grub\n' >> "$apparmor_directory/commands"
@@ -100,24 +82,18 @@ for apparmor_scenario in success repeat absent reboot unknown_kernel missing_par
                     else
                         printf 'ActiveState=inactive\nUnitFileState=masked\n'
                     fi ;;
-                disable|stop) ;;
+                disable|stop)
+                    [[ $apparmor_scenario != disable_failure ]] || { printf 'Fixture disable failure.\n' >&2; return 1; } ;;
                 mask)
                     [[ $apparmor_scenario != mask_failure ]] || { printf 'Fixture mask failure.\n' >&2; return 1; }
                     : > "$apparmor_directory/masked" ;;
                 *) return 1 ;;
             esac
         }
-        rm() {
-            [[ $apparmor_scenario != remove_failure || ${*: -1} != "$apparmor_root/etc/apparmor.d" ]] || {
-                printf 'Fixture cleanup failure.\n' >&2; return 1;
-            }
-            command rm "$@"
-        }
         install() {
             case $apparmor_scenario:${*: -1} in
                 directory_failure:"$apparmor_root/etc/default/grub.d"|\
-                grub_write_failure:"$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg"|\
-                pin_write_failure:"$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor")
+                grub_write_failure:"$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg")
                     printf 'Fixture AppArmor persistence failure.\n' >&2; return 1 ;;
             esac
             local -a arguments=()
@@ -132,22 +108,17 @@ for apparmor_scenario in success repeat absent reboot unknown_kernel missing_par
             command install "${arguments[@]}"
         }
         if configure_apparmor "$apparmor_root" > "$apparmor_directory/stdout" 2> "$apparmor_directory/stderr"; then
-            case $apparmor_scenario in success|repeat|absent) ;; *) printf 'Unexpected AppArmor success: %s\n' "$apparmor_scenario" >&2; exit 1 ;; esac
+            case $apparmor_scenario in success|repeat|absent|existing_pin|symlink_pin|symlink_profiles) ;; *) printf 'Unexpected AppArmor success: %s\n' "$apparmor_scenario" >&2; exit 1 ;; esac
             if [[ $apparmor_scenario == repeat ]]; then configure_apparmor "$apparmor_root" || exit 1; fi
-            [[ ! -e $apparmor_root/etc/apparmor.d && ! -e $apparmor_root/var/lib/apparmor ]]
-            grep -Fxq 'Pin-Priority: -1' "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor"
             grep -Fxq 'systemctl mask apparmor.service' "$apparmor_directory/commands"
             [[ -f $apparmor_directory/masked ]]
             [[ $(stat -c %a "$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg") == 644 ]]
-            [[ $(stat -c %a "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor") == 644 ]]
-            if [[ $apparmor_scenario == absent ]]; then ! grep -q '^apt ' "$apparmor_directory/commands"; fi
         else
-            case $apparmor_scenario in success|repeat|absent) cat "$apparmor_directory/stderr" >&2; exit 1 ;; esac
+            case $apparmor_scenario in success|repeat|absent|existing_pin|symlink_pin|symlink_profiles) cat "$apparmor_directory/stderr" >&2; exit 1 ;; esac
             [[ -s $apparmor_directory/stderr ]]
             case $apparmor_scenario in
                 reboot|unknown_kernel|missing_parameter|active_lsm)
                     ! grep -q '^systemctl ' "$apparmor_directory/commands"
-                    ! grep -q '^apt --assume-yes' "$apparmor_directory/commands"
                     [[ -f $apparmor_root/etc/apparmor.d/custom ]]
                     if [[ $apparmor_scenario == reboot ]]; then
                         grep -Fq 'reboot manually' "$apparmor_directory/stderr"
@@ -158,53 +129,37 @@ for apparmor_scenario in success repeat absent reboot unknown_kernel missing_par
                     ! grep -q '^systemctl ' "$apparmor_directory/commands" ;;
             esac
         fi
+        [[ $(< "$apparmor_root/etc/apparmor.d/custom") == 'custom profile' ]]
+        for apparmor_data in var/cache/apparmor var/lib/apparmor usr/share/apparmor; do
+            [[ $(< "$apparmor_root/$apparmor_data/custom") == 'retained state' ]]
+        done
         [[ $(< "$apparmor_root/etc/apt/preferences.d/10-unrelated") == retained ]]
+        if [[ $apparmor_scenario == existing_pin ]]; then
+            [[ $(< "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor") == 'existing preferences' ]]
+        elif [[ $apparmor_scenario == symlink_pin ]]; then
+            [[ -L $apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor ]]
+        else
+            [[ ! -e $apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor ]]
+        fi
         if [[ $apparmor_scenario == missing_grub ]]; then
             [[ ! -e $apparmor_root/etc/default/grub ]]
         else
             [[ $(< "$apparmor_root/etc/default/grub") == 'original grub' ]]
         fi
-        ! grep -Eq '^apt --assume-yes.*(libapparmor1|systemd)' "$apparmor_directory/commands" 2>/dev/null
+        ! grep -Eq '^(apt |query$|candidate$)' "$apparmor_directory/commands" 2>/dev/null
     )
 done
-if command -v apt-cache >/dev/null; then
-    apparmor_apt="$temporary/apparmor-apt"
-    mkdir -p "$apparmor_apt/lists/partial"
-    : > "$apparmor_apt/status"
-    : > "$apparmor_apt/preferences"
-    printf 'deb [trusted=yes] file:/netcontrol-apparmor-test stable main\n' > "$apparmor_apt/sources.list"
-    apparmor_arch=$(dpkg --print-architecture)
-    for apparmor_package in apparmor apparmor-utils apparmor-future-tool python3-apparmor python3-libapparmor libpam-apparmor libapparmor1 systemd; do
-        printf 'Package: %s\nVersion: 1.0\nArchitecture: %s\nDescription: Synthetic pin test\n\n' "$apparmor_package" "$apparmor_arch"
-    done > "$apparmor_apt/lists/_netcontrol-apparmor-test_dists_stable_main_binary-${apparmor_arch}_Packages"
-    apparmor_policy=(apt-cache
-        -o "Dir::Etc::sourcelist=$apparmor_apt/sources.list" -o Dir::Etc::sourceparts=-
-        -o "Dir::Etc::preferences=$apparmor_apt/preferences" -o Dir::Etc::preferencesparts=-
-        -o "Dir::State::status=$apparmor_apt/status" -o "Dir::State::lists=$apparmor_apt/lists"
-        -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=)
-    LC_ALL=C "${apparmor_policy[@]}" policy apparmor | grep -Fxq '  Candidate: 1.0'
-    cp "$temporary/apparmor-success/root/etc/apt/preferences.d/99-netcontrol-no-apparmor" "$apparmor_apt/preferences"
-    for apparmor_package in apparmor apparmor-utils apparmor-future-tool python3-apparmor python3-libapparmor libpam-apparmor; do
-        LC_ALL=C "${apparmor_policy[@]}" policy "$apparmor_package" | grep -Fxq '  Candidate: (none)'
-    done
-    for apparmor_package in libapparmor1 systemd; do
-        LC_ALL=C "${apparmor_policy[@]}" policy "$apparmor_package" | grep -Fxq '  Candidate: 1.0'
-    done
-    printf 'Real offline APT candidate tests passed: tooling/wildcard packages pinned out; required library/systemd unaffected.\n'
-else
-    printf 'Skipped real offline APT pin test: apt-cache is unavailable.\n'
-fi
 python3 - <<'PY'
 from pathlib import Path
 install = Path("install.sh").read_text()
 main = install[install.index("\nmain() {"):]
-assert main.index("'Installing prerequisites'") < main.index("'Disabling and removing AppArmor'") < main.index("'Downloading and verifying")
+assert main.index("'Installing prerequisites'") < main.index("'Disabling AppArmor'") < main.index("'Downloading and verifying")
 upgrade = Path("upgrade.sh").read_text()
 deployment = upgrade[upgrade.index("\ndeploy_upgrade() {"):upgrade.index("\nmain() {")]
 assert "configure_apparmor && configure_conntrack" in deployment
 assert deployment.index("configure_apparmor") < deployment.index('upgrade_binary "$binary"')
 PY
-printf 'Fresh-install AppArmor boot gate, purge isolation, service masks, pins, cleanup, repeat and failure tests passed (mocked host operations).\n'
+printf 'AppArmor boot gate, service masks, package/profile/cache/APT preservation, repeat and failure tests passed (mocked host operations).\n'
 
 for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_failure unknown_state \
     disable_failure stop_failure mask_failure verify_failure still_active runtime_only \
