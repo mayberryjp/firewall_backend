@@ -5351,6 +5351,98 @@ history/restore and restart. Changes use existing confirmed transactions with
 There is no per-interface override, extra endpoint, mode selector or uRPF
 setting. The normalized Firewall/configuration always exposes the boolean.
 
+`GET /api/v1/firewall/rules` (`state.read`, API-key authentication) returns
+`FirewallView`: the existing observed Firewall fields plus a read-only
+`system_policies` array. The array currently contains one policy with
+`id:"spoof_block"`, `origin:"system"`, `read_only:true`,
+`config_path:"/firewall/spoof_block"` and `enabled:boolean`. This is a response
+projection, **not configuration**: desired state, runtime configuration,
+revision/export payloads and editable interface policies remain unchanged.
+Never copy `system_policies` into a transaction candidate; unknown configuration
+fields are rejected with `400`. Continue editing only `firewall.spoof_block`
+through normal confirmed transactions.
+
+The policy's `chains` array exposes the exact compiled source guard, in
+`input`, then `forward` hook order. Each chain has `name` (`input_spoof_block`
+or `forward_spoof_block`), `hook`, `priority:-1`, `policy:"accept"` and ordered
+`rules`. A chain's accept policy means **continue to later hook chains**, not
+final packet authorization. Each rule contains:
+
+- `id:string` (`<chain>:<order>`) and zero-based `order:integer`. These are
+  positional identities within this response, not persisted rule identifiers;
+  refresh after configuration changes and do not retain selection by position.
+- `action:"return"|"drop"`, `counter_id:string` matching a statistics row ID,
+  and `config_path:string|null`: `/firewall/spoof_block` for terminal drops,
+  otherwise null.
+- `matches`: `family:"ipv4"|"ipv6"`, `ingress_interface:string`,
+  `source:string|null` and `destination:string|null` (canonical CIDR, null
+  means unrestricted), `protocol:"any"|"udp"|"icmpv6"`,
+  `source_port:number|null`, `destination_port:number|null` (UDP ports,
+  1-65535), `icmp_type:number|null`, `icmp_code:number|null` (0-255),
+  and `hop_limit:number|null` (0-255). Null means no constraint, not zero;
+  generated ICMPv6 exceptions explicitly match code 0.
+
+All rules are returned, including zero-hit rules, exact DHCP destinations,
+each IPv6 exception and both per-interface terminal family drops. Rules use
+the same compiler as native enforcement, not a second frontend approximation.
+The response describes the observed applied configuration, including a pending
+transaction's candidate, and returns to the previous rules after rollback.
+Existing observation/backend failures remain explicit `503`; no incomplete
+or empty-success substitute is returned for a compilation failure. Existing
+authentication, permission and method handling is unchanged.
+
+When disabled, the policy remains present with `enabled:false, chains:[]`.
+Enabled with no managed LANs returns `enabled:true, chains:[]`; it does not
+imply any installed guard chain. Counter joins are **many-to-one**: terminal
+drop counters aggregate all LANs/families per chain, and generated return
+counters group matches by interface/category. Never display aggregate counters
+as distinct measured per-rule/per-interface hits or sum repeated `counter_id`s.
+Render policies/rules as system-owned, non-editable details alongside user
+policies; the global toggle remains the only Spoof Block control.
+
+Synthetic shortened response fragment (other Firewall fields and rules omitted):
+
+```json
+{
+  "spoof_block": true,
+  "system_policies": [{
+    "id": "spoof_block",
+    "origin": "system",
+    "read_only": true,
+    "config_path": "/firewall/spoof_block",
+    "enabled": true,
+    "chains": [{
+      "name": "input_spoof_block",
+      "hook": "input",
+      "priority": -1,
+      "policy": "accept",
+      "rules": [{
+        "id": "input_spoof_block:0",
+        "order": 0,
+        "counter_id": "input_spoof_block:generated/spoof_block/lan0/local",
+        "config_path": null,
+        "action": "return",
+        "matches": {
+          "family": "ipv4",
+          "ingress_interface": "lan0",
+          "source": "192.0.2.0/24",
+          "destination": null,
+          "protocol": "any",
+          "source_port": null,
+          "destination_port": null,
+          "icmp_type": null,
+          "icmp_code": null,
+          "hop_limit": null
+        }
+      }]
+    }]
+  }]
+}
+```
+
+Required system-policy rendering is tracked in
+[handoff 2026-11-09-09](docs/frontend-handoffs/2026-11-09.md#2026-11-09-09-read-only-spoof-block-system-policy-details).
+
 Enabled enforcement covers IPv4 and IPv6 entering every managed interface with
 `role:"lan"` (Ethernet, VLAN, dummy or WireGuard), including configured down
 LANs once traffic can enter them. WAN, unassigned/adopted-only links, loopback
@@ -6803,7 +6895,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/routes/bgp/advertised` | Exact established-session advertised prefixes per neighbor; not peer acceptance |
 | GET | `/services/bgp` | Committed `BGPConfig` |
 | GET | `/services/bgp/status` | Applied BGP worker and neighbor summary |
-| GET | `/firewall/rules` | Entire observed `Firewall`, including policy and NAT |
+| GET | `/firewall/rules` | Observed `FirewallView`: Firewall fields plus read-only compiled `system_policies` |
 | GET | `/firewall/deny-log` | Filtered persistent deny history, capture/loss/retention status; `firewall.logs.read` |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
@@ -7234,6 +7326,44 @@ interface Firewall {
   nat: { masquerade: MasqueradeRule[]; destination_rewrite: DestinationRewriteRule[] };
   policies?: { hosts: FirewallHost[]; interfaces: InterfacePolicy[] } | null;
   input?: InputFirewall | null;
+}
+
+// GET /firewall/rules only; never submit system_policies as configuration.
+interface FirewallView extends Firewall {
+  system_policies: SystemFirewallPolicy[];
+}
+
+interface SystemFirewallPolicy {
+  id: "spoof_block";
+  origin: "system";
+  read_only: true;
+  config_path: "/firewall/spoof_block";
+  enabled: boolean;
+  chains: Array<{
+    name: "input_spoof_block" | "forward_spoof_block";
+    hook: "input" | "forward";
+    priority: -1;
+    policy: "accept";
+    rules: Array<{
+      id: string;
+      order: number;
+      counter_id: string;
+      config_path: "/firewall/spoof_block" | null;
+      action: "return" | "drop";
+      matches: {
+        family: "ipv4" | "ipv6";
+        ingress_interface: string;
+        source: string | null;
+        destination: string | null;
+        protocol: "any" | "udp" | "icmpv6";
+        source_port: number | null;
+        destination_port: number | null;
+        icmp_type: number | null;
+        icmp_code: number | null;
+        hop_limit: number | null;
+      };
+    }>;
+  }>;
 }
 
 interface InputFirewall {

@@ -377,10 +377,9 @@ fn filter_protocol_api_validation_persistence_and_restart_rollback() {
             200
         );
         assert_eq!(engine.saved_configuration().firewall, saved.firewall);
-        assert_eq!(
-            request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body,
-            json!(saved.firewall)
-        );
+        let mut firewall = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body;
+        firewall.as_object_mut().unwrap().remove("system_policies");
+        assert_eq!(firewall, json!(saved.firewall));
         for (protocol, ports, status) in [
             (json!("icmp"), json!([80]), 422),
             (json!("icmp6"), json!([]), 422),
@@ -4644,6 +4643,95 @@ fn drop_logging_permissions_confirmation_persistence_and_rollback() {
         200
     );
     assert!(engine.saved_configuration().firewall.drop_logging_enabled);
+}
+
+#[test]
+fn spoof_block_system_policy_api_authorization_candidate_and_rollback() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let initial = config();
+    let pending = submit(&mut engine, initial.clone());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let persisted = fs::read(fixture.path()).unwrap();
+    let revision = engine.committed_revision();
+    for (actor, permissions, status) in [
+        ("", vec!["state.read".into()], 401),
+        ("writer", vec!["firewall.write".into()], 403),
+        ("reader", vec!["state.read".into()], 200),
+    ] {
+        let reply = engine.request(
+            "GET",
+            "/api/v1/firewall/rules",
+            "",
+            actor,
+            &permissions,
+            &[],
+        );
+        assert_eq!(reply.status, status, "{}", reply.body);
+        if status == 200 {
+            assert_eq!(reply.body["system_policies"][0]["enabled"], true);
+            assert_eq!(
+                reply.body["system_policies"][0]["chains"][0]["rules"][0]["matches"]["source"],
+                "192.0.2.0/24"
+            );
+        }
+    }
+    assert_eq!(fs::read(fixture.path()).unwrap(), persisted);
+    assert_eq!(engine.committed_revision(), revision);
+    let original = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body;
+    let mut changed = initial.clone();
+    changed.interfaces[0].addresses = vec!["198.51.100.1/24".into()];
+    let pending = submit(&mut engine, changed);
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    let applied = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null);
+    assert_eq!(applied.status, 200);
+    assert_eq!(
+        applied.body["system_policies"][0]["chains"][0]["rules"][0]["matches"]["source"],
+        "198.51.100.0/24"
+    );
+    assert_eq!(engine.saved_configuration().interfaces, initial.interfaces);
+    let rollback = request(
+        &mut engine,
+        "POST",
+        &format!(
+            "/api/v1/transactions/{}/rollback",
+            pending.body["id"].as_str().unwrap()
+        ),
+        Value::Null,
+    );
+    assert_eq!(rollback.status, 200, "{}", rollback.body);
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null).body,
+        original
+    );
+    let mut disabled = initial;
+    disabled.firewall.spoof_block = false;
+    let pending = submit(&mut engine, disabled);
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    let applied = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null);
+    assert_eq!(applied.body["system_policies"][0]["enabled"], false);
+    assert_eq!(applied.body["system_policies"][0]["chains"], json!([]));
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let mut engine = fixture.engine();
+    let reopened = request(&mut engine, "GET", "/api/v1/firewall/rules", Value::Null);
+    assert_eq!(reopened.status, 200, "{}", reopened.body);
+    assert_eq!(
+        reopened.body["system_policies"],
+        applied.body["system_policies"]
+    );
+    assert!(
+        serde_json::to_value(engine.saved_configuration()).unwrap()["firewall"]
+            .get("system_policies")
+            .is_none()
+    );
 }
 
 #[test]

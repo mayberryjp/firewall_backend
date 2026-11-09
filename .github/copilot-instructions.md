@@ -19,6 +19,7 @@
 
 ## Change and validation workflow
 
+- When providing shell commands for this repository, put each complete command or command sequence on one physical line in a copyable fenced code block. Do not include shell prompts, history line numbers, backslash line continuations or multiline command formatting. Separate sequential commands with semicolons where syntactically valid; preserve required shell syntax and failure handling rather than replacing conditional operators.
 - Before implementation, read the relevant code, tests, contract documentation, and change memory described below. Reuse existing patterns and keep changes scoped to the request.
 - Update directly affected documentation and tests alongside behavior changes. Document current contract changes explicitly without treating backward compatibility as a constraint.
 - Run the smallest relevant tests first, such as `cargo test -p netcontrold` or `cargo test -p netcontrol-core`. For cross-crate changes run `cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, and `cargo build --workspace --locked`.

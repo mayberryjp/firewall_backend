@@ -250,6 +250,13 @@ bootstrap and IPv6 neighbor-discovery/multicast-listener exceptions bypass only
 Spoof Block, so existing DHCP/IPv6 service permissions are still required.
 Drops report `reason:"spoof_block"` and use normal logging/Discord policies.
 
+`GET /api/v1/firewall/rules` exposes read-only `system_policies` with each
+LAN-specific compiled match, DHCP/IPv6 exception, chain priority, action and
+counter ID. These details share the native compiler and reflect the applied
+candidate during confirmed transactions. They are not editable configuration;
+do not include them in transaction candidates. Counter IDs can be shared by
+multiple matches and do not provide distinct per-interface drop totals.
+
 Disable explicitly through a confirmed firewall transaction or
 `firewall spoof-block disable` when intentionally routing nonlocal sources
 through a LAN. This is not Linux uRPF and does not change `rp_filter`, resolve

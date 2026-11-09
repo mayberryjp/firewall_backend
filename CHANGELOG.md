@@ -4,6 +4,14 @@
 
 ### Added
 
+- `GET /api/v1/firewall/rules` now includes read-only, system-owned Spoof Block
+  policies with exact LAN/family matches, DHCP/IPv6 exceptions, chain ordering,
+  actions and counter links. Share the source-guard compiler with native
+  enforcement; keep generated details out of editable/persisted configuration
+  and preserve aggregate counter semantics. Release impact: additive read API;
+  next automatic calendar version. Required frontend rendering:
+  [handoff 2026-11-09-09](docs/frontend-handoffs/2026-11-09.md#2026-11-09-09-read-only-spoof-block-system-policy-details).
+
 - Default-on global `firewall.spoof_block` rejects off-subnet IPv4/IPv6 sources
   on managed LAN interfaces before normal input/forward rules, ICMP,
   established/related acceptance and temporary diagnostic permits. Derive the
@@ -74,6 +82,11 @@
   [handoff 2026-11-08-01](docs/frontend-handoffs/2026-11-08.md#2026-11-08-01-conntrack-controls).
 
 ### Changed
+
+- Repository Copilot instructions now require copyable, single-physical-line
+  shell commands without prompts or history numbers, using semicolons where
+  valid while preserving failure handling. Documentation-only; release and
+  frontend contract impact: none.
 
 - Retrying component failures now report aggregate `degraded` rather than
   `unhealthy`; component errors and alerts remain visible. Discord delivery

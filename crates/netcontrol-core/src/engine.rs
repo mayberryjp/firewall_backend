@@ -2202,7 +2202,9 @@ impl Engine {
             "/api/v1/services/ntp" => value(observed.ntp),
             "/api/v1/services/syslog" => value(observed.syslog),
             "/api/v1/services/vnstat" => value(observed.vnstat),
-            "/api/v1/firewall/rules" => value(observed.firewall),
+            "/api/v1/firewall/rules" => {
+                crate::firewall_view::firewall_view(&observed).map_err(service_error)
+            }
             "/api/v1/firewall/nat" => value(observed.firewall.nat),
             "/api/v1/firewall/hosts" => value(
                 observed

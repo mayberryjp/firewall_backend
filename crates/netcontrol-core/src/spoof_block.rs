@@ -1,10 +1,31 @@
-use super::Match;
 use anyhow::{Context, Result, ensure};
 use ipnet::IpNet;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-pub fn compile(firewall: &Value, interfaces: &[crate::model::Link]) -> Result<Vec<Match>> {
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CompiledFirewallMatch {
+    pub counter_key: String,
+    pub source: String,
+    pub destination: String,
+    pub ingress: String,
+    pub egress: String,
+    pub protocol: String,
+    pub port: u16,
+    pub source_port: u16,
+    pub action: String,
+    pub established_related: bool,
+    pub family: Option<bool>,
+    pub icmpv6_type: Option<u8>,
+    pub hop_limit: Option<u8>,
+}
+
+use CompiledFirewallMatch as Match;
+
+pub fn compile_spoof_block<'a>(
+    firewall: &Value,
+    lan_interfaces: impl IntoIterator<Item = (&'a str, &'a [String])>,
+) -> Result<Vec<Match>> {
     let enabled = match firewall.get("spoof_block") {
         None => true,
         Some(value) => value
@@ -15,32 +36,32 @@ pub fn compile(firewall: &Value, interfaces: &[crate::model::Link]) -> Result<Ve
     if !enabled {
         return Ok(plans);
     }
-    for link in interfaces.iter().filter(|link| link.role == "lan") {
+    for (name, prefixes) in lan_interfaces {
         ensure!(
-            crate::safe_name(&link.name, 15),
+            crate::valid_interface_name(name),
             "invalid LAN interface name"
         );
         let mut networks = BTreeSet::new();
         let mut addresses = BTreeSet::new();
-        for address in &link.addresses {
-            crate::model::parse_prefix(address, false)?;
+        for address in prefixes {
+            crate::canonical_prefix(address, false)?;
             let prefix: IpNet = address.parse()?;
             networks.insert(prefix.trunc());
             addresses.insert(prefix.addr());
         }
         let base = Match {
-            ingress: link.name.clone(),
+            ingress: name.into(),
             action: "return".into(),
             ..Default::default()
         };
         for network in &networks {
             plans.push(Match {
-                counter_key: format!("generated/spoof_block/{}/local", link.name),
+                counter_key: format!("generated/spoof_block/{name}/local"),
                 source: network.to_string(),
                 ..base.clone()
             });
         }
-        let bootstrap = format!("generated/spoof_block/{}/bootstrap", link.name);
+        let bootstrap = format!("generated/spoof_block/{name}/bootstrap");
         for destination in std::iter::once("255.255.255.255/32".into()).chain(
             addresses
                 .iter()
@@ -68,7 +89,7 @@ pub fn compile(firewall: &Value, interfaces: &[crate::model::Link]) -> Result<Ve
                 ..base.clone()
             });
         }
-        let control = format!("generated/spoof_block/{}/ipv6_control", link.name);
+        let control = format!("generated/spoof_block/{name}/ipv6_control");
         let destinations: BTreeSet<String> = ["fe80::/10".into(), "ff02::/16".into()]
             .into_iter()
             .chain(
@@ -127,9 +148,9 @@ pub fn compile(firewall: &Value, interfaces: &[crate::model::Link]) -> Result<Ve
             });
         }
         ensure!(
-            plans.len() <= netcontrol_core::FIREWALL_EXPANSION_LIMIT,
+            plans.len() <= crate::FIREWALL_EXPANSION_LIMIT,
             "spoof block expands beyond {} rules",
-            netcontrol_core::FIREWALL_EXPANSION_LIMIT
+            crate::FIREWALL_EXPANSION_LIMIT
         );
     }
     Ok(plans)
@@ -140,7 +161,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn interfaces() -> Vec<crate::model::Link> {
+    fn interfaces() -> Vec<crate::Interface> {
         serde_json::from_value(json!([
             {"name":"lan0","role":"lan","kind":"ethernet","up":true,"mtu":1500,
              "addresses":["192.0.2.1/24","192.0.2.2/24","198.51.100.1/25","2001:db8:1::1/64"]},
@@ -151,15 +172,25 @@ mod tests {
         .unwrap()
     }
 
+    fn compile(firewall: &Value, interfaces: &[crate::Interface]) -> Result<Vec<Match>> {
+        compile_spoof_block(
+            firewall,
+            interfaces
+                .iter()
+                .filter(|link| link.role == "lan")
+                .map(|link| (link.name.as_str(), link.addresses.as_slice())),
+        )
+    }
+
     #[test]
     fn spoof_block_expansion_accepts_exact_limit_and_rejects_one_extra() {
         let mut links = interfaces();
-        links[0].addresses = (0..(netcontrol_core::FIREWALL_EXPANSION_LIMIT - 42) / 2)
+        links[0].addresses = (0..(crate::FIREWALL_EXPANSION_LIMIT - 42) / 2)
             .map(|index| format!("10.{}.{}.1/32", index / 256, index % 256))
             .collect();
         assert_eq!(
             compile(&json!({}), &links).unwrap().len(),
-            netcontrol_core::FIREWALL_EXPANSION_LIMIT
+            crate::FIREWALL_EXPANSION_LIMIT
         );
         links[0].addresses.push("10.255.255.1/32".into());
         assert!(

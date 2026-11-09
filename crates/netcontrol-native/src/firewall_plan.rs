@@ -3,24 +3,19 @@ use netcontrol_core::FIREWALL_EXPANSION_LIMIT;
 use serde_json::Value;
 use std::{collections::BTreeMap, net::IpAddr};
 
-mod spoof_block;
-pub use spoof_block::compile as compile_spoof_block;
+pub use netcontrol_core::CompiledFirewallMatch as Match;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub struct Match {
-    pub counter_key: String,
-    pub source: String,
-    pub destination: String,
-    pub ingress: String,
-    pub egress: String,
-    pub protocol: String,
-    pub port: u16,
-    pub source_port: u16,
-    pub action: String,
-    pub established_related: bool,
-    pub family: Option<bool>,
-    pub icmpv6_type: Option<u8>,
-    pub hop_limit: Option<u8>,
+pub fn compile_spoof_block(
+    firewall: &Value,
+    interfaces: &[crate::model::Link],
+) -> Result<Vec<Match>> {
+    netcontrol_core::compile_spoof_block(
+        firewall,
+        interfaces
+            .iter()
+            .filter(|link| link.role == "lan")
+            .map(|link| (link.name.as_str(), link.addresses.as_slice())),
+    )
 }
 
 pub fn destination_rewrites(
@@ -488,6 +483,34 @@ pub fn counter_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spoof_block_native_adapter_uses_shared_plan_and_only_lan_interfaces() {
+        let links: Vec<crate::model::Link> = serde_json::from_value(serde_json::json!([
+            {"name":"lan0","role":"lan","kind":"dummy","mtu":1500,"up":false,
+             "addresses":["192.0.2.1/24","2001:db8:1::1/64"]},
+            {"name":"wan0","role":"wan","kind":"dummy","mtu":1500,"up":true,
+             "addresses":["198.51.100.1/24"]},
+            {"name":"unused0","role":"unassigned","kind":"dummy","mtu":1500,"up":true,
+             "addresses":[]}
+        ]))
+        .unwrap();
+        let firewall = serde_json::json!({"spoof_block":true});
+        let plans = compile_spoof_block(&firewall, &links).unwrap();
+        let shared = netcontrol_core::compile_spoof_block(
+            &firewall,
+            [("lan0", links[0].addresses.as_slice())],
+        )
+        .unwrap();
+        assert_eq!(plans, shared);
+        assert_eq!(plans.len(), 28);
+        assert!(plans.iter().all(|plan| plan.ingress == "lan0"));
+        assert!(
+            compile_spoof_block(&serde_json::json!({"spoof_block":false}), &links)
+                .unwrap()
+                .is_empty()
+        );
+    }
     use serde_json::json;
 
     #[test]
