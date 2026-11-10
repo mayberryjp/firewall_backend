@@ -451,6 +451,20 @@ instructions must require planned manual OS patching and must not describe
 disabled automatic security patching as a security improvement.
 This host policy adds no API fields, permissions or web action and does not
 change the saved firewall configuration.
+The packaged systemd unit no longer pulls in or orders after
+`network-online.target`; it orders after `network.target`. Fresh installation
+and full source upgrades also stop/disable and persistently mask
+`systemd-networkd-wait-online.service`, including an absent unit, verifying
+inactive/failed state and persistent masks before continuing. Errors abort
+setup; networkd itself, resolved and Wi-Fi authentication are unchanged by this
+helper. Other network-online consumers may now start before connectivity is
+ready. Netcontrol readiness still requires native recovery and HTTP binding,
+not WAN availability. Binary-only/automatic HTTP updates, signed packages, reset
+and build-only runs do not establish this policy. No HTTP methods/paths,
+authentication, schemas, statuses or saved configuration change. Required
+frontend action is operator boot/deployment help, not forms/types/polling;
+see [boot-wait guidance](docs/BUILD_AND_INSTALL.md#network-online-boot-wait) and
+[handoff 2026-11-10-05](docs/frontend-handoffs/2026-11-10.md#2026-11-10-05-network-online-boot-wait).
 Fresh installation additionally requires AppArmor disabled before downloading/
 provisioning Netcontrol. It writes/verifies a GRUB `apparmor=0` drop-in; active
 AppArmor stops deployment for a manual console reboot and rerun, not a

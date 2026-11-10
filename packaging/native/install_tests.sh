@@ -682,7 +682,52 @@ for deny_scenario in success repeat counter_in_core tables_failure nfnetlink_fai
 done
 printf 'Firewall telemetry provider, core counter support and prerequisite/publication failure tests passed (mocked kernel commands).\n'
 
-for service_scenario in success repeat directory_failure chmod_failure publish_failure symlink_file symlink_directory file_directory nonregular_target; do
+for wait_scenario in success repeat absent masked inspect_failure disable_failure stop_failure mask_failure verify_failure still_active runtime_only; do
+    (
+        wait_directory="$temporary/network-wait-$wait_scenario"
+        mkdir "$wait_directory"
+        systemctl() {
+            printf '%s\n' "$*" >> "$wait_directory/commands"
+            [[ $2 == systemd-networkd-wait-online.service || ${3:-} == systemd-networkd-wait-online.service ]] || return 1
+            case $1 in
+                show)
+                    if [[ ${4:-} == LoadState ]]; then
+                        case $wait_scenario in
+                            inspect_failure) printf 'Fixture inspection failure.\n' >&2; return 1 ;;
+                            absent) printf 'not-found\n'; return 4 ;;
+                            masked|stop_failure) printf 'masked\n' ;;
+                            *) printf 'loaded\n' ;;
+                        esac
+                    else
+                        [[ $wait_scenario != verify_failure ]] || { printf 'Fixture verification failure.\n' >&2; return 1; }
+                        if [[ $wait_scenario == still_active ]]; then printf 'ActiveState=active\n'; else printf 'ActiveState=inactive\n'; fi
+                        if [[ $wait_scenario == runtime_only ]]; then printf 'UnitFileState=masked-runtime\n'; else printf 'UnitFileState=masked\n'; fi
+                    fi ;;
+                disable|stop|mask)
+                    [[ $wait_scenario != "${1}_failure" ]] || { printf 'Fixture %s failure.\n' "$1" >&2; return 1; } ;;
+                *) return 1 ;;
+            esac
+        }
+        if configure_network_wait > "$wait_directory/stdout" 2> "$wait_directory/stderr"; then
+            case $wait_scenario in success|repeat|absent|masked) ;; *) exit 1 ;; esac
+            if [[ $wait_scenario == repeat ]]; then configure_network_wait || exit 1; fi
+            grep -Fxq 'mask systemd-networkd-wait-online.service' "$wait_directory/commands"
+            case $wait_scenario in
+                absent) ! grep -Eq '^(disable|stop) ' "$wait_directory/commands" ;;
+                masked) grep -Fxq 'stop systemd-networkd-wait-online.service' "$wait_directory/commands" ;;
+                *) grep -Fxq 'disable --now systemd-networkd-wait-online.service' "$wait_directory/commands" ;;
+            esac
+        else
+            case $wait_scenario in success|repeat|absent|masked) cat "$wait_directory/stderr" >&2; exit 1 ;; esac
+            [[ -s $wait_directory/stderr ]]
+        fi
+    )
+done
+tr -d '\r' < packaging/native/netcontrold.service | grep -Fxq 'After=network.target'
+! grep -Fq 'network-online.target' packaging/native/netcontrold.service
+printf 'Networkd online-wait masks, failures, repeat setup and nonblocking packaged unit tests passed.\n'
+
+for service_scenario in success repeat wait_failure directory_failure chmod_failure publish_failure symlink_file symlink_directory file_directory nonregular_target; do
     service_directory="$temporary/service-opt-ins-$service_scenario"
     mkdir -p "$service_directory/drop-ins"
     printf 'custom unit\n' > "$service_directory/unit"
@@ -706,6 +751,7 @@ for service_scenario in success repeat directory_failure chmod_failure publish_f
             mkdir "$service_target" ;;
     esac
     if (
+        configure_network_wait() { [[ $service_scenario != wait_failure ]]; }
         install() {
             [[ $service_scenario != directory_failure ]] || return 1
             local -a arguments=()

@@ -1,7 +1,6 @@
 [Unit]
 Description=Netcontrol network control daemon
-Wants=network-online.target
-After=network-online.target
+After=network.target
 StartLimitIntervalSec=0
 
 [Service]

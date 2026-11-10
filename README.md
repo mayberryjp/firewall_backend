@@ -1052,6 +1052,11 @@ the service and binds HTTP management to LAN. It does not replace imported
 firewall policy with factory allow-all/NAT rules; review management permissions
 and client forwarding from console. Explicit factory reset remains separate.
 Existing appliance state is not reset.
+The packaged systemd service starts without waiting for `network-online.target`.
+Installation and full source upgrades persistently mask
+`systemd-networkd-wait-online.service` to avoid its boot timeout; this does not
+disable networkd itself or guarantee WAN connectivity at startup. See the
+[boot-wait operator guidance](docs/BUILD_AND_INSTALL.md#network-online-boot-wait).
 LAN clients currently need static addresses and the appliance as their gateway;
 no LAN DHCP or DNS server is installed. IPv6 forwarding is not enabled.
 Use console access during provisioning. See the

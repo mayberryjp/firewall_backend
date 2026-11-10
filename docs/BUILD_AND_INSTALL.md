@@ -1237,6 +1237,8 @@ at `/etc/systemd/system/netcontrold.service`. It creates root-only directories
 `/var/lib/netcontrol`, `/var/lib/netcontrol/services` and `/etc/netcontrol/keys`.
 The unit runs as root in native host mode, with private file creation (`0077`),
 journald logging, restart on failure and a 60-second shutdown allowance.
+It orders after `network.target`, not `network-online.target`: Netcontrol restores
+its own saved networking rather than waiting for an OS online check first.
 The unit and managed install/full-source-upgrade drop-in use `Type=notify`,
 `NotifyAccess=main`, `WatchdogSec=60s`, `WatchdogSignal=SIGKILL`,
 `TimeoutStartSec=180s`, `Restart=on-failure`, `RestartSec=5s`,
@@ -1294,6 +1296,38 @@ enables boot startup; for a manual/source installation, enable it after provisio
 ```sh
 sudo systemctl enable netcontrold
 ```
+
+#### Network-online boot wait
+
+Fresh installation and full source upgrades stop/disable and persistently mask
+`systemd-networkd-wait-online.service`, including an absent unit. They verify
+inactive/failed state and persistent masking; inspection/control/verification
+failures abort setup. The shared appliance-service setup performs this before
+source-upgrade binary replacement. Existing custom units/arguments are preserved;
+masking removes the standard networkd wait even if a unit still references
+`network-online.target`. No other online-wait implementation or instance is
+disabled, and no maximum overall boot time is promised.
+
+This removes networkd's usual two-minute online wait, not network configuration.
+It does not stop or disable `systemd-networkd.service`, resolved or Wi-Fi
+authentication. Other services using `network-online.target` can now start before
+links, addresses or WAN connectivity are ready; review network-dependent local
+workloads. Netcontrol readiness still requires successful native recovery and
+HTTP listener binding, not internet reachability.
+
+For an existing appliance, apply the same mask from its local console without
+restarting Netcontrol or networking:
+
+```sh
+sudo systemctl disable --now systemd-networkd-wait-online.service && sudo systemctl mask systemd-networkd-wait-online.service; systemctl show systemd-networkd-wait-online.service --property=ActiveState --property=UnitFileState
+```
+
+Expect `ActiveState=inactive` (or `failed`) and `UnitFileState=masked`; inspect
+any command error rather than assuming success. Confirm the next reboot from
+the console with `systemd-analyze critical-chain netcontrold.service` and real
+LAN/WAN checks. Binary-only HTTP/automatic updates, signed packages, reset and
+build-only runs do not install this host policy. The packaged unit's dependency
+change likewise requires unit deployment, not just a daemon binary update.
 
 Use `sudo systemctl edit netcontrold` for operator drop-ins. To change arguments,
 clear `ExecStart=` and supply the complete replacement command under `[Service]`;

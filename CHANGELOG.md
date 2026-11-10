@@ -88,6 +88,15 @@
 
 ### Changed
 
+- Remove the packaged daemon's `network-online.target` dependency and mask
+  `systemd-networkd-wait-online.service` during fresh installation/full source
+  upgrades, with explicit stopped/persistent-mask verification. Avoid the
+  standard networkd boot wait without disabling networking itself; other
+  online-target consumers may start before connectivity is ready.
+  Release impact: boot fix and breaking host readiness policy; next automatic
+  calendar version. Required operator-help review:
+  [handoff 2026-11-10-05](docs/frontend-handoffs/2026-11-10.md#2026-11-10-05-network-online-boot-wait).
+
 - Fresh installation and full source upgrades require kernel AppArmor disablement
   via verified GRUB boot settings, stopping for manual reboot/rerun when active.
   Persistently mask its service while preserving all packages (including Ubuntu

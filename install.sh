@@ -409,6 +409,20 @@ configure_os_updates() (
     installer_message success 'Automatic OS updates disabled.'
 )
 
+configure_network_wait() (
+    set -euo pipefail
+    local unit=systemd-networkd-wait-online.service status
+    configure_masked_units Network-online "$unit" || exit 1
+    systemctl mask "$unit" || exit 1
+    status=$(systemctl show "$unit" --property ActiveState --property UnitFileState) || exit 1
+    if ! grep -Fxq 'UnitFileState=masked' <<< "$status" ||
+       ! grep -Eq '^ActiveState=(inactive|failed)$' <<< "$status"; then
+        printf 'Network-online unit %s is not stopped and persistently masked.\n' "$unit" >&2
+        exit 1
+    fi
+    installer_message success 'Networkd online wait disabled; networking services are unchanged.'
+)
+
 configure_appliance_services() (
     set -euo pipefail
     local directory=${1:-/etc/systemd/system/netcontrold.service.d}
@@ -418,6 +432,7 @@ configure_appliance_services() (
         printf 'Refusing non-regular appliance service configuration: %s\n' "$destination" >&2
         exit 1
     }
+    configure_network_wait || exit 1
     install -d -o root -g root -m 0755 "$directory" || exit 1
     staged=$(mktemp "$directory/.appliance-services.XXXXXX") || exit 1
     trap '[[ -z $staged ]] || rm -f -- "$staged"' EXIT
