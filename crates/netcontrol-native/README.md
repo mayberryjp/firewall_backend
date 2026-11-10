@@ -546,6 +546,27 @@ foreign firewall tables, conflicting routes and unsupported kernel state still
 fail explicitly. Explicit factory reset uses the same snapshot/intent machinery
 to apply a replacement configuration selected by the local operator.
 
+On host reboot or same-boot startup with a configured-up Ethernet link down,
+reconciliation validates ownership and interface identity, captures the current
+state in a durable recovery intent, and raises configured-up managed Ethernet
+before restoring saved DHCP leases and applying the full network configuration.
+Native apply and interrupted-operation recovery use the same ordering under
+their existing intents. This covers static as well as DHCP interfaces; it does
+not raise configured-down links, unmanaged interfaces or read-only parents.
+Administrative up does not imply physical carrier. On owned routes the kernel's
+transient `linkdown` flag is not treated as a configured route change. Failures
+remain explicit and retain recovery state if rollback cannot complete. Recovery
+requires both original and per-operation identity snapshots for every configured-up
+managed Ethernet link; a missing or mismatched snapshot stops recovery without
+raising that link and retains the intent for investigation. Rollback restores
+captured address prefix-route flags on a down link without leaving a transient
+kernel-generated route that would block a subsequent DHCP lease restore. If an
+up link's captured prefix-route flag cannot be restored safely in place, recovery
+stops and retains its intent rather than deleting existing routes.
+The separate pending VLAN-adoption finisher runs before ordinary startup
+reconciliation; a down baseline link can still block that finisher. Its durable
+adoption receipt is retained on failure and must not be deleted to bypass recovery.
+
 Native committed-configuration comparisons use the current typed operational
 projection on both sides, not raw persisted JSON versus newly serialized defaults.
 Daemon-owned `software` release/check metadata, `mqtt` settings and descriptive

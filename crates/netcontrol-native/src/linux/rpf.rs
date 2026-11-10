@@ -275,8 +275,8 @@ mod tests {
             after: after.clone(),
             kernel_before: captured.clone(),
             ownership_before: ownership.clone(),
-            ethernet_before: BTreeMap::new(),
-            ethernet_originals: BTreeMap::new(),
+            ethernet_before: native.capture_ethernet(&before, &after)?,
+            ethernet_originals: ownership.ethernet_originals.clone(),
             ipv6_before: native.capture_ipv6(&before)?,
         };
         crate::linux::write_json(&native.state.join("intent.json"), &intent)?;

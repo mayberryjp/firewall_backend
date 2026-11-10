@@ -1,6 +1,6 @@
 use crate::{
     NativeOptions,
-    model::{EthernetSnapshot, Kernel, Network},
+    model::{EthernetSnapshot, Kernel, Network, Route},
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use netcontrol_core::{Backend, Config};
@@ -193,6 +193,16 @@ struct HostScope {
     device: u64,
     inode: u64,
     identity: String,
+}
+
+fn retain_committed_boot_routes(snapshot: &mut Value, committed: &[Route]) -> Result<()> {
+    let routes: Vec<_> = Network::parse(snapshot)?
+        .routes
+        .into_iter()
+        .filter(|route| committed.contains(route))
+        .collect();
+    snapshot["routes"] = serde_json::to_value(routes)?;
+    Ok(())
 }
 
 impl Native {
@@ -798,12 +808,14 @@ impl Native {
             if after.ipv6_enabled {
                 ipv6::set(true)?;
                 if let Some(snapshot) = original_ipv6.take() {
-                    rt.block_on(ipv6::restore_network(handle, &snapshot.unmanaged(&after)?))?;
+                    rt.block_on(ipv6::restore_network(handle, &snapshot.unmanaged(&after)?))
+                        .context("restore unmanaged IPv6 state before networking")?;
                 }
             }
             rt.block_on(networking::reconcile(
                 handle, &before, &after, &parents, &keys, &originals,
-            ))?;
+            ))
+            .context("reconcile managed networking")?;
             if !after.ipv6_enabled {
                 if original_ipv6.is_none() {
                     original_ipv6 = Some(rt.block_on(ipv6::capture(handle))?.unmanaged(&after)?);
@@ -936,6 +948,18 @@ impl Native {
         let network = Network::parse(before)?;
         session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(ipv6::capture(handle))?.unmanaged(&network)
+        })
+    }
+
+    fn capture_ethernet(
+        &self,
+        before: &Value,
+        after: &Value,
+    ) -> Result<BTreeMap<String, EthernetSnapshot>> {
+        let before = Network::parse(before)?;
+        let after = Network::parse(after)?;
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::capture_ethernet(handle, &before, &after))
         })
     }
 
@@ -1133,6 +1157,39 @@ impl Native {
         Ok(())
     }
 
+    fn activate_ethernet(
+        &self,
+        config: &Value,
+        originals: &BTreeMap<String, EthernetSnapshot>,
+        captured: &BTreeMap<String, EthernetSnapshot>,
+    ) -> Result<()> {
+        self.check_scope()?;
+        let network = Network::parse(config)?;
+        for link in network
+            .interfaces
+            .iter()
+            .filter(|link| link.kind == "ethernet" && link.up)
+        {
+            ensure!(
+                originals.contains_key(&link.name),
+                "managed Ethernet {} has no durable original snapshot",
+                link.name
+            );
+            ensure!(
+                captured.contains_key(&link.name),
+                "managed Ethernet {} has no durable operation snapshot",
+                link.name
+            );
+        }
+        let originals = originals.clone();
+        let captured = captured.clone();
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(networking::check_ethernet(handle, &originals))?;
+            rt.block_on(networking::check_ethernet(handle, &captured))?;
+            rt.block_on(networking::activate_ethernet(handle, &network))
+        })
+    }
+
     fn recover(&mut self) -> Result<()> {
         self.recover_interface_aliases()?;
         let path = self.state.join("intent.json");
@@ -1145,12 +1202,25 @@ impl Native {
             "pending native recovery belongs to another namespace"
         );
         self.preflight(&intent.before)?;
+        let mut service_before = intent.before.clone();
+        service_before
+            .as_object_mut()
+            .context("native recovery configuration must be an object")?
+            .remove("_monitor_policy_rules");
         let mut ownership = intent.ownership_before.clone();
         ownership
             .ethernet_originals
             .extend(intent.ethernet_originals);
         self.stop_services()?;
-        self.dhcp.configure(&intent.before)?;
+        self.activate_ethernet(
+            &intent.before,
+            &ownership.ethernet_originals,
+            &intent.ethernet_before,
+        )
+        .context("recovering Ethernet links; durable intent retained on failure")?;
+        self.dhcp
+            .configure(&service_before)
+            .context("recover DHCP clients; durable intent retained on failure")?;
         self.network_apply(
             &intent.after,
             &intent.before,
@@ -1182,7 +1252,7 @@ impl Native {
         } else {
             ownership.firewall_config = Some(Network::parse(&intent.before)?.firewall);
         }
-        self.repair_services(&intent.before)?;
+        self.repair_services(&service_before)?;
         self.save_ownership(&ownership)?;
         remove_durable(&path)
     }
@@ -1211,20 +1281,30 @@ impl Native {
             .state
             .lock()
             .map_err(|_| anyhow!("DHCP state poisoned"))?;
-        dhcp_client::effective(&mut expected, &leases)?;
+        let (reconciliation_leases, pending_routes) =
+            self.dhcp.reconciliation_state(&expected, &leases)?;
+        dhcp_client::effective(&mut expected, &reconciliation_leases)?;
+        let committed_routes = expected.routes.clone();
+        expected.routes.extend(pending_routes);
+        expected.routes.sort();
+        expected.routes.dedup();
         let originals = ownership.ethernet_originals.clone();
         let keys = self.wireguard_dns.control.clone();
         let (mut before, fingerprint) = session(self.namespace.clone(), move |rt, handle| {
             rt.block_on(networking::check_ethernet(handle, &originals))?;
             Ok((
-                rt.block_on(networking::boot_snapshot(handle, &expected, &keys))?,
+                rt.block_on(networking::boot_snapshot(handle, &expected, &keys))
+                    .context("capture networking before startup reconciliation")?,
                 netfilter::fingerprint()?,
             ))
         })?;
-        drop(leases);
+        // Interrupted DHCP updates are not committed boot state.
+        retain_committed_boot_routes(&mut before, &committed_routes)?;
         let mut previous = ownership.clone();
-        // A prior-boot lease or interface index must never be resurrected.
-        ownership.ipv6_original = None;
+        if ownership.boot != self.boot {
+            // A prior-boot lease or interface index must never be resurrected.
+            ownership.ipv6_original = None;
+        }
         if fingerprint == netfilter::empty_fingerprint() {
             previous.firewall_config = None;
             previous.firewall_fingerprint = None;
@@ -1263,12 +1343,20 @@ impl Native {
             ipv6_before: self.capture_ipv6(&before)?,
         };
         write_json(&self.state.join("intent.json"), &intent)?;
+        drop(leases);
         let mut target = ownership.kernel_baseline.clone();
         let desired = Network::parse(after)?;
         target.overlay(&desired.kernel);
         let result = (|| -> Result<()> {
             self.stop_services()?;
-            self.dhcp.configure(after)?;
+            self.activate_ethernet(
+                after,
+                &ownership.ethernet_originals,
+                &intent.ethernet_before,
+            )?;
+            self.dhcp
+                .configure(after)
+                .context("configure DHCP clients during startup reconciliation")?;
             self.network_apply(&before, after, target, &mut ownership)?;
             self.repair_services(after)?;
             ownership.firewall_config = Some(Network::parse(after)?.firewall);
@@ -1930,7 +2018,14 @@ impl Backend for Native {
             // Stop services before interface changes; their manager must restore prior workers on failure.
             let operation = (|| -> Result<()> {
                 self.stop_services()?;
-                self.dhcp.configure(&after)?;
+                self.activate_ethernet(
+                    &after,
+                    &ownership.ethernet_originals,
+                    &intent.ethernet_before,
+                )?;
+                self.dhcp
+                    .configure(&after)
+                    .context("configure DHCP clients during native apply")?;
                 self.network_apply(&before, &after, kernel_target, &mut ownership)?;
                 ownership.firewall_config = Some(Network::parse(&after)?.firewall);
                 ownership.managed_interfaces = Network::parse(&after)?
@@ -2221,13 +2316,27 @@ impl Backend for Native {
             rt.block_on(networking::check_ethernet(handle, &originals))
         })?;
         self.dhcp_monitors.shutdown()?;
-        self.dhcp.configure(&value)?;
         let ownership = self.ownership()?;
-        if self.options.namespace.is_empty()
+        let boot_changed = self.options.namespace.is_empty()
             && !ownership.boot.is_empty()
-            && ownership.boot != self.boot
+            && ownership.boot != self.boot;
+        let down_ethernet = if self.options.namespace.is_empty()
+            && ownership.committed_config.as_ref() == Some(&value)
         {
+            let network = Network::parse(&value)?;
+            session(self.namespace.clone(), move |rt, handle| {
+                rt.block_on(networking::needs_ethernet_activation(handle, &network))
+            })
+            .context("inspect configured Ethernet link state")?
+        } else {
+            false
+        };
+        if boot_changed || down_ethernet {
             self.reconcile_after_boot(&value, ownership, None)?;
+        } else {
+            self.dhcp
+                .configure(&value)
+                .context("configure DHCP clients during startup")?;
         }
         self.preflight(&value)?;
         if let Err(error) = self.verify(&value) {
@@ -2256,13 +2365,14 @@ impl Backend for Native {
                 self.deny_log.configure(true)?;
             }
             let captured = self.capture_kernel(&value, &value)?;
+            let ethernet_before = self.capture_ethernet(&value, &value)?;
             let intent = Intent {
                 scope: self.identity.clone(),
                 before: value.clone(),
                 after: value.clone(),
                 kernel_before: captured.clone(),
                 ownership_before: ownership.clone(),
-                ethernet_before: BTreeMap::new(),
+                ethernet_before,
                 ethernet_originals: ownership.ethernet_originals.clone(),
                 ipv6_before: self.capture_ipv6(&value)?,
             };
@@ -2521,6 +2631,31 @@ fn remove_durable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn boot_rollback_excludes_only_uncommitted_dhcp_routes() -> Result<()> {
+        let committed_dhcp = Route {
+            destination: "203.0.113.0/24".into(),
+            gateway: "192.0.2.1".into(),
+            interface: "wan0".into(),
+            table: 254,
+            metric: 10,
+        };
+        let mut pending = committed_dhcp.clone();
+        pending.gateway = "192.0.2.2".into();
+        let static_route = Route {
+            destination: "198.51.100.0/24".into(),
+            gateway: String::new(),
+            interface: "lan0".into(),
+            table: 254,
+            metric: 20,
+        };
+        let mut snapshot = serde_json::to_value(Config::empty())?;
+        snapshot["routes"] = serde_json::to_value([pending, static_route.clone()])?;
+        retain_committed_boot_routes(&mut snapshot, &[committed_dhcp, static_route.clone()])?;
+        assert_eq!(Network::parse(&snapshot)?.routes, vec![static_route]);
+        Ok(())
+    }
 
     #[test]
     fn oversized_feature_snapshots_cannot_replace_readable_recovery_state() -> Result<()> {

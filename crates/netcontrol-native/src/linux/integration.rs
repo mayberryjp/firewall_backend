@@ -552,7 +552,7 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
         after: after.clone(),
         kernel_before: native.capture_kernel(&before, &after)?,
         ownership_before: ownership.clone(),
-        ethernet_before: BTreeMap::new(),
+        ethernet_before: native.capture_ethernet(&before, &after)?,
         ethernet_originals: ownership.ethernet_originals.clone(),
         ipv6_before: native.capture_ipv6(&before)?,
     };
@@ -2120,6 +2120,328 @@ fn native_static_route_enabled_toggle_restart_and_rollback() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1, isolated Linux namespaces, net_admin and nftables"]
+fn native_startup_ethernet_dhcp_and_interrupted_recovery() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use netlink_packet_route::route::{RouteAttribute, RouteProtocol};
+
+    let fixture = Fixture::new()?;
+    let options = fixture.options();
+    let namespace = Arc::new(File::open(&fixture.namespace)?);
+    let mut native = Native::open(options.clone())?;
+    let empty = Config::empty();
+    native.repair(&empty)?;
+    session(namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            for (name, peer) in [
+                ("static0", "staticpeer"),
+                ("dhcp0", "dhcppeer"),
+                ("disabled0", "disabledpeer"),
+                ("unmanaged0", "unmanagedpeer"),
+            ] {
+                handle
+                    .link()
+                    .add()
+                    .veth(name.into(), peer.into())
+                    .execute()
+                    .await?;
+            }
+            for link in networking::links(handle).await? {
+                if matches!(networking::name(&link).as_str(), "staticpeer" | "dhcppeer") {
+                    handle.link().set(link.header.index).up().execute().await?;
+                }
+            }
+            Ok(())
+        })
+    })?;
+    let desired = config(json!({
+        "interfaces":[
+            {"name":"static0","kind":"ethernet","role":"lan","mtu":1500,"up":true,
+             "addresses":["198.51.100.1/24"]},
+            {"name":"dhcp0","kind":"ethernet","role":"wan","mtu":1500,"up":true},
+            {"name":"disabled0","kind":"ethernet","role":"unassigned","mtu":1500,"up":false}
+        ],
+        "dhcp_clients":{"dhcp0":{}},
+        "routes":[
+            {"destination":"203.0.113.0/24","interface":"static0","table":10000,"metric":10},
+            {"destination":"198.18.0.0/16","gateway":"dhcp","interface":"dhcp0","table":10001,"metric":10}
+        ]
+    }))?;
+    desired.validate()?;
+    native.apply(&empty, &desired)?;
+    native.dhcp.shutdown()?;
+    let value = desired.operational_value()?;
+    let lease = dhcp_client::Lease {
+        client: netcontrol_core::DHCPClientConfig::default(),
+        address: "192.0.2.2/24".into(),
+        server: "192.0.2.1".parse()?,
+        acquired_at: dhcp_client::now()?,
+        lifetime: 3600,
+        renewal: 1800,
+        rebinding: 3150,
+        routes: vec![
+            Route {
+                destination: "192.0.2.0/24".into(),
+                gateway: String::new(),
+                interface: "dhcp0".into(),
+                table: 254,
+                metric: 0,
+            },
+            Route {
+                destination: "0.0.0.0/0".into(),
+                gateway: "192.0.2.1".into(),
+                interface: "dhcp0".into(),
+                table: 254,
+                metric: 100,
+            },
+        ],
+        dns: vec![],
+        domain: String::new(),
+        mtu: None,
+    };
+    let lease_path = native.state.join("dhcp-dhcp0.json");
+    let lease_intent = lease_path.with_extension("intent");
+    let set_down = |names: Vec<&'static str>| -> Result<()> {
+        session(namespace.clone(), move |rt, handle| {
+            rt.block_on(async {
+                let links = networking::links(handle).await?;
+                for name in names {
+                    let link = links
+                        .iter()
+                        .find(|link| networking::name(link) == name)
+                        .context("fixture Ethernet missing")?;
+                    handle
+                        .link()
+                        .set(link.header.index)
+                        .down()
+                        .execute()
+                        .await?;
+                }
+                Ok(())
+            })
+        })
+    };
+    let states = || -> Result<BTreeMap<String, bool>> {
+        session(namespace.clone(), |rt, handle| {
+            rt.block_on(async {
+                Ok(networking::links(handle)
+                    .await?
+                    .into_iter()
+                    .map(|link| {
+                        (
+                            networking::name(&link),
+                            link.header
+                                .flags
+                                .contains(&netlink_packet_route::link::LinkFlag::Up),
+                        )
+                    })
+                    .collect())
+            })
+        })
+    };
+    let assert_states = |static_up, dhcp_up| -> Result<()> {
+        let states = states()?;
+        assert_eq!(states["static0"], static_up);
+        assert_eq!(states["dhcp0"], dhcp_up);
+        assert!(!states["disabled0"]);
+        assert!(!states["unmanaged0"]);
+        Ok(())
+    };
+    let reconcile = |native: &mut Native, target: &Value| -> Result<()> {
+        native.reconcile_after_boot(target, native.ownership()?, None)
+    };
+
+    set_down(vec!["static0", "dhcp0"])?;
+    let mut invalid_lease = lease.clone();
+    invalid_lease.routes[1].gateway = "198.51.100.99".into();
+    write_json(&lease_path, &invalid_lease)?;
+    let saved = fs::read(&lease_path)?;
+    let error = reconcile(&mut native, &value).unwrap_err();
+    assert!(format!("{error:#}").contains("configure DHCP clients during startup reconciliation"));
+    assert!(
+        format!("{error:#}").contains("captured boot state restored"),
+        "{error:#}"
+    );
+    assert_states(false, false)?;
+    assert!(!native.state.join("intent.json").exists());
+    assert_eq!(fs::read(&lease_path)?, saved);
+
+    write_json(&lease_path, &lease)?;
+    reconcile(&mut native, &value).context("reconcile after lease restoration failure")?;
+    native.observe(&desired)?;
+    assert_states(true, true)?;
+
+    native.dhcp.shutdown()?;
+    set_down(vec!["static0", "dhcp0"])?;
+    drop(native);
+    let mut native = Native::open(options.clone())?;
+    let previous_ownership = native.ownership()?;
+    let mut unreachable = desired.clone();
+    unreachable.routes[0].gateway = "203.0.113.1".into();
+    unreachable.validate()?;
+    let unreachable_value = unreachable.operational_value()?;
+    let mut unreachable_ownership = previous_ownership.clone();
+    unreachable_ownership.committed_config = Some(unreachable_value.clone());
+    let saved = fs::read(&lease_path)?;
+    let error = native
+        .reconcile_after_boot(&unreachable_value, unreachable_ownership, None)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("install managed route 203.0.113.0/24 on static0"),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("captured boot state restored"),
+        "{error:#}"
+    );
+    assert_states(false, false)?;
+    assert!(!native.state.join("intent.json").exists());
+    assert_eq!(fs::read(&lease_path)?, saved);
+    let mut restored_ownership = native.ownership()?;
+    restored_ownership.committed_config = previous_ownership.committed_config;
+    native.save_ownership(&restored_ownership)?;
+    reconcile(&mut native, &value).context("reconcile after static route failure")?;
+    native.observe(&desired)?;
+    assert_states(true, true)?;
+
+    native.dhcp.shutdown()?;
+    let mut pending = lease.clone();
+    pending.routes[1].gateway = "192.0.2.3".into();
+    let addressing = dhcp_client::Addressing {
+        routes: Network::parse(&value)?
+            .routes
+            .into_iter()
+            .filter(|route| route.interface == "dhcp0")
+            .collect(),
+        ..Default::default()
+    };
+    let previous = lease.clone();
+    let pending_kernel = pending.clone();
+    session(namespace.clone(), move |rt, handle| {
+        rt.block_on(networking::dhcp_lease(
+            handle,
+            "dhcp0",
+            Some(&previous),
+            Some(&pending_kernel),
+            &addressing,
+            false,
+        ))
+    })?;
+    write_json(&lease_intent, &json!({"after":pending}))?;
+    set_down(vec!["static0"])?;
+    drop(native);
+    let mut native = Native::open(options.clone())?;
+    reconcile(&mut native, &value).context("reconcile interrupted DHCP route update")?;
+    native.observe(&desired)?;
+    assert_states(true, true)?;
+    assert!(!lease_intent.exists());
+
+    native.dhcp.shutdown()?;
+    let previous = native.ownership()?;
+    let mut intent = Intent {
+        scope: native.identity.clone(),
+        before: value.clone(),
+        after: value.clone(),
+        kernel_before: native.capture_kernel(&value, &value)?,
+        ownership_before: previous.clone(),
+        ethernet_before: native.capture_ethernet(&value, &value)?,
+        ethernet_originals: previous.ethernet_originals.clone(),
+        ipv6_before: native.capture_ipv6(&value)?,
+    };
+    let missing = intent
+        .ethernet_before
+        .remove("dhcp0")
+        .context("fixture DHCP snapshot missing")?;
+    write_json(&native.state.join("intent.json"), &intent)?;
+    set_down(vec!["static0", "dhcp0"])?;
+    drop(native);
+    let error = match Native::open(options.clone()) {
+        Ok(_) => anyhow::bail!("recovery accepted a missing Ethernet operation snapshot"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("no durable operation snapshot"));
+    assert_states(false, false)?;
+    assert!(
+        options
+            .services_state
+            .join("native")
+            .join("intent.json")
+            .exists()
+    );
+    intent.ethernet_before.insert("dhcp0".into(), missing);
+    write_json(
+        &options.services_state.join("native").join("intent.json"),
+        &intent,
+    )?;
+    let mut native = Native::open(options)?;
+    native.observe(&desired)?;
+    assert_states(true, true)?;
+    assert!(!native.state.join("intent.json").exists());
+    native.dhcp.shutdown()?;
+    let snapshots = native.capture_ethernet(&value, &value)?;
+    let index = session(namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            let link = networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|link| networking::name(link) == "dhcp0")
+                .context("fixture DHCP interface missing")?;
+            let index = link.header.index;
+            let mut removed = false;
+            for address in networking::addresses(handle, index).await? {
+                if networking::address_string(&address)?.as_deref() == Some("192.0.2.2/24") {
+                    handle.address().del(address).execute().await?;
+                    removed = true;
+                }
+            }
+            ensure!(removed, "fixture DHCP address missing");
+            handle
+                .address()
+                .add(index, "192.0.2.2".parse()?, 24)
+                .execute()
+                .await?;
+            handle
+                .route()
+                .add()
+                .v4()
+                .destination_prefix("198.18.0.0".parse()?, 16)
+                .gateway("192.0.2.1".parse()?)
+                .output_interface(index)
+                .table_id(10001)
+                .priority(10)
+                .protocol(RouteProtocol::Other(crate::model::PROTOCOL))
+                .execute()
+                .await?;
+            Ok(index)
+        })
+    })?;
+    let error = session(namespace.clone(), move |rt, handle| {
+        rt.block_on(networking::restore_ethernet(handle, &snapshots))
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("cannot safely restore prefix-route flags"));
+    session(namespace, move |rt, handle| {
+        rt.block_on(async {
+            let routes: Vec<_> = handle
+                .route()
+                .get(rtnetlink::IpVersion::V4)
+                .execute()
+                .try_collect()
+                .await?;
+            assert!(routes.iter().any(|route| {
+                route.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL)
+                    && route
+                        .attributes
+                        .iter()
+                        .any(|attribute| matches!(attribute, RouteAttribute::Oif(value) if *value == index))
+            }));
+            Ok(())
+        })
+    })?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
 fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -3108,7 +3430,7 @@ fn native_dhcp_gateway_waiting_apply_rollback_reopen_and_recovery() -> Result<()
         after: after.clone(),
         kernel_before: native.capture_kernel(&before, &after)?,
         ownership_before: native.ownership()?,
-        ethernet_before: BTreeMap::new(),
+        ethernet_before: native.capture_ethernet(&before, &after)?,
         ethernet_originals: native.ownership()?.ethernet_originals,
         ipv6_before: native.capture_ipv6(&before)?,
     };

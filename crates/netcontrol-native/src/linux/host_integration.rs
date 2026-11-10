@@ -602,6 +602,220 @@ pub(super) fn isolate_host_fixture(test_name: &str) -> Result<bool> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux network namespace privileges"]
+fn ethernet_activation_precedes_dhcp_lease_restore() -> Result<()> {
+    let test_name = "linux::host_integration::ethernet_activation_precedes_dhcp_lease_restore";
+    if !isolate_host_fixture(test_name)? {
+        return Ok(());
+    }
+    let state = StateDirectory(std::env::temp_dir().join(format!(
+        ".native-activation-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    )));
+    fs::DirBuilder::new().mode(0o700).create(&state.0)?;
+    let keys = wireguard::Control {
+        keys: state.0.join("keys"),
+        dns: wireguard_dns::Cache::new(state.0.join("wireguard-dns.json"))?,
+    };
+    let namespace = Arc::new(File::open("/proc/thread-self/ns/net")?);
+    session(namespace, move |rt, handle| {
+        rt.block_on(async {
+            for (name, peer) in [
+                ("dhcp0", "peer0"),
+                ("static0", "staticpeer"),
+                ("disabled0", "disabledpeer"),
+                ("unmanaged0", "unmanagedpeer"),
+            ] {
+                handle
+                    .link()
+                    .add()
+                    .veth(name.into(), peer.into())
+                    .execute()
+                    .await?;
+            }
+            let links = networking::links(handle).await?;
+            let index = links
+                .iter()
+                .find(|link| networking::name(link) == "dhcp0")
+                .context("DHCP fixture interface missing")?
+                .header
+                .index;
+            let peer = links
+                .iter()
+                .find(|link| networking::name(link) == "peer0")
+                .context("DHCP fixture peer missing")?
+                .header
+                .index;
+            handle.link().set(peer).up().execute().await?;
+            handle.link().set(index).down().execute().await?;
+            let config: Config = serde_json::from_value(json!({
+                "interfaces":[
+                    {"name":"dhcp0","kind":"ethernet","role":"wan","mtu":1500,"up":true},
+                    {"name":"static0","kind":"ethernet","role":"lan","mtu":1500,"up":true,
+                     "addresses":["198.51.100.1/24"]},
+                    {"name":"disabled0","kind":"ethernet","role":"unassigned","mtu":1500,"up":false}
+                ],
+                "dhcp_clients":{"dhcp0":{}}
+            }))?;
+            let network = Network::parse(&config.operational_value()?)?;
+            let snapshots = networking::capture_ethernet(handle, &network, &network).await?;
+            let mut replaced = snapshots.clone();
+            let identity = replaced
+                .get_mut("static0")
+                .context("static fixture identity missing")?;
+            identity.mac = if identity.mac == "02:00:00:00:00:01" {
+                "02:00:00:00:00:02"
+            } else {
+                "02:00:00:00:00:01"
+            }
+            .into();
+            assert!(networking::check_ethernet(handle, &replaced).await.is_err());
+            assert!(networking::needs_ethernet_activation(handle, &network).await?);
+            networking::activate_ethernet(handle, &network).await?;
+            let activated = networking::links(handle).await?;
+            for (name, expected_up) in [
+                ("dhcp0", true),
+                ("static0", true),
+                ("disabled0", false),
+                ("unmanaged0", false),
+            ] {
+                let link = activated
+                    .iter()
+                    .find(|link| networking::name(link) == name)
+                    .context("activation fixture interface missing")?;
+                assert_eq!(
+                    link.header
+                        .flags
+                        .contains(&netlink_packet_route::link::LinkFlag::Up),
+                    expected_up,
+                    "{name}"
+                );
+            }
+            assert!(!networking::needs_ethernet_activation(handle, &network).await?);
+            let committed_route = Route {
+                destination: "203.0.113.0/24".into(),
+                gateway: "192.0.2.1".into(),
+                interface: "dhcp0".into(),
+                table: 254,
+                metric: 10,
+            };
+            let mut pending_route = committed_route.clone();
+            pending_route.gateway = "192.0.2.3".into();
+            let mut configured_route = committed_route.clone();
+            configured_route.gateway = "dhcp".into();
+            let lease = dhcp_client::Lease {
+                client: netcontrol_core::DHCPClientConfig::default(),
+                address: "192.0.2.2/24".into(),
+                server: "192.0.2.1".parse()?,
+                acquired_at: dhcp_client::now()?,
+                lifetime: 3600,
+                renewal: 1800,
+                rebinding: 3150,
+                routes: vec![
+                    crate::model::Route {
+                        destination: "192.0.2.0/24".into(),
+                        gateway: String::new(),
+                        interface: "dhcp0".into(),
+                        table: 254,
+                        metric: 0,
+                    },
+                    crate::model::Route {
+                        destination: "0.0.0.0/0".into(),
+                        gateway: "192.0.2.3".into(),
+                        interface: "dhcp0".into(),
+                        table: 254,
+                        metric: 100,
+                    },
+                ],
+                dns: Vec::new(),
+                domain: String::new(),
+                mtu: None,
+            };
+            networking::dhcp_lease(
+                handle,
+                "dhcp0",
+                None,
+                Some(&lease),
+                &dhcp_client::Addressing {
+                    routes: vec![configured_route],
+                    ..Default::default()
+                },
+                false,
+            )
+            .await?;
+            let link = networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|link| networking::name(link) == "dhcp0")
+                .context("DHCP fixture interface disappeared")?;
+            ensure!(
+                link.header
+                    .flags
+                    .contains(&netlink_packet_route::link::LinkFlag::Up),
+                "DHCP lease restore left its interface down"
+            );
+            let routes: Vec<netlink_packet_route::route::RouteMessage> = handle
+                .route()
+                .get(rtnetlink::IpVersion::V4)
+                .execute()
+                .try_collect()
+                .await?;
+            ensure!(
+                routes.iter().any(|route| {
+                    route.header.protocol == RouteProtocol::Other(dhcp_client::PROTOCOL)
+                        && route.attributes.iter().any(|attribute| {
+                            matches!(
+                                attribute,
+                                netlink_packet_route::route::RouteAttribute::Oif(value)
+                                    if *value == index
+                            )
+                        })
+                }),
+                "DHCP lease restore did not install its routes"
+            );
+            handle.link().set(peer).down().execute().await?;
+            let mut allowed = network.clone();
+            allowed.routes = vec![committed_route.clone(), pending_route];
+            let mut captured = networking::boot_snapshot(handle, &allowed, &keys).await?;
+            assert_eq!(Network::parse(&captured)?.routes.len(), 1);
+            allowed.routes.pop();
+            assert!(
+                networking::boot_snapshot(handle, &allowed, &keys)
+                    .await
+                    .is_err(),
+                "a route not covered by the committed or pending DHCP state was accepted"
+            );
+            retain_committed_boot_routes(&mut captured, &[committed_route])?;
+            assert!(Network::parse(&captured)?.routes.is_empty());
+            networking::restore_ethernet(handle, &snapshots).await?;
+            let restored = networking::links(handle).await?;
+            for name in ["dhcp0", "static0", "disabled0", "unmanaged0"] {
+                let link = restored
+                    .iter()
+                    .find(|link| networking::name(link) == name)
+                    .context("restored fixture interface missing")?;
+                assert!(
+                    !link
+                        .header
+                        .flags
+                        .contains(&netlink_packet_route::link::LinkFlag::Up),
+                    "{name} was not restored to its original state"
+                );
+            }
+            assert!(
+                networking::addresses(handle, index)
+                    .await?
+                    .iter()
+                    .all(|address| networking::address_string(address)
+                        .is_ok_and(|value| value.as_deref() != Some("192.0.2.2/24")))
+            );
+            Ok(())
+        })
+    })
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft modules"]
 fn native_default_ipv6_policy_controls_empty_host_restart_and_future_links() -> Result<()> {
     if !isolate_host_fixture(
@@ -956,6 +1170,12 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             handle
                 .link()
                 .add()
+                .veth("cold0".into(), "coldpeer0".into())
+                .execute()
+                .await?;
+            handle
+                .link()
+                .add()
                 .dummy("unrelated0".into())
                 .execute()
                 .await?;
@@ -1106,6 +1326,8 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
     let baseline = row(&mut native, "nic0")?;
     assert_eq!(baseline["kind"], "ethernet");
     assert_eq!(baseline["ownership"], "unmanaged");
+    let cold_baseline = row(&mut native, "cold0")?;
+    assert_eq!(cold_baseline["up"], false);
     let unrelated = row(&mut native, "unrelated0")?;
     let foreign_count = foreign_routes(namespace.clone())?;
     native.repair(&empty)?;
@@ -1143,6 +1365,10 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
 
     // The first Ethernet transaction fails only after networking changed.
     let mut failed = value.clone();
+    failed["interfaces"].as_array_mut().unwrap().push(json!({
+        "name":"cold0","kind":"ethernet","role":"lan","mtu":1500,"up":true,
+        "addresses":["203.0.113.1/24"]
+    }));
     failed["ntp"] = json!({"enabled":true,"servers":["192.0.2.123"]});
     assert!(
         native
@@ -1150,6 +1376,7 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             .is_err()
     );
     assert_eq!(row(&mut native, "nic0")?, baseline);
+    assert_eq!(row(&mut native, "cold0")?, cold_baseline);
     assert_eq!(
         link_alias(namespace.clone(), "nic0")?,
         "Original physical label"
@@ -1271,6 +1498,13 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             }) {
                 handle.link().del(link.header.index).execute().await?;
             }
+            let nic = links
+                .iter()
+                .find(|link| networking::name(link) == "nic0")
+                .context("fixture NIC missing")?
+                .header
+                .index;
+            handle.link().set(nic).down().execute().await?;
             Ok::<(), anyhow::Error>(())
         })?;
         let fingerprint = netfilter::fingerprint()?;
@@ -1294,9 +1528,95 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
             .to_string()
             .contains("does not match durable native ownership")
     );
+    assert_eq!(row(&mut native, "nic0")?["up"], false);
     native.repair(&desired)?;
     native.observe(&desired)?;
     assert_eq!(native.scope()?, scope);
+    assert_eq!(row(&mut native, "nic0")?["up"], true);
+    assert_eq!(row(&mut native, "cold0")?, cold_baseline);
+
+    session(namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            let link = networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|link| networking::name(link) == "nic0")
+                .context("fixture NIC missing")?;
+            handle
+                .link()
+                .set(link.header.index)
+                .down()
+                .execute()
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })?;
+    let valid_ownership = native.ownership()?;
+    let mut replaced = valid_ownership.clone();
+    let recorded = replaced
+        .ethernet_originals
+        .get_mut("nic0")
+        .context("fixture Ethernet identity missing")?;
+    recorded.mac = if recorded.mac == "02:00:00:00:00:01" {
+        "02:00:00:00:00:02"
+    } else {
+        "02:00:00:00:00:01"
+    }
+    .into();
+    native.save_ownership(&replaced)?;
+    assert!(
+        native
+            .repair(&desired)
+            .unwrap_err()
+            .to_string()
+            .contains("changed identity")
+    );
+    assert_eq!(row(&mut native, "nic0")?["up"], false);
+    native.save_ownership(&valid_ownership)?;
+    native.repair(&desired)?;
+    native.observe(&desired)?;
+    assert_eq!(row(&mut native, "nic0")?["up"], true);
+
+    session(namespace.clone(), |rt, handle| {
+        rt.block_on(async {
+            let link = networking::links(handle)
+                .await?
+                .into_iter()
+                .find(|link| networking::name(link) == "nic0")
+                .context("fixture NIC missing")?;
+            handle
+                .link()
+                .set(link.header.index)
+                .down()
+                .execute()
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })?;
+    let before = desired.operational_value()?;
+    let previous = native.ownership()?;
+    let mut intent = Intent {
+        scope: native.identity.clone(),
+        before: before.clone(),
+        after: before.clone(),
+        kernel_before: native.capture_kernel(&before, &before)?,
+        ownership_before: previous.clone(),
+        ethernet_before: BTreeMap::new(),
+        ethernet_originals: previous.ethernet_originals.clone(),
+        ipv6_before: native.capture_ipv6(&before)?,
+    };
+    write_json(&native.state.join("intent.json"), &intent)?;
+    let error = native.recover().unwrap_err();
+    assert!(format!("{error:#}").contains("no durable operation snapshot"));
+    assert_eq!(row(&mut native, "nic0")?["up"], false);
+    assert!(native.state.join("intent.json").exists());
+    intent.ethernet_before = native.capture_ethernet(&before, &before)?;
+    write_json(&native.state.join("intent.json"), &intent)?;
+    native.recover()?;
+    assert!(!native.state.join("intent.json").exists());
+    native.repair(&desired)?;
+    native.observe(&desired)?;
+    assert_eq!(row(&mut native, "nic0")?["up"], true);
 
     for rollback in [false, true] {
         session(namespace.clone(), |rt, handle| {

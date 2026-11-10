@@ -278,6 +278,18 @@
 
 ### Fixed
 
+- Stage configured-up managed Ethernet links, including static and DHCP
+  interfaces, before restoring leases during host startup reconciliation and
+  native apply/recovery. Validate identity and durably capture rollback state
+  first; leave configured-down and unmanaged links unchanged. Preserve saved
+  DHCP-route validation, recognize the kernel's transient route `linkdown`
+  state, restore prefix-route flags on down links and reject unsafe up-link
+  restoration, restore boot snapshots without passing private route metadata to
+  service configuration, and add interface/operation context to network failures.
+  The reported `Network is down` log did not identify its original operation.
+  The earlier pending VLAN-adoption finisher remains a separate startup path.
+  Release impact: startup/recovery fix; next automatic calendar version.
+
 - AppArmor installer regression fixtures now mock root ownership locally so the
   shell suite runs as CI's unprivileged user. Preserve real file/mode operations
   and cover directory, GRUB drop-in and APT pin persistence failures. Test-only

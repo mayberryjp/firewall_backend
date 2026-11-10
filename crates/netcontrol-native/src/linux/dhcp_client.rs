@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -204,6 +204,18 @@ pub struct Addressing {
     pub routes: Vec<Route>,
 }
 
+fn read_valid_lease(path: &Path, client: &DHCPClientConfig) -> Result<Option<Lease>> {
+    let lease = if path.try_exists()? {
+        Some(
+            read_json::<Lease>(path)
+                .with_context(|| format!("read saved DHCP lease {}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    Ok(lease.filter(|lease| &lease.client == client && lease.valid()))
+}
+
 pub fn lease_routes(
     interface: &str,
     configured: &[Route],
@@ -296,6 +308,49 @@ impl Manager {
 
     pub fn configure(&mut self, value: &Value) -> Result<()> {
         self.configure_selected(value, None)
+    }
+
+    pub(super) fn reconciliation_state(
+        &self,
+        network: &Network,
+        current: &State,
+    ) -> Result<(State, Vec<Route>)> {
+        let mut snapshot = current.clone();
+        let mut pending_routes = Vec::new();
+        for (name, client) in &network.dhcp_clients {
+            let enabled = network
+                .interfaces
+                .iter()
+                .any(|link| link.name == *name && link.up);
+            let running = self.workers.get(name).is_some_and(|worker| {
+                worker.client == *client
+                    && !worker.join.is_finished()
+                    && !current.errors.contains_key(name)
+            });
+            if enabled && running {
+                continue;
+            }
+            snapshot.leases.remove(name);
+            if enabled {
+                let path = self.directory.join(format!("dhcp-{name}.json"));
+                let intent_path = path.with_extension("intent");
+                if intent_path.try_exists()? {
+                    let intent: LeaseIntent = read_json(&intent_path)
+                        .with_context(|| format!("read pending DHCP lease update for {name}"))?;
+                    let configured = network
+                        .routes
+                        .iter()
+                        .filter(|route| route.interface == *name)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    pending_routes.extend(lease_routes(name, &configured, Some(&intent.after))?);
+                }
+                if let Some(lease) = read_valid_lease(&path, client)? {
+                    snapshot.leases.insert(name.clone(), lease);
+                }
+            }
+        }
+        Ok((snapshot, pending_routes))
     }
 
     fn stop_worker(&mut self, name: &str, deadline: Instant) -> Result<()> {
@@ -417,12 +472,7 @@ impl Manager {
             let seed = if only.is_none() || intent_path.try_exists()? {
                 if intent_path.try_exists()? {
                     let intent: LeaseIntent = read_json(&intent_path)?;
-                    let committed = if path.try_exists()? {
-                        Some(read_json::<Lease>(&path)?)
-                    } else {
-                        None
-                    };
-                    let target = committed.filter(|lease| lease.client == client && lease.valid());
+                    let target = read_valid_lease(&path, &client)?;
                     change_lease(
                         self.namespace.clone(),
                         self.publish_dns,
@@ -436,12 +486,7 @@ impl Manager {
                     )?;
                     super::remove_durable(&intent_path)?;
                 }
-                let seed = if path.try_exists()? {
-                    Some(read_json::<Lease>(&path)?)
-                } else {
-                    None
-                };
-                let seed = seed.filter(|lease| lease.client == client && lease.valid());
+                let seed = read_valid_lease(&path, &client)?;
                 if let Some(lease) = &seed {
                     change_lease(
                         self.namespace.clone(),
@@ -595,7 +640,8 @@ fn change_lease(
                 ),
             )
             .await
-            .context("DHCP kernel/DNS update timed out")?
+            .with_context(|| format!("DHCP kernel/DNS update on {name} timed out"))?
+            .with_context(|| format!("reconcile DHCP kernel/DNS state on {name}"))
         })
     })
 }
@@ -904,6 +950,124 @@ mod tests {
             PathBuf::new(),
             false,
         )
+    }
+
+    #[test]
+    fn reconciliation_preview_reads_only_valid_matching_saved_leases() -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        struct TestDirectory(PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "netcontrol-dhcp-preview-{}-{stamp}",
+            std::process::id()
+        )));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory.0)?;
+        let manager = Manager::new(
+            Arc::new(File::open("/proc/thread-self/ns/net")?),
+            directory.0.clone(),
+            false,
+        );
+        let config: Config = serde_json::from_value(json!({
+            "interfaces":[{"name":"wan0","kind":"ethernet","role":"wan","mtu":1500,"up":true}],
+            "dhcp_clients":{"wan0":{}},
+            "routes":[{"destination":"203.0.113.0/24","gateway":"dhcp",
+                "interface":"wan0","table":10001,"metric":10}]
+        }))?;
+        let network = Network::parse(&config.operational_value()?)?;
+        let lease = Lease {
+            client: DHCPClientConfig::default(),
+            address: "192.0.2.10/24".into(),
+            server: "192.0.2.1".parse()?,
+            acquired_at: now()?,
+            lifetime: 3600,
+            renewal: 1800,
+            rebinding: 3150,
+            routes: vec![Route {
+                destination: "0.0.0.0/0".into(),
+                gateway: "192.0.2.1".into(),
+                interface: "wan0".into(),
+                table: 254,
+                metric: 100,
+            }],
+            dns: Vec::new(),
+            domain: String::new(),
+            mtu: None,
+        };
+        let path = directory.0.join("dhcp-wan0.json");
+        let intent_path = directory.0.join("dhcp-wan0.intent");
+        write_json(&path, &lease)?;
+        let mut pending = lease.clone();
+        pending.routes[0].gateway = "192.0.2.2".into();
+        write_json(&intent_path, &json!({"after":pending}))?;
+        let intent_before = std::fs::read(&intent_path)?;
+        let current = State::default();
+        let (preview, pending_routes) = manager.reconciliation_state(&network, &current)?;
+        assert_eq!(preview.leases["wan0"].address, "192.0.2.10/24");
+        assert_eq!(pending_routes.len(), 1);
+        assert_eq!(pending_routes[0].gateway, "192.0.2.2");
+        let mut expected = network.clone();
+        effective(&mut expected, &preview)?;
+        assert_eq!(expected.routes[0].gateway, "192.0.2.1");
+        assert!(current.leases.is_empty());
+        assert!(manager.state.lock().unwrap().leases.is_empty());
+        assert_eq!(std::fs::read(&intent_path)?, intent_before);
+
+        let mut disabled = network.clone();
+        disabled.interfaces[0].up = false;
+        assert!(
+            manager
+                .reconciliation_state(&disabled, &current)?
+                .0
+                .leases
+                .is_empty()
+        );
+        let mut expired = lease.clone();
+        expired.lifetime = 0;
+        write_json(&path, &expired)?;
+        assert!(
+            manager
+                .reconciliation_state(&network, &current)?
+                .0
+                .leases
+                .is_empty()
+        );
+        let mut mismatched = lease.clone();
+        mismatched.client.route_metric += 1;
+        write_json(&path, &mismatched)?;
+        assert!(
+            manager
+                .reconciliation_state(&network, &current)?
+                .0
+                .leases
+                .is_empty()
+        );
+        std::fs::write(&path, b"not JSON")?;
+        assert!(manager.reconciliation_state(&network, &current).is_err());
+
+        let mut manager = manager;
+        let (worker, release) = blocked_worker();
+        manager.workers.insert("wan0".into(), worker);
+        let mut active = State::default();
+        active.leases.insert("wan0".into(), lease);
+        let (preview, pending_routes) = manager.reconciliation_state(&network, &active)?;
+        assert_eq!(preview.leases["wan0"].address, "192.0.2.10/24");
+        assert!(pending_routes.is_empty());
+        active.errors.insert("wan0".into(), "worker failed".into());
+        assert!(manager.reconciliation_state(&network, &active).is_err());
+        release.send(())?;
+        manager.shutdown()?;
+        Ok(())
     }
 
     #[test]

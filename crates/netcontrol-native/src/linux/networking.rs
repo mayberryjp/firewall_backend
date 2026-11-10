@@ -58,6 +58,75 @@ mod tests {
     }
 
     #[test]
+    fn startup_ethernet_activation_selects_only_managed_configured_up_links() -> Result<()> {
+        let config: netcontrol_core::Config = serde_json::from_value(json!({
+            "interfaces": [
+                {"name":"static0","kind":"ethernet","role":"lan","mtu":1500,"up":true,
+                 "addresses":["192.0.2.1/24"]},
+                {"name":"dhcp0","kind":"ethernet","role":"wan","mtu":1500,"up":true},
+                {"name":"disabled0","kind":"ethernet","role":"unassigned","mtu":1500,"up":false}
+            ],
+            "dhcp_clients":{"dhcp0":{}}
+        }))?;
+        let network = Network::parse(&config.operational_value()?)?;
+        let link = |name: &str, index, up| {
+            let mut link = LinkMessage::default();
+            link.header.index = index;
+            if up {
+                link.header.flags.push(LinkFlag::Up);
+            }
+            link.attributes.push(LinkAttribute::IfName(name.into()));
+            link
+        };
+        let mut available = vec![
+            link("static0", 2, false),
+            link("dhcp0", 3, false),
+            link("disabled0", 4, false),
+            link("unmanaged0", 5, false),
+        ];
+        assert_eq!(
+            down_configured_ethernet(&network, &available)?,
+            vec![("dhcp0".into(), 3), ("static0".into(), 2)]
+        );
+        available[0].header.flags.push(LinkFlag::Up);
+        assert_eq!(
+            down_configured_ethernet(&network, &available)?,
+            vec![("dhcp0".into(), 3)]
+        );
+        let mut wrong_kind = available.clone();
+        wrong_kind[0]
+            .attributes
+            .push(LinkAttribute::LinkInfo(vec![LinkInfo::Kind(
+                netlink_packet_route::link::InfoKind::Dummy,
+            )]));
+        assert!(down_configured_ethernet(&network, &wrong_kind).is_err());
+        available.retain(|link| name(link) != "dhcp0");
+        assert!(down_configured_ethernet(&network, &available).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ethernet_rollback_distinguishes_address_and_prefix_route_flags() {
+        let mut captured = AddressMessage::default();
+        captured.header.family = AddressFamily::Inet;
+        captured.header.prefix_len = 24;
+        captured
+            .attributes
+            .push(AddressAttribute::Local("192.0.2.2".parse().unwrap()));
+        captured
+            .attributes
+            .push(AddressAttribute::Flags(vec![AddressFlag::Noprefixroute]));
+        let mut current = captured.clone();
+        assert!(same_address(&captured, &current));
+        assert!(same_prefix_route_flag(&captured, &current));
+        current
+            .attributes
+            .retain(|attribute| !matches!(attribute, AddressAttribute::Flags(_)));
+        assert!(same_address(&captured, &current));
+        assert!(!same_prefix_route_flag(&captured, &current));
+    }
+
+    #[test]
     fn vlan_adoption_requires_exact_unmastered_nonstacked_standard_identity() {
         let (link, parent, request) = adoption_links();
         validate_adoptable_vlan(&link, &parent, &request).unwrap();
@@ -357,6 +426,15 @@ mod tests {
             let decoded = decode_route(&message, &names)?;
             assert_eq!(decoded.interface, "test0");
             assert_eq!(decoded.gateway, gateway.unwrap_or_default());
+            message
+                .header
+                .flags
+                .push(netlink_packet_route::route::RouteFlag::Linkdown);
+            assert!(decode_route(&message, &names).is_err());
+            message.header.protocol = RouteProtocol::Other(PROTOCOL);
+            assert_eq!(decode_route(&message, &names)?, decoded);
+            message.header.protocol = RouteProtocol::Other(super::super::dhcp_client::PROTOCOL);
+            assert_eq!(decode_route(&message, &names)?, decoded);
             message.header.scope = RouteScope::Host;
             assert!(decode_route(&message, &names).is_err());
         }
@@ -524,6 +602,59 @@ pub(super) fn parent(link: &LinkMessage) -> Parent {
 fn matches_kind(actual: &LinkMessage, wanted: &str) -> bool {
     let actual = kind(actual);
     actual == wanted || (wanted == "ethernet" && ethernet_kind(&actual))
+}
+
+fn down_configured_ethernet(
+    network: &Network,
+    available: &[LinkMessage],
+) -> Result<Vec<(String, u32)>> {
+    let mut down = Vec::new();
+    for desired in network
+        .interfaces
+        .iter()
+        .filter(|link| link.kind == "ethernet" && link.up)
+    {
+        let actual = available
+            .iter()
+            .find(|link| name(link) == desired.name)
+            .with_context(|| format!("configured Ethernet {} is missing", desired.name))?;
+        ensure!(
+            matches_kind(actual, "ethernet"),
+            "configured Ethernet {} changed kind",
+            desired.name
+        );
+        if !actual.header.flags.contains(&LinkFlag::Up) {
+            down.push((desired.name.clone(), actual.header.index));
+        }
+    }
+    Ok(down)
+}
+
+pub(super) async fn needs_ethernet_activation(handle: &Handle, network: &Network) -> Result<bool> {
+    Ok(!down_configured_ethernet(network, &links(handle).await?)?.is_empty())
+}
+
+pub(super) async fn activate_ethernet(handle: &Handle, network: &Network) -> Result<()> {
+    for (name, index) in down_configured_ethernet(network, &links(handle).await?)? {
+        handle
+            .link()
+            .set(index)
+            .up()
+            .execute()
+            .await
+            .with_context(|| format!("bring configured Ethernet {name} up"))?;
+    }
+    let remaining = down_configured_ethernet(network, &links(handle).await?)?;
+    ensure!(
+        remaining.is_empty(),
+        "configured Ethernet interfaces remain administratively down: {}",
+        remaining
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
 }
 
 pub async fn discover(handle: &Handle, managed: &BTreeSet<String>) -> Result<Value> {
@@ -1085,9 +1216,18 @@ pub async fn restore_ethernet(
             }
         }
         for address in addresses(handle, index).await? {
-            if address.header.scope != AddressScope::Link
-                && !original.iter().any(|old| same_address(old, &address))
-            {
+            if address.header.scope == AddressScope::Link {
+                continue;
+            }
+            let captured = original.iter().find(|old| same_address(old, &address));
+            if captured.is_some_and(|old| !same_prefix_route_flag(old, &address)) {
+                ensure!(
+                    !snapshot.up,
+                    "cannot safely restore prefix-route flags on up Ethernet {}",
+                    snapshot.name
+                );
+            }
+            if captured.is_none_or(|old| !same_prefix_route_flag(old, &address)) {
                 handle.address().del(address).execute().await?;
             }
         }
@@ -1129,6 +1269,16 @@ fn same_address(a: &AddressMessage, b: &AddressMessage) -> bool {
                 .iter()
                 .filter(|a| matches!(a, AddressAttribute::Local(_) | AddressAttribute::Address(_))))
 }
+
+fn same_prefix_route_flag(a: &AddressMessage, b: &AddressMessage) -> bool {
+    let has_no_prefix_route = |address: &AddressMessage| {
+        address.attributes.iter().any(|attribute| {
+            matches!(attribute, AddressAttribute::Flags(flags) if flags.contains(&AddressFlag::Noprefixroute))
+        })
+    };
+    has_no_prefix_route(a) == has_no_prefix_route(b)
+}
+
 pub async fn adopt(handle: &Handle, names: &BTreeSet<String>) -> Result<BTreeMap<String, Parent>> {
     let available = links(handle).await?;
     let mut result = BTreeMap::new();
@@ -1436,11 +1586,22 @@ pub(super) fn decode_owned_route(
     blackhole: Option<&netcontrol_core::BlackholeConfig>,
 ) -> Result<Route> {
     let action = blackhole.and_then(|_| blackhole_action(&message.header.kind));
+    // On our routes, Linkdown reflects live interface state rather than configuration.
     ensure!(
         (message.header.kind == RouteType::Unicast || action.is_some())
             && message.header.source_prefix_length == 0
             && message.header.tos == 0
-            && message.header.flags.is_empty(),
+            && message
+                .header
+                .flags
+                .iter()
+                .all(|flag| *flag == netlink_packet_route::route::RouteFlag::Linkdown)
+            && (message.header.flags.is_empty()
+                || matches!(
+                    message.header.protocol,
+                    RouteProtocol::Other(PROTOCOL)
+                        | RouteProtocol::Other(super::dhcp_client::PROTOCOL)
+                )),
         "unsupported owned route header"
     );
     let default = match message.header.address_family {
@@ -1815,7 +1976,17 @@ pub async fn reconcile(
     for message in owned_routes(handle).await? {
         let route = decode_owned_route(&message, &by_index, Some(&after.blackhole))?;
         if !after.routes.contains(&route) {
-            handle.route().del(message).execute().await?;
+            handle
+                .route()
+                .del(message)
+                .execute()
+                .await
+                .with_context(|| {
+                    format!(
+                        "remove managed route {} on {}",
+                        route.destination, route.interface
+                    )
+                })?;
         }
     }
     // Recreate identity changes and removed links children-first.
@@ -1967,17 +2138,38 @@ pub async fn reconcile(
                 .header
                 .index
         };
-        handle.link().set(index).mtu(desired.mtu).execute().await?;
+        handle
+            .link()
+            .set(index)
+            .mtu(desired.mtu)
+            .execute()
+            .await
+            .with_context(|| format!("set MTU on {}", desired.name))?;
         let request = handle.link().set(index);
         if desired.up {
-            request.up().execute().await?;
+            request
+                .up()
+                .execute()
+                .await
+                .with_context(|| format!("bring interface {} up", desired.name))?;
         } else {
-            request.down().execute().await?;
+            request
+                .down()
+                .execute()
+                .await
+                .with_context(|| format!("bring interface {} down", desired.name))?;
         }
         for address in addresses(handle, index).await? {
             if let Some(prefix) = address_string(&address)? {
                 if !desired.addresses.contains(&prefix) {
-                    handle.address().del(address).execute().await?;
+                    handle
+                        .address()
+                        .del(address)
+                        .execute()
+                        .await
+                        .with_context(|| {
+                            format!("remove address {prefix} from {}", desired.name)
+                        })?;
                 }
             }
         }
@@ -1991,7 +2183,10 @@ pub async fn reconcile(
                 .message_mut()
                 .attributes
                 .push(AddressAttribute::Flags(vec![AddressFlag::Nodad]));
-            request.execute().await?;
+            request
+                .execute()
+                .await
+                .with_context(|| format!("configure address {prefix} on {}", desired.name))?;
         }
         if let Some(wg) = &desired.wireguard {
             let changed = before
@@ -2020,7 +2215,14 @@ pub async fn reconcile(
         if present_routes.contains(route) {
             continue;
         }
-        install_route(handle, route, &available, &after.blackhole).await?;
+        install_route(handle, route, &available, &after.blackhole)
+            .await
+            .with_context(|| {
+                format!(
+                    "install managed route {} on {}",
+                    route.destination, route.interface
+                )
+            })?;
     }
     for rule in &after.policy_rules {
         if present_rules.contains(rule) {
@@ -2232,7 +2434,13 @@ pub async fn dhcp_lease(
     dhcp_static_routes(handle, name, &previous_static, &next_static, false).await?;
     let mtu = next.and_then(|lease| lease.mtu).unwrap_or(addressing.mtu);
     if mtu != 0 {
-        handle.link().set(index).mtu(mtu).execute().await?;
+        handle
+            .link()
+            .set(index)
+            .mtu(mtu)
+            .execute()
+            .await
+            .with_context(|| format!("set DHCP MTU on {name}"))?;
     }
     let names = BTreeMap::from([(index, name.to_owned())]);
     for message in routes {
@@ -2250,14 +2458,26 @@ pub async fn dhcp_lease(
             .retain(|attribute| !matches!(attribute, RouteAttribute::PrefSource(_)));
         let observed = decode_route(&decoded, &names)?;
         if !next.is_some_and(|lease| lease.routes.contains(&observed)) {
-            handle.route().del(message).execute().await?;
+            handle
+                .route()
+                .del(message)
+                .execute()
+                .await
+                .with_context(|| format!("remove DHCP route {} on {name}", observed.destination))?;
         }
     }
     if let Some(previous) = previous {
         if next.is_none_or(|lease| lease.address != previous.address) {
             for address in addresses(handle, index).await? {
                 if address_string(&address)?.as_deref() == Some(previous.address.as_str()) {
-                    handle.address().del(address).execute().await?;
+                    handle
+                        .address()
+                        .del(address)
+                        .execute()
+                        .await
+                        .with_context(|| {
+                            format!("remove DHCP address {} from {name}", previous.address)
+                        })?;
                 }
             }
         }
@@ -2284,7 +2504,10 @@ pub async fn dhcp_lease(
             .push(AddressAttribute::Flags(vec![
                 netlink_packet_route::address::AddressFlag::Noprefixroute,
             ]));
-        request.execute().await?;
+        request
+            .execute()
+            .await
+            .with_context(|| format!("configure DHCP address {} on {name}", lease.address))?;
     }
     if let Some(lease) = next {
         let mut routes: Vec<_> = lease.routes.iter().collect();
@@ -2312,7 +2535,10 @@ pub async fn dhcp_lease(
             if !route.gateway.is_empty() {
                 request = request.gateway(route.gateway.parse()?);
             }
-            request.execute().await?;
+            request
+                .execute()
+                .await
+                .with_context(|| format!("install DHCP route {} on {name}", route.destination))?;
         }
         dhcp_static_routes(handle, name, &previous_static, &next_static, true).await?;
     }
