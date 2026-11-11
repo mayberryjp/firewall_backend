@@ -152,6 +152,16 @@ drift and durable transaction recovery safeguards remain enforced.
   relay settings in its atomic firewall transaction; this worker does not mutate
   firewall configuration. Core validation, native rules and the worker share
   the same lexicographically selected relay-address helper.
+  `Services::dhcp_relay_log` exposes an always-on 2048-event in-memory ring for
+  cursor-based polling; `statistics("/statistics/dhcp-relay", "")` returns
+  decimal-string per-interface counters and shared-worker totals/status.
+  Epoch/generation identify daemon and attempt resets. Logs survive worker
+  retries/reconfiguration but not daemon restart; counters reset per preparation
+  attempt. Reception, forwarding, rejections, send errors, pending entries and
+  120-second tracking expiry are observations, not proof of leases or remote
+  receipt. Pruning runs on idle loops too. No disk log, payload capture or child
+  processes. See the [API contract](../../FRONTEND_SPEC.md#dhcp-relay-diagnostics)
+  for cursor gaps, filtering, nullability and counter semantics.
 * **NTP:** host UDP poll client, one resolved endpoint per configured server,
   sixty-four-second polling and three-second response deadlines. Validates
   server mode, v3/v4, leap, stratum, originate/receive/transmit timestamps,
@@ -188,22 +198,44 @@ drift and durable transaction recovery safeguards remain enforced.
   `/dev/kmsg`, or tails `backend.log`, avoiding duplicate kernel/backend capture.
   Journald's forwarded message text is wrapped in bounded RFC5424 output with
   APP-NAME `journald`; this is not a journal cursor reader or metadata-preserving
-  journal export. A local copy is appended to `syslog-host.log`.
+  journal export. A local copy is synchronously appended to private rotating
+  `logs/syslog` history (four segments, at most 2 MiB each). Valid activation
+  plus host-services opt-in starts local capture regardless of the remote
+  forwarding setting. `syslog.enabled` controls destination connections/sends
+  only; disabled forwarding sends nothing and does not replay captured history
+  after enable. `forwarding_enabled` in runtime/MQTT distinguishes that setting
+  from the worker's running/error state.
   Messages are bounded to 65,000 bytes. Each remote destination reconnects
   independently with a 1..30-second capped exponential backoff; successful writes
   reset its delay. Connection/write failures retain a row-local warning while
   local capture and other destinations continue. `destination_errors` lists
-  current destination failures; `captured_records` counts local records,
+  current destination failures; `received_records` counts journald datagrams
+  read, including subsequent validation/local-write failures;
+  `captured_records` counts records whose local append and `sync_data` succeeded,
   `forwarded_records` counts records written successfully to every destination,
-  and `failed_deliveries` counts missed per-destination sends. These numeric
-  counters reset when the worker restarts; successful sends do not prove receipt.
+  `forwarded_deliveries` counts successful per-destination writes, including
+  partial fan-out, and `failed_deliveries` counts missed per-destination sends.
+  These five numeric saturating u64 counters initialize/reset to zero on every
+  execution attempt, including automatic recovery; counts observed before a
+  processing error remain visible until the next attempt. Successful sends do
+  not prove receipt. HTTP status/runtime exposes the numeric counters; MQTT
+  service sensors export lossless decimal strings with records/deliveries units.
   Missed deliveries are not queued or replayed. Socket-path/local I/O failure
   invokes shared worker recovery. Systemd owns socket lifetime; worker repair/rollback
-  reuses the inherited receiver and never unlinks it. While disabled/stopped,
-  the bounded socket queue may retain messages for later forwarding or overflow;
+  reuses the inherited receiver and never unlinks it. During worker stop/restart,
+  the bounded socket queue may retain messages until capture resumes or overflow;
   daemon stop/restart closes the managed socket and its queue. Journald capture,
   rate limits and forwarding settings determine coverage. No complete delivery,
-  acknowledgment, durable forwarding queue/replay or rotation is claimed.
+  acknowledgment or durable forwarding queue/replay is claimed. Local retained
+  history is distinct from a forwarding queue. `GET /api/v1/logs/syslog`
+  requires `logs.read`, pages this history and reports capture availability.
+  History/cursor identity persists across service and daemon restart, with
+  explicit retention gaps. Missing activation can yield readable older history
+  with capture unavailable; missing host opt-in yields 503 for this API.
+  Incompatible/corrupt retained history fails explicitly without deletion/reset.
+  Failed/partial storage writes make this sink unavailable until restart and
+  operator repair where necessary. See
+  [storage and API contract](../../FRONTEND_SPEC.md#persistent-log-viewing-apis).
 * **Traffic counters:** one host-namespace Rust worker samples all `/proc/thread-self/net/dev`
   interfaces, including loopback, every five seconds. Captures byte/packet
   baselines, accumulates observed deltas, and records boot/namespace/interface/reset
@@ -276,6 +308,13 @@ drift and durable transaction recovery safeguards remain enforced.
   before application filtering/sampling and are read at the configured export-scan
   interval. Capture/statistics socket errors and export failures remain fatal.
   Running does not verify collector delivery or loss-free capture.
+  Per-instance export totals count successful UDP datagrams/payload bytes,
+  flow records and the sampled packet/layer-3 byte totals they represent.
+  `export_errors` counts failed encode/send/deadline batches. Publish partial
+  successes and shutdown exports, reset on each execution attempt, and retain
+  observations on failure/stop. New counters are exact decimal strings;
+  `exported_flows` retains its numeric type. See the
+  [counter contract](../../docs/NETFLOW_IPFIX_SPEC.md#5-runtime-and-status-api).
   Versions 1 and 5 represent IPv4; v9 and IPFIX represent IPv4 and IPv6,
   with template IDs 256/257 refreshed in every export packet, 64-bit counters,
   protocol/ports/flags/TOS/timestamps, and sampling interval/algorithm elements.
@@ -406,7 +445,9 @@ Common enabled appliance row:
   `fragments: "excluded"`, `capture_filter`, `sampling_rate` integer,
   `sampling_metadata` boolean (false only for v1); after collection, nonnegative integer
   `active_flows`, `exported_flows`, `excluded_packets`, `filtered_packets`,
-  `malformed_packets`; optional `error`.
+  `malformed_packets`; optional `error`. Export counters initialize at worker
+  entry: numeric `exported_flows` and decimal-string `exported_packets`,
+  `exported_bytes`, `exported_flow_packets`, `exported_flow_bytes`, `export_errors`.
 * Disabled appliance rows have only `name`, `scope`, `state`; disabled exporter
   rows only `name`, `state`. Enabled-but-stopped rows have the same identity
   properties with `state: "stopped"`.

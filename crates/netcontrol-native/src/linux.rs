@@ -90,6 +90,7 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 }
 
 pub struct Native {
+    netcontrol_log: netcontrol_core::DiskLog,
     panic_reboot: Option<panic_reboot::Guard>,
     path_test: path_test::Manager,
     performance: crate::performance::Monitor,
@@ -207,6 +208,12 @@ fn retain_committed_boot_routes(snapshot: &mut Value, committed: &[Route]) -> Re
 
 impl Native {
     pub fn open(options: NativeOptions) -> Result<Self> {
+        Self::open_with_log(options, None)
+    }
+    pub fn open_with_log(
+        options: NativeOptions,
+        netcontrol_log: Option<netcontrol_core::DiskLog>,
+    ) -> Result<Self> {
         ensure!(
             cfg!(feature = "nftables"),
             "native backend was built without nftables support; this build cannot manage networking"
@@ -368,6 +375,12 @@ impl Native {
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
         let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
         let mut native = Self {
+            netcontrol_log: match netcontrol_log {
+                Some(log) => log,
+                None => netcontrol_core::DiskLog::open(
+                    &options.services_state.join("logs").join("netcontrol"),
+                )?,
+            },
             panic_reboot: None,
             path_test: path_test::Manager::new(
                 namespace.clone(),
@@ -1614,6 +1627,30 @@ impl Backend for Native {
     fn shutdown_path_test(&mut self) -> Result<()> {
         self.path_test.shutdown()
     }
+    fn syslog_capture_active(&self) -> bool {
+        self.services.syslog_capture_active()
+    }
+    fn logs(
+        &mut self,
+        source: netcontrol_core::LogSource,
+        query: &netcontrol_core::LogQuery,
+    ) -> Result<Value> {
+        match source {
+            netcontrol_core::LogSource::Syslog => self.services.syslog_log(query),
+            netcontrol_core::LogSource::Netcontrol => {
+                let mut page = serde_json::to_value(self.netcontrol_log.read(query)?)?;
+                page["source"] = json!("netcontrol");
+                page["capture"] = json!({"state":"running","retrying":false,"error":null});
+                Ok(page)
+            }
+        }
+    }
+    fn dhcp_relay_log(&mut self, query: &netcontrol_core::DHCPRelayLogQuery) -> Result<Value> {
+        let mut value = self.services.dhcp_relay_log(query)?;
+        value["scope"] = json!(self.identity);
+        Ok(value)
+    }
+
     fn deny_log(&mut self, query: &netcontrol_core::DenyLogQuery) -> Result<Value> {
         self.check_scope()?;
         self.deny_log.snapshot(query)
@@ -2426,16 +2463,16 @@ impl Backend for Native {
 impl Drop for Native {
     fn drop(&mut self) {
         if let Err(error) = self.path_test.shutdown() {
-            eprintln!("path-test cleanup failed; recovery intent retained: {error:#}");
+            tracing::error!("path-test cleanup failed; recovery intent retained: {error:#}");
         }
         if let Err(error) = self.wireguard_dns.shutdown() {
-            eprintln!("WireGuard DNS shutdown failed: {error:#}");
+            tracing::error!("WireGuard DNS shutdown failed: {error:#}");
         }
         if let Err(error) = self.deny_log.shutdown() {
-            eprintln!("deny-log shutdown failed: {error:#}");
+            tracing::error!("deny-log shutdown failed: {error:#}");
         }
         if let Err(error) = self.bgp.shutdown() {
-            eprintln!("BGP shutdown failed: {error:#}");
+            tracing::error!("BGP shutdown failed: {error:#}");
         }
         let _ = self.dhcp_monitors.shutdown();
         let _ = self.dhcp.shutdown();
@@ -2445,26 +2482,8 @@ impl Drop for Native {
 
 impl Native {
     fn log(&self, message: &str) -> Result<()> {
-        let mut log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.options.services_state.join("backend.log"))?;
-        let metadata = log.metadata()?;
-        ensure!(
-            metadata.is_file()
-                && metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.nlink() == 1
-                && metadata.mode() & 0o022 == 0,
-            "untrusted backend log"
-        );
-        writeln!(
-            log,
-            "{}",
-            json!({"source":"backend","component":"native","message":message})
-        )?;
-        Ok(())
+        self.netcontrol_log
+            .append(&json!({"source":"backend","component":"native","message":message}).to_string())
     }
 }
 

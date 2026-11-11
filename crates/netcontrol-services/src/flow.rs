@@ -22,6 +22,64 @@ pub(crate) struct Flow {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Default)]
+struct ExportCounters {
+    flows: u64,
+    packets: u64,
+    bytes: u64,
+    flow_packets: u64,
+    flow_bytes: u64,
+    errors: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ExportCounters {
+    fn export(
+        &mut self,
+        batch: &[(Key, Flow)],
+        version: u16,
+        mut send: impl FnMut(&[(Key, Flow)]) -> Result<usize>,
+    ) -> Result<()> {
+        let begin = std::time::Instant::now();
+        let result = (|| {
+            for chunk in batch.chunks(if version == 1 { 24 } else { 30 }) {
+                ensure!(
+                    begin.elapsed() < std::time::Duration::from_secs(2),
+                    "NetFlow export batch exceeded 2s bound; {} records could not be delivered",
+                    batch.len()
+                );
+                let bytes = send(chunk)?;
+                self.flows = self.flows.saturating_add(chunk.len() as u64);
+                self.packets = self.packets.saturating_add(1);
+                self.bytes = self.bytes.saturating_add(bytes as u64);
+                for (_, flow) in chunk {
+                    self.flow_packets = self.flow_packets.saturating_add(flow.packets);
+                    self.flow_bytes = self.flow_bytes.saturating_add(flow.bytes);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.errors = self.errors.saturating_add(1);
+        }
+        result
+    }
+
+    fn publish(&self, status: &mut serde_json::Value) {
+        status["exported_flows"] = serde_json::json!(self.flows);
+        for (field, value) in [
+            ("exported_packets", self.packets),
+            ("exported_bytes", self.bytes),
+            ("exported_flow_packets", self.flow_packets),
+            ("exported_flow_bytes", self.flow_bytes),
+            ("export_errors", self.errors),
+        ] {
+            status[field] = serde_json::json!(value.to_string());
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 struct FlowTable {
     flows: std::collections::HashMap<Key, Flow>,
     oldest: std::collections::BTreeSet<(std::time::Instant, Key)>,
@@ -605,25 +663,23 @@ pub(crate) fn prepare(
         let mut table = FlowTable::new(config.max_flows, fixed_counters);
         let mut sampled = 0u64;
         let mut sequence = 0u32;
-        let mut exports = 0u64;
+        let mut exports = ExportCounters::default();
         let mut ignored_ipv6 = 0u64;
         let mut malformed = 0u64;
         let mut filtered = 0u64;
         let mut dropped = 0u64;
         ctx.update(|s| {
+            exports.publish(s);
             s["dropped_packets"] = serde_json::json!("0");
             s["statistics_complete"] = serde_json::json!(true);
         });
         let domain = rand::random::<u32>();
         let mut last_flush = Instant::now();
-        let export = |batch: &[(Key, Flow)], sequence: &mut u32, exports: &mut u64| -> Result<()> {
-            let begin = Instant::now();
-            for chunk in batch.chunks(if config.export_version == 1 { 24 } else { 30 }) {
-                ensure!(
-                    begin.elapsed() < Duration::from_secs(2),
-                    "NetFlow export batch exceeded 2s bound; {} records could not be delivered",
-                    batch.len()
-                );
+        let export = |batch: &[(Key, Flow)],
+                      sequence: &mut u32,
+                      exports: &mut ExportCounters|
+         -> Result<()> {
+            let result = exports.export(batch, config.export_version, |chunk| {
                 let p = if config.export_version == 1 {
                     v1(chunk, start.elapsed().as_millis() as u32, SystemTime::now())?
                 } else if config.export_version == 5 {
@@ -651,9 +707,10 @@ pub(crate) fn prepare(
                 } else {
                     chunk.len() as u32
                 });
-                *exports += chunk.len() as u64;
-            }
-            Ok(())
+                Ok(p.len())
+            });
+            ctx.update(|s| exports.publish(s));
+            result
         };
         while !ctx.stopping() {
             ensure!(
@@ -739,7 +796,6 @@ pub(crate) fn prepare(
                     s["dropped_packets"] = serde_json::json!(dropped.to_string());
                     s["statistics_complete"] = serde_json::json!(dropped == 0);
                     s["active_flows"] = serde_json::json!(table.flows.len());
-                    s["exported_flows"] = serde_json::json!(exports);
                     s["excluded_packets"] = serde_json::json!(ignored_ipv6);
                     s["filtered_packets"] = serde_json::json!(filtered);
                     s["malformed_packets"] = serde_json::json!(malformed);
@@ -758,6 +814,153 @@ pub(crate) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_counters_match_udp_datagrams_and_sampled_flow_totals_for_all_versions() {
+        use std::{net::UdpSocket, time::Duration};
+        for version in [1, 5, 9, 10] {
+            let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+            collector
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sender.connect(collector.local_addr().unwrap()).unwrap();
+            let batch: Vec<_> = (1..=61)
+                .map(|index| {
+                    (
+                        flow_test_key(index),
+                        Flow {
+                            packets: u64::from(index),
+                            bytes: u64::from(index) * 40,
+                            first: 1,
+                            last: 2,
+                            flags: 0,
+                            changed: std::time::Instant::now(),
+                        },
+                    )
+                })
+                .collect();
+            let mut counters = ExportCounters::default();
+            counters
+                .export(&batch, version, |chunk| {
+                    let epoch = std::time::SystemTime::now();
+                    let packet = match version {
+                        1 => v1(chunk, 3, epoch)?,
+                        5 => v5(chunk, 3, 0, epoch, 4)?,
+                        _ => template_export(chunk, version, 3, 0, epoch, 4, 7)?,
+                    };
+                    let n = sender.send(&packet)?;
+                    ensure!(n == packet.len(), "short test UDP write");
+                    Ok(n)
+                })
+                .unwrap();
+            let mut bytes = 0u64;
+            let mut buffer = [0; 4096];
+            for _ in 0..3 {
+                let n = collector.recv(&mut buffer).unwrap();
+                assert_eq!(&buffer[..2], &version.to_be_bytes());
+                bytes += n as u64;
+            }
+            assert_eq!(counters.packets, 3);
+            assert_eq!(counters.bytes, bytes);
+            assert_eq!(counters.flows, 61);
+            assert_eq!(counters.flow_packets, 1891);
+            assert_eq!(counters.flow_bytes, 75640);
+            assert_eq!(counters.errors, 0);
+        }
+    }
+
+    #[test]
+    fn export_counters_preserve_partial_success_errors_and_instance_isolation() {
+        let flow = Flow {
+            packets: 3,
+            bytes: 120,
+            first: 1,
+            last: 2,
+            flags: 0,
+            changed: std::time::Instant::now(),
+        };
+        let batch = vec![(flow_test_key(1), flow); 31];
+        let mut counters = ExportCounters::default();
+        let mut sends = 0;
+        let result = counters.export(&batch, 10, |_| {
+            sends += 1;
+            ensure!(sends == 1, "injected export failure");
+            Ok(1500)
+        });
+        assert!(result.unwrap_err().to_string().contains("injected"));
+        let mut status = serde_json::json!({});
+        counters.publish(&mut status);
+        assert_eq!(
+            status,
+            serde_json::json!({
+                "exported_flows":30,"exported_packets":"1","exported_bytes":"1500",
+                "exported_flow_packets":"90","exported_flow_bytes":"3600","export_errors":"1"
+            })
+        );
+        counters
+            .export(&[], 10, |_| panic!("empty export"))
+            .unwrap();
+        assert_eq!(counters.errors, 1);
+        counters.export(&batch[..1], 10, |_| Ok(200)).unwrap();
+        assert_eq!(
+            (counters.flows, counters.packets, counters.bytes),
+            (31, 2, 1700)
+        );
+        assert_eq!((counters.flow_packets, counters.flow_bytes), (93, 3720));
+        assert_eq!(counters.errors, 1);
+        ExportCounters::default().publish(&mut status);
+        assert_eq!(
+            status,
+            serde_json::json!({
+                "exported_flows":0,"exported_packets":"0","exported_bytes":"0",
+                "exported_flow_packets":"0","exported_flow_bytes":"0","export_errors":"0"
+            })
+        );
+        assert_eq!(counters.flows, 31);
+    }
+
+    #[test]
+    fn export_counters_keep_exact_u64_strings_and_saturate_without_wrapping() {
+        let mut counters = ExportCounters {
+            flows: u64::MAX,
+            packets: u64::MAX,
+            bytes: u64::MAX,
+            flow_packets: u64::MAX,
+            flow_bytes: u64::MAX,
+            errors: u64::MAX,
+        };
+        let batch = [(
+            flow_test_key(1),
+            Flow {
+                packets: 1,
+                bytes: 40,
+                first: 0,
+                last: 0,
+                flags: 0,
+                changed: std::time::Instant::now(),
+            },
+        )];
+        counters.export(&batch, 5, |_| Ok(72)).unwrap();
+        assert!(
+            counters
+                .export(&batch, 5, |_| anyhow::bail!("send failed"))
+                .is_err()
+        );
+        let mut status = serde_json::json!({});
+        counters.publish(&mut status);
+        assert_eq!(status["exported_flows"], u64::MAX);
+        for field in [
+            "exported_packets",
+            "exported_bytes",
+            "exported_flow_packets",
+            "exported_flow_bytes",
+            "export_errors",
+        ] {
+            assert_eq!(status[field], u64::MAX.to_string());
+        }
+    }
+
     fn flow_test_key(index: u32) -> Key {
         Key {
             src: Ipv4Addr::from(0x0a000000 | index).into(),

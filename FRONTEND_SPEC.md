@@ -170,7 +170,8 @@ No old identity, network-state, or vnStat database importer/reset is provided.
 
 CLI options use `--long-options`. External executable, child UID/GID,
 runtime-directory, `--backend-log-file`, and `--syslog-ca-file` settings are
-removed. The backend audit file is `<services-state-dir>/backend.log`; native syslog
+removed. Native daemon/backend history is `<services-state-dir>/logs/netcontrol`,
+and socket history is `<services-state-dir>/logs/syslog`; native syslog
 receives journald-forwarded messages via systemd socket activation, and syslog TLS
 uses system CA trust. See the [daemon contract](crates/netcontrold/README.md)
 and [installation guide](docs/BUILD_AND_INSTALL.md) for current deployment flags.
@@ -786,6 +787,10 @@ scoped credential files must grant `system.upgrade` explicitly.
 Firewall deny history has the separate `firewall.logs.read` permission; neither
 `state.read` nor `firewall.write` grants traffic-log access. Device-account keys
 include it; scoped keys must explicitly grant it.
+General socket/daemon log viewing has the separate `logs.read` permission,
+not granted by `state.read`, `syslog.write` or `firewall.logs.read`. Device-account
+keys include it; scoped keys must grant it explicitly. Logs may contain sensitive
+third-party message text; do not grant general readers log access implicitly.
 Configuration changes additionally require permissions for every changed area:
 
 | Change | Additional permission |
@@ -2809,10 +2814,30 @@ visible service errors and automatically retry; they are not configuration-healt
 gates. Existing drift, authorization and transaction recovery guards still apply.
 Syslog keeps local capture and reachable destinations running while unavailable
 destinations reconnect independently (1..30-second exponential backoff, reset on
-successful write). Optional numeric counters `captured_records`,
-`forwarded_records`, and `failed_deliveries` count locally captured records,
-records successfully written to every destination, and missed per-destination
-sends respectively, since the latest execution attempt. `destination_errors`
+successful write). Optional nonnegative integer counters expose:
+
+| Field | Meaning |
+|---|---|
+| `received_records` | Journald datagrams read, including records that subsequently fail validation or local append |
+| `captured_records` | Records whose local append and `sync_data` succeeded (not proof against device/power failure) |
+| `forwarded_records` | Records successfully written to every configured destination |
+| `forwarded_deliveries` | Successful per-destination writes, including partial fan-out success |
+| `failed_deliveries` | Missed per-destination sends, including disconnected destinations |
+
+All five are numeric `u64` counters, saturating at the maximum, initialized to
+zero and reset for every execution attempt (automatic retry, repair,
+configuration restart or daemon restart); they are not persisted lifetime totals.
+Publish counts already observed even if record processing subsequently fails.
+For two destinations, one successful send and one failure yields one received,
+one captured, zero forwarded records, one forwarded delivery and one failed
+delivery. Label the primary totals **Logs read** and **Remote sends**; optionally
+show **Locally captured**, **Relayed to all destinations** and **Missed sends**.
+Never subtract sends from reads to calculate loss: fan-out changes their units.
+Unavailable/disabled/simulated rows can omit counters; render unavailable, not
+invented zero. Reset displayed rate baselines on `started_at` changes or counter
+decreases. HTTP counters follow existing numeric encoding; MQTT exports these
+as lossless decimal strings, with `records` or `deliveries` units.
+`destination_errors`
 is an optional `string[]` of active destination warnings, empty after recovery;
 the row can be `running` with an `error`. No delivery acknowledgment or replay
 of missed records is provided. Render failures as service-local warnings.
@@ -2834,9 +2859,18 @@ Ubuntu install/full source-upgrade scripts configure `ForwardToSyslog=yes`,
 `MaxLevelSyslog=debug`, `ReadKMsg=yes` and `netcontrol-syslog.socket`, and stop/mask
 common competing syslog receivers. They preserve journald and its `/dev/log` input.
 Build-only and API/package upgrades do not provision this setup. Saved
-syslog settings remain unchanged: disabling native syslog stops forwarding, not
-local journald capture. The bounded receiver queue may retain messages while
-disabled and forward them on enable; overflow/daemon restart may lose them.
+syslog settings remain unchanged: `syslog.enabled` controls remote forwarding,
+not local collection. With host-services opt-in and valid activation, Netcontrol
+keeps its capture worker running and retains socket messages while forwarding
+is disabled, in addition to journald's journal. Runtime/status syslog
+`forwarding_enabled:boolean` is the applied forwarding setting; `state` describes
+the capture worker and may be `running` while that setting is false. MQTT adds
+the same boolean service sensor; simulator reports its modeled setting without
+invented capture/counters. The syslog managed restart target can restart an
+active local capture worker even when forwarding is disabled (`system.restart`).
+The bounded receiver queue may retain messages during worker stop/restart;
+overflow/daemon restart may lose uncollected messages. Previously captured disk
+history is never replayed to destinations on enable.
 Capture/rate limits/forwarding settings determine coverage; a running worker is
 not evidence of complete capture or delivery. Enabled native syslog without the
 inherited socket fails preflight explicitly (HTTP 500 on transaction apply under
@@ -3029,6 +3063,92 @@ continue non-overlapping 2..5-second polling. Preserve drafts and configuration
 access: health labels and alerts are **observations only**, never write locks,
 rollback triggers or reasons to stop healthy workers. Existing authorization,
 configuration validation, genuine network drift and durable recovery guards stay.
+
+### Persistent log viewing APIs
+
+Provide separate socket/system and Netcontrol diagnostics views:
+
+| Method | Path | Permission | Source |
+|---|---|---|---|
+| GET | `/api/v1/logs/syslog` | `logs.read` | Locally captured journald forwarding-socket records, wrapped as RFC5424 text |
+| GET | `/api/v1/logs/netcontrol` | `logs.read` | Native daemon tracing diagnostics, native backend events and worker diagnostics, as JSON message text |
+
+Neither endpoint reads journald's journal or arbitrary filesystem paths.
+Socket history may contain Netcontrol stderr messages forwarded by journald;
+the direct Netcontrol stream is separate, not a disjoint/deduplicated source.
+Standalone helper/conversion/local-key CLI output and failures before logging
+initialization are not included in direct daemon history; journald may capture
+their stderr separately. No new configuration/editor fields or clear/delete
+endpoint. Simulator returns 503 rather than modeled log messages.
+
+Both are bodyless GETs with optional strict `cursor` and `limit` query fields.
+Default `limit=100`, canonical integer 1..500; query maximum 1024 bytes.
+Unknown/duplicate fields, empty/malformed cursors and noncanonical limits are
+400. Other methods are 405, missing/invalid authentication 401, missing
+`logs.read` 403. Storage/backend unavailability is 503 with the existing
+`{error:string}` envelope; never return an empty success on corruption/I/O failure.
+Responses retain `Cache-Control: no-store`; do not store log text in browser
+local storage, analytics or shared caches.
+
+Synthetic response:
+
+```json
+{"source":"syslog","entries":[{"sequence":"7","timestamp":"2026-11-11T00:00:00+00:00","message":"<14>1 2026-11-11T00:00:00Z appliance journald - - - synthetic event"}],"next_cursor":"0123456789abcdef0123456789abcdef:7","oldest_cursor":"0123456789abcdef0123456789abcdef:6","gap":false,"reset":false,"has_more":false,"retention_bytes":8388608,"max_message_bytes":65000,"capture":{"state":"running","retrying":false,"error":null}}
+```
+
+`source` is `syslog|netcontrol`. Entry `sequence` is an exact positive decimal
+u64 string; `timestamp` is the UTC capture timestamp, not an assertion about
+original event time. `message` is UTF-8 text, at most 65,000 bytes. Netcontrol
+messages contain JSON text, not a new stable schema for individual tracing
+fields. Render text safely; optional JSON formatting must handle opaque text.
+Order by numeric sequence, never lexicographic sequence or timestamps.
+`capture` is `{state:string,retrying:boolean,error:string|null}`; state can be
+`running|error|stopped|unavailable`. A 200 page can contain retained history
+while current socket capture is unavailable/stopped/error. Missing socket
+activation does not erase older history; absent host-services opt-in returns
+503 for the socket endpoint. Direct native daemon storage does not require
+the remote-forwarding flag or host-services opt-in.
+
+A cursor is `32-lowercase-hex-stream-identity:canonical-u64-sequence`;
+sequence zero means before the first record. Without a cursor, return the newest
+bounded page in chronological order. With a matching cursor, return records
+strictly after it, also chronological. Empty polls retain the current cursor.
+`next_cursor` is the last returned position; `has_more` indicates remaining
+forward pages. `oldest_cursor` is the position immediately before the oldest
+retained record, or null for empty history: use it to begin retained-history
+browsing rather than treating the default tail as a complete history.
+`gap:true` means intervening records expired; resume with the returned page.
+`reset:true` means a foreign stream identity (including the other endpoint's
+cursor); return the new stream's newest page. Cursors remain valid across daemon/
+worker restarts while the same persisted stream identity exists. A matching
+cursor ahead of history is 400. Keep separate cursor state for both endpoints.
+
+Pages contain at most `limit` entries and 512 KiB of serialized entry data
+(the complete JSON response remains under 1 MiB). Large messages can shorten a
+page even with fewer than `limit` entries; use `has_more`, not entry count, to
+decide whether to request another page. Poll only the visible view at the
+existing non-overlapping 2-5 second cadence; drain available forward pages
+without overlapping requests, pause when hidden and preserve the cursor on errors.
+Bound the frontend's own visible history and show gap/reset/retention notices.
+
+Each stream retains at most four 2 MiB segments below
+`<services-state-dir>/logs/{syslog,netcontrol}`, plus private identity/lock
+metadata. One additional segment can temporarily exist during rotation.
+The byte budget, not elapsed time, determines expiration. Records and stream
+identity persist through normal restart; counters still reset per worker
+attempt. Appends use `sync_data`, directory/rotation changes are synchronized
+on Linux, and interrupted empty-segment creation does not expire valid records.
+Partial/corrupt files, external replacement, public/link-owned paths and storage
+errors are explicit; no corrupt-state reset/import or automatic deletion of
+unknown files. A failed/partial write makes the sink unavailable until restart,
+with operator repair required if retained data is incomplete. This is not a
+tamper-evident audit log, journald cursor export, complete-capture guarantee or
+durable remote-forwarding queue. Power/device faults can still lose/corrupt data.
+Old `backend.log`/`syslog-host.log` files remain untouched but are no longer
+written/imported/exposed; no compatibility path or migration is added.
+
+Required frontend work and acceptance:
+[handoff 2026-11-11-05](docs/frontend-handoffs/2026-11-11.md#2026-11-11-05-persistent-socket-and-netcontrol-log-apis).
 
 ### 6.1.4 Home Assistant MQTT Streaming
 
@@ -3284,10 +3404,15 @@ Publisher and deployment contract:
   ...), `statistics_complete` (false once the kernel has dropped any capture
   packet until the worker restarts), `dropped_packets` (kernel capture-socket drops,
   exact decimal string, cumulative since worker start), `active_flows` (gauge),
-  `exported_flows`, `excluded_packets`, `filtered_packets` and `malformed_packets`
-  (cumulative). Counters reset when the worker restarts. A stopped, disabled or
-  just-started worker has no counters and they are unknown, never zero; the
-  counters other than drops appear after the first table scan. No entities exist
+  `exported_flows`, `exported_packets` (UDP datagrams), `exported_bytes` (UDP
+  payload bytes), `exported_flow_packets` and `exported_flow_bytes` (sampled
+  traffic represented by successfully sent records), `export_errors` (failed
+  export batches), `excluded_packets`, `filtered_packets` and `malformed_packets`
+  (cumulative). The five new export counters are exact decimal strings.
+  Counters reset when the worker restarts. Non-running workers' MQTT counters
+  are unknown, never fabricated zero. Export counters initialize at worker entry;
+  active/excluded/filtered/malformed fields appear after the first table scan.
+  No entities exist
   while no instance is configured; if the status read fails the existing entities
   are kept (unknown, expiring). Names are `<name> flow dropped packets` etc. Cap:
   64 instances. `running` is local worker health, not collector delivery; see
@@ -4698,6 +4823,78 @@ XDP and AF_XDP copy readiness remain unknown pending dedicated validation.
 Missing APIs, permissions or driver replies mean unknown with diagnostics,
 not unsupported hardware. Do not offer automatic tuning based on these rows.
 
+RSS now includes nullable interface `rss` details for the default context only:
+`context:0`, nullable `indirection_table:number[]`, `hash_function:number` and
+`input_transformation:number`. Table entries are RX queue indices, not CPU IDs.
+Hash/transform values are raw unsigned-byte kernel bitmasks; hash bits 1/2/4
+identify Toeplitz/XOR/CRC32. Preserve unknown bits. The RSS hash key is never
+returned or persisted. Detailed reads are bounded to a 256 KiB response,
+at most 65536 table entries and queue indices 0..4095.
+`rss.support` remains driver-table evidence. `rss.enabled:true` now means the
+observed default table targets multiple queues with identified active hashing;
+`false` means the observed table targets at most one queue (no RSS spreading).
+Multiple queues alone do not establish enabled. Multiple targets with
+unidentified hashing, or failed detailed reads, leave activation null with
+reason/errors, while retaining supported evidence. `rss` is null when no RSS
+table support was observed; its detail fields are null when unreadable.
+
+Nullable interface `interrupts` lists device MSI/MSI-X IRQs (or the device's
+reported non-MSI IRQ), including event IRQs that need not map to queues.
+Each entry contains `irq:number`, nullable `description:string`,
+`effective_cpus:number[]`, `counts:[{cpu_id:number,interrupts:string}]` and
+`errors:string[]`. CPU IDs are logical kernel IDs; counters are exact unsigned
+decimal strings, cumulative hardware interrupt events, not packets or CPU
+utilization. Empty effective CPU lists are observed empty lists, not unknown.
+Unreadable affinity or counters remain null independently; preserve other
+readable fields and render IRQ/row diagnostics.
+
+Each queue adds `irqs:number[]|null` and `irq_mapping_reason:string|null`.
+An exact unshared driver action ending in `INTERFACE-TxRx-N`,
+`INTERFACE-rx-N`/`INTERFACE-Rx-N` or `INTERFACE-tx-N`/`INTERFACE-Tx-N`
+must uniquely identify its IRQ. Combined actions can map the RX and TX queue
+with the same index to one IRQ. Unrecognized, shared, missing or ambiguous
+names remain null with diagnostics; never infer mappings from IRQ order or
+queue count. Join queue IRQ IDs to interface interrupt entries for CPU display.
+No observed physical device or unavailable device IRQ inventory means null
+`interrupts`; software queues have no fabricated hardware mapping.
+Lab namespaces omit host IRQ/sysfs evidence, and simulator measurements remain
+null. IRQ counters and affinities are snapshot observations, not an atomic
+live sample or proof of where subsequent RPS processing runs. Use the existing
+performance-statistics endpoint for live deltas; do not poll capability refresh.
+This is additive discovery metadata and an RSS activation-reporting fix.
+Deploy and explicitly refresh to obtain it; cached reads retain saved evidence.
+Required frontend tasks: [handoff 2026-11-11-06](docs/frontend-handoffs/2026-11-11.md#2026-11-11-06-rss-and-queue-irq-observations).
+
+Every capability includes `inherited_from:string|null`, null for directly
+observed capabilities and simulator rows. For native VLAN `rps` only, `support`
+and `enabled` describe the observed physical parent's RPS, not the VLAN's own
+queue masks. Follow observed VLAN lower links (including stacked VLANs) to a
+physical device, and name that device in `inherited_from`. `enabled:true` means
+at least one parent RX queue has a nonzero observed mask; it does not mean every
+queue/flow is steered or guarantee a performance benefit. `enabled:false` is an
+observed disabled parent, not a default for missing evidence. Parent activation
+unknown means `enabled:null` even when `inherited_from` is known.
+
+Render the enabled/disabled/unknown state with a separate
+"Inherited from eno1" annotation when `inherited_from` is nonnull. For VLANs,
+explain that ordinary receive traffic is steered at the physical parent before
+VLAN demultiplexing; their unchanged `queues[].rps_cpus` fields are raw local
+diagnostics, not effective receive steering. Never offer a per-VLAN RPS editor.
+Missing/cross-namespace/cyclic/over-32-link ancestry, unobserved physical identity
+or ambiguous software parents (such as bridge/bond/veth) produce unknown RPS,
+null `inherited_from` and explicit `reason`/row errors; never guess a parent or
+turn these cases into disabled. VLAN inheritance affects only RPS; RSS uses
+the direct default-context observations described above. Unknown evidence is
+not replaced with invented enabled/disabled values.
+
+This changes VLAN RPS reporting semantics, not configuration eligibility,
+packet processing or tuning. Both capability GET paths retain their existing
+permissions, status/error behavior, empty body/query requirements and snapshot
+timestamp/scope. After deploying, explicitly refresh once to obtain the new
+observations; cached reads never rescan or reinterpret saved observations.
+Required frontend work is tracked in
+[handoff 2026-11-11-04](docs/frontend-handoffs/2026-11-11.md#2026-11-11-04-vlan-rps-parent-reporting).
+
 In optional lab namespaces sysfs identity/queues are explicitly omitted because
 the sysfs mount may belong to another namespace; ethtool/netdev queries remain
 namespace-local. Simulator rows have `source: "simulator"`,
@@ -5207,6 +5404,119 @@ Offer explicit bodyless `POST /api/v1/services/dhcp-relay/reconcile` using store
 committed/pending settings, not drafts. It repairs all managed services, creates
 no revision, does not replay networking, and requires permissions described in
 the authorization section. Do not automatically retry it.
+
+#### DHCP relay diagnostics
+
+Two read-only native diagnostics endpoints require `state.read`, no request
+body, and add no configuration or write permissions:
+
+- `GET /api/v1/statistics/dhcp-relay`: no query parameters. Returns
+  `DHCPRelayStatistics` with the shared in-process worker's status, aggregate
+  counters and per-configured-interface rows. There are no child PIDs.
+- `GET /api/v1/services/dhcp-relay/log`: bounded, cursor-based recent events.
+  Query fields are optional `cursor`, `interface` (valid Linux interface name)
+  and canonical decimal `limit` (1..500, default 100). Query length is at most
+  1024 bytes. Unknown/duplicate fields, malformed values, request bodies and
+  same-epoch cursors ahead of the log return `400`; non-GET methods return `405`.
+  Unauthenticated/unauthorized requests return `401`/`403`; unavailable
+  diagnostics return `503`. Log retrieval in simulator mode is unsupported
+  (`503`); simulator statistics explicitly use null counters/identity/times and
+  simulated/disabled rows, never measured zeros.
+
+Logging is always active with the relay worker: one daemon-local ring retains
+the latest **2048 events**, shared by all relays, with no age-based retention,
+disk persistence, SSE or packet payload/hostname/other-option-value capture. The ring
+and random 32-lowercase-hex `epoch` last for the service manager object's lifetime
+(normally the daemon lifetime). Worker retries, reconfiguration, repair and
+rollback retain events; daemon restart clears them. There is no minimum retained
+time under load and no packet-loss/completeness guarantee.
+
+Poll about once per second while the diagnostic view is visible. Start without
+a cursor to retrieve oldest retained events, then pass the returned opaque
+`next_cursor` (`<epoch>:<canonical-u64-sequence>`, URL-encoded as needed). Events
+are oldest-first; `has_more:true` permits immediate bounded page draining.
+An empty result still advances the global cursor past scanned events. Keep the
+same interface filter while continuing; restart without a cursor if changing
+filters. Interface filters may name removed interfaces to inspect retained
+history; they do not imply that a relay is currently configured.
+
+`reset:true` means the supplied epoch differs: the server returns the current
+ring from its oldest retained event. Clear the UI's previous epoch/history.
+`gap:true` means the same-epoch cursor fell behind overwritten events; display
+a visible missing-events warning. Gaps concern the global ring, even with an
+interface filter. `overwritten` is the lifetime count of ring evictions, not
+kernel packet loss. An initial un-cursored page can already have overwritten
+history (`gap:false`, `overwritten` nonzero). `capacity` is 2048.
+
+Synthetic log response (identity and timestamp are illustrative):
+
+```json
+{"scope":"native-example","epoch":"0123456789abcdef0123456789abcdef","events":[{"sequence":"1","generation":"1","timestamp":"2026-11-11T00:00:00Z","interface":"vlan10","event":"requests_forwarded","reason":"","peer":"192.0.2.10:67","message_type":1,"transaction_id":"0000002a","client_mac":"02:00:00:00:00:01"}],"next_cursor":"0123456789abcdef0123456789abcdef:1","reset":false,"gap":false,"has_more":false,"capacity":2048,"overwritten":"0"}
+```
+
+Events include requests/replies received, successful server/client sends,
+rejections, send errors, transaction tracking expiry, worker start and worker
+failure. `message_type` is numeric DHCPv4 option 53 (1 Discover, 2 Offer,
+3 Request, 4 Decline, 5 ACK, 6 NAK, 7 Release, 8 Inform), or null when no valid
+packet metadata is available. `transaction_id` is eight lowercase hex digits
+and `client_mac` is six colon-separated lowercase hex octets; both nullable.
+Invalid packets, lifecycle/expiry events may have null packet metadata.
+`interface` is nullable for shared-worker events and unattributed packets
+(including unmatched replies); `peer` is a nullable IPv4 socket string, source
+on receipt/rejection and destination on forwarding/send error.
+`reason` is empty on normal receipts/forwards/start, a stable rejection category,
+`to_server|to_client|to_client_layer2` for send errors, `tracking_timeout` for
+expiry, or diagnostic text (at most 512 characters) for worker failure.
+Rejection categories: `truncated_datagram`, `non_ipv4_source`, `short_packet`,
+`unmanaged_ingress`, `invalid_client_endpoint`, `invalid_client_address`,
+`invalid_client_packet`, `transaction_capacity`, `unmatched_reply`,
+`missing_binding`, `invalid_server_endpoint`, `invalid_server_packet`,
+`off_link_target`, `invalid_op`.
+
+Counters are canonical decimal **strings**, with saturating `u64` cumulative
+counts and a current pending gauge:
+
+| Counter | Meaning |
+| --- | --- |
+| `requests_received` | Fixed-header-sized BOOTREQUEST packets seen by the worker, before admission |
+| `replies_received` | Fixed-header-sized BOOTREPLY packets seen, before admission |
+| `requests_forwarded` | Successful sends to servers; fan-out counts once per successful server send |
+| `replies_forwarded` | Successful sends toward clients, including broadcast and layer-2 unicast |
+| `packets_rejected` | Worker rejection decisions, not firewall/kernel drops |
+| `rejected_by_reason` | Sparse rejection-category -> decimal-string count map |
+| `send_errors` | Failed server/client send attempts; existing worker error/retry behavior remains |
+| `transactions_expired` | Tracking entries aged out after 120 seconds, not failed leases |
+| `pending_transactions` | Current transaction-ID/MAC tracking entries, not outstanding lease requests |
+
+Replies do not remove tracking entries: multiple server replies and later DHCP
+messages remain admissible until replacement/expiry. Retransmission refreshes
+the entry without double-counting the pending gauge. Expiry runs about once per
+second even without incoming traffic. One packet can generate receipt and
+forward/rejection events; event count is not packet count. Totals include
+unattributed packets, so do not assume they equal the visible interface sum.
+These counters do not measure pre-worker firewall drops, UDP receive loss,
+server reachability, lease completion or actual client acceptance.
+
+All counters reset for each worker preparation attempt, including automatic
+retry, explicit restart, reconfiguration and rollback; compare both `epoch`
+and decimal-string `generation` before calculating deltas. `counters_since`
+is the UTC attempt-start timestamp, not readiness time; `collected_at` is read
+time. Generation is `"0"` with null `counters_since` before the first attempt.
+Stopping clears pending entries, retains the last attempt's cumulative totals
+and log; disabled interface rows have null counters, not live zero measurements.
+Enabled rows without a prepared counter set are null. Inspect `worker.state`,
+`retrying`, `restart_count`, `error`/`last_error`; do not render retained counters
+as evidence that an errored/stopped worker is forwarding.
+
+Add a per-relay diagnostics view and shared-worker summary, message/outcome
+badges, optional interface filtering, explicit gap/reset notices and a pause
+control. Stop polling when hidden; surface API errors without disabling the
+configured relay or automatically reconciling. Treat MAC/IP diagnostics as
+operator data, not public analytics. Existing status/runtime response shapes,
+relay configuration, packet admission and firewall permissions remain unchanged.
+Backend availability is Unreleased; no frontend deployment ordering is needed
+for unchanged configuration. See
+[handoff 2026-11-11-02](docs/frontend-handoffs/2026-11-11.md#2026-11-11-02-dhcp-relay-diagnostics).
 
 ### 6.3 Adopted parents
 
@@ -6558,6 +6868,25 @@ Display runtime states:
 Missing runtime data means Unknown, not Disabled. Keep top-level runtime error
 visible even if individual rows appear healthy.
 
+Show read-only per-instance export statistics on the table/detail: existing
+`exported_flows` (successfully sent unidirectional records), `exported_packets`
+(successful UDP datagrams), `exported_bytes` (UDP payload bytes, including
+templates/padding but excluding UDP/IP/link headers), `exported_flow_packets`
+and `exported_flow_bytes` (sampled packet and layer-3 byte totals in those records),
+and `export_errors` (failed export batches, including encode/send/deadline errors).
+The five new fields are optional unsigned decimal strings, initialized to `"0"`
+at worker entry and saturated at u64 maximum. Keep strings exact; do not pass
+through JavaScript `Number`. Existing `exported_flows` remains a JSON number.
+Update totals after each export batch, including successful chunks before a
+failure and the shutdown flush. Error/stopped rows retain their last observations;
+disabled/simulated/unavailable fields remain unknown. All totals reset on each
+worker execution attempt, including supervised retry, reconcile and daemon restart;
+they are not persisted. Use `started_at` to identify a new observation period.
+Flow packet/byte totals are not multiplied by `sampling_rate`, and active
+unexported flows do not contribute. UDP success is local socket acceptance, not
+collector receipt; never display these as acknowledged delivery. Poll the existing
+status endpoint with `state.read`; no new write/reset endpoint is introduced.
+
 Native AF_PACKET packet drops no longer stop export or fail service verification
 by themselves. Runtime/status rows expose `dropped_packets` (exact unsigned decimal
 string) and `statistics_complete` (boolean). Enabled native workers initialize
@@ -6899,12 +7228,16 @@ Paths below are relative to `/api/v1`.
 | GET | `/services/bgp/status` | Applied BGP worker and neighbor summary |
 | GET | `/firewall/rules` | Entire observed `Firewall`, including `rpf_mode`, policy and NAT; no generated system policies |
 | GET | `/firewall/deny-log` | Filtered persistent deny history, capture/loss/retention status; `firewall.logs.read` |
+| GET | `/logs/syslog` | Bounded persistent socket-log page; `logs.read`, optional cursor/limit |
+| GET | `/logs/netcontrol` | Bounded persistent daemon/native diagnostic page; `logs.read`, optional cursor/limit |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
 | GET | `/firewall/nat` | Observed `{ "masquerade": [...], "destination_rewrite": [...] }` |
 | GET | `/services/softflowd` | Observed `SoftflowdConfig[]` |
 | GET | `/services/softflowd/status` | `{ "instances": SoftflowdStatus[], "error": string }` |
 | GET | `/services/dhcp-relay/status` | `{ "interfaces": DHCPRelayStatus[], "error": string }` |
+| GET | `/services/dhcp-relay/log` | Cursor-based `DHCPRelayLogPage`; `state.read`, no body |
+| GET | `/statistics/dhcp-relay` | Shared-worker and per-interface `DHCPRelayStatistics`; `state.read`, no body/query |
 | POST | `/services/discord/webhooks` | Private `{webhook_url}` upload -> `201 {webhook_ref}`; `discord.write` |
 | GET | `/services/discord/status` | First-seen alert delivery state/counts, no secret; `state.read` |
 | GET | `/gateway-monitors` | Observed `GatewayMonitor[]` metadata |
@@ -7083,7 +7416,10 @@ interface ApplianceServiceStatus {
   failed_datagrams?: string;
   source?: "journald"; // syslog worker only
   host_source?: "/run/systemd/journal/syslog"; // syslog worker only
-  forwarded_records?: number; // nonnegative integer, per syslog worker start
+  forwarding_enabled?: boolean; // syslog setting, independent of capture worker state
+  received_records?: number; // journald datagrams read, per execution attempt
+  forwarded_records?: number; // records sent to all destinations, per execution attempt
+  forwarded_deliveries?: number; // successful per-destination syslog writes
   captured_records?: number; // syslog locally captured records, per execution attempt
   failed_deliveries?: number; // syslog missed per-destination sends, no replay
   destination_errors?: string[]; // syslog current connection/write warnings
@@ -7219,17 +7555,33 @@ interface InterfaceCapabilities {
     other: number;
     combined: number;
   } | null;
+  rss: {
+    context: number; // Default context 0 only.
+    indirection_table: number[] | null; // RX queue indices, not CPUs.
+    hash_function: number | null; // Raw u8 bitmask: 1 Toeplitz, 2 XOR, 4 CRC32.
+    input_transformation: number | null; // Raw u8 kernel bitmask.
+  } | null;
+  interrupts: {
+    irq: number;
+    description: string | null;
+    effective_cpus: number[] | null; // Logical CPU IDs.
+    counts: { cpu_id: number; interrupts: string }[] | null; // Exact cumulative decimal counts.
+    errors: string[];
+  }[] | null;
   queues: {
     name: string;
     rps_cpus: string | null;
     rps_flow_count: number | null; // Table entries, not packets.
     xps_cpus: string | null;
     xps_rxqs: string | null; // Hexadecimal RX-queue mask, not CPU mask.
+    irqs: number[] | null;
+    irq_mapping_reason: string | null;
   }[];
   capabilities: {
     name: string;
     support: "supported" | "unsupported" | "unknown" | "not_applicable";
     enabled: boolean | null;
+    inherited_from: string | null; // VLAN RPS physical source; null for direct/unknown ancestry.
     evidence: string[];
     reason: string | null;
   }[];
@@ -7481,7 +7833,12 @@ interface SoftflowdStatus {
   dropped_packets?: string; // Exact cumulative AF_PACKET drops since worker start.
   statistics_complete?: boolean; // False remains sticky after an observed drop.
   active_flows?: number; // Present after the first table scan; counters are JSON numbers.
-  exported_flows?: number;
+  exported_flows?: number; // Successfully sent flow records; initialized at worker entry.
+  exported_packets?: string; // Successful UDP datagrams.
+  exported_bytes?: string; // UDP payload bytes, including templates/padding.
+  exported_flow_packets?: string; // Sampled packets represented by sent records.
+  exported_flow_bytes?: string; // Sampled layer-3 bytes represented by sent records.
+  export_errors?: string; // Failed export batches (encode/send/deadline).
   excluded_packets?: number;
   filtered_packets?: number;
   malformed_packets?: number;
@@ -7530,6 +7887,70 @@ interface DHCPRelayStatus {
   state: string;
   started_at?: Timestamp;
   error?: string;
+}
+
+interface DHCPRelayCounters {
+  requests_received: string;
+  replies_received: string;
+  requests_forwarded: string;
+  replies_forwarded: string;
+  packets_rejected: string;
+  rejected_by_reason: Record<string, string>;
+  send_errors: string;
+  transactions_expired: string;
+  pending_transactions: string;
+}
+
+interface DHCPRelayStatistics {
+  scope: string;
+  epoch: string | null;
+  generation: string | null;
+  counters_since: Timestamp | null;
+  collected_at: Timestamp | null;
+  totals: DHCPRelayCounters | null;
+  log_capacity: number | null;
+  log_overwritten: string | null;
+  worker: {
+    name: "dhcp-relay";
+    scope?: string;
+    state: "running" | "error" | "stopped" | "disabled" | "simulated";
+    started_at?: Timestamp;
+    retrying?: boolean;
+    restart_count?: number;
+    error?: string;
+    last_error?: string;
+  };
+  interfaces: {
+    interface: string;
+    enabled: boolean;
+    state: string;
+    counters: DHCPRelayCounters | null;
+  }[];
+}
+
+interface DHCPRelayLogPage {
+  scope: string;
+  epoch: string;
+  next_cursor: string;
+  reset: boolean;
+  gap: boolean;
+  has_more: boolean;
+  capacity: number;
+  overwritten: string;
+  events: {
+    sequence: string;
+    generation: string;
+    timestamp: Timestamp;
+    interface: string | null;
+    event: "requests_received" | "replies_received" | "requests_forwarded" |
+      "replies_forwarded" | "packets_rejected" | "send_errors" |
+      "transactions_expired" | "worker_start" | "worker_error";
+    reason: string;
+    peer: string | null;
+    message_type: number | null;
+    transaction_id: string | null;
+    client_mac: string | null;
+  }[];
 }
 
 interface RevisionMetadata {

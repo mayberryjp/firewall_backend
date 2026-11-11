@@ -3,6 +3,7 @@
 mod config;
 mod counters;
 mod dhcp;
+mod dhcp_telemetry;
 mod dns_lookup;
 pub use dns_lookup::lookup as dns_lookup;
 mod flow;
@@ -64,6 +65,8 @@ pub struct ServiceOptions {
     pub allow_gateway_monitoring: bool,
 }
 pub struct Services {
+    syslog_log: Option<netcontrol_core::DiskLog>,
+    dhcp_telemetry: dhcp_telemetry::Telemetry,
     options: ServiceOptions,
     config: Config,
     workers: BTreeMap<String, Worker>,
@@ -135,6 +138,14 @@ impl Services {
             host_namespace.clone()
         };
         Ok(Self {
+            syslog_log: if options.allow_host_services {
+                Some(netcontrol_core::DiskLog::open(
+                    &options.state_directory.join("logs").join("syslog"),
+                )?)
+            } else {
+                None
+            },
+            dhcp_telemetry: Default::default(),
             options,
             config: Config::default(),
             workers: BTreeMap::new(),
@@ -283,8 +294,40 @@ impl Services {
     /// True when exactly the requested supervisors exist, including workers awaiting recovery.
     /// A shutdown leaves the stored configuration in place, so an empty worker set is not current.
     fn workers_current(&self, c: &Config) -> bool {
-        self.workers.keys().cloned().collect::<BTreeSet<_>>() == expected_workers(c)
+        let mut expected = expected_workers(c);
+        if self.local_syslog_available() {
+            expected.insert("syslog".to_owned());
+        }
+        self.workers.keys().cloned().collect::<BTreeSet<_>>() == expected
             && self.workers.values().all(Worker::active)
+    }
+    fn local_syslog_available(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.syslog_log.is_some() && self.syslog_socket.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+    pub fn syslog_capture_active(&self) -> bool {
+        self.workers.get("syslog").is_some_and(Worker::active)
+    }
+    pub fn syslog_log(&self, query: &netcontrol_core::LogQuery) -> Result<Value> {
+        let log = self
+            .syslog_log
+            .as_ref()
+            .context("local syslog history requires host services opt-in")?;
+        let mut page = serde_json::to_value(log.read(query)?)?;
+        page["source"] = json!("syslog");
+        page["capture"] = if let Some(worker) = self.workers.get("syslog") {
+            let row = worker.snapshot();
+            json!({"state":row["state"],"retrying":row["retrying"],"error":row.get("error").cloned().unwrap_or(Value::Null)})
+        } else {
+            json!({"state":"unavailable","retrying":false,"error":"local capture requires active host services and systemd/journald socket activation"})
+        };
+        Ok(page)
     }
     fn start(&mut self, c: &Config) -> Result<()> {
         #[cfg(target_os = "linux")]
@@ -301,14 +344,17 @@ impl Services {
                     move || ntp::prepare(config.clone(), ipv6_enabled),
                 )?;
             }
-            if c.syslog.enabled {
+            if c.syslog.enabled || self.local_syslog_available() {
                 let config = c.syslog.clone();
-                let dir = self.options.state_directory.clone();
+                let log = self
+                    .syslog_log
+                    .clone()
+                    .context("local syslog storage missing")?;
                 let socket = self
                     .syslog_socket
                     .clone()
                     .context("systemd syslog socket missing")?;
-                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","source":"journald","host_source":syslog::JOURNAL_SOCKET}),move||syslog::prepare(config.clone(),dir.clone(),socket.clone(),ipv6_enabled))?;
+                self.insert("syslog",host.clone(),json!({"name":"syslog","scope":"host","source":"journald","host_source":syslog::JOURNAL_SOCKET,"forwarding_enabled":c.syslog.enabled}),move||syslog::prepare(config.clone(),log.clone(),socket.clone(),ipv6_enabled))?;
             }
             if c.vnstat.enabled {
                 let dir = self.options.state_directory.clone();
@@ -336,11 +382,12 @@ impl Services {
                 })?;
             }
             if !relays.is_empty() {
+                let telemetry = self.dhcp_telemetry.clone();
                 self.insert(
                     "dhcp-relay",
                     managed.clone(),
                     json!({"name":"dhcp-relay","scope":"managed"}),
-                    move || dhcp::prepare(relays.clone()),
+                    move || dhcp::prepare_observed(relays.clone(), telemetry.clone()),
                 )?;
             }
             for instance in c
@@ -433,8 +480,8 @@ impl Services {
             self.row("ntp", c.ntp.enabled, json!({"name":"ntp","scope":"host"})),
             self.row(
                 "syslog",
-                c.syslog.enabled,
-                json!({"name":"syslog","scope":"host"}),
+                c.syslog.enabled || self.local_syslog_available(),
+                json!({"name":"syslog","scope":"host","forwarding_enabled":c.syslog.enabled}),
             ),
             self.row(
                 "vnstat",
@@ -527,12 +574,35 @@ impl Services {
         stringify_counts(&mut result);
         result
     }
+    pub fn dhcp_relay_log(&self, query: &netcontrol_core::DHCPRelayLogQuery) -> Result<Value> {
+        self.dhcp_telemetry.log(query)
+    }
+
     pub fn statistics(&self, path: &str, query: &str) -> Result<Value> {
         ensure!(
             query.is_empty(),
             "service statistics endpoints do not accept query parameters"
         );
         let path = path.strip_prefix("/api/v1").unwrap_or(path);
+        if path == "/statistics/dhcp-relay" {
+            let mut statistics = self.dhcp_telemetry.statistics()?;
+            statistics["worker"] = self.row(
+                "dhcp-relay",
+                self.config.interfaces.iter().any(|i| i.dhcp_relay.enabled),
+                json!({"name":"dhcp-relay","scope":"managed"}),
+            );
+            let measured = statistics["interfaces"]
+                .as_array()
+                .context("missing relay counters")?
+                .clone();
+            statistics["interfaces"] = json!(self.config.interfaces.iter().map(|interface| {
+                let counters = measured.iter().find(|row|row["interface"] == interface.name).map(|row|row["counters"].clone());
+                json!({"interface":interface.name,"enabled":interface.dhcp_relay.enabled,
+                    "state":if interface.dhcp_relay.enabled {statistics["worker"]["state"].clone()} else {json!("disabled")},
+                    "counters":if interface.dhcp_relay.enabled {counters} else {None}})
+            }).collect::<Vec<_>>());
+            return Ok(statistics);
+        }
         let status = self.status();
         if path == "/statistics/gateways" || path.starts_with("/statistics/gateways/") {
             let gateways = status["gateway_monitors"].as_array().unwrap();

@@ -193,6 +193,7 @@ impl Remote {
         }
     }
     fn forward(&mut self, bytes: &[u8], ctx: &super::worker::ContextState) -> Result<()> {
+        ensure!(!ctx.stopping(), "syslog forwarding interrupted by shutdown");
         ensure!(
             bytes.len() <= 65000,
             "syslog record exceeds 65000-byte bound"
@@ -326,15 +327,15 @@ impl JournalSocket {
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     config: super::config::Syslog,
-    directory: std::path::PathBuf,
+    local: netcontrol_core::DiskLog,
     socket: Arc<JournalSocket>,
     ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
-    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
     socket.check_path()?;
     let mut remotes: Vec<_> = config
         .servers
         .into_iter()
+        .filter(|_| config.enabled)
         .map(|destination| DestinationState {
             destination,
             remote: None,
@@ -343,16 +344,6 @@ pub(crate) fn prepare(
             error: None,
         })
         .collect();
-    let mut local = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(directory.join("syslog-host.log"))?;
-    ensure!(
-        local.metadata()?.is_file(),
-        "local syslog destination must be regular file"
-    );
     let mut hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")?
         .trim()
         .to_owned();
@@ -360,7 +351,20 @@ pub(crate) fn prepare(
         let mut buffer = vec![0; 65536];
         let mut forwarded = 0u64;
         let mut captured = 0u64;
+        let mut received = 0u64;
+        let mut forwarded_deliveries = 0u64;
         let mut failed_deliveries = 0u64;
+        ctx.update(|s| {
+            for field in [
+                "received_records",
+                "captured_records",
+                "forwarded_records",
+                "forwarded_deliveries",
+                "failed_deliveries",
+            ] {
+                s[field] = serde_json::json!(0);
+            }
+        });
         let mut hostname_read = Instant::now();
         while !ctx.stopping() {
             socket.check_path()?;
@@ -377,35 +381,47 @@ pub(crate) fn prepare(
                     hostname = name.trim().to_owned();
                 }
             }
-            for _ in 0..64 {
-                match socket.socket.recv(&mut buffer) {
-                    Ok(n) => {
-                        ensure!(n < buffer.len(), "oversize journald syslog datagram");
-                        let record =
-                            message(&buffer[..n], &hostname, "journald", &super::worker::now());
-                        ensure!(record.len() <= 65000, "syslog record too large");
-                        local.write_all(&record)?;
-                        local.write_all(b"\n")?;
-                        captured = captured.saturating_add(1);
-                        let mut delivered = true;
-                        for remote in &mut remotes {
-                            if !remote.forward(&record, &ctx) {
-                                delivered = false;
-                                failed_deliveries = failed_deliveries.saturating_add(1);
+            let result = (|| -> Result<()> {
+                for _ in 0..64 {
+                    if ctx.stopping() {
+                        break;
+                    }
+                    match socket.socket.recv(&mut buffer) {
+                        Ok(n) => {
+                            received = received.saturating_add(1);
+                            ensure!(n < buffer.len(), "oversize journald syslog datagram");
+                            let record =
+                                message(&buffer[..n], &hostname, "journald", &super::worker::now());
+                            ensure!(record.len() <= 65000, "syslog record too large");
+                            local.append(
+                                std::str::from_utf8(&record).context("invalid formatted syslog")?,
+                            )?;
+                            captured = captured.saturating_add(1);
+                            let mut delivered = !remotes.is_empty();
+                            for remote in &mut remotes {
+                                if !remote.forward(&record, &ctx) {
+                                    delivered = false;
+                                    failed_deliveries = failed_deliveries.saturating_add(1);
+                                } else {
+                                    forwarded_deliveries = forwarded_deliveries.saturating_add(1);
+                                }
+                            }
+                            if delivered {
+                                forwarded = forwarded.saturating_add(1);
                             }
                         }
-                        if delivered {
-                            forwarded = forwarded.saturating_add(1);
-                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e).context("journald syslog receive failed"),
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e).context("journald syslog receive failed"),
                 }
-            }
+                Ok(())
+            })();
             ctx.update(|s| {
+                s["received_records"] = serde_json::json!(received);
                 s["forwarded_records"] = serde_json::json!(forwarded);
                 s["captured_records"] = serde_json::json!(captured);
+                s["forwarded_deliveries"] = serde_json::json!(forwarded_deliveries);
                 s["failed_deliveries"] = serde_json::json!(failed_deliveries);
                 let errors: Vec<_> = remotes
                     .iter()
@@ -425,15 +441,115 @@ pub(crate) fn prepare(
                     s["error"] = serde_json::json!(errors.join("; "));
                 }
             });
+            result?;
             ctx.wait(Duration::from_millis(20));
         }
-        local.sync_data()?;
+        local.sync()?;
         Ok(())
     }))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_socket_capture_is_independent_persistent_and_stops_cleanly() {
+        use netcontrol_core::LogQuery;
+        use std::os::{fd::AsRawFd, unix::net::UnixDatagram};
+        let directory =
+            std::env::temp_dir().join(format!("nc-local-syslog-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("socket");
+        let inherited = UnixDatagram::bind(&path).unwrap();
+        let socket = Arc::new(JournalSocket::from_fd(inherited.as_raw_fd(), &path).unwrap());
+        let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+        collector
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let sender = UnixDatagram::unbound().unwrap();
+        let options = || super::super::ServiceOptions {
+            namespace: None,
+            state_directory: directory.clone(),
+            allow_host_services: true,
+            allow_gateway_monitoring: false,
+        };
+        let mut services = super::super::Services::new(options()).unwrap();
+        services.syslog_socket = Some(socket.clone());
+        let disabled = serde_json::json!({"syslog":{"enabled":false,"servers":[{
+            "host":"127.0.0.1","port":collector.local_addr().unwrap().port(),"transport":"udp"
+        }]}});
+        services.apply(&serde_json::json!({}), &disabled).unwrap();
+        let read = LogQuery::parse("").unwrap();
+        let mut count = 0;
+        let mut wait_for_capture = |services: &super::super::Services, text: &[u8]| {
+            sender.send_to(text, &path).unwrap();
+            count += 1;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let page = services.syslog_log(&read).unwrap();
+                if page["entries"].as_array().unwrap().len() == count {
+                    assert_eq!(page["capture"]["state"], "running");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "local socket capture did not progress"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for_capture(&services, b"<14>local while forwarding disabled");
+        let mut bytes = [0; 4096];
+        assert!(collector.recv(&mut bytes).is_err());
+        assert_eq!(
+            services.workers["syslog"].snapshot()["forwarded_records"],
+            0
+        );
+        assert_eq!(
+            services.status()["appliance_services"][1]["forwarding_enabled"],
+            false
+        );
+        services.verify(&disabled).unwrap();
+        assert!(services.syslog_capture_active());
+        services.restart_worker("syslog").unwrap();
+        assert_eq!(
+            services.syslog_log(&read).unwrap()["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut enabled = disabled.clone();
+        enabled["syslog"]["enabled"] = serde_json::json!(true);
+        services.apply(&disabled, &enabled).unwrap();
+        wait_for_capture(&services, b"<14>local and remote");
+        collector.recv(&mut bytes).unwrap();
+        services.apply(&enabled, &disabled).unwrap();
+        wait_for_capture(&services, b"<14>local after forwarding disabled");
+        assert!(collector.recv(&mut bytes).is_err());
+        services.shutdown().unwrap();
+        assert!(!services.syslog_capture_active());
+        assert_eq!(
+            services.syslog_log(&read).unwrap()["capture"]["state"],
+            "unavailable"
+        );
+        drop(services);
+        let mut services = super::super::Services::new(options()).unwrap();
+        services.syslog_socket = Some(socket);
+        assert_eq!(
+            services.syslog_log(&read).unwrap()["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        services.apply(&serde_json::json!({}), &disabled).unwrap();
+        wait_for_capture(&services, b"<14>local after daemon recreation");
+        services.shutdown().unwrap();
+        assert!(path.exists());
+        drop(services);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn activation_requires_current_pid_and_exact_named_descriptor() {
@@ -496,7 +612,14 @@ mod tests {
                     let directory = directory.clone();
                     let socket = socket.clone();
                     let config = config.clone();
-                    move || prepare(config.clone(), directory.clone(), socket.clone(), true)
+                    move || {
+                        prepare(
+                            config.clone(),
+                            netcontrol_core::DiskLog::open(&directory.join("logs").join("syslog"))?,
+                            socket.clone(),
+                            true,
+                        )
+                    }
                 },
             )
             .unwrap();
@@ -516,6 +639,10 @@ mod tests {
             worker.shutdown().unwrap();
             assert_eq!(worker.snapshot()["state"], "stopped");
             assert_eq!(worker.snapshot()["forwarded_records"], 1);
+            assert_eq!(worker.snapshot()["received_records"], 1);
+            assert_eq!(worker.snapshot()["captured_records"], 1);
+            assert_eq!(worker.snapshot()["forwarded_deliveries"], 1);
+            assert_eq!(worker.snapshot()["failed_deliveries"], 0);
             assert!(path.exists(), "worker must not unlink systemd's socket");
         }
         let mut services = super::super::Services::new(super::super::ServiceOptions {
@@ -534,6 +661,8 @@ mod tests {
         let unused_port = closed.local_addr().unwrap().port();
         drop(closed);
         let failing = serde_json::json!({"syslog":{"enabled":true,"servers":[{
+            "host":"127.0.0.1","port":collector.local_addr().unwrap().port(),"transport":"udp"
+        },{
             "host":"127.0.0.1","port":unused_port,"transport":"tcp"
         }]}});
         services.apply(&enabled, &failing).unwrap();
@@ -554,10 +683,22 @@ mod tests {
             services.workers["syslog"].snapshot()["failed_deliveries"],
             1
         );
+        let partial = services.workers["syslog"].snapshot();
+        assert_eq!(partial["received_records"], 1);
+        assert_eq!(partial["forwarded_deliveries"], 1);
+        assert_eq!(partial["forwarded_records"], 0);
+        let mut buffer = [0; 4096];
+        collector.recv(&mut buffer).unwrap();
         assert!(
-            std::fs::read_to_string(directory.join("syslog-host.log"))
+            services
+                .syslog_log
+                .as_ref()
                 .unwrap()
-                .contains("captured during collector outage")
+                .read(&netcontrol_core::LogQuery::parse("").unwrap())
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| entry.message.contains("captured during collector outage"))
         );
         let recovered_collector = std::net::TcpListener::bind(("127.0.0.1", unused_port)).unwrap();
         recovered_collector.set_nonblocking(true).unwrap();
@@ -584,6 +725,24 @@ mod tests {
             String::from_utf8_lossy(&recovered[..count])
                 .contains("collector recovered automatically")
         );
+        collector.recv(&mut buffer).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = services.workers["syslog"].snapshot();
+            if status["forwarded_records"] == 1 {
+                assert_eq!(status["received_records"], 2);
+                assert_eq!(status["captured_records"], 2);
+                assert_eq!(status["forwarded_deliveries"], 3);
+                assert_eq!(status["failed_deliveries"], 1);
+                assert_eq!(status["destination_errors"], serde_json::json!([]));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "relay counters were not published"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         services.repair(&enabled).unwrap();
         sender
             .send_to(b"<30>restored after rollback and repair", &path)
@@ -593,6 +752,18 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&buffer[..n]).contains("restored after rollback and repair")
         );
+        services
+            .workers
+            .get_mut("syslog")
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        let repaired = services.workers["syslog"].snapshot();
+        assert_eq!(repaired["received_records"], 1);
+        assert_eq!(repaired["captured_records"], 1);
+        assert_eq!(repaired["forwarded_records"], 1);
+        assert_eq!(repaired["forwarded_deliveries"], 1);
+        assert_eq!(repaired["failed_deliveries"], 0);
         services.shutdown().unwrap();
         assert!(path.exists());
         drop(services);
@@ -604,7 +775,14 @@ mod tests {
                 let socket = socket.clone();
                 let config = config.clone();
                 let directory = directory.clone();
-                move || prepare(config.clone(), directory.clone(), socket.clone(), true)
+                move || {
+                    prepare(
+                        config.clone(),
+                        netcontrol_core::DiskLog::open(&directory.join("logs").join("syslog"))?,
+                        socket.clone(),
+                        true,
+                    )
+                }
             },
         )
         .unwrap();
@@ -626,7 +804,73 @@ mod tests {
             socket.check_path().is_err(),
             "socket replacement must be detected"
         );
-        assert!(prepare(config, directory.clone(), socket, true).is_err());
+        assert!(
+            prepare(
+                config,
+                netcontrol_core::DiskLog::open(&directory.join("logs").join("syslog")).unwrap(),
+                socket,
+                true
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_counters_survive_record_error_and_reset_on_next_execution() {
+        use std::os::{fd::AsRawFd, unix::net::UnixDatagram};
+        let directory =
+            std::env::temp_dir().join(format!("nc-syslog-counts-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("syslog");
+        let inherited = UnixDatagram::bind(&path).unwrap();
+        let socket = Arc::new(JournalSocket::from_fd(inherited.as_raw_fd(), &path).unwrap());
+        let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let config = super::super::config::Syslog {
+            enabled: true,
+            servers: vec![super::super::config::Destination {
+                host: "127.0.0.1".into(),
+                port: collector.local_addr().unwrap().port(),
+                transport: "udp".into(),
+            }],
+        };
+        let sender = UnixDatagram::unbound().unwrap();
+        sender.send_to(b"<30>valid before error", &path).unwrap();
+        sender.send_to(&vec![b'x'; 65536], &path).unwrap();
+        let context = ctx();
+        let log = netcontrol_core::DiskLog::open(&directory.join("logs").join("syslog")).unwrap();
+        let run = prepare(config.clone(), log.clone(), socket.clone(), true).unwrap();
+        assert!(
+            run(context.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("oversize")
+        );
+        {
+            let status = context.status.lock().unwrap();
+            assert_eq!(status["received_records"], 2);
+            assert_eq!(status["captured_records"], 1);
+            assert_eq!(status["forwarded_records"], 1);
+            assert_eq!(status["forwarded_deliveries"], 1);
+            assert_eq!(status["failed_deliveries"], 0);
+        }
+        context
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        prepare(config, log, socket, true).unwrap()(context.clone()).unwrap();
+        {
+            let status = context.status.lock().unwrap();
+            for field in [
+                "received_records",
+                "captured_records",
+                "forwarded_records",
+                "forwarded_deliveries",
+                "failed_deliveries",
+            ] {
+                assert_eq!(status[field], 0);
+            }
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 

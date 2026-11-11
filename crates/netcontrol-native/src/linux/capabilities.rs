@@ -2,11 +2,13 @@ use super::networking;
 use anyhow::{Context, Result, anyhow, ensure};
 use netcontrol_core::{
     CapabilitySupport, InterfaceCapabilities, InterfaceChannels, InterfaceDriver,
-    InterfaceHardware, InterfaceInventory, InterfaceLink, InterfaceLinkMode, InterfaceQueue,
-    InventorySource, InventoryStatus, PERFORMANCE_CAPABILITIES, PerformanceCapability,
+    InterfaceHardware, InterfaceInterrupt, InterfaceInterruptCount, InterfaceInventory,
+    InterfaceLink, InterfaceLinkMode, InterfaceQueue, InterfaceRss, InventorySource,
+    InventoryStatus, PERFORMANCE_CAPABILITIES, PerformanceCapability,
 };
+use netlink_packet_route::link::{LinkAttribute, LinkMessage};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Read,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -30,13 +32,22 @@ pub(super) async fn discover(
         &mut errors,
     );
     let xdp_family = netdev_family().map_err(|error| format!("{error:#}"));
+    let interrupts = if host_mode {
+        Some(
+            crate::performance::read_hardware_interrupts(Path::new("/proc/interrupts"))
+                .map_err(|error| format!("{error:#}")),
+        )
+    } else {
+        None
+    };
     let mut interfaces = vec![];
-    for link in networking::links(handle).await? {
+    let links = networking::links(handle).await?;
+    for link in &links {
         ensure!(
             interfaces.len() < 8192 && started.elapsed() < Duration::from_secs(30),
             "interface capability scan exceeded interface/time limit"
         );
-        let parent = networking::parent(&link);
+        let parent = networking::parent(link);
         let mut row = InterfaceCapabilities {
             name: parent.name.clone(),
             kind: parent.kind.clone(),
@@ -56,16 +67,7 @@ pub(super) async fn discover(
         row.driver = observed(driver(&socket, &row.name), &mut row.errors);
         row.link = observed(link_settings(&socket, &row.name), &mut row.errors);
         row.channels = observed(channels(&socket, &row.name), &mut row.errors);
-        match rss(&socket, &row.name) {
-            Ok(size) => set_capability(
-                &mut row,
-                "rss",
-                size > 0,
-                None,
-                format!("ethtool RSS indirection table size: {size}"),
-            ),
-            Err(e) => source_error(&mut row, "rss", e),
-        }
+        discover_rss(&mut row, |bytes| ethtool(&socket, &parent.name, bytes));
         match offloads(&socket, &row.name) {
             Ok(features) => row.capabilities.extend(features),
             Err(e) => row.errors.push(format!("ethtool offloads: {e:#}")),
@@ -114,7 +116,29 @@ pub(super) async fn discover(
         );
         if host_mode {
             match sysfs(&mut row, Path::new("/sys/class/net")) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if row.hardware.is_some() {
+                        if let Err(error) = discover_interrupts(
+                            &mut row,
+                            Path::new("/sys/class/net"),
+                            Path::new("/proc"),
+                            interrupts
+                                .as_ref()
+                                .context("missing host interrupt observation")?,
+                        ) {
+                            row.errors.push(format!("interrupt discovery: {error:#}"));
+                            for queue in &mut row.queues {
+                                queue.irq_mapping_reason =
+                                    Some(format!("interrupt discovery: {error:#}"));
+                            }
+                        }
+                    } else {
+                        for queue in &mut row.queues {
+                            queue.irq_mapping_reason =
+                                Some("no observed hardware device IRQs; software queue".into());
+                        }
+                    }
+                }
                 Err(e) => row.errors.push(format!("sysfs: {e:#}")),
             }
         } else {
@@ -124,23 +148,25 @@ pub(super) async fn discover(
         }
         interfaces.push(row);
     }
-    let current: BTreeSet<_> = networking::links(handle)
+    inherit_vlan_rps(&mut interfaces, &links);
+    let current: BTreeMap<_, _> = networking::links(handle)
         .await?
-        .iter()
-        .map(|link| {
-            let parent = networking::parent(link);
-            (parent.name, parent.index, parent.mac)
-        })
+        .into_iter()
+        .map(|link| (link.header.index, link))
         .collect();
-    for row in &interfaces {
+    for link in &links {
+        let before = networking::parent(link);
+        let after_link = current
+            .get(&before.index)
+            .with_context(|| format!("interface {} disappeared during discovery", before.name))?;
+        let after = networking::parent(after_link);
         ensure!(
-            current.contains(&(
-                row.name.clone(),
-                row.index.context("missing interface index")?,
-                row.mac.clone().unwrap_or_default()
-            )),
-            "interface {} changed identity during discovery; retry refresh",
-            row.name
+            before.name == after.name
+                && before.mac == after.mac
+                && before.kind == after.kind
+                && (before.kind != "vlan" || vlan_lower_link(link) == vlan_lower_link(after_link)),
+            "interface {} changed identity or VLAN parent during discovery; retry refresh",
+            before.name
         );
     }
     ensure!(
@@ -159,6 +185,100 @@ pub(super) async fn discover(
         errors,
         interfaces,
     })
+}
+
+fn vlan_lower_link(link: &LinkMessage) -> (Option<u32>, bool) {
+    let lower = link
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::Link(index) => Some(*index),
+            _ => None,
+        });
+    let foreign = link
+        .attributes
+        .iter()
+        .any(|attribute| matches!(attribute, LinkAttribute::NetnsId(_)));
+    (lower, foreign)
+}
+
+fn inherit_vlan_rps(rows: &mut [InterfaceCapabilities], links: &[LinkMessage]) {
+    let by_index: BTreeMap<_, _> = rows
+        .iter()
+        .filter_map(|row| row.index.map(|index| (index, row)))
+        .collect();
+    let ancestry: BTreeMap<_, _> = links
+        .iter()
+        .map(|link| (link.header.index, vlan_lower_link(link)))
+        .collect();
+    let updates: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.kind == "vlan")
+        .map(|(position, row)| {
+            let inherited = (|| -> Result<PerformanceCapability> {
+                let mut index = row.index.context("VLAN kernel index unavailable")?;
+                let mut visited = BTreeSet::new();
+                loop {
+                    ensure!(visited.insert(index), "cyclic VLAN ancestry");
+                    ensure!(visited.len() <= 32, "VLAN ancestry exceeds 32 links");
+                    let parent = by_index.get(&index).context("VLAN parent is missing")?;
+                    if parent.kind != "vlan" {
+                        ensure!(
+                            parent.hardware.is_some(),
+                            "VLAN parent {} is not an observed physical device; receive path is ambiguous",
+                            parent.name
+                        );
+                        let mut rps = parent
+                            .capabilities
+                            .iter()
+                            .find(|cap| cap.name == "rps")
+                            .context("VLAN parent RPS evidence unavailable")?
+                            .clone();
+                        let rx: Vec<_> = parent
+                            .queues
+                            .iter()
+                            .filter(|queue| queue.name.starts_with("rx-"))
+                            .collect();
+                        if rps.enabled == Some(false)
+                            && (rx.is_empty() || rx.iter().any(|queue| queue.rps_cpus.is_none()))
+                        {
+                            rps.enabled = None;
+                            rps.reason = Some(
+                                "parent RX queue masks are incomplete; disabled RPS cannot be established".into(),
+                            );
+                        }
+                        rps.inherited_from = Some(parent.name.clone());
+                        rps.evidence.insert(0, format!(
+                            "normal VLAN receive path uses physical parent {} RPS; VLAN queue masks are diagnostic only",
+                            parent.name
+                        ));
+                        return Ok(rps);
+                    }
+                    let (lower, foreign) = ancestry
+                        .get(&index)
+                        .context("VLAN parent topology unavailable")?;
+                    ensure!(
+                        !*foreign,
+                        "VLAN parent is outside the observed network namespace"
+                    );
+                    index = (*lower).context("VLAN lower-link index unavailable")?;
+                }
+            })();
+            (position, inherited)
+        })
+        .collect();
+    for (position, inherited) in updates {
+        let row = &mut rows[position];
+        match inherited {
+            Ok(rps) => *capability(row, "rps") = rps,
+            Err(error) => {
+                let reason = format!("VLAN RPS inheritance: {error:#}");
+                *capability(row, "rps") = PerformanceCapability::unknown("rps", &reason);
+                row.errors.push(reason);
+            }
+        }
+    }
 }
 
 fn observed<T>(value: Result<T>, errors: &mut Vec<String>) -> Option<T> {
@@ -476,9 +596,115 @@ fn channels(fd: &OwnedFd, name: &str) -> Result<InterfaceChannels> {
     })
 }
 
-fn rss(fd: &OwnedFd, name: &str) -> Result<u32> {
-    let bytes = ethtool(fd, name, &request(0x38, 8))?;
-    word(&bytes, 4)
+fn discover_rss(row: &mut InterfaceCapabilities, mut query: impl FnMut(&[u8]) -> Result<Vec<u8>>) {
+    // The size-only query establishes support even if detailed driver reads fail.
+    let size = match query(&request(0x38, 8)).and_then(|bytes| word(&bytes, 4)) {
+        Ok(size) => size,
+        Err(error) => {
+            source_error(row, "rss", error);
+            return;
+        }
+    };
+    set_capability(
+        row,
+        "rss",
+        size > 0,
+        None,
+        format!("ethtool RSS indirection table size: {size}"),
+    );
+    if size == 0 {
+        return;
+    }
+    row.rss = Some(InterfaceRss {
+        context: 0,
+        indirection_table: None,
+        hash_function: None,
+        input_transformation: None,
+    });
+    let details = (|| -> Result<InterfaceRss> {
+        let sizes = query(&request(0x46, 24))?; // ETHTOOL_GRSSH, default RSS context.
+        let (entries, key_size) = rss_sizes(&sizes)?;
+        let mut bytes = request(0x46, 24 + entries * 4 + key_size);
+        bytes[8..12].copy_from_slice(&(entries as u32).to_ne_bytes());
+        bytes[12..16].copy_from_slice(&(key_size as u32).to_ne_bytes());
+        let response = query(&bytes)?;
+        ensure!(
+            rss_sizes(&response)? == (entries, key_size),
+            "RSS sizes changed during discovery; retry refresh"
+        );
+        decode_rss(&response)
+    })();
+    match details {
+        Ok(rss) => {
+            let targets: BTreeSet<_> = rss
+                .indirection_table
+                .as_ref()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
+            let enabled = if targets.len() <= 1 {
+                Some(false)
+            } else if rss.hash_function.is_some_and(|function| function & 7 != 0) {
+                Some(true)
+            } else {
+                None
+            };
+            let cap = capability(row, "rss");
+            cap.enabled = enabled;
+            cap.evidence.push(format!(
+                "default RSS context targets RX queues {targets:?}; hash function bits: {}",
+                rss.hash_function.unwrap()
+            ));
+            if enabled.is_none() {
+                let reason =
+                    "RSS table targets multiple queues but active hashing is not identified"
+                        .to_string();
+                cap.reason = Some(reason.clone());
+                row.errors.push(reason);
+            }
+            row.rss = Some(rss);
+        }
+        Err(error) => source_error(row, "rss", error),
+    }
+}
+
+fn rss_sizes(bytes: &[u8]) -> Result<(usize, usize)> {
+    ensure!(
+        bytes.len() >= 24 && word(bytes, 4)? == 0,
+        "invalid default RSS context header"
+    );
+    let entries = word(bytes, 8)? as usize;
+    let key_size = word(bytes, 12)? as usize;
+    ensure!(
+        entries > 0
+            && entries <= 65536
+            && key_size <= 4096
+            && 24 + entries * 4 + key_size <= 256 * 1024,
+        "RSS table/key exceeds discovery bounds"
+    );
+    Ok((entries, key_size))
+}
+
+fn decode_rss(bytes: &[u8]) -> Result<InterfaceRss> {
+    let (entries, key_size) = rss_sizes(bytes)?;
+    ensure!(
+        bytes.len() == 24 + 4 * entries + key_size,
+        "short or oversized RSS response"
+    );
+    let table: Vec<_> = (0..entries)
+        .map(|index| word(bytes, 24 + 4 * index))
+        .collect::<Result<_>>()?;
+    ensure!(
+        table.iter().all(|queue| *queue <= 4095),
+        "RSS target exceeds RX queue index limit"
+    );
+    Ok(InterfaceRss {
+        context: 0,
+        indirection_table: Some(table),
+        hash_function: Some(bytes[16]),
+        input_transformation: Some(bytes[17]),
+    })
 }
 
 fn offloads(fd: &OwnedFd, name: &str) -> Result<Vec<PerformanceCapability>> {
@@ -538,6 +764,7 @@ fn decode_offloads(
                 CapabilitySupport::Unknown
             },
             enabled: Some(active),
+            inherited_from: None,
             evidence: vec![format!(
                 "ethtool feature bit {bit}; changeable={available}; active={active}"
             )],
@@ -677,8 +904,148 @@ fn sysfs(row: &mut InterfaceCapabilities, root: &Path) -> Result<()> {
             rps_flow_count: optional_text(&path.join("rps_flow_cnt"))?
                 .map(|v| v.parse::<u32>())
                 .transpose()?,
+            ..Default::default()
         });
     }
+
+    finish_queue_observation(row, queues)?;
+    ensure!(
+        read_text(&base.join("ifindex"))?.parse::<u32>()? == index,
+        "sysfs interface changed during discovery"
+    );
+    Ok(())
+}
+
+fn discover_interrupts(
+    row: &mut InterfaceCapabilities,
+    sys: &Path,
+    proc: &Path,
+    observation: &std::result::Result<Vec<crate::performance::HardwareInterrupt>, String>,
+) -> Result<()> {
+    let device = sys.join(&row.name).join("device");
+    let mut irqs = BTreeSet::new();
+    match fs::read_dir(device.join("msi_irqs")) {
+        Ok(entries) => {
+            for entry in entries {
+                ensure!(irqs.len() < 4096, "too many device IRQs");
+                let entry = entry?;
+                let irq = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow!("non-UTF8 IRQ name"))?
+                    .parse::<u32>()?;
+                ensure!(irqs.insert(irq), "duplicate device IRQ");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(irq) = optional_text(&device.join("irq"))? {
+                let irq: u32 = irq.parse()?;
+                if irq > 0 {
+                    irqs.insert(irq);
+                }
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    ensure!(!irqs.is_empty(), "device IRQ inventory unavailable");
+    let mut observations = vec![];
+    for irq in irqs {
+        let mut errors = vec![];
+        let interrupt = match observation {
+            Ok(rows) => {
+                let found = rows.iter().find(|row| row.irq == irq);
+                if found.is_none() {
+                    errors.push(format!("IRQ {irq} absent from interrupt snapshot"));
+                }
+                found
+            }
+            Err(error) => {
+                errors.push(format!("interrupt counters unavailable: {error}"));
+                None
+            }
+        };
+        let effective_cpus = observed(
+            read_text(
+                &proc
+                    .join("irq")
+                    .join(irq.to_string())
+                    .join("effective_affinity_list"),
+            )
+            .and_then(|value| netcontrol_core::parse_cpu_list(&value))
+            .map(|cpus| cpus.into_iter().collect()),
+            &mut errors,
+        );
+        row.errors
+            .extend(errors.iter().map(|error| format!("IRQ {irq}: {error}")));
+        observations.push(InterfaceInterrupt {
+            irq,
+            description: interrupt.map(|row| row.description.clone()),
+            effective_cpus,
+            counts: interrupt.map(|row| {
+                row.counts
+                    .iter()
+                    .map(|(cpu_id, count)| InterfaceInterruptCount {
+                        cpu_id: *cpu_id,
+                        interrupts: count.to_string(),
+                    })
+                    .collect()
+            }),
+            errors,
+        });
+    }
+    row.interrupts = Some(observations);
+    map_queue_irqs(row);
+    Ok(())
+}
+
+fn map_queue_irqs(row: &mut InterfaceCapabilities) {
+    for queue in &mut row.queues {
+        let Some((direction, index)) = queue.name.split_once('-') else {
+            continue;
+        };
+        let names = [
+            format!("{}-{direction}-{index}", row.name),
+            format!(
+                "{}-{}-{index}",
+                row.name,
+                if direction == "rx" { "Rx" } else { "Tx" }
+            ),
+            format!("{}-TxRx-{index}", row.name),
+        ];
+        let matches: Vec<_> = row
+            .interrupts
+            .iter()
+            .flatten()
+            .filter(|interrupt| {
+                interrupt.description.as_ref().is_some_and(|description| {
+                    // Only exact, unshared driver action names establish queue identity.
+                    !description.contains(',')
+                        && description
+                            .split_whitespace()
+                            .last()
+                            .is_some_and(|action| names.iter().any(|name| name == action))
+                })
+            })
+            .map(|interrupt| interrupt.irq)
+            .collect();
+        if matches.len() == 1 {
+            queue.irqs = Some(matches);
+            queue.irq_mapping_reason = None;
+        } else {
+            let reason = format!(
+                "queue {} IRQ mapping unavailable or ambiguous; driver action must uniquely identify the queue",
+                queue.name
+            );
+            queue.irqs = None;
+            queue.irq_mapping_reason = Some(reason.clone());
+            row.errors.push(reason);
+        }
+    }
+}
+fn finish_queue_observation(
+    row: &mut InterfaceCapabilities,
+    mut queues: Vec<InterfaceQueue>,
+) -> Result<()> {
     queues.sort_by(|a, b| a.name.cmp(&b.name));
     for (name, field, rx) in [
         ("rps", "rps_cpus", true),
@@ -742,10 +1109,6 @@ fn sysfs(row: &mut InterfaceCapabilities, root: &Path) -> Result<()> {
         );
     }
     row.queues = queues;
-    ensure!(
-        read_text(&base.join("ifindex"))?.parse::<u32>()? == index,
-        "sysfs interface changed during discovery"
-    );
     Ok(())
 }
 
@@ -869,6 +1232,311 @@ fn xdp_features(family: u16, index: u32) -> Result<u64> {
 mod tests {
     use super::*;
 
+    fn rss_reply(table: &[u32], function: u8) -> Vec<u8> {
+        let mut bytes = request(0x46, 24 + table.len() * 4);
+        bytes[8..12].copy_from_slice(&(table.len() as u32).to_ne_bytes());
+        bytes[16] = function;
+        bytes[17] = 2;
+        for (index, queue) in table.iter().enumerate() {
+            bytes[24 + index * 4..28 + index * 4].copy_from_slice(&queue.to_ne_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn capabilities_rss_observes_table_hashing_and_unknown_without_queue_count_inference() {
+        for (table, function, enabled) in [
+            (vec![0, 1, 2, 3], 1, Some(true)),
+            (vec![0, 0, 0, 0], 1, Some(false)),
+            (vec![0, 1], 0, None),
+            (vec![0, 1], 8, None),
+            (vec![0, 1], 2, Some(true)),
+            (vec![0, 1], 4, Some(true)),
+        ] {
+            let reply = rss_reply(&table, function);
+            let mut row = InterfaceCapabilities {
+                capabilities: vec![PerformanceCapability::unknown("rss", "not inspected")],
+                ..Default::default()
+            };
+            let mut calls = 0;
+            discover_rss(&mut row, |bytes| {
+                calls += 1;
+                match word(bytes, 0)? {
+                    0x38 => {
+                        let mut bytes = request(0x38, 8);
+                        bytes[4..8].copy_from_slice(&(table.len() as u32).to_ne_bytes());
+                        Ok(bytes)
+                    }
+                    0x46 if bytes.len() == 24 => Ok(reply[..24].to_vec()),
+                    0x46 => {
+                        assert_eq!(word(bytes, 8)?, table.len() as u32);
+                        Ok(reply.clone())
+                    }
+                    _ => anyhow::bail!("unexpected query"),
+                }
+            });
+            assert_eq!(calls, 3);
+            assert_eq!(
+                capability(&mut row, "rss").support,
+                CapabilitySupport::Supported
+            );
+            assert_eq!(capability(&mut row, "rss").enabled, enabled);
+            let rss = row.rss.unwrap();
+            assert_eq!(rss.input_transformation, Some(2));
+            assert_eq!(rss.indirection_table.unwrap(), table);
+            assert_eq!(row.errors.is_empty(), enabled.is_some());
+        }
+    }
+
+    #[test]
+    fn capabilities_rss_detail_failures_preserve_support_and_explicit_unknown() {
+        let mut row = InterfaceCapabilities {
+            capabilities: vec![PerformanceCapability::unknown("rss", "not inspected")],
+            ..Default::default()
+        };
+        discover_rss(&mut row, |bytes| {
+            if word(bytes, 0)? == 0x38 {
+                Ok(vec![0x38, 0, 0, 0, 128, 0, 0, 0])
+            } else {
+                anyhow::bail!("driver cannot read RSS hash settings")
+            }
+        });
+        let cap = capability(&mut row, "rss");
+        assert_eq!(cap.support, CapabilitySupport::Supported);
+        assert_eq!(cap.enabled, None);
+        assert!(cap.reason.as_ref().unwrap().contains("cannot read"));
+        assert!(row.rss.unwrap().indirection_table.is_none());
+        assert_eq!(row.errors.len(), 1);
+        let mut row = InterfaceCapabilities {
+            capabilities: vec![PerformanceCapability::unknown("rss", "not inspected")],
+            ..Default::default()
+        };
+        discover_rss(&mut row, |_| anyhow::bail!("permission denied"));
+        assert_eq!(
+            capability(&mut row, "rss").support,
+            CapabilitySupport::Unknown
+        );
+        assert!(row.rss.is_none());
+        let mut row = InterfaceCapabilities {
+            capabilities: vec![PerformanceCapability::unknown("rss", "not inspected")],
+            ..Default::default()
+        };
+        discover_rss(&mut row, |_| Ok(request(0x38, 8)));
+        assert_eq!(
+            capability(&mut row, "rss").support,
+            CapabilitySupport::Unsupported
+        );
+        assert!(row.rss.is_none());
+    }
+
+    #[test]
+    fn capabilities_rss_bounds_truncation_and_size_races() {
+        let valid = rss_reply(&[0, 1], 1);
+        assert!(decode_rss(&valid[..valid.len() - 1]).is_err());
+        assert!(decode_rss(&rss_reply(&[4096], 1)).is_err());
+        for (offset, value) in [(8, 0u32), (8, 65537), (12, 4097), (4, 1)] {
+            let mut invalid = valid.clone();
+            invalid[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+            assert!(rss_sizes(&invalid).is_err());
+        }
+        let mut row = InterfaceCapabilities {
+            capabilities: vec![PerformanceCapability::unknown("rss", "not inspected")],
+            ..Default::default()
+        };
+        let mut calls = 0;
+        discover_rss(&mut row, |_| {
+            calls += 1;
+            Ok(match calls {
+                1 => vec![0x38, 0, 0, 0, 2, 0, 0, 0],
+                2 => valid[..24].to_vec(),
+                _ => rss_reply(&[0, 1, 2], 1),
+            })
+        });
+        assert_eq!(capability(&mut row, "rss").enabled, None);
+        assert!(row.errors[0].contains("sizes changed"));
+    }
+
+    #[test]
+    fn capabilities_irq_mapping_requires_exact_unambiguous_driver_actions() {
+        let mut row = InterfaceCapabilities {
+            name: "enp1s0".into(),
+            queues: (0..4)
+                .map(|index| InterfaceQueue {
+                    name: format!("rx-{index}"),
+                    ..Default::default()
+                })
+                .collect(),
+            interrupts: Some(
+                (0..4)
+                    .map(|index| InterfaceInterrupt {
+                        irq: 135 + index,
+                        description: Some(format!("PCI-MSIX enp1s0-TxRx-{index}")),
+                        effective_cpus: Some(vec![(index + 1) % 4]),
+                        counts: None,
+                        errors: vec![],
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        map_queue_irqs(&mut row);
+        for (index, queue) in row.queues.iter().enumerate() {
+            assert_eq!(queue.irqs, Some(vec![135 + index as u32]));
+        }
+        let interrupts = row.interrupts.as_mut().unwrap();
+        interrupts[0].description = Some("PCI-MSI other-enp1s0-TxRx-0".into());
+        interrupts[1].description = Some("PCI-MSI enp1s0-TxRx-1, shared".into());
+        interrupts[2].description = None;
+        let mut duplicate = interrupts[3].clone();
+        duplicate.irq = 140;
+        interrupts.push(duplicate);
+        map_queue_irqs(&mut row);
+        assert!(
+            row.queues
+                .iter()
+                .all(|queue| queue.irqs.is_none() && queue.irq_mapping_reason.is_some())
+        );
+    }
+
+    fn rps_row(name: &str, index: u32, kind: &str, enabled: Option<bool>) -> InterfaceCapabilities {
+        let mut rps = PerformanceCapability::unknown("rps", "queue observation unavailable");
+        if enabled.is_some() {
+            rps.support = CapabilitySupport::Supported;
+            rps.reason = None;
+        }
+        rps.enabled = enabled;
+        InterfaceCapabilities {
+            name: name.into(),
+            index: Some(index),
+            kind: kind.into(),
+            hardware: (kind == "device").then(InterfaceHardware::default),
+            queues: vec![InterfaceQueue {
+                name: "rx-0".into(),
+                rps_cpus: Some(if enabled == Some(true) { "2" } else { "0" }.into()),
+                rps_flow_count: None,
+                xps_cpus: None,
+                xps_rxqs: None,
+                ..Default::default()
+            }],
+            capabilities: vec![rps, PerformanceCapability::unknown("rss", "not inspected")],
+            ..Default::default()
+        }
+    }
+
+    fn vlan_link(index: u32, lower: u32) -> LinkMessage {
+        let mut link = LinkMessage::default();
+        link.header.index = index;
+        link.attributes.push(LinkAttribute::Link(lower));
+        link
+    }
+
+    #[test]
+    fn capabilities_vlan_rps_inherits_parent_state_not_own_masks() {
+        for enabled in [Some(true), Some(false), None] {
+            let mut rows = vec![
+                rps_row("vlan20", 4, "vlan", Some(true)),
+                rps_row("vlan10", 3, "vlan", Some(false)),
+                rps_row("eno1", 2, "device", enabled),
+                rps_row("wg0", 5, "wireguard", Some(true)),
+                rps_row("lo", 1, "loopback", Some(false)),
+            ];
+            inherit_vlan_rps(&mut rows, &[vlan_link(4, 3), vlan_link(3, 2)]);
+            for row in &mut rows[..2] {
+                let rps = capability(row, "rps");
+                assert_eq!(rps.enabled, enabled);
+                assert_eq!(rps.inherited_from.as_deref(), Some("eno1"));
+                assert_eq!(rps.reason.is_some(), enabled.is_none());
+                assert!(rps.evidence[0].contains("diagnostic only"));
+                assert!(capability(row, "rss").inherited_from.is_none());
+            }
+            assert_eq!(rows[0].queues[0].rps_cpus.as_deref(), Some("2"));
+            assert_eq!(rows[1].queues[0].rps_cpus.as_deref(), Some("0"));
+            for row in &mut rows[2..] {
+                assert!(capability(row, "rps").inherited_from.is_none());
+            }
+            assert_eq!(capability(&mut rows[3], "rps").enabled, Some(true));
+        }
+    }
+
+    #[test]
+    fn capabilities_vlan_rps_unresolved_ancestry_is_unknown_with_errors() {
+        let mut foreign = vlan_link(3, 2);
+        foreign.attributes.push(LinkAttribute::NetnsId(0));
+        for links in [
+            vec![],
+            vec![vlan_link(3, 99)],
+            vec![vlan_link(3, 3)],
+            vec![foreign],
+        ] {
+            let mut rows = vec![
+                rps_row("vlan10", 3, "vlan", Some(true)),
+                rps_row("eno1", 2, "device", Some(true)),
+            ];
+            inherit_vlan_rps(&mut rows, &links);
+            let rps = capability(&mut rows[0], "rps");
+            assert_eq!(rps.support, CapabilitySupport::Unknown);
+            assert_eq!(rps.enabled, None);
+            assert_eq!(rps.inherited_from, None);
+            assert!(
+                rps.reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("VLAN RPS inheritance")
+            );
+            assert_eq!(rows[0].errors.len(), 1);
+        }
+        for kind in ["bridge", "bond", "veth", "wireguard"] {
+            let mut rows = vec![
+                rps_row("vlan10", 3, "vlan", Some(true)),
+                rps_row("lower0", 2, kind, Some(true)),
+            ];
+            inherit_vlan_rps(&mut rows, &[vlan_link(3, 2)]);
+            assert_eq!(capability(&mut rows[0], "rps").enabled, None);
+            assert!(rows[0].errors[0].contains("receive path is ambiguous"));
+        }
+    }
+
+    #[test]
+    fn capabilities_vlan_rps_missing_parent_masks_are_not_disabled() {
+        for enabled in [Some(false), Some(true)] {
+            let mut parent = rps_row("eno1", 2, "device", enabled);
+            parent.queues.push(InterfaceQueue {
+                name: "rx-1".into(),
+                rps_cpus: None,
+                rps_flow_count: None,
+                xps_cpus: None,
+                xps_rxqs: None,
+                ..Default::default()
+            });
+            let mut rows = vec![rps_row("vlan10", 3, "vlan", Some(false)), parent];
+            inherit_vlan_rps(&mut rows, &[vlan_link(3, 2)]);
+            let rps = capability(&mut rows[0], "rps");
+            assert_eq!(rps.enabled, enabled.filter(|enabled| *enabled));
+            assert_eq!(rps.inherited_from.as_deref(), Some("eno1"));
+            assert_eq!(rps.reason.is_some(), enabled == Some(false));
+        }
+    }
+
+    #[test]
+    fn capabilities_vlan_rps_ancestry_is_bounded_and_parent_changes_are_detectable() {
+        let mut rows: Vec<_> = (1..=33)
+            .map(|index| rps_row(&format!("vlan{index}"), index, "vlan", Some(false)))
+            .collect();
+        rows.push(rps_row("eno1", 34, "device", Some(true)));
+        let links: Vec<_> = (1..=33).map(|index| vlan_link(index, index + 1)).collect();
+        inherit_vlan_rps(&mut rows, &links);
+        assert_eq!(capability(&mut rows[0], "rps").enabled, None);
+        assert!(rows[0].errors[0].contains("exceeds 32 links"));
+        assert_eq!(capability(&mut rows[2], "rps").enabled, Some(true));
+        assert_ne!(
+            vlan_lower_link(&vlan_link(3, 2)),
+            vlan_lower_link(&vlan_link(3, 4))
+        );
+        let mut foreign = vlan_link(3, 2);
+        foreign.attributes.push(LinkAttribute::NetnsId(0));
+        assert_ne!(vlan_lower_link(&vlan_link(3, 2)), vlan_lower_link(&foreign));
+    }
+
     #[test]
     fn capabilities_link_modes_preserve_unknown_bits_and_down_state() {
         let mut bytes = request(0x4c, 48 + 48);
@@ -981,6 +1649,72 @@ mod tests {
         assert_eq!(capability(&mut row, "rps").enabled, Some(true));
         assert_eq!(capability(&mut row, "xps").enabled, Some(false));
         assert_eq!(capability(&mut row, "xps_rxqs").enabled, Some(true));
+        fs::create_dir_all(device.join("msi_irqs")).unwrap();
+        fs::write(device.join("msi_irqs/135"), "msix").unwrap();
+        fs::write(device.join("msi_irqs/134"), "msix").unwrap();
+        fs::create_dir_all(root.join("proc/irq/135")).unwrap();
+        fs::write(root.join("proc/irq/135/effective_affinity_list"), "1,3").unwrap();
+        let interrupts = crate::performance::hardware_interrupts(
+            "CPU1 CPU3\n134: 1 0 PCI-MSI test0\n135: 18446744073709551615 7 PCI-MSI test0-TxRx-0\n",
+        )
+        .unwrap();
+        discover_interrupts(
+            &mut row,
+            &root.join("net"),
+            &root.join("proc"),
+            &Ok(interrupts),
+        )
+        .unwrap();
+        assert_eq!(row.queues[0].irqs, Some(vec![135]));
+        assert_eq!(row.queues[1].irqs, Some(vec![135]));
+        let irqs = row.interrupts.as_ref().unwrap();
+        assert_eq!(irqs[1].effective_cpus, Some(vec![1, 3]));
+        assert_eq!(
+            irqs[1].counts.as_ref().unwrap()[0].interrupts,
+            u64::MAX.to_string()
+        );
+        assert!(irqs[0].effective_cpus.is_none());
+        assert!(!irqs[0].errors.is_empty());
+        row.interrupts = None;
+        discover_interrupts(
+            &mut row,
+            &root.join("net"),
+            &root.join("proc"),
+            &Err("unreadable procfs".into()),
+        )
+        .unwrap();
+        assert!(
+            row.interrupts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|irq| irq.counts.is_none())
+        );
+        assert!(row.queues.iter().all(|queue| queue.irqs.is_none()));
+        assert_eq!(
+            row.interrupts.as_ref().unwrap()[1].effective_cpus,
+            Some(vec![1, 3])
+        );
+        fs::remove_file(device.join("msi_irqs/134")).unwrap();
+        fs::remove_file(device.join("msi_irqs/135")).unwrap();
+        fs::remove_dir(device.join("msi_irqs")).unwrap();
+        fs::write(device.join("irq"), "135").unwrap();
+        fs::write(root.join("proc/irq/135/effective_affinity_list"), "3-1").unwrap();
+        let interrupts =
+            crate::performance::hardware_interrupts("CPU1 CPU3\n135: 9 7 PCI-MSI test0-TxRx-0\n")
+                .unwrap();
+        discover_interrupts(
+            &mut row,
+            &root.join("net"),
+            &root.join("proc"),
+            &Ok(interrupts),
+        )
+        .unwrap();
+        let irqs = row.interrupts.as_ref().unwrap();
+        assert_eq!(irqs.len(), 1);
+        assert!(irqs[0].effective_cpus.is_none());
+        assert!(!irqs[0].errors.is_empty());
+        assert!(irqs[0].counts.is_some());
         row.index = Some(3);
         assert!(sysfs(&mut row, &root.join("net")).is_err());
         fs::remove_dir_all(&root).unwrap();

@@ -491,6 +491,72 @@ fn native_flow_sustained_capture_above_old_receive_ceiling() {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
+fn native_flow_shutdown_publishes_final_export_counters() {
+    isolated(|| {
+        let collector = UdpSocket::bind("127.0.0.1:2055")?;
+        collector.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let target = UdpSocket::bind("127.0.0.1:25001")?;
+        let sender = UdpSocket::bind("127.0.0.1:25002")?;
+        let config = config::Flow {
+            name: "shutdown-counters".into(),
+            enabled: true,
+            interface: "lo".into(),
+            collector: "127.0.0.1:2055".into(),
+            export_version: 5,
+            sampling_rate: 1,
+            max_flows: 100,
+            snaplen: 128,
+            promiscuous: false,
+            capture_filter: "udp".into(),
+            timeouts: std::collections::BTreeMap::from([
+                ("general".into(), 60),
+                ("expint".into(), 0),
+            ]),
+        };
+        let mut worker = worker::Worker::start(
+            "flow-shutdown-counters".into(),
+            None,
+            json!({"name":"shutdown-counters"}),
+            move || flow::prepare(config.clone(), true),
+        )?;
+        sender.send_to(&[0; 16], target.local_addr()?)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while worker.snapshot()["active_flows"] != 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = worker.snapshot();
+        ensure!(
+            before["active_flows"] == 1
+                && before["exported_flows"] == 0
+                && before["exported_packets"] == "0",
+            "expected one unexported active flow: {before}"
+        );
+        worker.shutdown()?;
+        let mut buffer = [0; 2048];
+        let n = collector.recv(&mut buffer)?;
+        ensure!(n == 72, "expected one shutdown v5 record, got {n} bytes");
+        let packets = u32::from_be_bytes(buffer[40..44].try_into()?);
+        let bytes = u32::from_be_bytes(buffer[44..48].try_into()?);
+        let expected_bytes = n.to_string();
+        let expected_flow_packets = packets.to_string();
+        let expected_flow_bytes = bytes.to_string();
+        let after = worker.snapshot();
+        ensure!(
+            after["state"] == "stopped"
+                && after["exported_flows"] == 1
+                && after["exported_packets"] == "1"
+                && after["exported_bytes"].as_str() == Some(expected_bytes.as_str())
+                && after["exported_flow_packets"].as_str() == Some(expected_flow_packets.as_str())
+                && after["exported_flow_bytes"].as_str() == Some(expected_flow_bytes.as_str())
+                && after["export_errors"] == "0",
+            "shutdown export totals do not match collector datagram: {after}"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
 fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
     isolated(|| {
         let directory =
@@ -542,10 +608,32 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                 "fresh loss-free exporter did not reset capture statistics: {status}"
             );
             worker.shutdown()?;
+            let status = worker.snapshot();
             ensure!(
-                worker.snapshot()["state"] == "stopped",
+                status["state"] == "stopped",
                 "flow worker shutdown failed: {}",
-                worker.snapshot()
+                status
+            );
+            for field in [
+                "exported_packets",
+                "exported_bytes",
+                "exported_flow_packets",
+                "exported_flow_bytes",
+            ] {
+                ensure!(
+                    status[field]
+                        .as_str()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|value| value > 0),
+                    "missing final export counter {field}: {status}"
+                );
+            }
+            ensure!(
+                status["exported_flows"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0)
+                    && status["export_errors"] == "0",
+                "incorrect final export totals: {status}"
             );
             if ![1, 5].contains(&version) {
                 let header = if version == 9 { 20 } else { 16 };

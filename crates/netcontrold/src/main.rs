@@ -150,7 +150,11 @@ struct Options {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run(Options::parse()).await {
-        eprintln!("netcontrold: {error:#}");
+        if tracing::enabled!(tracing::Level::ERROR) {
+            tracing::error!("netcontrold: {error:#}");
+        } else {
+            eprintln!("netcontrold: {error:#}");
+        }
         std::process::exit(1);
     }
 }
@@ -251,7 +255,13 @@ async fn run(options: Options) -> Result<()> {
         println!("{public}");
         return Ok(());
     }
-    configure_logging(&options)?;
+    let netcontrol_log = netcontrold::logs::configure(
+        (options.backend == "linux"
+            && !options.upgrade_worker
+            && !options.upgrade_recover
+            && options.configure_updates.is_none())
+        .then_some(options.services_state_dir.as_path()),
+    )?;
     if let Some(path) = &options.configure_updates {
         return netcontrold::updates::configure(path);
     }
@@ -341,61 +351,6 @@ async fn run(options: Options) -> Result<()> {
             "HTTP is unencrypted; passwords and API keys require a trusted management network"
         );
     }
-    fn configure_logging(options: &Options) -> Result<()> {
-        if options.backend != "linux" || !options.allow_host_services {
-            tracing_subscriber::fmt()
-                .json()
-                .with_writer(std::io::stderr)
-                .try_init()
-                .map_err(|_| anyhow::anyhow!("initialize daemon logging"))?;
-            return Ok(());
-        }
-        use tracing_subscriber::fmt::writer::MakeWriterExt;
-        let mut directory = std::fs::DirBuilder::new();
-        directory.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            directory.mode(0o700);
-        }
-        directory.create(&options.services_state_dir)?;
-        let path = options.services_state_dir.join("backend.log");
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    bail!("backend log must be a regular file");
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if metadata.mode() & 0o077 != 0
-                        || metadata.uid() != unsafe { libc::geteuid() }
-                        || metadata.nlink() != 1
-                    {
-                        bail!(
-                            "backend log must be private, owned by the daemon, and not hard-linked"
-                        );
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let mut open = std::fs::OpenOptions::new();
-        open.append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = open.open(path)?;
-        tracing_subscriber::fmt()
-            .json()
-            .with_writer(Mutex::new(file).and(std::io::stderr))
-            .try_init()
-            .map_err(|_| anyhow::anyhow!("initialize daemon logging"))?;
-        Ok(())
-    }
     let saved_native_startup = options.backend == "linux"
         && options.namespace.is_empty()
         && options.provision_wan.is_none();
@@ -413,15 +368,18 @@ async fn run(options: Options) -> Result<()> {
     };
     let mqtt_root = appended(&options.state, ".mqtt");
     let backend: Box<dyn Backend> = match options.backend.as_str() {
-        "linux" => Box::new(Native::open(NativeOptions {
-            namespace: options.namespace,
-            keys: options.keys,
-            adopted_parents: options.adopt_parents,
-            allow_host_tunables: options.allow_host_tunables,
-            allow_host_services: options.allow_host_services,
-            gateway_monitoring: options.allow_gateway_monitoring,
-            services_state: options.services_state_dir,
-        })?),
+        "linux" => Box::new(Native::open_with_log(
+            NativeOptions {
+                namespace: options.namespace,
+                keys: options.keys,
+                adopted_parents: options.adopt_parents,
+                allow_host_tunables: options.allow_host_tunables,
+                allow_host_services: options.allow_host_services,
+                gateway_monitoring: options.allow_gateway_monitoring,
+                services_state: options.services_state_dir,
+            },
+            netcontrol_log,
+        )?),
         _ => Box::new(Simulator::new()),
     };
     let mut engine = if options.factory_reset {

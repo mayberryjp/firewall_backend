@@ -7,6 +7,9 @@ pub fn service_response(path: &str, mut value: Value, scope: &str) -> Result<Val
         value["sample"]["scope"] = json!(scope);
     }
     match path {
+        "/api/v1/statistics/dhcp-relay" => {
+            value["scope"] = json!(scope);
+        }
         "/api/v1/statistics/vnstat" => {
             ensure!(
                 value["schema"] == "netcontrol-services/counters/v2"

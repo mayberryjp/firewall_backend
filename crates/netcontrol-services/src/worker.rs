@@ -77,6 +77,7 @@ impl Worker {
         let ctx = context.clone();
         let worker_namespace = namespace.clone();
         let worker_prepare = prepare.clone();
+        let worker_name = name.clone();
         let join = thread::Builder::new()
             .name(format!("nc-{name}"))
             .spawn(move || {
@@ -142,6 +143,7 @@ impl Worker {
                         Ok(()) => "service worker exited unexpectedly".to_owned(),
                         Err(error) => format!("{error:#}"),
                     };
+                    tracing::error!(worker = %worker_name, error = %text, "service worker failed; retrying");
                     restart_count = restart_count.saturating_add(1);
                     ctx.update(|s| {
                         s["state"] = json!("error");

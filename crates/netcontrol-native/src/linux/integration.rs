@@ -514,6 +514,33 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
     assert_eq!(&wire[4..8], &50u32.to_be_bytes());
     assert_eq!(&wire[12..16], &[10, 4, 30, 2]);
 
+    let relay_statistics = native.statistics(&enabled, "/api/v1/statistics/dhcp-relay", "")?;
+    assert_eq!(relay_statistics["worker"]["state"], "running");
+    assert_eq!(relay_statistics["totals"]["requests_forwarded"], "3");
+    assert_eq!(relay_statistics["totals"]["replies_forwarded"], "1");
+    assert_eq!(relay_statistics["totals"]["pending_transactions"], "3");
+    let relay_row = relay_statistics["interfaces"]
+        .as_array()
+        .context("missing relay counter rows")?
+        .iter()
+        .find(|row| row["interface"] == "vlan30")
+        .context("missing vlan30 relay counters")?;
+    assert_eq!(relay_row["counters"]["requests_forwarded"], "3");
+    assert_eq!(relay_row["counters"]["replies_forwarded"], "1");
+    assert_eq!(relay_row["counters"]["pending_transactions"], "3");
+    let relay_log = native.dhcp_relay_log(&netcontrol_core::DHCPRelayLogQuery::parse(
+        "interface=vlan30",
+    )?)?;
+    assert!(
+        relay_log["events"]
+            .as_array()
+            .context("missing relay events")?
+            .iter()
+            .any(|event| event["event"] == "replies_forwarded"
+                && event["message_type"] == 2
+                && event["transaction_id"] == "00000005")
+    );
+    let old_epoch = relay_log["epoch"].clone();
     drop(native);
     let mut native = Native::open(options)?;
     native.repair(&enabled)?;
@@ -523,6 +550,10 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
         snapshot["ruleset_id"]
     );
     exchange(6, &upstream, "10.4.30.1")?;
+    let restarted = native.statistics(&enabled, "/api/v1/statistics/dhcp-relay", "")?;
+    assert_ne!(restarted["epoch"], old_epoch);
+    assert_eq!(restarted["totals"]["requests_forwarded"], "1");
+    assert_eq!(restarted["totals"]["replies_forwarded"], "1");
     let mut changed = enabled.clone();
     changed.interfaces[1].addresses = vec!["10.4.30.9/24".into()];
     changed.interfaces[1].dhcp_relay.servers = vec!["10.4.40.41".into()];
@@ -571,6 +602,16 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
     assert_eq!(native.observe(&enabled)?, enabled);
     exchange(10, &upstream, "10.4.30.1")?;
     native.apply(&enabled, &disabled)?;
+    let diagnostics = native.statistics(&disabled, "/api/v1/statistics/dhcp-relay", "")?;
+    assert_eq!(diagnostics["worker"]["state"], "disabled");
+    assert_eq!(diagnostics["totals"]["pending_transactions"], "0");
+    assert!(
+        diagnostics["interfaces"]
+            .as_array()
+            .context("missing relay rows")?
+            .iter()
+            .all(|row| row["counters"].is_null())
+    );
     let stopped = native.statistics(&disabled, path, "")?;
     assert!(
         !stopped["rules"]

@@ -227,6 +227,11 @@ interface SoftflowdStatus {
   statistics_complete?: boolean;
   active_flows?: number;              // flows currently in the table
   exported_flows?: number;            // cumulative since worker start
+  exported_packets?: string;          // successful UDP datagrams
+  exported_bytes?: string;            // successful UDP payload bytes
+  exported_flow_packets?: string;     // sampled packets in successfully sent records
+  exported_flow_bytes?: string;       // sampled layer-3 bytes in successfully sent records
+  export_errors?: string;             // failed export batches (encode/send/deadline)
   excluded_packets?: number;          // sampled packets excluded (see section 3)
   filtered_packets?: number;          // sampled packets rejected by the filter
   malformed_packets?: number;         // sampled packets that failed parsing
@@ -235,10 +240,28 @@ interface SoftflowdStatus {
 
 Only a row whose worker exists (running, or failed with `error`) carries the static
 fields; an enabled instance with no worker is just `{name, state: "stopped"}` and a
-disabled one is `{name, state: "disabled"}`. The counters are JSON numbers (decimal
-strings only for `dropped_packets`); treat them as bounded display values, not for
-exact arithmetic past 2^53. All counters and `started_at` restart when the worker
-restarts.
+disabled one is `{name, state: "disabled"}`. `dropped_packets` and the five new
+export counters are exact unsigned decimal strings; the remaining counters are
+JSON numbers, not suitable for exact arithmetic past 2^53. Do not convert string
+counters through JavaScript `Number`. All counters and `started_at` reset on each
+worker execution attempt, including supervised retry, reconcile and daemon restart.
+Counters are not persisted.
+
+Export totals initialize to zero at worker entry and update after every export
+batch, including capacity/overflow expiry, partial success before an error, and
+shutdown flushing. Count only complete successful local UDP sends.
+`exported_flows` counts unidirectional records, not unique lifetime connections.
+`exported_packets` counts export UDP datagrams, not captured traffic.
+`exported_bytes` includes NetFlow/IPFIX headers, templates and padding but excludes
+UDP/IP/link headers. `exported_flow_packets` and `exported_flow_bytes` sum the
+sampled packet/layer-3 byte values in successfully sent records without scaling
+by the sampling rate; active unexported flows are not included. `export_errors`
+increments once for a failed export batch (not once per unsent record); the error
+still propagates to the worker supervisor. Totals saturate at u64 maximum.
+Each instance has independent counters. A successful send is local socket
+acceptance, **not collector acknowledgement or receipt**. Error/stopped rows
+retain their last export totals until the next execution resets them; unavailable,
+disabled and simulated fields mean unknown, not zero.
 
 | `state` | Meaning |
 | --- | --- |
@@ -251,7 +274,7 @@ restarts.
 
 Missing runtime data means **Unknown**, not Disabled. A top-level `error` stays
 visible even if rows look healthy. `dropped_packets` and `statistics_complete` are set
-when the worker starts; `active_flows`, `exported_flows` and the packet counters
+when the worker starts, as do export totals; `active_flows` and the capture packet counters
 appear after the first table scan, so a freshly started worker can show `running`
 without them.
 
@@ -288,7 +311,8 @@ Do not retry or reconcile automatically because of a warning.
 
 When MQTT streaming is enabled and at least one exporter is configured, each sample
 also publishes, per instance, `state`, `statistics_complete`, `dropped_packets`
-(exact decimal string), `active_flows`, `exported_flows`, `excluded_packets`,
+(exact decimal string), `active_flows`, `exported_flows`, `exported_packets`,
+`exported_bytes`, `exported_flow_packets`, `exported_flow_bytes`, `export_errors`, `excluded_packets`,
 `filtered_packets` and `malformed_packets`, read from the same status rows. Values
 without a running worker are unknown (not zero). See
 [FRONTEND_SPEC.md](../FRONTEND_SPEC.md#614-home-assistant-mqtt-streaming).

@@ -19,6 +19,7 @@ rand.workspace = true
 sha2.workspace = true
 hex.workspace = true
 fs2 = "0.4"
+libc.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "now"] }
 base64 = "0.22"
 zeroize = "1"

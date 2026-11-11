@@ -20,6 +20,7 @@ pub const PERMISSIONS: &[&str] = &[
     "routes.write",
     "firewall.write",
     "firewall.logs.read",
+    "logs.read",
     "nat.write",
     "wireguard.write",
     "softflowd.write",
@@ -894,6 +895,54 @@ impl Engine {
             }
             return value(&self.state.interface_capabilities).map(|v| Reply::value(200, v));
         }
+        if path == "/api/v1/logs/syslog" || path == "/api/v1/logs/netcontrol" {
+            require(permissions, "logs.read")?;
+            if method != "GET" {
+                return Err(ApiError::new(405, "method not allowed"));
+            }
+            if !body.is_empty() {
+                return Err(ApiError::new(400, "log retrieval accepts no body"));
+            }
+            let source = if path.ends_with("/syslog") {
+                crate::LogSource::Syslog
+            } else {
+                crate::LogSource::Netcontrol
+            };
+            let query = crate::LogQuery::parse(query).map_err(|e| ApiError::new(400, e))?;
+            return self
+                .backend
+                .logs(source, &query)
+                .map(|v| Reply::value(200, v))
+                .map_err(|error| {
+                    if error.is::<crate::LogCursorAhead>() {
+                        ApiError::new(400, error)
+                    } else {
+                        service_error(error)
+                    }
+                });
+        }
+        if path == "/api/v1/services/dhcp-relay/log" {
+            require(permissions, "state.read")?;
+            if method != "GET" {
+                return Err(ApiError::new(405, "method not allowed"));
+            }
+            if !body.is_empty() {
+                return Err(ApiError::new(400, "DHCP relay log accepts no body"));
+            }
+            let query = crate::DHCPRelayLogQuery::parse(query)
+                .map_err(|error| ApiError::new(400, error))?;
+            return self
+                .backend
+                .dhcp_relay_log(&query)
+                .map(|value| Reply::value(200, value))
+                .map_err(|error| {
+                    if error.to_string() == "DHCP relay cursor is ahead of the log" {
+                        ApiError::new(400, error)
+                    } else {
+                        service_error(error)
+                    }
+                });
+        }
         if path == "/api/v1/firewall/deny-log" {
             require(permissions, "firewall.logs.read")?;
             if method != "GET" {
@@ -1087,15 +1136,19 @@ impl Engine {
             require(permissions, "state.read")?;
             if matches!(
                 path,
-                "/api/v1/statistics/firewall" | "/api/v1/statistics/performance"
+                "/api/v1/statistics/firewall"
+                    | "/api/v1/statistics/performance"
+                    | "/api/v1/statistics/dhcp-relay"
             ) && !body.is_empty()
             {
                 return Err(ApiError::new(
                     400,
                     if path == "/api/v1/statistics/firewall" {
                         "firewall counters accept no request body"
-                    } else {
+                    } else if path == "/api/v1/statistics/performance" {
                         "performance diagnostics accept no request body"
+                    } else {
+                        "DHCP relay statistics accept no request body"
                     },
                 ));
             }
@@ -1356,7 +1409,7 @@ impl Engine {
         let c = self.saved_configuration();
         let enabled = match target {
             "ntp" => Some(c.ntp.enabled),
-            "syslog" => Some(c.syslog.enabled),
+            "syslog" => Some(c.syslog.enabled || self.backend.syslog_capture_active()),
             "mdns" => Some(c.mdns.enabled),
             "bgp" => Some(c.bgp.enabled),
             "vnstat" => Some(c.vnstat.enabled),
@@ -2337,6 +2390,7 @@ fn validate_statistics(path: &str, query: &str) -> ApiResult<()> {
         "/api/v1/statistics/link-diagnostics",
         "/api/v1/statistics/gateways",
         "/api/v1/statistics/vnstat",
+        "/api/v1/statistics/dhcp-relay",
     ]
     .contains(&path)
     {

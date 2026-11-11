@@ -1,3 +1,4 @@
+use super::dhcp_telemetry::{Action, Telemetry};
 use anyhow::{Result, ensure};
 use std::net::Ipv4Addr;
 const FIXED: usize = 240;
@@ -71,6 +72,47 @@ fn message_type(packet: &[u8]) -> u8 {
     }
     0
 }
+pub(crate) fn metadata(packet: &[u8]) -> Option<(u8, String, String)> {
+    valid(packet).then(|| {
+        (
+            message_type(packet),
+            format!(
+                "{:08x}",
+                u32::from_be_bytes(packet[4..8].try_into().unwrap())
+            ),
+            packet[28..34]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":"),
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_observed(
+    interfaces: Vec<super::config::Interface>,
+    telemetry: Telemetry,
+) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
+    telemetry.begin(interfaces.iter().map(|interface| interface.name.clone()))?;
+    let prepared = prepare(interfaces, telemetry.clone());
+    match prepared {
+        Ok(run) => Ok(Box::new(move |ctx| {
+            telemetry.record(None, Action::WorkerStart, "", &[], None)?;
+            let result = run(ctx);
+            telemetry.pending(Default::default())?;
+            if let Err(error) = &result {
+                telemetry.record(None, Action::WorkerError, &format!("{error:#}"), &[], None)?;
+            }
+            result
+        })),
+        Err(error) => {
+            telemetry.record(None, Action::WorkerError, &format!("{error:#}"), &[], None)?;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn request(packet: &[u8], relay: Ipv4Addr) -> Result<Vec<u8>> {
     ensure!(
         valid(packet) && packet[0] == 1,
@@ -182,6 +224,7 @@ pub(crate) fn unicast_wire(packet: &[u8], source: Ipv4Addr, target: Ipv4Addr) ->
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     interfaces: Vec<super::config::Interface>,
+    telemetry: Telemetry,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     use crate::linux as l;
     use std::{
@@ -223,6 +266,24 @@ pub(crate) fn prepare(
             BTreeMap::new();
         let mut pruned = Instant::now();
         while !ctx.stopping() {
+            if pruned.elapsed() >= Duration::from_secs(1) {
+                let mut expired = Vec::new();
+                for (key, (index, since, _, _, _)) in &transactions {
+                    if since.elapsed() >= Duration::from_secs(120) {
+                        expired.push((*key, *index));
+                    }
+                }
+                for (key, index) in expired {
+                    let name = &bindings
+                        .get(&index)
+                        .ok_or_else(|| anyhow::anyhow!("missing DHCP relay binding"))?
+                        .0;
+                    telemetry.record(Some(name), Action::Expired, "tracking_timeout", &[], None)?;
+                    telemetry.track(name, false)?;
+                    transactions.remove(&key);
+                }
+                pruned = Instant::now();
+            }
             let mut src: libc::sockaddr_storage = unsafe { mem::zeroed() };
             let mut iov = libc::iovec {
                 iov_base: buffer.as_mut_ptr() as *mut _,
@@ -248,9 +309,6 @@ pub(crate) fn prepare(
                 }
                 return Err(e.into());
             }
-            if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-                continue;
-            }
             let mut idx = 0;
             let mut destination = Ipv4Addr::UNSPECIFIED;
             unsafe {
@@ -271,33 +329,90 @@ pub(crate) fn prepare(
             }
             let packet = &buffer[..n as usize];
             let source = l::from_sockaddr(&src)?;
+            let ingress = bindings.get(&idx).map(|binding| binding.0.as_str());
+            if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+                telemetry.record(
+                    ingress,
+                    Action::Rejected,
+                    "truncated_datagram",
+                    &[],
+                    Some(source),
+                )?;
+                continue;
+            }
             let IpAddr::V4(source_ip) = source.ip() else {
+                telemetry.record(
+                    ingress,
+                    Action::Rejected,
+                    "non_ipv4_source",
+                    &[],
+                    Some(source),
+                )?;
                 continue;
             };
             if packet.len() < FIXED {
+                telemetry.record(
+                    ingress,
+                    Action::Rejected,
+                    "short_packet",
+                    packet,
+                    Some(source),
+                )?;
                 continue;
             }
-            if pruned.elapsed() >= Duration::from_secs(1) {
-                transactions.retain(|_, v| v.1.elapsed() < Duration::from_secs(120));
-                pruned = Instant::now();
-            }
             if packet[0] == 1 {
+                telemetry.record(ingress, Action::Request, "", packet, Some(source))?;
                 let Some((name, relay, servers, prefixes)) = bindings.get(&idx) else {
+                    telemetry.record(
+                        None,
+                        Action::Rejected,
+                        "unmanaged_ingress",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 };
                 if source.port() != 68
                     || !(destination == Ipv4Addr::BROADCAST || destination == *relay)
                 {
+                    telemetry.record(
+                        Some(name),
+                        Action::Rejected,
+                        "invalid_client_endpoint",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 }
                 if source_ip.is_unspecified() {
                     if !ip(packet, 12).is_unspecified() {
+                        telemetry.record(
+                            Some(name),
+                            Action::Rejected,
+                            "invalid_client_address",
+                            packet,
+                            Some(source),
+                        )?;
                         continue;
                     }
                 } else if ip(packet, 12) != source_ip || !on_link(prefixes, source_ip, *relay) {
+                    telemetry.record(
+                        Some(name),
+                        Action::Rejected,
+                        "invalid_client_address",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 }
                 let Ok(wire) = request(packet, *relay) else {
+                    telemetry.record(
+                        Some(name),
+                        Action::Rejected,
+                        "invalid_client_packet",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 };
                 let (live, addresses) = l::interface_snapshot(name)?;
@@ -306,9 +421,16 @@ pub(crate) fn prepare(
                     "relay interface changed"
                 );
                 if transactions.len() >= 65536 && !transactions.contains_key(&key(packet)) {
+                    telemetry.record(
+                        Some(name),
+                        Action::Rejected,
+                        "transaction_capacity",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 }
-                transactions.insert(
+                let previous = transactions.insert(
                     key(packet),
                     (
                         idx,
@@ -318,31 +440,87 @@ pub(crate) fn prepare(
                         packet[3] == 0,
                     ),
                 );
+                if let Some((previous, _, _, _, _)) = previous {
+                    let previous_name = &bindings
+                        .get(&previous)
+                        .ok_or_else(|| anyhow::anyhow!("missing previous DHCP relay binding"))?
+                        .0;
+                    telemetry.track(previous_name, false)?;
+                }
+                telemetry.track(name, true)?;
                 for server in servers {
                     if ctx.stopping() {
                         break;
                     }
-                    send_info(fd.as_raw_fd(), &wire, *server, 67, 0, *relay)?;
+                    let peer = SocketAddr::from((*server, 67));
+                    if let Err(error) = send_info(fd.as_raw_fd(), &wire, *server, 67, 0, *relay) {
+                        telemetry.record(
+                            Some(name),
+                            Action::SendError,
+                            "to_server",
+                            packet,
+                            Some(peer),
+                        )?;
+                        return Err(error);
+                    }
+                    telemetry.record(Some(name), Action::ToServer, "", packet, Some(peer))?;
                 }
             } else if packet[0] == 2 {
                 let Some((down, _, client, flags, _)) = transactions.get(&key(packet)) else {
+                    telemetry.record(None, Action::Reply, "", packet, Some(source))?;
+                    telemetry.record(
+                        None,
+                        Action::Rejected,
+                        "unmatched_reply",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 };
                 let Some((name, relay, servers, prefixes)) = bindings.get(down) else {
+                    telemetry.record(
+                        None,
+                        Action::Rejected,
+                        "missing_binding",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 };
+                telemetry.record(Some(name), Action::Reply, "", packet, Some(source))?;
                 if source.port() != 67
                     || !servers.contains(&source_ip)
                     || destination != *relay
                     || ip(packet, 12) != *client
                     || u16::from_be_bytes([packet[10], packet[11]]) != *flags
                 {
+                    telemetry.record(
+                        Some(name),
+                        Action::Rejected,
+                        "invalid_server_endpoint",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 }
                 let Ok((target, broadcast)) = response(packet, *relay) else {
+                    telemetry.record(
+                        Some(name),
+                        Action::Rejected,
+                        "invalid_server_packet",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 };
                 if !broadcast && !on_link(prefixes, target, *relay) {
+                    telemetry.record(
+                        Some(name),
+                        Action::Rejected,
+                        "off_link_target",
+                        packet,
+                        Some(source),
+                    )?;
                     continue;
                 }
                 let (live, addresses) = l::interface_snapshot(name)?;
@@ -368,14 +546,45 @@ pub(crate) fn prepare(
                             mem::size_of_val(&addr) as _,
                         )
                     };
-                    ensure!(
-                        sent == wire.len() as isize,
-                        "DHCP layer2 unicast failed: {}",
-                        std::io::Error::last_os_error()
-                    );
+                    if sent != wire.len() as isize {
+                        let error = std::io::Error::last_os_error();
+                        telemetry.record(
+                            Some(name),
+                            Action::SendError,
+                            "to_client_layer2",
+                            packet,
+                            Some(SocketAddr::from((target, 68))),
+                        )?;
+                        anyhow::bail!("DHCP layer2 unicast failed: {error}");
+                    }
                 } else {
-                    send_info(fd.as_raw_fd(), packet, target, 68, *down, *relay)?;
+                    if let Err(error) = send_info(fd.as_raw_fd(), packet, target, 68, *down, *relay)
+                    {
+                        telemetry.record(
+                            Some(name),
+                            Action::SendError,
+                            "to_client",
+                            packet,
+                            Some(SocketAddr::from((target, 68))),
+                        )?;
+                        return Err(error);
+                    }
                 }
+                telemetry.record(
+                    Some(name),
+                    Action::ToClient,
+                    "",
+                    packet,
+                    Some(SocketAddr::from((target, 68))),
+                )?;
+            } else {
+                telemetry.record(
+                    ingress,
+                    Action::Rejected,
+                    "invalid_op",
+                    packet,
+                    Some(source),
+                )?;
             }
             #[cfg(target_os = "linux")]
             fn send_info(
@@ -443,6 +652,11 @@ mod tests {
     #[test]
     fn relay_request_hops_cookie_options() {
         let p = packet();
+        assert_eq!(
+            metadata(&p),
+            Some((1, "00000000".into(), "02:00:00:00:00:00".into()))
+        );
+        assert!(metadata(&p[..200]).is_none());
         let r = request(&p, "192.0.2.1".parse().unwrap()).unwrap();
         assert_eq!(r[3], 1);
         assert_eq!(&r[24..28], &[192, 0, 2, 1]);

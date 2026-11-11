@@ -341,7 +341,7 @@ impl Manager {
                         .lock()
                         .map_err(|_| anyhow!("WireGuard DNS status poisoned"))? =
                         Some(format!("{failure:#}"));
-                    eprintln!("WireGuard DNS worker failed: {failure:#}");
+                    tracing::error!("WireGuard DNS worker failed: {failure:#}");
                 }
                 result
             },
@@ -409,7 +409,7 @@ impl Manager {
 impl Drop for Manager {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
-            eprintln!("WireGuard DNS shutdown failed: {error:#}");
+            tracing::error!("WireGuard DNS shutdown failed: {error:#}");
         }
     }
 }

@@ -451,7 +451,7 @@ impl Drop for Monitor {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
-                eprintln!("link diagnostics worker panicked during shutdown");
+                tracing::error!("link diagnostics worker panicked during shutdown");
             }
         }
     }

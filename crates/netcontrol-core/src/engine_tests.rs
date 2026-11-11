@@ -43,6 +43,207 @@ fn all() -> Vec<String> {
 }
 
 #[test]
+fn separate_log_apis_require_logs_permission_and_preserve_state() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let expected = json!({"entries":[{"sequence":"1","timestamp":"2026-11-11T00:00:00Z","message":"synthetic"}],"next_cursor":"0123456789abcdef0123456789abcdef:1","gap":false,"reset":false,"has_more":false});
+    faults.lock().unwrap().log_response = Some(expected.clone());
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let saved = fs::read(fixture.path()).unwrap();
+    for source in ["syslog", "netcontrol"] {
+        let path = format!("/api/v1/logs/{source}");
+        for (actor, permissions, method, query, body, status) in [
+            ("", vec!["logs.read".into()], "GET", "", "", 401),
+            ("reader", vec!["state.read".into()], "GET", "", "", 403),
+            (
+                "reader",
+                vec!["firewall.logs.read".into()],
+                "GET",
+                "",
+                "",
+                403,
+            ),
+            ("reader", vec!["logs.read".into()], "POST", "", "", 405),
+            ("reader", vec!["logs.read".into()], "GET", "", "{}", 400),
+            (
+                "reader",
+                vec!["logs.read".into()],
+                "GET",
+                "unknown=1",
+                "",
+                400,
+            ),
+            (
+                "reader",
+                vec!["logs.read".into()],
+                "GET",
+                "limit=501",
+                "",
+                400,
+            ),
+            (
+                "reader",
+                vec!["logs.read".into()],
+                "GET",
+                "cursor=0123456789abcdef0123456789abcdef:999",
+                "",
+                400,
+            ),
+            (
+                "reader",
+                vec!["logs.read".into()],
+                "GET",
+                "limit=1",
+                "",
+                200,
+            ),
+        ] {
+            let reply = engine.request(method, &path, query, actor, &permissions, body.as_bytes());
+            assert_eq!(reply.status, status, "{source}: {}", reply.body);
+            if status == 200 {
+                assert_eq!(reply.body, expected);
+            }
+        }
+    }
+    assert_eq!(
+        faults.lock().unwrap().log_sources,
+        ["syslog", "syslog", "netcontrol", "netcontrol"]
+    );
+    faults.lock().unwrap().log_response = None;
+    assert_eq!(
+        engine
+            .request(
+                "GET",
+                "/api/v1/logs/netcontrol",
+                "",
+                "reader",
+                &["logs.read".into()],
+                &[]
+            )
+            .status,
+        503
+    );
+    let simulator_fixture = Fixture::new();
+    assert_eq!(
+        simulator_fixture
+            .engine()
+            .request(
+                "GET",
+                "/api/v1/logs/syslog",
+                "",
+                "reader",
+                &["logs.read".into()],
+                &[]
+            )
+            .status,
+        503
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), saved);
+}
+
+#[test]
+fn dhcp_relay_diagnostics_api_is_authorized_validated_and_read_only() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let expected = json!({"events":[],"next_cursor":"0123456789abcdef0123456789abcdef:0","gap":false,"reset":false});
+    faults.lock().unwrap().dhcp_relay_log_response = Some(expected.clone());
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let saved = fs::read(fixture.path()).unwrap();
+    let path = "/api/v1/services/dhcp-relay/log";
+    for (actor, permissions, method, query, body, status) in [
+        ("", vec!["state.read".into()], "GET", "", "", 401),
+        ("reader", vec![], "GET", "", "", 403),
+        ("reader", vec!["state.read".into()], "POST", "", "", 405),
+        (
+            "reader",
+            vec!["state.read".into()],
+            "GET",
+            "limit=501",
+            "",
+            400,
+        ),
+        (
+            "reader",
+            vec!["state.read".into()],
+            "GET",
+            "unknown=1",
+            "",
+            400,
+        ),
+        ("reader", vec!["state.read".into()], "GET", "", "{}", 400),
+        (
+            "reader",
+            vec!["state.read".into()],
+            "GET",
+            "interface=lan&limit=1",
+            "",
+            200,
+        ),
+        (
+            "reader",
+            vec!["state.read".into()],
+            "GET",
+            "cursor=0123456789abcdef0123456789abcdef:999",
+            "",
+            400,
+        ),
+    ] {
+        let reply = engine.request(method, path, query, actor, &permissions, body.as_bytes());
+        assert_eq!(reply.status, status, "{}", reply.body);
+        if status == 200 {
+            assert_eq!(reply.body, expected);
+        }
+    }
+    assert_eq!(faults.lock().unwrap().dhcp_relay_log_calls, 2);
+    faults.lock().unwrap().dhcp_relay_log_response = None;
+    assert_eq!(
+        engine
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .status,
+        503
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), saved);
+
+    let mut simulator = Fixture::new().engine();
+    let statistics = "/api/v1/statistics/dhcp-relay";
+    let reply = simulator.request("GET", statistics, "", "reader", &["state.read".into()], &[]);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["totals"], Value::Null);
+    assert_eq!(reply.body["worker"]["state"], "simulated");
+    for (method, query, body, status) in [
+        ("GET", "unknown=1", "", 400),
+        ("GET", "", "{}", 400),
+        ("POST", "", "", 405),
+    ] {
+        assert_eq!(
+            simulator
+                .request(
+                    method,
+                    statistics,
+                    query,
+                    "reader",
+                    &["state.read".into()],
+                    body.as_bytes()
+                )
+                .status,
+            status
+        );
+    }
+    assert_eq!(
+        simulator
+            .request("GET", statistics, "", "reader", &[], &[])
+            .status,
+        403
+    );
+    assert_eq!(
+        simulator
+            .request("GET", path, "", "reader", &["state.read".into()], &[])
+            .status,
+        503
+    );
+}
+
+#[test]
 fn deny_log_retrieval_is_separate_authorized_validated_and_read_only() {
     let fixture = Fixture::new();
     let faults = Arc::new(Mutex::new(Faults::default()));
@@ -1776,6 +1977,10 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    log_response: Option<Value>,
+    log_sources: Vec<String>,
+    dhcp_relay_log_response: Option<Value>,
+    dhcp_relay_log_calls: usize,
     conntrack_capture: Option<KernelConfig>,
     conntrack_capture_calls: usize,
     vlan_prepares: usize,
@@ -1816,6 +2021,17 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn logs(&mut self, source: crate::LogSource, query: &crate::LogQuery) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.log_sources.push(source.as_str().to_owned());
+        if query.cursor.as_ref().is_some_and(|(_, seq)| *seq == 999) {
+            return Err(crate::LogCursorAhead.into());
+        }
+        faults
+            .log_response
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("injected log unavailable"))
+    }
     fn capture_conntrack_tunables(&mut self, _: &KernelConfig) -> Result<KernelConfig> {
         let mut faults = self.0.lock().unwrap();
         faults.conntrack_capture_calls += 1;
@@ -1902,6 +2118,21 @@ impl Backend for FaultBackend {
             .reporting_identities
             .push(system.clone());
         Ok(())
+    }
+    fn dhcp_relay_log(&mut self, query: &crate::DHCPRelayLogQuery) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.dhcp_relay_log_calls += 1;
+        if query
+            .cursor
+            .as_ref()
+            .is_some_and(|(_, sequence)| *sequence == 999)
+        {
+            anyhow::bail!("DHCP relay cursor is ahead of the log");
+        }
+        faults
+            .dhcp_relay_log_response
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("injected relay log unavailable"))
     }
     fn deny_log(&mut self, _: &crate::DenyLogQuery) -> Result<Value> {
         let mut faults = self.0.lock().unwrap();

@@ -132,7 +132,7 @@ impl Monitor {
                 };
                 let result = run(&socket, &output, &stopping);
                 if let Err(error) = result {
-                    eprintln!("firewall deny logging failed: {error:#}");
+                    tracing::error!("firewall deny logging failed: {error:#}");
                     if let Ok(mut state) = output.lock() {
                         state.status = "error";
                         state.error = Some(format!("{error:#}"));
@@ -194,7 +194,7 @@ impl Monitor {
 impl Drop for Monitor {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
-            eprintln!("deny-log shutdown failed: {error:#}");
+            tracing::error!("deny-log shutdown failed: {error:#}");
         }
     }
 }

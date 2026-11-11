@@ -251,7 +251,7 @@ impl Manager {
 impl Drop for Manager {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
-            eprintln!("BGP shutdown failed: {error:#}");
+            tracing::error!("BGP shutdown failed: {error:#}");
         }
     }
 }

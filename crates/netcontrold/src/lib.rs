@@ -6,6 +6,7 @@ pub mod host_system;
 pub mod http;
 pub mod identity;
 pub mod local_control;
+pub mod logs;
 pub mod mqtt;
 mod mqtt_flow;
 mod mqtt_host;

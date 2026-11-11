@@ -724,7 +724,22 @@ fn parse_softnet(text: &str) -> Result<Counters> {
     })
 }
 
-fn parse_interrupts(text: &str) -> Result<Counters> {
+pub(crate) struct HardwareInterrupt {
+    pub irq: u32,
+    pub description: String,
+    pub counts: Vec<(u32, u64)>,
+}
+
+pub(crate) fn read_hardware_interrupts(path: &Path) -> Result<Vec<HardwareInterrupt>> {
+    let text = HostSources {
+        remaining_bytes: MAX_BYTES,
+        remaining_files: 1,
+    }
+    .read(path)?;
+    hardware_interrupts(&text)
+}
+
+pub(crate) fn hardware_interrupts(text: &str) -> Result<Vec<HardwareInterrupt>> {
     let lines = lines(text)?;
     let cpus = cpu_header(lines.first().context("missing interrupt header")?)?;
     let mut rows = Vec::new();
@@ -748,11 +763,31 @@ fn parse_interrupts(text: &str) -> Result<Counters> {
         }
         let description = words.collect::<Vec<_>>().join(" ");
         ensure!(!description.is_empty(), "missing hardware IRQ description");
-        for (id, count) in cpus.iter().zip(counts) {
-            ensure!(
-                rows.len() < MAX_IRQ_CPU_ROWS,
-                "IRQ/CPU matrix exceeds row limit"
-            );
+        ensure!(
+            (rows.len() + 1) * cpus.len() <= MAX_IRQ_CPU_ROWS,
+            "IRQ/CPU matrix exceeds row limit"
+        );
+        rows.push(HardwareInterrupt {
+            irq,
+            description,
+            counts: cpus.iter().copied().zip(counts).collect(),
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_interrupts(text: &str) -> Result<Counters> {
+    let interrupts = hardware_interrupts(text)?;
+    let source_lines = lines(text)?;
+    let cpus = cpu_header(source_lines.first().context("missing interrupt header")?)?;
+    let mut rows = Vec::new();
+    for HardwareInterrupt {
+        irq,
+        description,
+        counts,
+    } in interrupts
+    {
+        for (id, count) in counts {
             rows.push(CounterRow {
                 key: format!("{irq}/{id}/{description}"),
                 metadata: json!({"irq":irq,"cpu_id":id,"description":description}),

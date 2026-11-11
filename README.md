@@ -43,6 +43,23 @@ its synthetic interfaces, addresses, revision and firewall policy. Govee LAN
 Control must be enabled; discovery does not grant routed device access. This
 runs inside Netcontrol with automatic reconnect/retry, not an external package.
 
+## Persistent log viewing
+
+`GET /api/v1/logs/syslog` reads locally captured journald/socket messages;
+`GET /api/v1/logs/netcontrol` reads daemon diagnostics and native backend events.
+Both require the separate `logs.read` permission and support bounded cursor
+polling. Each stream retains four 2 MiB segments under
+`<services-state-dir>/logs`, survives daemon restart and reports cursor gaps
+when old segments expire. No whole-file download or forwarding replay.
+
+With the host-services opt-in and valid systemd/journald activation, local
+socket capture runs even when `syslog.enabled` is false; that setting controls
+remote forwarding only. Runtime/MQTT `forwarding_enabled` distinguishes the
+forwarding setting from the capture worker's state. Simulator log APIs return
+explicit unavailability. Logs can contain sensitive third-party text: restrict
+log-reading keys and render text safely. See the
+[API contract](FRONTEND_SPEC.md#persistent-log-viewing-apis).
+
 Host-wide traffic accounting uses one Rust worker for every kernel interface,
 including unmanaged, VLAN, tunnel, veth and loopback links. Optional
 `vnstat.collector` sends one `hostname.domain|vnstat --oneline`-format UDP datagram per
@@ -71,6 +88,17 @@ offload evidence are daemon-owned observations, not editable configuration.
 Refresh is an explicit scan-and-save GET for GET-only API explorers, not a
 read-only resource: never prefetch, automatically retry, cache or poll it.
 Unknown/partial results are explicit; no tuning or device rebinding occurs.
+RSS details report the default indirection table and raw hash/transform settings,
+not the hash key. Enabled means observed multi-queue distribution with identified
+hashing, not simply multiple queues. Physical device IRQs expose effective CPU
+affinity and exact cumulative per-CPU interrupt counts; queues map to IRQs only
+when exact driver action names establish identity. Unknown mappings stay explicit.
+IRQ CPU placement is separate from RPS and does not prove balanced processing.
+VLAN RPS reports the observed physical parent's enabled/disabled state with
+`inherited_from` naming that parent, including stacked VLANs. Unresolved ancestry
+or missing parent measurements remain unknown, never disabled by default.
+The VLAN's own queue masks remain raw diagnostics, not its normal receive-path
+RPS setting. Configure RPS on the physical parent, not the VLAN.
 DPDK readiness requires future PMD-specific validation. See the
 [design](docs/INTERFACE_CAPABILITIES.md) and
 [frontend contract](FRONTEND_SPEC.md#interface-capability-snapshots).
@@ -211,6 +239,17 @@ return routes, DHCP scopes and permissions on other firewalls. Inspect generated
 `input:generated/input/dhcp_relay/<interface>/clients` and `/servers` rows at
 `GET /api/v1/statistics/firewall`, alongside worker status and packet captures.
 See the [relay contract](FRONTEND_SPEC.md#621-per-interface-dhcpv4-relay).
+
+Relay diagnostics are also available with `state.read`:
+`GET /api/v1/statistics/dhcp-relay` returns per-interface and shared-worker
+received/forwarded/rejected/error/expiry counters plus pending tracking entries.
+`GET /api/v1/services/dhcp-relay/log` offers a 2048-event in-memory ring with
+cursor-based polling (about once per second), optional interface filtering and
+explicit overwrite/reset markers. No packet payloads or disk log; daemon
+restart clears history. Counters reset per worker attempt, not per API read.
+These are forwarding observations, not proof of DHCP lease completion. See the
+[diagnostics contract](FRONTEND_SPEC.md#dhcp-relay-diagnostics) and
+[frontend handoff](docs/frontend-handoffs/2026-11-11.md#2026-11-11-02-dhcp-relay-diagnostics).
 
 ## Bulk firewall clearing
 
@@ -749,7 +788,11 @@ summaries, interface counters, configuration revision and daemon uptime, plus ho
 health: memory/swap, load, uptime, pressure, **per-core CPU busy percent**, **per
 temperature/fan sensor** (thermal zones and hwmon) and local filesystem space, and
 per-instance NetFlow/IPFIX export state, **dropped capture packets**, active/exported
-flows and excluded/filtered/malformed packet counters. Coverage also includes
+flows, exported UDP datagrams/payload bytes, sampled packets/bytes represented
+by sent flow records, export errors and excluded/filtered/malformed packet counters.
+The same per-instance totals are available in the
+[runtime/status API](docs/NETFLOW_IPFIX_SPEC.md#5-runtime-and-status-api);
+they reset on worker restart and do not confirm collector receipt. Coverage also includes
 all interface error counters, IP/TCP/UDP/ICMP kernel counters, disk I/O, VM and
 scheduler counters, all PSI windows, service/NTP/syslog/mDNS/relay statistics,
 DHCP lease summaries, WireGuard peer byte counters/handshakes, BGP neighbor

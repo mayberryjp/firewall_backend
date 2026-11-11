@@ -107,6 +107,9 @@ pub struct Native;
 
 #[cfg(not(target_os = "linux"))]
 impl Native {
+    pub fn open_with_log(_: NativeOptions, _: Option<netcontrol_core::DiskLog>) -> Result<Self> {
+        bail!("the native backend requires Linux; no non-Linux networking fallback exists")
+    }
     pub fn open(_: NativeOptions) -> Result<Self> {
         bail!("the native backend requires Linux; no non-Linux networking fallback exists")
     }

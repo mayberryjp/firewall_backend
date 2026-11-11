@@ -47,6 +47,21 @@ pub fn sensors(status: Option<&Value>) -> HostSensors {
             ("dropped_packets", "dropped packets", "packets", COUNTER),
             ("active_flows", "active flows", "flows", GAUGE),
             ("exported_flows", "exported flows", "flows", COUNTER),
+            (
+                "exported_packets",
+                "exported UDP packets",
+                "packets",
+                COUNTER,
+            ),
+            ("exported_bytes", "exported UDP payload bytes", "B", COUNTER),
+            (
+                "exported_flow_packets",
+                "exported flow packets",
+                "packets",
+                COUNTER,
+            ),
+            ("exported_flow_bytes", "exported flow bytes", "B", COUNTER),
+            ("export_errors", "export errors", "errors", COUNTER),
             ("excluded_packets", "excluded packets", "packets", COUNTER),
             ("filtered_packets", "filtered packets", "packets", COUNTER),
             ("malformed_packets", "malformed packets", "packets", COUNTER),
@@ -91,7 +106,9 @@ mod tests {
     fn flow_sensors_keep_exact_drops_and_report_unknown_as_null() {
         let status = json!({"error":"","instances":[
             {"name":"office","state":"running","dropped_packets":"18446744073709551615","statistics_complete":false,
-             "active_flows":4,"exported_flows":9,"excluded_packets":1,"filtered_packets":2,"malformed_packets":0},
+             "active_flows":4,"exported_flows":9,"exported_packets":"3","exported_bytes":"1800",
+             "exported_flow_packets":"18446744073709551615","exported_flow_bytes":"9000","export_errors":"0",
+             "excluded_packets":1,"filtered_packets":2,"malformed_packets":0},
             {"name":"lab","state":"stopped","active_flows":"9","dropped_packets":"7","statistics_complete":true},
             {"name":"off","state":"disabled"}]});
         let sensors = sensors(Some(&status));
@@ -103,6 +120,14 @@ mod tests {
         assert_eq!(value(&sensors, "office", "statistics_complete"), false);
         assert_eq!(value(&sensors, "office", "state"), "running");
         assert_eq!(value(&sensors, "office", "active_flows"), json!(4));
+        assert_eq!(value(&sensors, "office", "exported_packets"), "3");
+        assert_eq!(value(&sensors, "office", "exported_bytes"), "1800");
+        assert_eq!(
+            value(&sensors, "office", "exported_flow_packets"),
+            "18446744073709551615"
+        );
+        assert_eq!(value(&sensors, "office", "exported_flow_bytes"), "9000");
+        assert_eq!(value(&sensors, "office", "export_errors"), "0");
         assert_eq!(value(&sensors, "office", "malformed_packets"), json!(0));
         for name in ["lab", "off"] {
             for field in [
@@ -110,6 +135,11 @@ mod tests {
                 "statistics_complete",
                 "active_flows",
                 "exported_flows",
+                "exported_packets",
+                "exported_bytes",
+                "exported_flow_packets",
+                "exported_flow_bytes",
+                "export_errors",
                 "excluded_packets",
                 "filtered_packets",
                 "malformed_packets",

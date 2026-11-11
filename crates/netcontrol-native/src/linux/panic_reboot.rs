@@ -142,15 +142,15 @@ impl Guard {
                     let mut current = match output.lock() {
                         Ok(current) => current,
                         Err(error) => {
-                            eprintln!("panic reboot enforcement status poisoned: {error}");
+                            tracing::error!("panic reboot enforcement status poisoned: {error}");
                             break;
                         }
                     };
                     if *current != next {
                         if let Some(error) = &next {
-                            eprintln!("panic reboot enforcement failed; retrying: {error}");
+                            tracing::error!("panic reboot enforcement failed; retrying: {error}");
                         } else {
-                            eprintln!("panic reboot enforcement recovered");
+                            tracing::info!("panic reboot enforcement recovered");
                         }
                     }
                     *current = next;
@@ -194,7 +194,7 @@ impl Drop for Guard {
             .take()
             .is_some_and(|thread| thread.join().is_err())
         {
-            eprintln!("panic reboot enforcement thread panicked");
+            tracing::error!("panic reboot enforcement thread panicked");
         }
     }
 }

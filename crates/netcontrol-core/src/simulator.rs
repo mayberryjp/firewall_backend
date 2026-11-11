@@ -239,6 +239,9 @@ impl Backend for Simulator {
             appliance.push(
                 json!({"name":name,"scope":scope,"state":if enabled{"simulated"}else{"disabled"}}),
             );
+            if name == "syslog" {
+                appliance.last_mut().unwrap()["forwarding_enabled"] = json!(enabled);
+            }
         }
         let softflowd: Vec<_> = config
             .softflowd
@@ -338,6 +341,17 @@ impl Backend for Simulator {
             ensure!(config.vnstat.enabled, "vnstat is disabled");
             anyhow::bail!(
                 "traffic history unavailable: simulator does not collect traffic counters"
+            );
+        }
+        if path == "/api/v1/statistics/dhcp-relay" {
+            return Ok(
+                json!({"scope":"simulator","worker":{"name":"dhcp-relay","state":"simulated"},
+                "epoch":null,"generation":null,"counters_since":null,"collected_at":null,"totals":null,
+                "log_capacity":null,"log_overwritten":null,
+                "interfaces":config.interfaces.iter().map(|interface|json!({
+                    "interface":interface.name,"enabled":interface.dhcp_relay.enabled,
+                    "state":if interface.dhcp_relay.enabled {"simulated"}else{"disabled"},"counters":null
+                })).collect::<Vec<_>>()}),
             );
         }
         let sample = json!({"scope":"simulator","started_at":Utc::now(),"collected_at":Utc::now(),"status":"simulated"});

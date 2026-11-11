@@ -205,15 +205,29 @@ pub fn services(runtime: Option<&Value>) -> Result<HostSensors> {
                         }
                     }
                     "syslog" => {
-                        for field in ["captured_records", "forwarded_records", "failed_deliveries"]
-                        {
+                        metric(
+                            &mut out,
+                            "service",
+                            &identity,
+                            "forwarding_enabled",
+                            &row["forwarding_enabled"],
+                            None,
+                            None,
+                        );
+                        for field in [
+                            "received_records",
+                            "captured_records",
+                            "forwarded_records",
+                            "forwarded_deliveries",
+                            "failed_deliveries",
+                        ] {
                             metric(
                                 &mut out,
                                 "service",
                                 &identity,
                                 field,
                                 if running { &row[field] } else { &Value::Null },
-                                Some(if field == "failed_deliveries" {
+                                Some(if field.ends_with("_deliveries") {
                                     "deliveries"
                                 } else {
                                     "records"
@@ -826,7 +840,8 @@ pub(crate) mod tests {
             "appliance_services":[
                 {"name":"ntp","state":"running","sample_status":"available","offset_ms":-2.5,
                     "delay_ms":1.0,"requested_slew_ms":-2.0,"uncorrected_offset_ms":-0.5},
-                {"name":"syslog","state":"running","captured_records":"18446744073709551615",
+                {"name":"syslog","state":"running","forwarding_enabled":false,"received_records":"18446744073709551615",
+                    "captured_records":"18446744073709551615","forwarded_deliveries":"85",
                     "forwarded_records":"42","failed_deliveries":"3","destination_errors":["omit-private-error"]},
                 {"name":"mdns","state":"running","collected_at":"2026-10-30T12:00:00Z",
                     "received_packets":"13","receive_drops":null,"queue_drops":"2","statistics_complete":false,
@@ -920,6 +935,14 @@ pub(crate) mod tests {
                 json!("18446744073709551615"),
             ),
             ("service", "syslog", "destination_error_count", json!(1)),
+            ("service", "syslog", "forwarding_enabled", json!(false)),
+            (
+                "service",
+                "syslog",
+                "received_records",
+                json!("18446744073709551615"),
+            ),
+            ("service", "syslog", "forwarded_deliveries", json!("85")),
             ("service", "mdns", "statistics_complete", json!(false)),
             ("service", "mdns", "queue_drops", json!("2")),
             ("service", "mdns", "malformed_packets", json!("4")),
@@ -1003,6 +1026,8 @@ pub(crate) mod tests {
         for (kind, name, field) in [
             ("service", "ntp", "offset_ms"),
             ("service", "syslog", "captured_records"),
+            ("service", "syslog", "received_records"),
+            ("service", "syslog", "forwarded_deliveries"),
             ("service", "mdns", "queue_drops"),
             ("service", "udp-broadcast-relay:7", "received_packets"),
             ("service", "vnstat", "sent_datagrams"),

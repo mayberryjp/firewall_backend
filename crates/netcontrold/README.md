@@ -27,8 +27,8 @@ Specifically removed: `--softflowd-binary`, `--softflowd-runtime-dir`,
 `--softflowd-uid`, `--softflowd-gid`, `--dhcp-relay-binary`,
 `--dhcp-relay-runtime-dir`, `--dhcp-relay-uid`, `--dhcp-relay-gid`,
 `--ntp-binary`, `--syslog-binary`, `--vnstatd-binary`, `--vnstat-binary`,
-and `--services-runtime-dir`. `--backend-log-file` is replaced by the fixed
-`<services-state-dir>/backend.log` audit file; `--syslog-ca-file` is replaced by
+and `--services-runtime-dir`. Daemon/native diagnostics use the fixed
+`<services-state-dir>/logs/netcontrol` rotating history; `--syslog-ca-file` is replaced by
 the native service's system-trust TLS policy. The WireGuard key-directory
 default is now `/etc/netcontrol/keys`.
 
@@ -85,13 +85,31 @@ upgrade/restart workflows. See the
 [operational API contract](../../FRONTEND_SPEC.md#operational-restart-and-dns-diagnostics)
 for complete request/response, authorization, targets, timing and failure rules.
 
-With host services enabled on Linux, structured daemon events are appended to
-`<services-state-dir>/backend.log` and stderr. The file is private; native syslog
-receives the stderr copy through journald forwarding, not by tailing the file.
+In native Linux daemon mode, structured daemon events are written to private
+rotating `<services-state-dir>/logs/netcontrol` history and stderr. Native backend
+events share that history; worker diagnostics use the same tracing sink.
+Native syslog receives the stderr copy through journald forwarding, not by
+tailing the history. Standalone upgrade/configuration helpers and local key/
+conversion CLI output are not captured by the daemon's direct history sink.
+Early failures before logging initialization still print to stderr.
 Native syslog requires systemd socket activation from `netcontrol-syslog.socket`
 and journald `ForwardToSyslog=yes`; OpenRC/direct launches cannot enable it.
+With the host-services opt-in and valid activation, local socket capture runs
+regardless of `syslog.enabled`; only remote forwarding depends on that flag.
 Request bodies, raw URLs, cookies, passwords,
 Authorization headers, and API-key tokens are never logged.
+
+`GET /api/v1/logs/syslog` and `GET /api/v1/logs/netcontrol` require `logs.read`
+(not `state.read` or `syslog.write`) and expose separately retained streams,
+each bounded to four 2 MiB segments. Default reads show the latest 100 records;
+strict `cursor`/`limit` queries page/poll chronologically, with limit 1..500
+and a 512 KiB entry-data budget. Records contain exact string sequences,
+capture timestamps and message text. Cursor identity/sequences survive restart;
+expired history and foreign-stream cursors are explicit gap/reset markers.
+Simulator returns 503, not invented logs. Legacy `backend.log` and
+`syslog-host.log` files are neither imported nor deleted. Full contract,
+retention/error limitations and frontend requirements:
+[persistent log APIs](../../FRONTEND_SPEC.md#persistent-log-viewing-apis).
 
 ## Configuration SSH
 

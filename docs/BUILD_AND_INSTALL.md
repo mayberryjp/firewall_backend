@@ -1654,7 +1654,11 @@ Kernel + daemon stdout/stderr -> journald -------------------------------^
 Journald keeps `/dev/log`, kernel capture and its local journal even when native
 syslog is disabled. Netcontrol neither binds/unlinks `/dev/log`, reads
 `/dev/kmsg`, nor tails `backend.log`; this avoids duplicate kernel/backend
-forwarding. `backend.log` remains a private daemon audit file. Messages from
+forwarding. Private daemon/native history now uses `logs/netcontrol`, and local
+socket history uses `logs/syslog`, below the services state directory. Each stream
+retains four 2 MiB segments with private identity/lock files. Old `backend.log`
+and `syslog-host.log` are preserved but no longer written, imported or served.
+Messages from
 journald are wrapped as RFC5424 records with APP-NAME `journald`; original
 forwarded headers stay in message text, not structured journal fields.
 
@@ -1702,11 +1706,28 @@ systemd deployments must provide the equivalent units/journald settings.
 Signed API/package upgrades update binaries, not this deployment setup; provision
 it before deploying code with enabled native syslog. Use console/independent OS SSH.
 
-Saved syslog stays opt-in: disabled means no native remote forwarding, while
-journald still captures locally. The socket queue is bounded, not durable:
-messages may be buffered while disabled and forwarded on later enable, or lost
-to overflow/rate limits. Daemon stop/restart discards the managed socket queue.
-No journal replay/cursor, exact coverage or remote acknowledgment is provided.
+Saved syslog stays opt-in for remote forwarding: disabled means no destination
+connections/sends. With host-services opt-in and valid activation, Netcontrol
+continues local socket capture into rotating disk history, in addition to
+journald's journal. Previously captured records are never forwarded on enable.
+The socket queue remains bounded/non-durable during worker stop/restart and may
+overflow; daemon stop/restart discards it, not the retained disk history.
+No journal replay, exact coverage or remote acknowledgment is provided.
+`GET /api/v1/logs/syslog` and `GET /api/v1/logs/netcontrol` require `logs.read`
+and provide bounded retained-history cursors, not journald cursors.
+Restrict log-reading keys: captured third-party messages may contain sensitive
+text, and this is not a tamper-evident audit service.
+
+Allow at least 16 MiB for both streams, plus small identity/lock metadata and
+one temporary extra segment per stream during rotation/recovery. Writes use
+`sync_data`; rotation/directory changes are synchronized on Linux. High log
+volume can still exceed capture/socket/disk throughput, and power/device failure
+can leave incomplete history. Storage/ownership/corruption errors are explicit;
+partial write errors require restart, and corrupt history requires operator
+repair without automatic data deletion/reset. Do not edit/rotate these owned
+segment files with an external log-rotation tool. History and cursor identity
+survive normal restart and worker repair; current source availability is
+reported independently from retained records.
 
 Verify `systemctl status netcontrold netcontrol-syslog.socket systemd-journald`
 and effective `systemd-analyze cat-config systemd/journald.conf`, then use a
@@ -1719,7 +1740,9 @@ An already blocked transaction/failed rollback still needs explicit operator
 recovery; these scripts do not clear it.
 
 Host-service permission also permits other native services **when enabled in
-saved configuration**. It does not turn on NTP/syslog/traffic workers, add
+saved configuration**. It also permits local syslog capture when its inherited
+socket is available, independently of remote forwarding. It does not turn on
+NTP/remote syslog/traffic collection, add
 monitors or change firewall/routing configuration by itself. Review saved service
 settings and competing host-service ownership before deployment.
 

@@ -4,6 +4,61 @@
 
 ### Added
 
+- Read-only RSS default-context table/hash/transform details and physical-device
+  IRQ effective CPU affinities/exact cumulative per-CPU counts in interface
+  capability snapshots. Map queue IRQs only from unique exact driver actions;
+  preserve unknown fields and diagnostics. RSS activation now distinguishes
+  observed multi-queue hashing from support alone. No tuning or packet-path
+  changes. Release impact: additive metadata and reporting fix; next automatic
+  calendar version. Required frontend review:
+  [handoff 2026-11-11-06](docs/frontend-handoffs/2026-11-11.md#2026-11-11-06-rss-and-queue-irq-observations).
+
+- Separate `logs.read` APIs at `GET /api/v1/logs/syslog` and
+  `GET /api/v1/logs/netcontrol`, with bounded cursor paging, retention-gap/reset
+  markers and private rotating disk history (four 2 MiB segments per stream).
+  Capture socket logs independently of remote forwarding when host-services
+  opt-in/systemd activation are available; expose `forwarding_enabled` in
+  runtime/status/MQTT and permit restart of active local capture. Capture
+  daemon/native/worker diagnostics in the direct stream. Preserve old text
+  files without importing/deleting them. Release impact: additive read APIs
+  and breaking logging-path/worker-state deployment contract; next automatic
+  calendar version. Required frontend/operator update:
+  [handoff 2026-11-11-05](docs/frontend-handoffs/2026-11-11.md#2026-11-11-05-persistent-socket-and-netcontrol-log-apis).
+
+- Interface capability `inherited_from` source metadata. VLAN RPS reports the
+  observed physical parent's enabled/disabled/unknown state, including stacked
+  VLANs, while preserving raw VLAN queue masks. Unresolved or ambiguous ancestry
+  is explicitly unknown; no per-VLAN tuning or packet-path changes.
+  Release impact: breaking VLAN reporting semantics with additive metadata;
+  next automatic calendar version. Required frontend labeling:
+  [handoff 2026-11-11-04](docs/frontend-handoffs/2026-11-11.md#2026-11-11-04-vlan-rps-parent-reporting).
+
+- DHCPv4 relay diagnostics: `state.read` APIs for cursor-based polling of a
+  bounded 2048-event in-memory log and decimal-string counters per relay
+  interface plus shared-worker totals. Report forwarding/rejections/send errors,
+  pending tracking/expiry, worker attempt identity and log gaps/restarts without
+  packet payloads or disk persistence. Idle tracking now expires on schedule.
+  Release impact: additive API and tracking-expiry fix; next automatic calendar
+  version. Required diagnostics UI review:
+  [handoff 2026-11-11-02](docs/frontend-handoffs/2026-11-11.md#2026-11-11-02-dhcp-relay-diagnostics).
+
+- Per-instance NetFlow/IPFIX export counters for successful UDP datagrams and
+  payload bytes, sampled packets/bytes represented by sent flow records, and
+  failed export batches, alongside existing exported-flow totals. Publish exact
+  decimal strings in runtime/status and MQTT, account for partial success and
+  shutdown flushing, and reset per execution attempt. UDP success does not prove
+  collector receipt. Release impact: additive observability; next automatic
+  calendar version. Required frontend statistics:
+  [handoff 2026-11-11-03](docs/frontend-handoffs/2026-11-11.md#2026-11-11-03-per-instance-netflow-export-counters).
+
+- Syslog `received_records` (journald datagrams read) and `forwarded_deliveries`
+  (successful per-destination sends, including partial fan-out) in runtime/status
+  and MQTT service statistics. Preserve observed counters on processing errors
+  and reset all syslog counters explicitly per execution attempt. No remote
+  receipt guarantee or durable queue. Release impact: additive observability
+  and counter-reset fix; next automatic calendar version.
+  [Frontend handoff 2026-11-11-01](docs/frontend-handoffs/2026-11-11.md#2026-11-11-01-syslog-read-and-relay-counters).
+
 - Mandatory native-host `kernel.panic=10` ownership: attempt reboot ten seconds
   after a kernel panic, overwrite conflicts at startup, durably persist the boot
   setting and reclaim live/owned-file drift every second in Rust. Expose measured
@@ -286,6 +341,12 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Complete combined-worktree validation for the unreleased diagnostics work:
+  synchronize Cargo lockfile dependency edges without changing versions,
+  initialize RSS test fixtures with their required capability entry, and keep
+  NetFlow decimal-string assertions exact while removing lint warnings.
+  Build/test corrections only; no additional API or runtime contract change.
 
 - Stage configured-up managed Ethernet links, including static and DHCP
   interfaces, before restoring leases during host startup reconciliation and

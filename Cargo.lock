@@ -1888,6 +1888,7 @@ dependencies = [
  "chrono",
  "fs2",
  "hex",
+ "libc",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -1923,6 +1924,7 @@ dependencies = [
  "sha2 0.10.9",
  "time",
  "tokio",
+ "tracing",
  "wireguard-control",
  "zbus",
 ]
@@ -1960,6 +1962,7 @@ dependencies = [
  "sha2 0.11.1",
  "subtle",
  "time",
+ "tracing",
  "zeroize",
 ]
 

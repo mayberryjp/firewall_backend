@@ -1,10 +1,17 @@
 //! Typed networking domain, durable transactions, and deterministic simulator.
 mod bgp;
 mod deny_log;
+mod dhcp_relay;
 mod diagnostics;
+mod logs;
+pub use logs::{
+    DiskLog, LOG_MESSAGE_BYTES, LOG_PAGE_BYTES, LOG_SEGMENT_BYTES, LOG_SEGMENTS, LogCursorAhead,
+    LogEntry, LogPage, LogQuery, LogSource,
+};
 mod path_test;
 pub use bgp::{BGPConfig, BGPNeighbor};
 pub use deny_log::{DenyLogQuery, DenyRecord, DenyTrafficTag};
+pub use dhcp_relay::DHCPRelayLogQuery;
 pub use path_test::{
     PATH_TEST_ARM_SECONDS, PATH_TEST_LIFETIME_SECONDS, PATH_TEST_PORT, PATH_TEST_RUN_SECONDS,
     PathTestParent, PathTestRequest,
@@ -72,6 +79,15 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    fn syslog_capture_active(&self) -> bool {
+        false
+    }
+    fn logs(&mut self, _source: LogSource, _query: &LogQuery) -> Result<Value> {
+        anyhow::bail!("log history requires the native Linux backend")
+    }
+    fn dhcp_relay_log(&mut self, _query: &DHCPRelayLogQuery) -> Result<Value> {
+        anyhow::bail!("DHCP relay logs require the native Linux backend")
+    }
     /// Capture only: no networking or ownership changes before the core intent is durable.
     fn prepare_vlan_adoption(
         &mut self,

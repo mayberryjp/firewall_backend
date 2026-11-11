@@ -61,11 +61,44 @@ Each interface contains `name`, nullable kernel `index`/`mac`, `kind`, nullable
   visible; never manufacture speed/duplex support from current speed.
 - Queues: RX/TX names and CPU masks/flow-table sizes, plus a nullable `channels`
   object with ethtool channel maxima and current counts when exposed. CPU masks
-  are Linux hexadecimal masks.
+  are Linux hexadecimal masks. Nullable `irqs` and `irq_mapping_reason` describe
+  an observed unique hardware IRQ mapping or explain why it is unknown.
+- RSS: nullable `rss` contains default `context:0`, nullable RX queue index
+  `indirection_table` and raw unsigned-byte `hash_function`/
+  `input_transformation` bitmasks. No hash key is serialized. RSS activation
+  is true for multiple table targets with recognized active hash bits (1/2/4
+  for Toeplitz/XOR/CRC32), false for a table targeting at most one queue, and
+  unknown for missing details or unrecognized hashing with multiple targets.
+  Support remains driver-table evidence, independent of activation/CPU affinity.
+- Interrupts: nullable `interrupts` lists device IRQ numbers, nullable
+  descriptions/effective logical CPU IDs and cumulative per-CPU counts
+  (`cpu_id`, exact decimal-string `interrupts`), plus errors per IRQ.
+  Event IRQs remain visible even without a queue association. Missing sources
+  are null independently, never zero. These are interrupt events, not packet
+  counts, utilization or post-RPS CPU measurements.
 - Capabilities: stable feature `name`, `support` (`supported`, `unsupported`,
-  `unknown`, `not_applicable`), nullable `enabled`, evidence strings and nullable
-  reason. Enabled is unknown unless directly observed; support is never proof
-  of availability, activation or operational verification.
+  `unknown`, `not_applicable`), nullable `enabled`/`inherited_from`, evidence
+  strings and nullable reason. Activation requires observed queue evidence;
+  support is never proof of operational verification or performance benefit.
+
+For VLAN RPS, `support`/`enabled` come from the observed physical parent and
+`inherited_from` names that source, including stacked VLANs. Render Enabled or
+Disabled plus "Inherited from <parent>", not an independent third activation
+state. A parent with unknown activation remains `enabled:null` with its source
+name. Non-VLAN capabilities and simulator rows use null `inherited_from`.
+The VLAN's own `queues[].rps_cpus` stays unchanged as diagnostic evidence:
+ordinary tagged receive traffic is steered on the physical device before VLAN
+demultiplexing, without a second RPS selection using the VLAN's mask.
+At least one enabled parent queue means enabled, not that every queue/flow is
+steered. Per-VLAN configuration remains rejected.
+
+Unresolved/missing/cross-namespace ancestry, cycles, more than 32 ancestry links,
+missing physical identity or ambiguous software parents (bridge/bond/veth)
+produce unknown RPS with null source and explicit row errors/reason. Never
+infer disabled or fabricate ancestry. VLAN inheritance affects only RPS;
+RSS and device IRQ observations remain direct, not inherited.
+Deploy the backend and explicitly refresh the snapshot for new observations;
+cached reads retain their timestamp and do not perform implicit scans.
 
 Performance inventory includes RSS, RPS, RFS, accelerated RFS, XPS CPU/RX-queue
 steering, native/hardware XDP, XDP redirect/multi-buffer, AF_XDP zero-copy,
@@ -104,14 +137,16 @@ measured NIC or a complete response):
     {
       "name": "rss",
       "support": "supported",
-      "enabled": null,
-      "evidence": ["ethtool RSS indirection table size: 128"],
+      "enabled": true,
+      "inherited_from": null,
+      "evidence": ["default RSS context targets RX queues {0, 1, 2, 3}; hash function bits: 1"],
       "reason": null
     },
     {
       "name": "dpdk",
       "support": "unknown",
       "enabled": null,
+      "inherited_from": null,
       "evidence": [],
       "reason": "PMD and deployment prerequisites have not been validated"
     }
@@ -123,6 +158,8 @@ measured NIC or a complete response):
 
 - Enumerate live links with rtnetlink in the backend namespace.
 - Read driver info, modern link settings, channels, RSS indirection-table size
+  and default-context table/hash/transform settings with a two-phase size/data
+  handshake (ETHTOOL_GRSSH), rejecting size races and oversized/truncated replies,
   and feature names/flags using read-only ethtool ioctls on a namespace-local
   socket. Do not add legacy link-settings fallback contracts.
 - Query generic-netlink `netdev` XDP feature flags. Missing family/attributes or
@@ -131,8 +168,22 @@ measured NIC or a complete response):
   interface index before accepting sysfs evidence. Optional lab namespaces
   omit sysfs evidence explicitly because the mounted sysfs may describe another
   namespace. Validate link index again after collection to detect replacement.
+- Read `/proc/interrupts` once per scan with the performance monitor's shared
+  bounded parser (2 MiB, at most 4096 numeric IRQs/65536 IRQ-CPU cells).
+  Enumerate at most 4096 device MSI/MSI-X IRQs, or the reported non-MSI IRQ,
+  and read effective affinity independently. Do not infer queue identity from
+  vector position: require an exact unshared action name `INTERFACE-TxRx-N`,
+  `INTERFACE-rx-N`/`INTERFACE-Rx-N`, or `INTERFACE-tx-N`/`INTERFACE-Tx-N`
+  and a unique matching IRQ. Unknown/ambiguous mappings produce diagnostics.
+  Software/lab/simulator queues have no fabricated physical IRQ evidence.
+  Snapshot fields are not atomic live rates; reuse performance statistics for
+  live deltas without polling or automatically invoking capability refresh.
 - RPS/RFS/XPS presence and current masks/table sizes are software evidence.
   RSS requires driver evidence, not simply multiple queues.
+- Resolve VLAN RPS from namespace-local rtnetlink lower-link indices and
+  physical sysfs identity. Recheck link kind/identity and VLAN lower-link
+  topology after collection; a change fails refresh rather than saving mixed
+  ancestry. Preserve raw VLAN queue observations and diagnostics.
 - Accelerated RFS and DPDK readiness remain unknown unless a dedicated,
   driver-aware validator is added later. A PCI device or VFIO module alone does
   not prove DPDK PMD compatibility. Generic XDP/AF_XDP copy-mode operational
