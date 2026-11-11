@@ -262,7 +262,7 @@ mod tests {
                 ] {
                     handle
                         .link()
-                        .add(rtnetlink::LinkVeth::new(&inside, &outside).build())
+                        .add(rtnetlink::LinkVeth::new(inside, outside).build())
                         .execute()
                         .await?;
                     let peer = handle

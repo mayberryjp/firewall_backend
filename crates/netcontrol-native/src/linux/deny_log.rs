@@ -1106,7 +1106,7 @@ mod tests {
             rt.block_on(async {
                 handle
                     .link()
-                    .add(rtnetlink::LinkVeth::new(&"lan0", &"client0").build())
+                    .add(rtnetlink::LinkVeth::new("lan0", "client0").build())
                     .execute()
                     .await?;
                 let link = handle

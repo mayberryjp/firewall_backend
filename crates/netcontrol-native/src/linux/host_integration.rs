@@ -352,9 +352,9 @@ fn native_aggressive_takeover_imports_supported_state_and_clears_foreign_network
         use netlink_packet_route::{address::CacheInfo,link::LinkXdp};
         use std::os::fd::{AsRawFd,FromRawFd,OwnedFd};
         ipv6::set(true)?;
-        handle.link().add(rtnetlink::LinkVeth::new(&"nic0", &"peer0").build()).execute().await?;
-        handle.link().add(rtnetlink::LinkDummy::new(&"aux0").build()).execute().await?;
-        handle.link().add(rtnetlink::LinkBridge::new(&"foreign0").build()).execute().await?;
+        handle.link().add(rtnetlink::LinkVeth::new("nic0", "peer0").build()).execute().await?;
+        handle.link().add(rtnetlink::LinkDummy::new("aux0").build()).execute().await?;
+        handle.link().add(rtnetlink::LinkBridge::new("foreign0").build()).execute().await?;
         let links=networking::links(handle).await?;
         let index=|name:&str|links.iter().find(|link|networking::name(link)==name).map(|link|link.header.index).context("fixture link missing");
         let nic=index("nic0")?;
@@ -364,9 +364,9 @@ fn native_aggressive_takeover_imports_supported_state_and_clears_foreign_network
             handle.link().set(rtnetlink::LinkUnspec::new_with_index(id).up().build()).execute().await?;
         }
         handle.link().set(rtnetlink::LinkUnspec::new_with_index(nic).controller(bridge).mtu(1450).build()).execute().await?;
-        handle.link().add(rtnetlink::LinkVlan::new(&"tag10", nic, 10).build()).execute().await?;
+        handle.link().add(rtnetlink::LinkVlan::new("tag10", nic, 10).build()).execute().await?;
         let vlan=networking::links(handle).await?.into_iter().find(|link|networking::name(link)=="tag10").context("fixture VLAN missing")?.header.index;
-        handle.link().add(rtnetlink::LinkVlan::new(&"tag20", vlan, 20).build()).execute().await?;
+        handle.link().add(rtnetlink::LinkVlan::new("tag20", vlan, 20).build()).execute().await?;
         handle.address().add(nic,"192.0.2.1".parse()?,24).execute().await?;
         handle.address().add(bridge,"198.18.0.1".parse()?,24).execute().await?;
         let mut dynamic=handle.address().add(peer,"198.51.100.8".parse()?,24);
@@ -630,7 +630,7 @@ fn ethernet_activation_precedes_dhcp_lease_restore() -> Result<()> {
             ] {
                 handle
                     .link()
-                    .add(rtnetlink::LinkVeth::new(&name, &peer).build())
+                    .add(rtnetlink::LinkVeth::new(name, peer).build())
                     .execute()
                     .await?;
             }
@@ -843,7 +843,7 @@ fn native_default_ipv6_policy_controls_empty_host_restart_and_future_links() -> 
         rt.block_on(async {
             handle
                 .link()
-                .add(rtnetlink::LinkVeth::new(&"nic0", &"peer0").build())
+                .add(rtnetlink::LinkVeth::new("nic0", "peer0").build())
                 .execute()
                 .await?;
             let link = handle
@@ -919,7 +919,7 @@ fn native_default_ipv6_policy_controls_empty_host_restart_and_future_links() -> 
         rt.block_on(async {
             handle
                 .link()
-                .add(rtnetlink::LinkDummy::new(&"future0").build())
+                .add(rtnetlink::LinkDummy::new("future0").build())
                 .execute()
                 .await?;
             for link in networking::links(handle).await? {
@@ -987,7 +987,7 @@ fn native_vlan_adoption_recovery_restores_committed_dhcp_before_verification() -
         rt.block_on(async {
             handle
                 .link()
-                .add(rtnetlink::LinkVeth::new(&"wan0", &"lan0").build())
+                .add(rtnetlink::LinkVeth::new("wan0", "lan0").build())
                 .execute()
                 .await?;
             for link in networking::links(handle).await? {
@@ -1193,17 +1193,17 @@ fn native_current_namespace_ethernet_apply_rollback_recovery_and_reboot() -> Res
         rt.block_on(async {
             handle
                 .link()
-                .add(rtnetlink::LinkVeth::new(&"nic0", &"peer0").build())
+                .add(rtnetlink::LinkVeth::new("nic0", "peer0").build())
                 .execute()
                 .await?;
             handle
                 .link()
-                .add(rtnetlink::LinkVeth::new(&"cold0", &"coldpeer0").build())
+                .add(rtnetlink::LinkVeth::new("cold0", "coldpeer0").build())
                 .execute()
                 .await?;
             handle
                 .link()
-                .add(rtnetlink::LinkDummy::new(&"unrelated0").build())
+                .add(rtnetlink::LinkDummy::new("unrelated0").build())
                 .execute()
                 .await?;
             let links: Vec<_> = handle.link().get().execute().try_collect().await?;

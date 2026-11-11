@@ -122,7 +122,7 @@ mod tests {
             rt.block_on(async {
                 handle
                     .link()
-                    .add(rtnetlink::LinkVeth::new(&"lan0", &"peer0").build())
+                    .add(rtnetlink::LinkVeth::new("lan0", "peer0").build())
                     .execute()
                     .await?;
                 let link = handle
@@ -235,7 +235,7 @@ mod tests {
             rt.block_on(
                 handle
                     .link()
-                    .add(rtnetlink::LinkDummy::new(&"unmanaged@0").build())
+                    .add(rtnetlink::LinkDummy::new("unmanaged@0").build())
                     .execute(),
             )?;
             assert_eq!(read("unmanaged@0")?, "1");
@@ -259,7 +259,7 @@ mod tests {
             rt.block_on(
                 handle
                     .link()
-                    .add(rtnetlink::LinkDummy::new(&"external0").build())
+                    .add(rtnetlink::LinkDummy::new("external0").build())
                     .execute(),
             )?;
             Ok(())

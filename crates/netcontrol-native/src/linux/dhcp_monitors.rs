@@ -653,7 +653,7 @@ mod tests {
                 for (interface, address) in [("wan0", "198.51.100.2"), ("wan1", "192.0.2.2")] {
                     handle
                         .link()
-                        .add(rtnetlink::LinkDummy::new(&interface).build())
+                        .add(rtnetlink::LinkDummy::new(interface).build())
                         .execute()
                         .await?;
                     let link = super::super::networking::links(handle)

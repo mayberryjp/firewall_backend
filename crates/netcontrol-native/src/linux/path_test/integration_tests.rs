@@ -56,7 +56,7 @@ fn vlan_setup() -> Result<(Fixture, Native, Config)> {
             for name in ["lower0", "other0"] {
                 handle
                     .link()
-                    .add(rtnetlink::LinkDummy::new(&name).build())
+                    .add(rtnetlink::LinkDummy::new(name).build())
                     .execute()
                     .await?;
             }
@@ -77,7 +77,7 @@ fn vlan_setup() -> Result<(Fixture, Native, Config)> {
                 .await?;
             handle
                 .link()
-                .add(rtnetlink::LinkVlan::new(&"path0", parent.header.index, 42).build())
+                .add(rtnetlink::LinkVlan::new("path0", parent.header.index, 42).build())
                 .execute()
                 .await?;
             let links = networking::links(handle).await?;
@@ -380,7 +380,7 @@ fn path_test_refuses_replaced_interface_identity() -> Result<()> {
             handle.link().del(original.header.index).execute().await?;
             handle
                 .link()
-                .add(rtnetlink::LinkDummy::new(&"path0").build())
+                .add(rtnetlink::LinkDummy::new("path0").build())
                 .execute()
                 .await?;
             let replacement = networking::links(handle)
@@ -554,7 +554,7 @@ fn path_test_paired_native_drop_input_completes_and_restores_both_unmanaged_inte
         rt.block_on(async {
             handle
                 .link()
-                .add(rtnetlink::LinkVeth::new(&"path0", &"path1").build())
+                .add(rtnetlink::LinkVeth::new("path0", "path1").build())
                 .execute()
                 .await?;
             let links = networking::links(handle).await?;

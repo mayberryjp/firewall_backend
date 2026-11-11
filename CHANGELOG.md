@@ -342,6 +342,11 @@
 
 ### Fixed
 
+- Remove 68 redundant borrows from native netlink integration fixtures so
+  all-targets Clippy passes without suppressing warnings. Test-only CI fix;
+  no runtime or frontend contract change. Release impact: fix; next automatic
+  calendar version.
+
 - Update the native routing-netlink stack to decode all 240 bytes of Linux
   `IFLA_INET6_CONF`, including `force_forwarding`, instead of repeatedly warning
   that only 236 bytes are understood. Adapt link/route requests and typed flags;
