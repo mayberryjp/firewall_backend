@@ -8,7 +8,7 @@ use std::{
     net::{TcpStream, UdpSocket},
     time::{Duration, Instant},
 };
-pub(crate) fn message(input: &[u8], hostname: &str, app: &str, timestamp: &str) -> Vec<u8> {
+fn priority(input: &[u8]) -> (u16, &[u8]) {
     let mut pri = 14u16;
     let mut body = input;
     if input.first() == Some(&b'<') {
@@ -24,6 +24,62 @@ pub(crate) fn message(input: &[u8], hostname: &str, app: &str, timestamp: &str) 
             }
         }
     }
+    (pri, body)
+}
+#[cfg(any(test, target_os = "linux"))]
+fn is_netcontrol_record(input: &[u8]) -> bool {
+    let (_, body) = priority(input);
+    let Some(timestamp) = body.get(..16) else {
+        return false;
+    };
+    if !matches!(
+        &timestamp[..3],
+        b"Jan"
+            | b"Feb"
+            | b"Mar"
+            | b"Apr"
+            | b"May"
+            | b"Jun"
+            | b"Jul"
+            | b"Aug"
+            | b"Sep"
+            | b"Oct"
+            | b"Nov"
+            | b"Dec"
+    ) || timestamp[3] != b' '
+        || timestamp[6] != b' '
+        || timestamp[9] != b':'
+        || timestamp[12] != b':'
+        || timestamp[15] != b' '
+        || !(timestamp[4] == b' ' || timestamp[4].is_ascii_digit())
+        || ![5, 7, 8, 10, 11, 13, 14]
+            .into_iter()
+            .all(|i| timestamp[i].is_ascii_digit())
+    {
+        return false;
+    }
+    let pair = |i: usize| (timestamp[i] - b'0') * 10 + timestamp[i + 1] - b'0';
+    let day = if timestamp[4] == b' ' {
+        timestamp[5] - b'0'
+    } else {
+        pair(4)
+    };
+    if !(1..=31).contains(&day) || pair(7) > 23 || pair(10) > 59 || pair(13) > 60 {
+        return false;
+    }
+    let source = &body[16..];
+    let Some(end) = source.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let tag = &source[..end];
+    tag == b"netcontrold"
+        || tag
+            .strip_prefix(b"netcontrold[")
+            .and_then(|pid| pid.strip_suffix(b"]"))
+            .is_some_and(|pid| !pid.is_empty() && pid.iter().all(u8::is_ascii_digit))
+}
+pub(crate) fn message(input: &[u8], hostname: &str, app: &str, timestamp: &str) -> Vec<u8> {
+    let (pri, body) = priority(input);
     let host: String = hostname
         .chars()
         .filter(|c| c.is_ascii_graphic())
@@ -58,8 +114,19 @@ struct DestinationState {
 }
 impl DestinationState {
     fn failed(&mut self, error: anyhow::Error) {
+        let error = format!("{error:#}");
+        if self.error.as_deref() != Some(error.as_str()) {
+            tracing::warn!(
+                host = %self.destination.host,
+                port = self.destination.port,
+                transport = %self.destination.transport,
+                retry_in_seconds = self.delay.as_secs(),
+                %error,
+                "syslog destination unavailable; local capture continues"
+            );
+        }
         self.remote = None;
-        self.error = Some(format!("{error:#}"));
+        self.error = Some(error);
         self.retry_at = Instant::now() + self.delay;
         self.delay = (self.delay * 2).min(Duration::from_secs(30));
     }
@@ -68,7 +135,14 @@ impl DestinationState {
             match Remote::connect(&self.destination, ipv6_enabled) {
                 Ok(remote) => {
                     self.remote = Some(remote);
-                    self.error = None;
+                    if self.error.take().is_some() {
+                        tracing::info!(
+                            host = %self.destination.host,
+                            port = self.destination.port,
+                            transport = %self.destination.transport,
+                            "syslog destination reconnected"
+                        );
+                    }
                 }
                 Err(error) => self.failed(error),
             }
@@ -390,6 +464,9 @@ pub(crate) fn prepare(
                         Ok(n) => {
                             received = received.saturating_add(1);
                             ensure!(n < buffer.len(), "oversize journald syslog datagram");
+                            if is_netcontrol_record(&buffer[..n]) {
+                                continue;
+                            }
                             let record =
                                 message(&buffer[..n], &hostname, "journald", &super::worker::now());
                             ensure!(record.len() <= 65000, "syslog record too large");
@@ -451,6 +528,33 @@ pub(crate) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exclusion_matches_the_journald_source_not_message_contents() {
+        for record in [
+            "<30>Nov 11 10:24:19 netcontrold[246084]: synthetic diagnostic",
+            "<30>Nov 11 10:24:19 netcontrold: synthetic diagnostic",
+            "<14>Jan  1 00:00:00 netcontrold[1]: started",
+            "Nov 11 10:24:19 netcontrold[42]: diagnostic without priority",
+        ] {
+            assert!(is_netcontrol_record(record.as_bytes()), "{record}");
+        }
+        for record in [
+            "<30>Nov 11 10:24:19 systemd[1]: netcontrold[246084]: restarted",
+            "<30>Nov 11 10:24:19 kernel: netcontrold process warning",
+            "<30>Nov 11 10:24:19 other-netcontrold[1]: diagnostic",
+            "<30>Nov 11 10:24:19 netcontrold-helper[1]: diagnostic",
+            "<30>Nov 11 10:24:19 netcontrold[invalid]: diagnostic",
+            "<30>Nov 11 10:24:19 netcontrold[]: diagnostic",
+            "<30>Nov 11 10:24:19 netcontrold[1] diagnostic",
+            "<30>Nov 11 25:24:19 netcontrold[1]: invalid timestamp",
+            "<30>Nov 00 10:24:19 netcontrold[1]: invalid timestamp",
+            "<30>not a timestamp netcontrold[1]: diagnostic",
+            "<30>netcontrold[1]: unstructured text",
+            "",
+        ] {
+            assert!(!is_netcontrol_record(record.as_bytes()), "{record}");
+        }
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn local_socket_capture_is_independent_persistent_and_stops_cleanly() {
@@ -479,6 +583,12 @@ mod tests {
             "host":"127.0.0.1","port":collector.local_addr().unwrap().port(),"transport":"udp"
         }]}});
         services.apply(&serde_json::json!({}), &disabled).unwrap();
+        sender
+            .send_to(
+                b"<30>Nov 11 10:24:19 netcontrold[42]: excluded locally",
+                &path,
+            )
+            .unwrap();
         let read = LogQuery::parse("").unwrap();
         let mut count = 0;
         let mut wait_for_capture = |services: &super::super::Services, text: &[u8]| {
@@ -522,8 +632,21 @@ mod tests {
         let mut enabled = disabled.clone();
         enabled["syslog"]["enabled"] = serde_json::json!(true);
         services.apply(&disabled, &enabled).unwrap();
+        sender
+            .send_to(
+                b"<30>Nov 11 10:24:19 netcontrold[42]: excluded remotely",
+                &path,
+            )
+            .unwrap();
         wait_for_capture(&services, b"<14>local and remote");
-        collector.recv(&mut bytes).unwrap();
+        let n = collector.recv(&mut bytes).unwrap();
+        assert!(String::from_utf8_lossy(&bytes[..n]).contains("local and remote"));
+        assert!(collector.recv(&mut bytes).is_err());
+        let status = services.workers["syslog"].snapshot();
+        assert_eq!(status["received_records"], 2);
+        assert_eq!(status["captured_records"], 1);
+        assert_eq!(status["forwarded_records"], 1);
+        assert_eq!(status["forwarded_deliveries"], 1);
         services.apply(&enabled, &disabled).unwrap();
         wait_for_capture(&services, b"<14>local after forwarding disabled");
         assert!(collector.recv(&mut bytes).is_err());

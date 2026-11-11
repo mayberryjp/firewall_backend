@@ -2818,7 +2818,7 @@ successful write). Optional nonnegative integer counters expose:
 
 | Field | Meaning |
 |---|---|
-| `received_records` | Journald datagrams read, including records that subsequently fail validation or local append |
+| `received_records` | Journald datagrams read, including excluded Netcontrol records and records that subsequently fail validation or local append |
 | `captured_records` | Records whose local append and `sync_data` succeeded (not proof against device/power failure) |
 | `forwarded_records` | Records successfully written to every configured destination |
 | `forwarded_deliveries` | Successful per-destination writes, including partial fan-out success |
@@ -2833,6 +2833,8 @@ one captured, zero forwarded records, one forwarded delivery and one failed
 delivery. Label the primary totals **Logs read** and **Remote sends**; optionally
 show **Locally captured**, **Relayed to all destinations** and **Missed sends**.
 Never subtract sends from reads to calculate loss: fan-out changes their units.
+Reads also include intentionally excluded Netcontrol records, which do not
+increment captured/forwarded records or delivery counters.
 Unavailable/disabled/simulated rows can omit counters; render unavailable, not
 invented zero. Reset displayed rate baselines on `started_at` changes or counter
 decreases. HTTP counters follow existing numeric encoding; MQTT exports these
@@ -3074,12 +3076,31 @@ Provide separate socket/system and Netcontrol diagnostics views:
 | GET | `/api/v1/logs/netcontrol` | `logs.read` | Native daemon tracing diagnostics, native backend events and worker diagnostics, as JSON message text |
 
 Neither endpoint reads journald's journal or arbitrary filesystem paths.
-Socket history may contain Netcontrol stderr messages forwarded by journald;
-the direct Netcontrol stream is separate, not a disjoint/deduplicated source.
+New journald socket records with source tag `netcontrold` or
+`netcontrold[<numeric PID>]` are excluded before local capture and remote syslog
+forwarding. Match the native journald timestamp/source header, not mentions of
+Netcontrol in another program's message; kernel and systemd messages mentioning
+Netcontrol remain system logs. Packaged systemd units and installer-managed
+drop-ins set `SyslogIdentifier=netcontrold`. The forwarded header is not trusted
+journal identity metadata or a security boundary. Existing duplicate history is
+retained until normal rotation; do not reset cursors, erase entries or deduplicate
+historical messages in the client.
+
+The direct Netcontrol stream retains daemon diagnostics. Routine HTTP request
+completion events are no longer emitted at any level. Named managed-process
+start/stop/restart/failure and native-worker start/recovery/stop events, worker
+failure retry delays/counts, and syslog destination failure/reconnection events
+provide troubleshooting context without per-request/per-packet success events.
+Repeated identical destination failures are not logged again until recovery or
+a changed error. Tracing JSON message fields remain diagnostic text, not stable
+client schemas. Genuine operation failures remain logged.
+
 Standalone helper/conversion/local-key CLI output and failures before logging
-initialization are not included in direct daemon history; journald may capture
-their stderr separately. No new configuration/editor fields or clear/delete
-endpoint. Simulator returns 503 rather than modeled log messages.
+initialization are not included in direct daemon history. The host journal
+still retains stderr, including early daemon failures; daemon-tagged forwards
+are excluded from syslog even before direct logging initializes, so operators
+must use the host journal for those failures. No new configuration/editor fields
+or clear/delete endpoint. Simulator returns 503 rather than modeled log messages.
 
 Both are bodyless GETs with optional strict `cursor` and `limit` query fields.
 Default `limit=100`, canonical integer 1..500; query maximum 1024 bytes.

@@ -143,6 +143,25 @@
 
 ### Changed
 
+- Separate newly captured system syslog from Netcontrol diagnostics: exclude
+  journald's exact `netcontrold` source before local storage and remote forwarding,
+  pin the packaged/installer syslog identifier, and remove routine HTTP
+  completion events at their source. Keep historical records/cursors intact.
+  Add named process/worker lifecycle, worker retry-delay/count and syslog
+  destination failure/recovery diagnostics without per-request/packet success
+  spam or repeated identical destination errors. Fix/log-content contract change;
+  no HTTP schema, permission or configuration changes. Next automatic calendar
+  version; optional frontend explanatory copy:
+  [handoff 2026-11-11-07](docs/frontend-handoffs/2026-11-11.md#2026-11-11-07-system-and-netcontrol-log-separation).
+
+- Repository agent instructions now require scoped Docker/WSL test-resource
+  cleanup and verification after testing, prohibit persistent test caches by
+  default, and require verified Windows host-space reclamation after builds:
+  TRIM, authorized idle-Docker offline compaction and restoration, not merely
+  volume deletion. Preserve shared resources and application data, and stop
+  further builds on storage/engine failures.
+  Documentation-only workflow policy; no runtime/API contract or release impact.
+
 - Remove the packaged daemon's `network-online.target` dependency and mask
   `systemd-networkd-wait-online.service` during fresh installation/full source
   upgrades, with explicit stopped/persistent-mask verification. Avoid the

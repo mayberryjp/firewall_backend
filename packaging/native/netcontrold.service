@@ -28,6 +28,7 @@ RestartSec=5s
 TimeoutStopSec=60s
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=netcontrold
 
 [Install]
 WantedBy=multi-user.target

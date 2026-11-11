@@ -60,6 +60,12 @@ explicit unavailability. Logs can contain sensitive third-party text: restrict
 log-reading keys and render text safely. See the
 [API contract](FRONTEND_SPEC.md#persistent-log-viewing-apis).
 
+New socket records tagged `netcontrold` by journald are excluded from both local
+syslog history and remote forwarding; daemon diagnostics remain in the Netcontrol
+view and host journal. Existing history is not rewritten. Routine HTTP completion
+events are not emitted. Named process/worker lifecycle, retry and destination
+recovery events provide troubleshooting context without request/packet logging.
+
 Host-wide traffic accounting uses one Rust worker for every kernel interface,
 including unmanaged, VLAN, tunnel, veth and loopback links. Optional
 `vnstat.collector` sends one `hostname.domain|vnstat --oneline`-format UDP datagram per

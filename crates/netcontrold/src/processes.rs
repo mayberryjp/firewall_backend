@@ -10,22 +10,21 @@ use std::{
 use tokio::sync::watch;
 
 pub struct Control {
+    name: String,
     requested: watch::Sender<u64>,
     active: AtomicBool,
     status: Mutex<Value>,
 }
 
-impl Default for Control {
-    fn default() -> Self {
+impl Control {
+    pub fn new(name: &str) -> Self {
         Self {
+            name: name.to_owned(),
             requested: watch::Sender::new(0),
             active: AtomicBool::new(false),
             status: Mutex::new(json!({"state":"stopped","error":null})),
         }
     }
-}
-
-impl Control {
     pub fn status(&self) -> Result<Value> {
         Ok(self
             .status
@@ -85,6 +84,11 @@ impl Control {
             }
             let mut task = Task(tokio::spawn(start(receiver)));
             self.state("running", None)?;
+            tracing::info!(
+                process = %self.name,
+                generation = *self.requested.borrow(),
+                "managed process running"
+            );
             let (stopping, joined) = tokio::select! {
                 result = &mut task.0 => {
                     let error=match result {
@@ -92,12 +96,18 @@ impl Control {
                         Ok(Err(error))=>format!("{error:#}"),
                         Err(error)=>format!("managed task failed: {error}"),
                     };
-                    tracing::error!(%error,"managed process stopped; explicit restart remains available");
+                    tracing::error!(process = %self.name, %error,"managed process stopped; explicit restart remains available");
                     self.state("error",Some(error))?;
                     let stopping=tokio::select! {
                         _=stop.changed()=>true,
                         _=restart.changed()=>false,
                     };
+                    tracing::info!(
+                        process = %self.name,
+                        generation = *self.requested.borrow(),
+                        stopping = stopping || *stop.borrow(),
+                        "managed process stopping"
+                    );
                     (stopping,true)
                 },
                 _ = stop.changed() => (true,false),
@@ -111,13 +121,14 @@ impl Control {
                     Ok(Ok(())) => {}
                     result => {
                         let error = format!("managed task stop failed: {result:?}");
-                        tracing::error!(%error,"managed process shutdown failed");
+                        tracing::error!(process = %self.name, %error,"managed process shutdown failed");
                         self.state("error", Some(error))?;
                     }
                 }
             }
             if stopping || *stop.borrow() {
                 self.state("stopped", None)?;
+                tracing::info!(process = %self.name, "managed process stopped");
                 return Ok(());
             }
             restart.borrow_and_update();
@@ -137,7 +148,15 @@ mod tests {
 
     #[tokio::test]
     async fn failed_and_panicked_managers_remain_restartable() {
-        let control = Arc::new(Control::default());
+        use tracing::instrument::WithSubscriber;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("process-tracing.jsonl");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(Arc::new(std::fs::File::create(&path).unwrap()))
+            .finish();
+        let control = Arc::new(Control::new("test-manager"));
         let starts = Arc::new(AtomicUsize::new(0));
         let (stop, receiver) = watch::channel(false);
         let task = {
@@ -160,6 +179,7 @@ mod tests {
                             }
                         }
                     })
+                    .with_subscriber(subscriber)
                     .await
             })
         };
@@ -189,11 +209,37 @@ mod tests {
         stop.send(true).unwrap();
         task.await.unwrap().unwrap();
         assert!(control.request().is_err());
+        let logged = std::fs::read_to_string(path).unwrap();
+        let events: Vec<Value> = logged
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["fields"].clone())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .all(|fields| fields["process"] == "test-manager")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|fields| fields["message"] == "managed process running")
+                .count(),
+            3
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|fields| fields["message"]
+                    == "managed process stopped; explicit restart remains available")
+                .count(),
+            2
+        );
+        assert_eq!(events.last().unwrap()["message"], "managed process stopped");
     }
 
     #[tokio::test]
     async fn restart_joins_previous_attempt_and_shutdown_prevents_another_start() {
-        let control = Arc::new(Control::default());
+        let control = Arc::new(Control::new("test-manager"));
         assert!(control.request().is_err());
         let starts = Arc::new(AtomicUsize::new(0));
         let active = Arc::new(AtomicUsize::new(0));

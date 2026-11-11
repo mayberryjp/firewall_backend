@@ -407,12 +407,15 @@ async fn front_door(State(app): State<Arc<App>>, request: Request) -> Response {
     let mut result =
         tokio::task::spawn_blocking(move || dispatch(&app, &method, &path, &query, &headers, body))
             .await
-            .unwrap_or_else(|_| fail(500, "service unavailable", api));
-    tracing::info!(
-        surface = if api { "networking" } else { "management" },
-        status = result.status().as_u16(),
-        "HTTP request completed"
-    );
+            .unwrap_or_else(|error| {
+                tracing::error!(
+                    surface = if api { "networking" } else { "management" },
+                    panicked = error.is_panic(),
+                    cancelled = error.is_cancelled(),
+                    "HTTP handler task failed"
+                );
+                fail(500, "service unavailable", api)
+            });
     set(&mut result, "cache-control", "no-store");
     set(&mut result, "x-content-type-options", "nosniff");
     set(&mut result, "referrer-policy", "no-referrer");

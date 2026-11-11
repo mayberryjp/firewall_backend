@@ -489,7 +489,7 @@ async fn run(options: Options) -> Result<()> {
         .map(|name| {
             (
                 name.to_string(),
-                Arc::new(netcontrold::processes::Control::default()),
+                Arc::new(netcontrold::processes::Control::new(name)),
             )
         })
         .collect();

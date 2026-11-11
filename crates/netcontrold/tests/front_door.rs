@@ -111,6 +111,35 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn routine_http_requests_do_not_emit_completion_events() {
+    use tracing::instrument::WithSubscriber;
+    let fixture = Fixture::new(false);
+    let path = fixture.path.join("request-tracing.jsonl");
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(Arc::new(fs::File::create(&path).unwrap()))
+        .finish();
+    async {
+        for _ in 0..3 {
+            assert_eq!(
+                fixture
+                    .request("GET", "/auth/status", "", "", "", "")
+                    .await
+                    .0,
+                200
+            );
+        }
+        tracing::info!("synthetic log capture marker");
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logged = fs::read_to_string(path).unwrap();
+    assert!(logged.contains("synthetic log capture marker"));
+    assert!(!logged.contains("HTTP request completed"));
+}
+
+#[tokio::test]
 async fn configuration_transactions_remain_available_during_service_failures() {
     use netcontrold::http::Credential;
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

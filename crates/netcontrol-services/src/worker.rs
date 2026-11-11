@@ -132,6 +132,11 @@ impl Worker {
                                 }
                                 s.as_object_mut().unwrap().remove("error");
                             });
+                            tracing::info!(
+                                worker = %worker_name,
+                                restart_count,
+                                "service worker running"
+                            );
                             let _ = ready_tx.send(Ok::<(), String>(()));
                             run(ctx.clone())
                         }))
@@ -143,8 +148,17 @@ impl Worker {
                         Ok(()) => "service worker exited unexpectedly".to_owned(),
                         Err(error) => format!("{error:#}"),
                     };
-                    tracing::error!(worker = %worker_name, error = %text, "service worker failed; retrying");
                     restart_count = restart_count.saturating_add(1);
+                    if attempt.elapsed() >= Duration::from_secs(60) {
+                        delay = Duration::from_secs(1);
+                    }
+                    tracing::error!(
+                        worker = %worker_name,
+                        error = %text,
+                        restart_count,
+                        retry_in_seconds = delay.as_secs(),
+                        "service worker failed; retrying"
+                    );
                     ctx.update(|s| {
                         s["state"] = json!("error");
                         s["error"] = json!(text);
@@ -156,9 +170,6 @@ impl Worker {
                         }
                     });
                     let _ = ready_tx.try_send(Ok::<(), String>(()));
-                    if attempt.elapsed() >= Duration::from_secs(60) {
-                        delay = Duration::from_secs(1);
-                    }
                     if ctx.wait(delay) {
                         break;
                     }
@@ -168,6 +179,7 @@ impl Worker {
                     s["state"] = json!("stopped");
                     s["retrying"] = json!(false);
                 });
+                tracing::info!(worker = %worker_name, restart_count, "service worker stopped");
                 let _ = done_tx.send(());
             })
             .context("start native service thread")?;

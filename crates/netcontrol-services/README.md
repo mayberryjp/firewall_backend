@@ -198,7 +198,15 @@ drift and durable transaction recovery safeguards remain enforced.
   `/dev/kmsg`, or tails `backend.log`, avoiding duplicate kernel/backend capture.
   Journald's forwarded message text is wrapped in bounded RFC5424 output with
   APP-NAME `journald`; this is not a journal cursor reader or metadata-preserving
-  journal export. A local copy is synchronously appended to private rotating
+  journal export. Before local storage or forwarding, exclude the native
+  journald source tag `netcontrold`, optionally followed by a numeric `[PID]`.
+  The packaged service and installer drop-in pin `SyslogIdentifier=netcontrold`.
+  This is header-based source separation, not a message-body substring filter
+  or authenticated identity check. System/kernel messages merely mentioning
+  Netcontrol are retained. Daemon diagnostics remain in the direct Netcontrol
+  stream and host journal; preexisting duplicate history expires normally, with
+  no deletion or cursor reset. A local copy of each included record is
+  synchronously appended to private rotating
   `logs/syslog` history (four segments, at most 2 MiB each). Valid activation
   plus host-services opt-in starts local capture regardless of the remote
   forwarding setting. `syslog.enabled` controls destination connections/sends
@@ -208,13 +216,17 @@ drift and durable transaction recovery safeguards remain enforced.
   Messages are bounded to 65,000 bytes. Each remote destination reconnects
   independently with a 1..30-second capped exponential backoff; successful writes
   reset its delay. Connection/write failures retain a row-local warning while
-  local capture and other destinations continue. `destination_errors` lists
+  local capture and other destinations continue. A changed/first failure and
+  subsequent successful reconnection emit daemon diagnostics; identical ongoing
+  errors do not log on every retry. `destination_errors` lists
   current destination failures; `received_records` counts journald datagrams
-  read, including subsequent validation/local-write failures;
+  read, including excluded Netcontrol records and subsequent
+  validation/local-write failures;
   `captured_records` counts records whose local append and `sync_data` succeeded,
   `forwarded_records` counts records written successfully to every destination,
   `forwarded_deliveries` counts successful per-destination writes, including
   partial fan-out, and `failed_deliveries` counts missed per-destination sends.
+  Excluded records increment only `received_records`, not capture/delivery totals.
   These five numeric saturating u64 counters initialize/reset to zero on every
   execution attempt, including automatic recovery; counts observed before a
   processing error remain visible until the next attempt. Successful sends do
