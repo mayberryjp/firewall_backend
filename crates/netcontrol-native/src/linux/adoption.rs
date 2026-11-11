@@ -7,12 +7,12 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use configparser::ini::Ini;
 use futures_util::TryStreamExt;
 use netcontrol_core::{Config, DHCPClientConfig, DHCPRelayConfig, DNSConfig, DNSDomain, Interface};
+use netlink_packet_core::{Emitable, Parseable};
 use netlink_packet_route::{
     address::{AddressAttribute, AddressMessage, AddressMessageBuffer, AddressScope},
     link::LinkAttribute,
     route::{RouteAddress, RouteAttribute, RouteMessage, RouteMessageBuffer, RouteProtocol},
 };
-use netlink_packet_utils::{Emitable, Parseable};
 use rtnetlink::{Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -774,7 +774,12 @@ async fn capture_selected(
         if !ipv6_enabled && version == IpVersion::V6 {
             continue;
         }
-        let live: Vec<RouteMessage> = handle.route().get(version).execute().try_collect().await?;
+        let live: Vec<RouteMessage> = handle
+            .route()
+            .get(crate::linux::networking::route_query(version))
+            .execute()
+            .try_collect()
+            .await?;
         for message in live {
             let index = message
                 .attributes
@@ -1061,9 +1066,7 @@ pub async fn transfer_routes(handle: &Handle, receipt: &Receipt, restore: bool) 
             let _ = handle.route().del(message).execute().await;
             message = original;
         }
-        let mut request = handle.route().add();
-        *request.message_mut() = message;
-        request.replace().execute().await?;
+        handle.route().add(message).replace().execute().await?;
     }
     Ok(())
 }

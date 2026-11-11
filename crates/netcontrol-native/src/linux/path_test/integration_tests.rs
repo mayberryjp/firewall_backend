@@ -54,7 +54,11 @@ fn vlan_setup() -> Result<(Fixture, Native, Config)> {
     session(native.namespace.clone(), |rt, handle| {
         rt.block_on(async {
             for name in ["lower0", "other0"] {
-                handle.link().add().dummy(name.into()).execute().await?;
+                handle
+                    .link()
+                    .add(rtnetlink::LinkDummy::new(&name).build())
+                    .execute()
+                    .await?;
             }
             let links = networking::links(handle).await?;
             let parent = links
@@ -63,15 +67,17 @@ fn vlan_setup() -> Result<(Fixture, Native, Config)> {
                 .context("VLAN parent missing")?;
             handle
                 .link()
-                .set(parent.header.index)
-                .mtu(1500)
-                .up()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(parent.header.index)
+                        .mtu(1500)
+                        .up()
+                        .build(),
+                )
                 .execute()
                 .await?;
             handle
                 .link()
-                .add()
-                .vlan("path0".into(), parent.header.index, 42)
+                .add(rtnetlink::LinkVlan::new(&"path0", parent.header.index, 42).build())
                 .execute()
                 .await?;
             let links = networking::links(handle).await?;
@@ -81,9 +87,12 @@ fn vlan_setup() -> Result<(Fixture, Native, Config)> {
                 .context("VLAN child missing")?;
             handle
                 .link()
-                .set(child.header.index)
-                .mtu(1500)
-                .up()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(child.header.index)
+                        .mtu(1500)
+                        .up()
+                        .build(),
+                )
                 .execute()
                 .await?;
             handle
@@ -277,8 +286,11 @@ fn path_test_cleanup_failure_retains_busy_intent_and_refuses_external_mtu() -> R
                 .context("test interface missing")?;
             handle
                 .link()
-                .set(link.header.index)
-                .mtu(8000)
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .mtu(8000)
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -303,8 +315,11 @@ fn path_test_cleanup_failure_retains_busy_intent_and_refuses_external_mtu() -> R
                 .context("test interface missing")?;
             handle
                 .link()
-                .set(link.header.index)
-                .mtu(9000)
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .mtu(9000)
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -363,7 +378,11 @@ fn path_test_refuses_replaced_interface_identity() -> Result<()> {
                 .find(|message| networking::name(message) == "path0")
                 .context("test interface missing")?;
             handle.link().del(original.header.index).execute().await?;
-            handle.link().add().dummy("path0".into()).execute().await?;
+            handle
+                .link()
+                .add(rtnetlink::LinkDummy::new(&"path0").build())
+                .execute()
+                .await?;
             let replacement = networking::links(handle)
                 .await?
                 .into_iter()
@@ -375,9 +394,12 @@ fn path_test_refuses_replaced_interface_identity() -> Result<()> {
             );
             handle
                 .link()
-                .set(replacement.header.index)
-                .mtu(1700)
-                .up()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(replacement.header.index)
+                        .mtu(1700)
+                        .up()
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -421,7 +443,16 @@ fn path_test_restart_recovers_durable_before_snapshot_before_reconciliation() ->
     };
     write_json(&native.state.join(INTENT), &intent)?;
     session(namespace, move |rt, handle| {
-        rt.block_on(handle.link().set(intent.links[0].index).mtu(9000).execute())?;
+        rt.block_on(
+            handle
+                .link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(intent.links[0].index)
+                        .mtu(9000)
+                        .build(),
+                )
+                .execute(),
+        )?;
         permits::install(&intent.rules, &intent.lease)
     })?;
     // No worker owns this fault-injection intent: dropping the initial fixture
@@ -523,8 +554,7 @@ fn path_test_paired_native_drop_input_completes_and_restores_both_unmanaged_inte
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .veth("path0".into(), "path1".into())
+                .add(rtnetlink::LinkVeth::new(&"path0", &"path1").build())
                 .execute()
                 .await?;
             let links = networking::links(handle).await?;
@@ -534,8 +564,11 @@ fn path_test_paired_native_drop_input_completes_and_restores_both_unmanaged_inte
                 .context("paired interface missing")?;
             handle
                 .link()
-                .set(peer.header.index)
-                .setns_by_fd(target.as_raw_fd())
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(peer.header.index)
+                        .setns_by_fd(target.as_raw_fd())
+                        .build(),
+                )
                 .execute()
                 .await?;
             let selected = links
@@ -544,9 +577,12 @@ fn path_test_paired_native_drop_input_completes_and_restores_both_unmanaged_inte
                 .context("selected interface missing")?;
             handle
                 .link()
-                .set(selected.header.index)
-                .mtu(1500)
-                .up()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(selected.header.index)
+                        .mtu(1500)
+                        .up()
+                        .build(),
+                )
                 .execute()
                 .await?;
             handle
@@ -566,9 +602,12 @@ fn path_test_paired_native_drop_input_completes_and_restores_both_unmanaged_inte
                 .context("paired interface missing")?;
             handle
                 .link()
-                .set(peer.header.index)
-                .mtu(1500)
-                .up()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(peer.header.index)
+                        .mtu(1500)
+                        .up()
+                        .build(),
+                )
                 .execute()
                 .await?;
             handle

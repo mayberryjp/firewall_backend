@@ -130,7 +130,7 @@ async fn clear(handle: &Handle, table: Option<u32>) -> Result<()> {
     }
     for route in handle
         .route()
-        .get(IpVersion::V4)
+        .get(crate::linux::networking::route_query(IpVersion::V4))
         .execute()
         .try_collect::<Vec<_>>()
         .await?
@@ -163,7 +163,7 @@ async fn install(handle: &Handle, path: &Path) -> Result<()> {
     );
     let routes = handle
         .route()
-        .get(IpVersion::V4)
+        .get(crate::linux::networking::route_query(IpVersion::V4))
         .execute()
         .try_collect::<Vec<_>>()
         .await?;
@@ -181,46 +181,46 @@ async fn install(handle: &Handle, path: &Path) -> Result<()> {
     let connected: ipnet::Ipv4Net = path.prefix.parse()?;
     handle
         .route()
-        .add()
-        .v4()
-        .destination_prefix(connected.network(), connected.prefix_len())
-        .output_interface(index)
-        .table_id(path.table)
-        .protocol(RouteProtocol::Other(PROTOCOL))
-        .scope(RouteScope::Link)
+        .add(
+            rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                .destination_prefix(connected.network(), connected.prefix_len())
+                .output_interface(index)
+                .table_id(path.table)
+                .protocol(RouteProtocol::Other(PROTOCOL))
+                .scope(RouteScope::Link)
+                .build(),
+        )
         .execute()
         .await?;
     if path.destination != path.prefix {
         let destination: ipnet::Ipv4Net = path.destination.parse()?;
-        let request = handle
-            .route()
-            .add()
-            .v4()
+        let message = rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
             .destination_prefix(destination.network(), destination.prefix_len())
             .output_interface(index)
             .table_id(path.table)
             .protocol(RouteProtocol::Other(PROTOCOL));
-        if path.direct {
-            request.scope(RouteScope::Link).execute().await?;
+        let message = if path.direct {
+            message.scope(RouteScope::Link)
         } else if connected.contains(&path.gateway.parse::<Ipv4Addr>()?) {
-            request
+            message
                 .gateway(path.gateway.parse()?)
                 .scope(RouteScope::Universe)
-                .execute()
-                .await?;
         } else {
             anyhow::bail!("DHCP gateway is not on the leased subnet");
-        }
+        };
+        handle.route().add(message.build()).execute().await?;
     }
     handle
         .route()
-        .add()
-        .v4()
-        .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
-        .table_id(path.table)
-        .protocol(RouteProtocol::Other(PROTOCOL))
-        .priority(u32::MAX)
-        .kind(RouteType::Unreachable)
+        .add(
+            rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
+                .table_id(path.table)
+                .protocol(RouteProtocol::Other(PROTOCOL))
+                .priority(u32::MAX)
+                .kind(RouteType::Unreachable)
+                .build(),
+        )
         .execute()
         .await?;
     let mut rule = handle
@@ -653,8 +653,7 @@ mod tests {
                 for (interface, address) in [("wan0", "198.51.100.2"), ("wan1", "192.0.2.2")] {
                     handle
                         .link()
-                        .add()
-                        .dummy(interface.into())
+                        .add(rtnetlink::LinkDummy::new(&interface).build())
                         .execute()
                         .await?;
                     let link = super::super::networking::links(handle)
@@ -662,7 +661,15 @@ mod tests {
                         .into_iter()
                         .find(|link| super::super::networking::name(link) == interface)
                         .unwrap();
-                    handle.link().set(link.header.index).up().execute().await?;
+                    handle
+                        .link()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .up()
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
                     handle
                         .address()
                         .add(link.header.index, address.parse()?, 24)
@@ -678,12 +685,14 @@ mod tests {
                     .index;
                 handle
                     .route()
-                    .add()
-                    .v4()
-                    .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
-                    .gateway("192.0.2.1".parse()?)
-                    .output_interface(other)
-                    .table_id(254)
+                    .add(
+                        rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                            .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
+                            .gateway("192.0.2.1".parse()?)
+                            .output_interface(other)
+                            .table_id(254)
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -825,7 +834,7 @@ mod tests {
                 assert!(
                     handle
                         .route()
-                        .get(IpVersion::V4)
+                        .get(crate::linux::networking::route_query(IpVersion::V4))
                         .execute()
                         .try_collect::<Vec<_>>()
                         .await?

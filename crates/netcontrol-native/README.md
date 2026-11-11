@@ -6,6 +6,12 @@ It never invokes `ip`, `nft`, `wg`, Go, a shell, or a service executable.
 `wireguard-control` is always explicitly selected with `Backend::Kernel`; its
 optional userspace-program backend is never selected.
 
+Routing netlink uses `rtnetlink 0.21` and `netlink-packet-route 0.30`, which
+decode the 240-byte `IFLA_INET6_CONF` payload including `force_forwarding`.
+This fixes the repeated "expecting 236, got 240" parser warning without
+disabling IPv6, changing sysctls or filtering daemon warnings. The fix requires
+an updated daemon binary; there is no runtime setting to update its parser.
+
 Firewall updates, including large imported rulesets and destination rewrites,
 remain one atomic netfilter transaction. The sender sizes its private socket
 buffer for the complete datagram, using `SO_SNDBUFFORCE` with the already-required

@@ -2,11 +2,11 @@
 use super::{netfilter, networking, read_json, remove_durable, session, write_json};
 use anyhow::{Context, Result, anyhow, ensure};
 use netcontrol_core::{PATH_TEST_LIFETIME_SECONDS, PathTestRequest};
+use netlink_packet_core::Emitable;
 use netlink_packet_route::{
-    address::{AddressAttribute, AddressFlag, AddressHeaderFlag},
-    link::{LinkAttribute, LinkFlag, LinkInfo, LinkMessage},
+    address::{AddressAttribute, AddressFlags, AddressHeaderFlags},
+    link::{LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
 };
-use netlink_packet_utils::Emitable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -547,8 +547,8 @@ async fn snapshot(handle: &rtnetlink::Handle, request: &PathTestRequest) -> Resu
         .find(|message| networking::name(message) == request.interface)
         .context("selected interface does not exist")?;
     ensure!(
-        selected.header.flags.contains(&LinkFlag::Up)
-            && !selected.header.flags.contains(&LinkFlag::Loopback),
+        selected.header.flags.contains(LinkFlags::Up)
+            && !selected.header.flags.contains(LinkFlags::Loopback),
         "selected interface must be up and non-loopback"
     );
     if request.source_address.is_ipv6() {
@@ -563,11 +563,11 @@ async fn snapshot(handle: &rtnetlink::Handle, request: &PathTestRequest) -> Resu
     }
     let addresses = networking::addresses(handle, selected.header.index).await?;
     ensure!(addresses.iter().any(|message| {
-        !message.header.flags.contains(&AddressHeaderFlag::Tentative)
-            && !message.header.flags.contains(&AddressHeaderFlag::Dadfailed)
+        !message.header.flags.contains(AddressHeaderFlags::Tentative)
+            && !message.header.flags.contains(AddressHeaderFlags::Dadfailed)
             && !message.attributes.iter().any(|attribute| matches!(attribute,
-                AddressAttribute::Flags(flags) if flags.contains(&AddressFlag::Tentative)
-                    || flags.contains(&AddressFlag::Dadfailed)))
+                AddressAttribute::Flags(flags) if flags.contains(AddressFlags::Tentative)
+                    || flags.contains(AddressFlags::Dadfailed)))
             && !message.attributes.iter().any(|attribute| matches!(attribute,
                 AddressAttribute::CacheInfo(info) if u64::from(info.ifa_valid) <= PATH_TEST_LIFETIME_SECONDS))
             && message.attributes.iter().find_map(|attribute| match attribute {
@@ -769,8 +769,11 @@ fn execute(
                     Duration::from_millis(500),
                     handle
                         .link()
-                        .set(link.index)
-                        .mtu(link.maximum_mtu)
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.index)
+                                .mtu(link.maximum_mtu)
+                                .build(),
+                        )
                         .execute(),
                 )
                 .await??;
@@ -850,8 +853,11 @@ fn restore(namespace: Arc<File>, path: &Path, boot: &str, intent: &Intent) -> Re
                             Duration::from_millis(500),
                             handle
                                 .link()
-                                .set(original.index)
-                                .mtu(original.original_mtu)
+                                .set(
+                                    rtnetlink::LinkUnspec::new_with_index(original.index)
+                                        .mtu(original.original_mtu)
+                                        .build(),
+                                )
                                 .execute(),
                         )
                         .await??;

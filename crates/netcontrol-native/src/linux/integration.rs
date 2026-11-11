@@ -202,8 +202,7 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
             rt.block_on(async {
                 handle
                     .link()
-                    .add()
-                    .veth(name.into(), peer.into())
+                    .add(rtnetlink::LinkVeth::new(&name, &peer).build())
                     .execute()
                     .await?;
                 let link = handle
@@ -216,8 +215,11 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                     .context("DHCP peer missing")?;
                 handle
                     .link()
-                    .set(link.header.index)
-                    .setns_by_fd(target.as_raw_fd())
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .setns_by_fd(target.as_raw_fd())
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -234,11 +236,18 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                 .try_next()
                 .await?
                 .context("DHCP client trunk missing")?;
-            handle.link().set(link.header.index).up().execute().await?;
             handle
                 .link()
-                .add()
-                .vlan("vlan30".into(), link.header.index, 30)
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
+            handle
+                .link()
+                .add(rtnetlink::LinkVlan::new(&"vlan30", link.header.index, 30).build())
                 .execute()
                 .await?;
             let vlan = handle
@@ -254,7 +263,15 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                 .add(vlan.header.index, "10.4.30.2".parse()?, 24)
                 .execute()
                 .await?;
-            handle.link().set(vlan.header.index).up().execute().await?;
+            handle
+                .link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(vlan.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
             Ok(())
         })
     })?;
@@ -275,14 +292,24 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                     .execute()
                     .await?;
             }
-            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
             handle
                 .route()
-                .add()
-                .v4()
-                .destination_prefix("10.4.30.0".parse()?, 24)
-                .gateway("10.4.40.1".parse()?)
-                .output_interface(link.header.index)
+                .add(
+                    rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                        .destination_prefix("10.4.30.0".parse()?, 24)
+                        .gateway("10.4.40.1".parse()?)
+                        .output_interface(link.header.index)
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -637,16 +664,16 @@ fn native_interface_ownership_restores_physical_and_vlan_without_touching_other_
     let namespace = Arc::new(File::open(&fixture.namespace)?);
     session(namespace.clone(), |rt, handle| {
         rt.block_on(async {
-        handle.link().add().veth("parent0".into(), "peer0".into()).execute().await?;
+        handle.link().add(rtnetlink::LinkVeth::new(&"parent0", &"peer0").build()).execute().await?;
         let links = networking::links(handle).await?;
         let parent = links.iter().find(|link| networking::name(link) == "parent0").context("parent missing")?.header.index;
-        handle.link().set(parent).up().execute().await?;
+        handle.link().set(rtnetlink::LinkUnspec::new_with_index(parent).up().build()).execute().await?;
         let peer = links.iter().find(|link| networking::name(link) == "peer0").context("peer missing")?.header.index;
-        handle.link().set(peer).up().execute().await?;
-        handle.link().add().vlan("vlan50".into(), parent, 50).execute().await?;
+        handle.link().set(rtnetlink::LinkUnspec::new_with_index(peer).up().build()).execute().await?;
+        handle.link().add(rtnetlink::LinkVlan::new(&"vlan50",  parent,  50).build()).execute().await?;
         let links = networking::links(handle).await?;
         let index = links.iter().find(|link| networking::name(link) == "vlan50").context("VLAN missing")?.header.index;
-        handle.link().set(index).up().execute().await?;
+        handle.link().set(rtnetlink::LinkUnspec::new_with_index(index).up().build()).execute().await?;
         handle.address().add(index, "192.0.2.1".parse()?, 24).execute().await?;
         let wanted = netcontrol_core::AdoptVlanRequest {name:"vlan50".into(),parent:"parent0".into(),id:50};
         let snapshot = networking::capture_vlan_snapshot(handle, &wanted).await?;
@@ -683,10 +710,10 @@ fn native_interface_ownership_restores_physical_and_vlan_without_touching_other_
             }
         }
         handle.address().add(parent, "203.0.115.1".parse()?, 24).execute().await?;
-        handle.link().set(parent).mtu(1450).execute().await?;
-        handle.link().set(parent).down().execute().await?;
+        handle.link().set(rtnetlink::LinkUnspec::new_with_index(parent).mtu(1450).build()).execute().await?;
+        handle.link().set(rtnetlink::LinkUnspec::new_with_index(parent).down().build()).execute().await?;
         handle.address().add(index, "198.51.100.1".parse()?, 24).execute().await?;
-        handle.link().set(index).mtu(1400).execute().await?;
+        handle.link().set(rtnetlink::LinkUnspec::new_with_index(index).mtu(1400).build()).execute().await?;
         networking::check_vlan_identity(handle, &wanted, &snapshot).await?;
         networking::restore_interfaces(handle, &originals).await?;
         let restored = networking::capture_vlan_snapshot(handle, &wanted).await?;
@@ -703,7 +730,7 @@ fn native_interface_ownership_restores_physical_and_vlan_without_touching_other_
             (peer_before.name, peer_before.index, peer_before.mac, peer_before.mtu, peer_before.up));
         assert_eq!(networking::addresses(handle, parent).await?.iter()
             .filter(|address| address.header.scope != netlink_packet_route::address::AddressScope::Link).count(), 2);
-        handle.link().add().vlan("stacked".into(), index, 51).execute().await?;
+        handle.link().add(rtnetlink::LinkVlan::new(&"stacked",  index,  51).build()).execute().await?;
         assert!(networking::capture_vlan_snapshot(handle, &wanted).await.is_err());
         let stacked = networking::links(handle).await?.into_iter().find(|link| networking::name(link) == "stacked").context("stacked missing")?;
         handle.link().del(stacked.header.index).execute().await?;
@@ -742,8 +769,7 @@ fn native_capabilities_discovery_is_namespace_scoped_and_passive() -> Result<()>
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .dummy("caps-test0".into())
+                .add(rtnetlink::LinkDummy::new(&"caps-test0").build())
                 .execute()
                 .await?;
             Ok(())
@@ -786,16 +812,19 @@ fn native_loopback_discovery_has_fixed_role_and_static_addressing() -> Result<()
                         .find(|link| {
                             link.header
                                 .flags
-                                .contains(&netlink_packet_route::link::LinkFlag::Loopback)
+                                .contains(netlink_packet_route::link::LinkFlags::Loopback)
                         })
                         .context("loopback missing")?
                         .header
                         .index;
-                    handle.link().set(index).up().execute().await?;
                     handle
                         .link()
-                        .add()
-                        .dummy("lo-test0".into())
+                        .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+                        .execute()
+                        .await?;
+                    handle
+                        .link()
+                        .add(rtnetlink::LinkDummy::new(&"lo-test0").build())
                         .execute()
                         .await?;
                     Ok(())
@@ -873,8 +902,7 @@ fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()>
             runtime.block_on(async {
                 handle
                     .link()
-                    .add()
-                    .veth(name.into(), peer.into())
+                    .add(rtnetlink::LinkVeth::new(&name, &peer).build())
                     .execute()
                     .await?;
                 let link = handle
@@ -887,8 +915,11 @@ fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()>
                     .context("relay peer missing")?;
                 handle
                     .link()
-                    .set(link.header.index)
-                    .setns_by_fd(target.as_raw_fd())
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .setns_by_fd(target.as_raw_fd())
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -909,14 +940,24 @@ fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()>
                     .add(link.header.index, address.parse()?, 24)
                     .execute()
                     .await?;
-                handle.link().set(link.header.index).up().execute().await?;
+                handle
+                    .link()
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .up()
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
                 handle
                     .route()
-                    .add()
-                    .v4()
-                    .destination_prefix("0.0.0.0".parse()?, 0)
-                    .gateway(gateway.parse()?)
-                    .output_interface(link.header.index)
+                    .add(
+                        rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                            .destination_prefix("0.0.0.0".parse()?, 0)
+                            .gateway(gateway.parse()?)
+                            .output_interface(link.header.index)
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -1169,8 +1210,11 @@ fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()>
                 .context("iot0 missing")?;
             handle
                 .link()
-                .set(link.header.index)
-                .down()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .down()
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -1203,7 +1247,15 @@ fn native_udp_relay_discovery_source_modes_recovery_and_rollback() -> Result<()>
                 .try_next()
                 .await?
                 .context("iot0 missing")?;
-            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
             Ok(())
         })
     })?;
@@ -1334,8 +1386,7 @@ fn native_destination_rewrite_packets_filtering_restart_and_rollback() -> Result
             rt.block_on(async {
                 handle
                     .link()
-                    .add()
-                    .veth(name.into(), peer.into())
+                    .add(rtnetlink::LinkVeth::new(&name, &peer).build())
                     .execute()
                     .await?;
                 let link = handle
@@ -1348,8 +1399,11 @@ fn native_destination_rewrite_packets_filtering_restart_and_rollback() -> Result
                     .context("peer missing")?;
                 handle
                     .link()
-                    .set(link.header.index)
-                    .setns_by_fd(target.as_raw_fd())
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .setns_by_fd(target.as_raw_fd())
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -1381,23 +1435,35 @@ fn native_destination_rewrite_packets_filtering_restart_and_rollback() -> Result
                     .add(link.header.index, address.parse()?, 24)
                     .execute()
                     .await?;
-                handle.link().set(link.header.index).up().execute().await?;
                 handle
-                    .route()
-                    .add()
-                    .v4()
-                    .destination_prefix("0.0.0.0".parse()?, 0)
-                    .gateway(gateway.parse()?)
-                    .output_interface(link.header.index)
+                    .link()
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .up()
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 handle
                     .route()
-                    .add()
-                    .v6()
-                    .destination_prefix("::".parse()?, 0)
-                    .gateway(gateway6.parse()?)
-                    .output_interface(link.header.index)
+                    .add(
+                        rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                            .destination_prefix("0.0.0.0".parse()?, 0)
+                            .gateway(gateway.parse()?)
+                            .output_interface(link.header.index)
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
+                handle
+                    .route()
+                    .add(
+                        rtnetlink::RouteMessageBuilder::<std::net::Ipv6Addr>::new()
+                            .destination_prefix("::".parse()?, 0)
+                            .gateway(gateway6.parse()?)
+                            .output_interface(link.header.index)
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -1609,8 +1675,7 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
     session(ns1.clone(), move |rt, h| {
         rt.block_on(async {
             h.link()
-                .add()
-                .veth("under0".into(), "under1".into())
+                .add(rtnetlink::LinkVeth::new(&"under0", &"under1").build())
                 .execute()
                 .await?;
             let peer = h
@@ -1622,8 +1687,11 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
                 .await?
                 .context("veth missing")?;
             h.link()
-                .set(peer.header.index)
-                .setns_by_fd(target.as_raw_fd())
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(peer.header.index)
+                        .setns_by_fd(target.as_raw_fd())
+                        .build(),
+                )
                 .execute()
                 .await?;
             let local = h
@@ -1638,7 +1706,14 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
                 .add(local.header.index, "192.0.2.1".parse()?, 24)
                 .execute()
                 .await?;
-            h.link().set(local.header.index).up().execute().await?;
+            h.link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(local.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
             Ok::<(), anyhow::Error>(())
         })
     })?;
@@ -1656,7 +1731,14 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
                 .add(link.header.index, "192.0.2.2".parse()?, 24)
                 .execute()
                 .await?;
-            h.link().set(link.header.index).up().execute().await?;
+            h.link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
             Ok::<(), anyhow::Error>(())
         })
     })?;
@@ -1752,7 +1834,9 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
             );
             let routes = rt.block_on(
                 h.route()
-                    .get(rtnetlink::IpVersion::V4)
+                    .get(crate::linux::networking::route_query(
+                        rtnetlink::IpVersion::V4,
+                    ))
                     .execute()
                     .try_collect::<Vec<_>>(),
             )?;
@@ -1780,7 +1864,9 @@ fn native_bgp_wireguard_learns_installs_withdraws_and_preserves_static_configura
             rt.block_on(async {
                 let routes = h
                     .route()
-                    .get(rtnetlink::IpVersion::V4)
+                    .get(crate::linux::networking::route_query(
+                        rtnetlink::IpVersion::V4,
+                    ))
                     .execute()
                     .try_collect::<Vec<_>>()
                     .await?;
@@ -1907,7 +1993,15 @@ fn native_operational_dns_and_link_monitor_restart_preserve_configuration() -> R
                 .try_next()
                 .await?
                 .context("loopback missing")?;
-            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
             Ok::<(), anyhow::Error>(())
         })?;
         let socket = std::net::UdpSocket::bind("0.0.0.0:53")?;
@@ -2182,14 +2276,21 @@ fn native_startup_ethernet_dhcp_and_interrupted_recovery() -> Result<()> {
             ] {
                 handle
                     .link()
-                    .add()
-                    .veth(name.into(), peer.into())
+                    .add(rtnetlink::LinkVeth::new(&name, &peer).build())
                     .execute()
                     .await?;
             }
             for link in networking::links(handle).await? {
                 if matches!(networking::name(&link).as_str(), "staticpeer" | "dhcppeer") {
-                    handle.link().set(link.header.index).up().execute().await?;
+                    handle
+                        .link()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .up()
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
                 }
             }
             Ok(())
@@ -2253,8 +2354,11 @@ fn native_startup_ethernet_dhcp_and_interrupted_recovery() -> Result<()> {
                         .context("fixture Ethernet missing")?;
                     handle
                         .link()
-                        .set(link.header.index)
-                        .down()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .down()
+                                .build(),
+                        )
                         .execute()
                         .await?;
                 }
@@ -2273,7 +2377,7 @@ fn native_startup_ethernet_dhcp_and_interrupted_recovery() -> Result<()> {
                             networking::name(&link),
                             link.header
                                 .flags
-                                .contains(&netlink_packet_route::link::LinkFlag::Up),
+                                .contains(netlink_packet_route::link::LinkFlags::Up),
                         )
                     })
                     .collect())
@@ -2443,14 +2547,16 @@ fn native_startup_ethernet_dhcp_and_interrupted_recovery() -> Result<()> {
                 .await?;
             handle
                 .route()
-                .add()
-                .v4()
-                .destination_prefix("198.18.0.0".parse()?, 16)
-                .gateway("192.0.2.1".parse()?)
-                .output_interface(index)
-                .table_id(10001)
-                .priority(10)
-                .protocol(RouteProtocol::Other(crate::model::PROTOCOL))
+                .add(
+                    rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                        .destination_prefix("198.18.0.0".parse()?, 16)
+                        .gateway("192.0.2.1".parse()?)
+                        .output_interface(index)
+                        .table_id(10001)
+                        .priority(10)
+                        .protocol(RouteProtocol::Other(crate::model::PROTOCOL))
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(index)
@@ -2465,7 +2571,7 @@ fn native_startup_ethernet_dhcp_and_interrupted_recovery() -> Result<()> {
         rt.block_on(async {
             let routes: Vec<_> = handle
                 .route()
-                .get(rtnetlink::IpVersion::V4)
+                .get(crate::linux::networking::route_query(rtnetlink::IpVersion::V4))
                 .execute()
                 .try_collect()
                 .await?;
@@ -2494,8 +2600,7 @@ fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Res
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .dummy("unmanaged0".into())
+                .add(rtnetlink::LinkDummy::new(&"unmanaged0").build())
                 .execute()
                 .await?;
             let links = networking::links(handle).await?;
@@ -2506,7 +2611,11 @@ fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Res
                     .unwrap()
                     .header
                     .index;
-                handle.link().set(index).up().execute().await?;
+                handle
+                    .link()
+                    .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+                    .execute()
+                    .await?;
                 if name == "unmanaged0" {
                     handle
                         .address()
@@ -2515,12 +2624,14 @@ fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Res
                         .await?;
                     handle
                         .route()
-                        .add()
-                        .v6()
-                        .destination_prefix("2001:db8:20::".parse()?, 64)
-                        .output_interface(index)
-                        .priority(123)
-                        .protocol(netlink_packet_route::route::RouteProtocol::Static)
+                        .add(
+                            rtnetlink::RouteMessageBuilder::<std::net::Ipv6Addr>::new()
+                                .destination_prefix("2001:db8:20::".parse()?, 64)
+                                .output_interface(index)
+                                .priority(123)
+                                .protocol(netlink_packet_route::route::RouteProtocol::Static)
+                                .build(),
+                        )
                         .execute()
                         .await?;
                 }
@@ -2536,8 +2647,7 @@ fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Res
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .dummy("future0".into())
+                .add(rtnetlink::LinkDummy::new(&"future0").build())
                 .execute()
                 .await?;
             for link in networking::links(handle).await? {
@@ -2573,7 +2683,7 @@ fn global_ipv6_disables_existing_loopback_and_future_links_and_restores() -> Res
             );
             use futures_util::TryStreamExt;
             use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
-            let routes: Vec<RouteMessage> = handle.route().get(rtnetlink::IpVersion::V6)
+            let routes: Vec<RouteMessage> = handle.route().get(crate::linux::networking::route_query(rtnetlink::IpVersion::V6))
                 .execute().try_collect().await?;
             assert!(routes.iter().any(|route| route.attributes.iter().any(|a|
                 matches!(a, RouteAttribute::Destination(RouteAddress::Inet6(ip)) if *ip == "2001:db8:20::".parse::<std::net::Ipv6Addr>().unwrap()))));
@@ -2650,8 +2760,7 @@ fn native_icmp_filters_match_both_families_extension_headers_and_rollback() -> R
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .veth("lan0".into(), "client0".into())
+                .add(rtnetlink::LinkVeth::new(&"lan0", &"client0").build())
                 .execute()
                 .await?;
             let link = handle
@@ -2664,8 +2773,11 @@ fn native_icmp_filters_match_both_families_extension_headers_and_rollback() -> R
                 .context("ICMP peer missing")?;
             handle
                 .link()
-                .set(link.header.index)
-                .setns_by_fd(peer.as_raw_fd())
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .setns_by_fd(peer.as_raw_fd())
+                        .build(),
+                )
                 .execute()
                 .await?;
             fs::write("/proc/sys/net/ipv6/conf/lan0/accept_dad", "0")?;
@@ -2693,23 +2805,35 @@ fn native_icmp_filters_match_both_families_extension_headers_and_rollback() -> R
                 .add(link.header.index, "2001:db8::2".parse()?, 64)
                 .execute()
                 .await?;
-            handle.link().set(link.header.index).up().execute().await?;
             handle
-                .route()
-                .add()
-                .v4()
-                .destination_prefix("0.0.0.0".parse()?, 0)
-                .gateway("192.0.2.1".parse()?)
-                .output_interface(link.header.index)
+                .link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .up()
+                        .build(),
+                )
                 .execute()
                 .await?;
             handle
                 .route()
-                .add()
-                .v6()
-                .destination_prefix("::".parse()?, 0)
-                .gateway("2001:db8::1".parse()?)
-                .output_interface(link.header.index)
+                .add(
+                    rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                        .destination_prefix("0.0.0.0".parse()?, 0)
+                        .gateway("192.0.2.1".parse()?)
+                        .output_interface(link.header.index)
+                        .build(),
+                )
+                .execute()
+                .await?;
+            handle
+                .route()
+                .add(
+                    rtnetlink::RouteMessageBuilder::<std::net::Ipv6Addr>::new()
+                        .destination_prefix("::".parse()?, 0)
+                        .gateway("2001:db8::1".parse()?)
+                        .output_interface(link.header.index)
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -2955,8 +3079,7 @@ fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift(
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .veth("lan0".into(), "client0".into())
+                .add(rtnetlink::LinkVeth::new(&"lan0", &"client0").build())
                 .execute()
                 .await?;
             let link = handle
@@ -2969,8 +3092,11 @@ fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift(
                 .context("counter peer missing")?;
             handle
                 .link()
-                .set(link.header.index)
-                .setns_by_fd(peer.as_raw_fd())
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .setns_by_fd(peer.as_raw_fd())
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -2994,14 +3120,24 @@ fn native_firewall_counters_measure_rules_defaults_nat_and_resets_without_drift(
                     .await?;
             }
 
-            handle.link().set(link.header.index).up().execute().await?;
+            handle
+                .link()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .up()
+                        .build(),
+                )
+                .execute()
+                .await?;
             handle
                 .route()
-                .add()
-                .v4()
-                .destination_prefix("0.0.0.0".parse()?, 0)
-                .gateway("192.0.2.1".parse()?)
-                .output_interface(link.header.index)
+                .add(
+                    rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                        .destination_prefix("0.0.0.0".parse()?, 0)
+                        .gateway("192.0.2.1".parse()?)
+                        .output_interface(link.header.index)
+                        .build(),
+                )
                 .execute()
                 .await?;
             Ok(())
@@ -3264,7 +3400,11 @@ fn native_connection_statistics_observe_udp_without_mutating_owned_state() -> Re
                 .context("loopback missing")?
                 .header
                 .index;
-            handle.link().set(index).up().execute().await?;
+            handle
+                .link()
+                .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+                .execute()
+                .await?;
             let server = std::net::UdpSocket::bind("127.0.0.1:0")?;
             let client = std::net::UdpSocket::bind("127.0.0.1:0")?;
             for socket in [&server, &client] {
@@ -3322,7 +3462,11 @@ fn native_connection_delete_targets_one_entry_then_flushes_only_its_namespace() 
                 .context("loopback missing")?
                 .header
                 .index;
-            handle.link().set(index).up().execute().await?;
+            handle
+                .link()
+                .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+                .execute()
+                .await?;
             let mut ports = Vec::new();
             let mut sockets = Vec::new();
             for _ in 0..2 {
@@ -3396,8 +3540,7 @@ fn native_dhcp_gateway_waiting_apply_rollback_reopen_and_recovery() -> Result<()
         runtime.block_on(async {
             handle
                 .link()
-                .add()
-                .veth("wan0".into(), "peer0".into())
+                .add(rtnetlink::LinkVeth::new(&"wan0", &"peer0").build())
                 .execute()
                 .await?;
             Ok(())
@@ -3504,11 +3647,11 @@ fn native_dhcp_installs_connected_route_before_default_gateway() -> Result<()> {
     let namespace = Arc::new(File::open(&fixture.namespace)?);
     session(namespace, |rt, handle| {
         rt.block_on(async {
-            handle.link().add().dummy("dhcp0".into()).execute().await?;
+            handle.link().add(rtnetlink::LinkDummy::new(&"dhcp0").build()).execute().await?;
             let index = networking::links(handle).await?.iter()
                 .find(|link| networking::name(link) == "dhcp0")
                 .context("test DHCP interface missing")?.header.index;
-            handle.link().set(index).up().execute().await?;
+            handle.link().set(rtnetlink::LinkUnspec::new_with_index(index).up().build()).execute().await?;
             let lease: dhcp_client::Lease = serde_json::from_value(json!({
                 "client": {}, "address": "192.0.2.10/24", "server": "192.0.2.1",
                 "acquired_at": dhcp_client::now()?, "lifetime": 3600,
@@ -3526,7 +3669,7 @@ fn native_dhcp_installs_connected_route_before_default_gateway() -> Result<()> {
             assert!(addresses.iter().any(|address| address.attributes.iter().any(
                 |attribute| matches!(attribute, AddressAttribute::Local(value) if *value == leased_ip)
             )));
-            let routes: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let routes: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
             let owned: Vec<_> = routes.iter().filter(|route| route.header.protocol == RouteProtocol::Other(dhcp_client::PROTOCOL)
                 && route.attributes.iter().any(|attribute| matches!(attribute, RouteAttribute::Oif(value) if *value == index))).collect();
             assert_eq!(owned.len(), 2);
@@ -3542,7 +3685,7 @@ fn native_dhcp_installs_connected_route_before_default_gateway() -> Result<()> {
             assert!(!addresses.iter().any(|address| address.attributes.iter().any(
                 |attribute| matches!(attribute, AddressAttribute::Local(value) if *value == leased_ip)
             )));
-            let routes: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let routes: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
             assert!(!routes.iter().any(|route| route.header.protocol == RouteProtocol::Other(dhcp_client::PROTOCOL)));
             Ok(())
         })
@@ -3559,11 +3702,11 @@ fn native_dhcp_static_routes_survive_renewal_address_change_expiry_and_rollback(
     let fixture = Fixture::new()?;
     session(Arc::new(File::open(&fixture.namespace)?), |rt, handle| {
         rt.block_on(async {
-            handle.link().add().dummy("dhcp0".into()).execute().await?;
+            handle.link().add(rtnetlink::LinkDummy::new(&"dhcp0").build()).execute().await?;
             let index = networking::links(handle).await?.iter()
                 .find(|link| networking::name(link) == "dhcp0")
                 .context("test DHCP interface missing")?.header.index;
-            handle.link().set(index).up().execute().await?;
+            handle.link().set(rtnetlink::LinkUnspec::new_with_index(index).up().build()).execute().await?;
             let lease: dhcp_client::Lease = serde_json::from_value(json!({
                 "client":{}, "address":"192.0.2.10/24", "server":"192.0.2.1",
                 "acquired_at":dhcp_client::now()?, "lifetime":3600,
@@ -3582,7 +3725,7 @@ fn native_dhcp_static_routes_survive_renewal_address_change_expiry_and_rollback(
                 ..Default::default()
             };
             let owned = || async {
-                let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+                let messages: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
                 let mut routes = messages.iter()
                     .filter(|message| message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL))
                     .map(|message| networking::decode_route(message, &BTreeMap::from([(index, "dhcp0".into())])))
@@ -3592,21 +3735,21 @@ fn native_dhcp_static_routes_survive_renewal_address_change_expiry_and_rollback(
             };
             let mut expected = addressing.routes.clone();
             expected.sort();
-            handle.link().add().dummy("other0".into()).execute().await?;
+            handle.link().add(rtnetlink::LinkDummy::new(&"other0").build()).execute().await?;
             let other = networking::links(handle).await?.iter()
                 .find(|link| networking::name(link) == "other0")
                 .context("unrelated test interface missing")?.header.index;
-            handle.link().set(other).up().execute().await?;
-            handle.route().add().v4().destination_prefix("198.19.0.0".parse()?, 16)
+            handle.link().set(rtnetlink::LinkUnspec::new_with_index(other).up().build()).execute().await?;
+            handle.route().add(rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new().destination_prefix("198.19.0.0".parse()?, 16)
                 .output_interface(other).priority(30).protocol(RouteProtocol::Other(99))
-                .scope(netlink_packet_route::route::RouteScope::Link).execute().await?;
+                .scope(netlink_packet_route::route::RouteScope::Link).build()).execute().await?;
             networking::dhcp_lease(handle, "dhcp0", None, Some(&lease), &addressing, false).await?;
             assert_eq!(owned().await?, expected);
             networking::dhcp_lease(handle, "dhcp0", Some(&lease), Some(&lease), &addressing, false).await?;
             assert_eq!(owned().await?, expected);
 
             // A known configured route lost by the kernel is restored on the next lease update.
-            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let messages: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
             let route = messages.into_iter().find(|message| message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL))
                 .context("static test route missing")?;
             handle.route().del(route).execute().await?;
@@ -3633,19 +3776,19 @@ fn native_dhcp_static_routes_survive_renewal_address_change_expiry_and_rollback(
             assert_eq!(owned().await?, expected);
 
             // Never replace an operator's route sharing a configured identity.
-            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let messages: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
             for message in messages {
                 if message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL)
                     && message.attributes.iter().any(|attribute| matches!(attribute, RouteAttribute::Priority(10))) {
                     handle.route().del(message).execute().await?;
                 }
             }
-            handle.route().add().v4().destination_prefix("198.51.100.0".parse()?, 24)
+            handle.route().add(rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new().destination_prefix("198.51.100.0".parse()?, 24)
                 .gateway("192.0.2.1".parse()?).output_interface(index).priority(10)
-                .protocol(RouteProtocol::Other(99)).execute().await?;
+                .protocol(RouteProtocol::Other(99)).build()).execute().await?;
             let error = networking::dhcp_lease(handle, "dhcp0", Some(&changed), Some(&changed), &addressing, false).await.unwrap_err();
             assert!(format!("{error:#}").contains("conflicts with existing route"), "{error:#}");
-            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let messages: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
             assert_eq!(messages.iter().filter(|message| message.header.protocol == RouteProtocol::Other(99)).count(), 2);
             Ok(())
         })
@@ -3665,11 +3808,11 @@ fn native_dhcp_gateway_routes_follow_site_changes_and_preserve_ownership() -> Re
         Arc::new(File::open(&fixture.namespace)?),
         move |rt, handle| {
             rt.block_on(async {
-            handle.link().add().veth("wan0".into(), "peer0".into()).execute().await?;
+            handle.link().add(rtnetlink::LinkVeth::new(&"wan0", &"peer0").build()).execute().await?;
             let index = networking::links(handle).await?.iter()
                 .find(|link| networking::name(link) == "wan0")
                 .context("DHCP test interface missing")?.header.index;
-            handle.link().set(index).up().execute().await?;
+            handle.link().set(rtnetlink::LinkUnspec::new_with_index(index).up().build()).execute().await?;
             let lease: dhcp_client::Lease = serde_json::from_value(json!({
                 "client":{}, "address":"192.0.2.10/24", "server":"192.0.2.1",
                 "acquired_at":dhcp_client::now()?, "lifetime":3600,
@@ -3693,7 +3836,7 @@ fn native_dhcp_gateway_routes_follow_site_changes_and_preserve_ownership() -> Re
                 mtu:1500, routes:network.routes.clone(), ..Default::default()
             };
             let owned = || async {
-                let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+                let messages: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
                 let mut routes = messages.iter()
                     .filter(|message| message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL))
                     .map(|message| networking::decode_route(message, &BTreeMap::from([(index, "wan0".into())])))
@@ -3760,19 +3903,19 @@ fn native_dhcp_gateway_routes_follow_site_changes_and_preserve_ownership() -> Re
             networking::dhcp_lease(handle, "wan0", None, Some(&changed), &addressing, false).await?;
             assert_eq!(owned().await?, expected(&changed, &addressing)?);
 
-            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let messages: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
             let owned_route = messages.into_iter().find(|message|
                 message.header.protocol == RouteProtocol::Other(crate::model::PROTOCOL)
                     && message.header.table == 254).context("owned host route missing")?;
             handle.route().del(owned_route).execute().await?;
-            handle.route().add().v4().destination_prefix("203.0.113.10".parse()?, 32)
+            handle.route().add(rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new().destination_prefix("203.0.113.10".parse()?, 32)
                 .output_interface(index).priority(10).protocol(RouteProtocol::Other(99))
-                .scope(RouteScope::Link).execute().await?;
+                .scope(RouteScope::Link).build()).execute().await?;
             let before = owned().await?;
             let error = networking::dhcp_lease(handle, "wan0", Some(&changed), Some(&same_address), &addressing, false).await.unwrap_err();
             assert!(format!("{error:#}").contains("conflicts with existing route"), "{error:#}");
             assert_eq!(owned().await?, before);
-            let messages: Vec<_> = handle.route().get(IpVersion::V4).execute().try_collect().await?;
+            let messages: Vec<_> = handle.route().get(crate::linux::networking::route_query(IpVersion::V4)).execute().try_collect().await?;
             assert!(messages.iter().any(|message| message.header.protocol == RouteProtocol::Other(99)));
             assert_eq!(configured.routes[0].gateway, "dhcp");
             Ok(())
@@ -3794,8 +3937,7 @@ fn native_dhcp_gateway_lease_intent_recovery_and_restart() -> Result<()> {
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .veth("wan0".into(), "peer0".into())
+                .add(rtnetlink::LinkVeth::new(&"wan0", &"peer0").build())
                 .execute()
                 .await?;
             let index = networking::links(handle)
@@ -3805,7 +3947,11 @@ fn native_dhcp_gateway_lease_intent_recovery_and_restart() -> Result<()> {
                 .context("DHCP test interface missing")?
                 .header
                 .index;
-            handle.link().set(index).up().execute().await?;
+            handle
+                .link()
+                .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+                .execute()
+                .await?;
             Ok(())
         })
     })?;
@@ -3880,7 +4026,7 @@ fn native_dhcp_gateway_lease_intent_recovery_and_restart() -> Result<()> {
                     .collect();
                 let routes: Vec<_> = handle
                     .route()
-                    .get(IpVersion::V4)
+                    .get(crate::linux::networking::route_query(IpVersion::V4))
                     .execute()
                     .try_collect()
                     .await?;
@@ -4469,7 +4615,11 @@ fn native_preserves_unmanaged_links_and_adopted_parent() -> Result<()> {
     let namespace = Arc::new(open_namespace(&fixture.namespace)?);
     session(namespace.clone(), |rt, handle| {
         rt.block_on(async {
-            handle.link().add().dummy("uplink".into()).execute().await?;
+            handle
+                .link()
+                .add(rtnetlink::LinkDummy::new(&"uplink").build())
+                .execute()
+                .await?;
             Ok(())
         })
     })?;
@@ -4482,8 +4632,7 @@ fn native_preserves_unmanaged_links_and_adopted_parent() -> Result<()> {
         rt.block_on(async {
             handle
                 .link()
-                .add()
-                .dummy("foreign".into())
+                .add(rtnetlink::LinkDummy::new(&"foreign").build())
                 .execute()
                 .await?;
             Ok(())

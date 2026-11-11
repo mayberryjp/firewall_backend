@@ -36,7 +36,10 @@ pub async fn routes(handle: &Handle, remove: &[Installed], add: &[Installed]) ->
             })
         })
         .collect::<BTreeMap<_, _>>();
-    let mut messages = handle.route().get(IpVersion::V4).execute();
+    let mut messages = handle
+        .route()
+        .get(crate::linux::networking::route_query(IpVersion::V4))
+        .execute();
     let mut existing = BTreeMap::new();
     while let Some(message) = messages.try_next().await? {
         let destination = message
@@ -124,10 +127,7 @@ pub async fn routes(handle: &Handle, remove: &[Installed], add: &[Installed]) ->
         let index = *indices
             .get(route.interface.as_str())
             .context("BGP route interface missing")?;
-        let request = handle
-            .route()
-            .add()
-            .v4()
+        let mut message = rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
             .destination_prefix(route.prefix.address, route.prefix.length)
             .table_id(254)
             .priority(METRIC)
@@ -139,10 +139,9 @@ pub async fn routes(handle: &Handle, remove: &[Installed], add: &[Installed]) ->
                 RouteScope::Link
             });
         if let Some(gateway) = route.gateway {
-            request.gateway(gateway).execute().await?;
-        } else {
-            request.execute().await?;
+            message = message.gateway(gateway);
         }
+        handle.route().add(message.build()).execute().await?;
     }
     Ok(())
 }
@@ -237,7 +236,7 @@ pub async fn connected(
         .filter(|l| {
             l.header
                 .flags
-                .contains(&netlink_packet_route::link::LinkFlag::Up)
+                .contains(netlink_packet_route::link::LinkFlags::Up)
         })
         .filter_map(|l| {
             l.attributes.iter().find_map(|a| {

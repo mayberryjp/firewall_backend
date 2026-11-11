@@ -1106,8 +1106,7 @@ mod tests {
             rt.block_on(async {
                 handle
                     .link()
-                    .add()
-                    .veth("lan0".into(), "client0".into())
+                    .add(rtnetlink::LinkVeth::new(&"lan0", &"client0").build())
                     .execute()
                     .await?;
                 let link = handle
@@ -1120,8 +1119,11 @@ mod tests {
                     .context("missing veth peer")?;
                 handle
                     .link()
-                    .set(link.header.index)
-                    .setns_by_fd(peer.as_raw_fd())
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .setns_by_fd(peer.as_raw_fd())
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -1164,14 +1166,24 @@ mod tests {
                         .add(link.header.index, ipv6.parse()?, 64)
                         .execute()
                         .await?;
-                    handle.link().set(link.header.index).up().execute().await?;
+                    handle
+                        .link()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .up()
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
                     handle
                         .route()
-                        .add()
-                        .v4()
-                        .destination_prefix("198.51.100.0".parse()?, 24)
-                        .gateway(gateway.parse()?)
-                        .output_interface(link.header.index)
+                        .add(
+                            rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                                .destination_prefix("198.51.100.0".parse()?, 24)
+                                .gateway(gateway.parse()?)
+                                .output_interface(link.header.index)
+                                .build(),
+                        )
                         .execute()
                         .await?;
                     Ok(())

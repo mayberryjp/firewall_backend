@@ -198,7 +198,7 @@ fn vlan_lower_link(link: &LinkMessage) -> (Option<u32>, bool) {
     let foreign = link
         .attributes
         .iter()
-        .any(|attribute| matches!(attribute, LinkAttribute::NetnsId(_)));
+        .any(|attribute| matches!(attribute, LinkAttribute::LinkNetNsId(_)));
     (lower, foreign)
 }
 
@@ -1461,7 +1461,7 @@ mod tests {
     #[test]
     fn capabilities_vlan_rps_unresolved_ancestry_is_unknown_with_errors() {
         let mut foreign = vlan_link(3, 2);
-        foreign.attributes.push(LinkAttribute::NetnsId(0));
+        foreign.attributes.push(LinkAttribute::LinkNetNsId(0));
         for links in [
             vec![],
             vec![vlan_link(3, 99)],
@@ -1533,7 +1533,7 @@ mod tests {
             vlan_lower_link(&vlan_link(3, 4))
         );
         let mut foreign = vlan_link(3, 2);
-        foreign.attributes.push(LinkAttribute::NetnsId(0));
+        foreign.attributes.push(LinkAttribute::LinkNetNsId(0));
         assert_ne!(vlan_lower_link(&vlan_link(3, 2)), vlan_lower_link(&foreign));
     }
 

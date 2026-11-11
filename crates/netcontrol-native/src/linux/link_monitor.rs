@@ -208,7 +208,15 @@ mod tests {
                         .try_next()
                         .await?
                         .context("fixture link missing")?;
-                    handle.link().set(link.header.index).up().execute().await?;
+                    handle
+                        .link()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .up()
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
                     if name != "lo" {
                         handle
                             .address()
@@ -220,10 +228,12 @@ mod tests {
                 if let Some(gateway) = gateway {
                     handle
                         .route()
-                        .add()
-                        .v4()
-                        .destination_prefix("0.0.0.0".parse()?, 0)
-                        .gateway(gateway)
+                        .add(
+                            rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                                .destination_prefix("0.0.0.0".parse()?, 0)
+                                .gateway(gateway)
+                                .build(),
+                        )
                         .execute()
                         .await?;
                 }
@@ -252,8 +262,7 @@ mod tests {
                 ] {
                     handle
                         .link()
-                        .add()
-                        .veth(inside.into(), outside.into())
+                        .add(rtnetlink::LinkVeth::new(&inside, &outside).build())
                         .execute()
                         .await?;
                     let peer = handle
@@ -266,8 +275,11 @@ mod tests {
                         .context("missing veth peer")?;
                     handle
                         .link()
-                        .set(peer.header.index)
-                        .setns_by_fd(target.as_raw_fd())
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(peer.header.index)
+                                .setns_by_fd(target.as_raw_fd())
+                                .build(),
+                        )
                         .execute()
                         .await?;
                 }

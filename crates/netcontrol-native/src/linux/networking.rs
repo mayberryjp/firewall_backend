@@ -1,20 +1,20 @@
 use crate::model::{EthernetSnapshot, Network, PROTOCOL, Route, Rule, ethernet_kind, parse_prefix};
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::TryStreamExt;
+use netlink_packet_core::{Emitable, Nla, Parseable};
 use netlink_packet_route::{
     AddressFamily,
     address::{
-        AddressAttribute, AddressFlag, AddressHeaderFlag, AddressMessage, AddressMessageBuffer,
+        AddressAttribute, AddressFlags, AddressHeaderFlags, AddressMessage, AddressMessageBuffer,
         AddressScope,
     },
-    link::{InfoData, InfoVlan, LinkAttribute, LinkFlag, LinkInfo, LinkMessage, VlanProtocol},
+    link::{InfoData, InfoVlan, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, VlanProtocol},
     route::{
         RouteAddress, RouteAttribute, RouteMessage, RoutePreference, RouteProtocol, RouteScope,
         RouteType,
     },
     rule::{RuleAction, RuleAttribute, RuleMessage},
 };
-use netlink_packet_utils::{Emitable, Parseable, nla::Nla};
 use rtnetlink::{Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,9 +23,67 @@ use std::{
     net::IpAddr,
 };
 
+pub(super) fn route_query(version: IpVersion) -> RouteMessage {
+    let mut message = RouteMessage::default();
+    message.header.address_family = match version {
+        IpVersion::V4 => AddressFamily::Inet,
+        IpVersion::V6 => AddressFamily::Inet6,
+    };
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_link_dump_decodes_all_240_devconf_bytes() -> Result<()> {
+        use netlink_packet_route::link::{AfSpecInet6, AfSpecUnspec, LinkMessageBuffer};
+
+        let mut bytes = vec![0u8; 16 + 4 + 4 + 4 + 240];
+        bytes[4..8].copy_from_slice(&2u32.to_ne_bytes());
+        bytes[16..18].copy_from_slice(&252u16.to_ne_bytes());
+        bytes[18..20].copy_from_slice(&26u16.to_ne_bytes());
+        bytes[20..22].copy_from_slice(&248u16.to_ne_bytes());
+        bytes[22..24].copy_from_slice(&10u16.to_ne_bytes());
+        bytes[24..26].copy_from_slice(&244u16.to_ne_bytes());
+        bytes[26..28].copy_from_slice(&2u16.to_ne_bytes());
+        for (index, field) in bytes[28..].chunks_exact_mut(4).enumerate() {
+            field.copy_from_slice(&(index as i32 + 1).to_ne_bytes());
+        }
+        let message = LinkMessage::parse(&LinkMessageBuffer::new_checked(&bytes)?)?;
+        let LinkAttribute::AfSpecUnspec(families) = &message.attributes[0] else {
+            bail!("missing AF_SPEC");
+        };
+        let AfSpecUnspec::Inet6(attributes) = &families[0] else {
+            bail!("missing AF_INET6");
+        };
+        let AfSpecInet6::DevConf(config) = &attributes[0] else {
+            bail!("missing IFLA_INET6_CONF");
+        };
+        assert_eq!(config.buffer_len(), 240);
+        assert_eq!(config.forwarding, 1);
+        assert_eq!(config.accept_ra_min_lft, 59);
+        assert_eq!(config.force_forwarding, 60);
+        let mut emitted = vec![0; message.buffer_len()];
+        message.emit(&mut emitted);
+        assert_eq!(emitted, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn route_queries_select_only_the_requested_address_family() {
+        for (version, family) in [
+            (IpVersion::V4, AddressFamily::Inet),
+            (IpVersion::V6, AddressFamily::Inet6),
+        ] {
+            let message = route_query(version);
+            assert_eq!(message.header.address_family, family);
+            assert!(message.attributes.is_empty());
+            assert!(message.header.flags.is_empty());
+            assert_eq!(message.header.table, 0);
+        }
+    }
 
     fn adoption_links() -> (LinkMessage, LinkMessage, netcontrol_core::AdoptVlanRequest) {
         let request = netcontrol_core::AdoptVlanRequest {
@@ -50,7 +108,10 @@ mod tests {
                 LinkInfo::Data(InfoData::Vlan(vec![
                     InfoVlan::Id(50),
                     InfoVlan::Protocol(VlanProtocol::Ieee8021Q),
-                    InfoVlan::Flags((1, u32::MAX)),
+                    InfoVlan::Flags((
+                        netlink_packet_route::link::VlanFlags::from_bits_retain(1),
+                        netlink_packet_route::link::VlanFlags::all(),
+                    )),
                 ])),
             ]),
         ];
@@ -73,7 +134,7 @@ mod tests {
             let mut link = LinkMessage::default();
             link.header.index = index;
             if up {
-                link.header.flags.push(LinkFlag::Up);
+                link.header.flags.insert(LinkFlags::Up);
             }
             link.attributes.push(LinkAttribute::IfName(name.into()));
             link
@@ -88,7 +149,7 @@ mod tests {
             down_configured_ethernet(&network, &available)?,
             vec![("dhcp0".into(), 3), ("static0".into(), 2)]
         );
-        available[0].header.flags.push(LinkFlag::Up);
+        available[0].header.flags.insert(LinkFlags::Up);
         assert_eq!(
             down_configured_ethernet(&network, &available)?,
             vec![("dhcp0".into(), 3)]
@@ -115,7 +176,7 @@ mod tests {
             .push(AddressAttribute::Local("192.0.2.2".parse().unwrap()));
         captured
             .attributes
-            .push(AddressAttribute::Flags(vec![AddressFlag::Noprefixroute]));
+            .push(AddressAttribute::Flags(AddressFlags::Noprefixroute));
         let mut current = captured.clone();
         assert!(same_address(&captured, &current));
         assert!(same_prefix_route_flag(&captured, &current));
@@ -153,8 +214,14 @@ mod tests {
         assert!(validate_adoptable_vlan(&link, &stacked, &request).is_err());
         for attribute in [
             InfoVlan::Protocol(VlanProtocol::Ieee8021Ad),
-            InfoVlan::Flags((2, u32::MAX)),
-            InfoVlan::Flags((0, u32::MAX)),
+            InfoVlan::Flags((
+                netlink_packet_route::link::VlanFlags::from_bits_retain(2),
+                netlink_packet_route::link::VlanFlags::all(),
+            )),
+            InfoVlan::Flags((
+                netlink_packet_route::link::VlanFlags::from_bits_retain(0),
+                netlink_packet_route::link::VlanFlags::all(),
+            )),
             InfoVlan::IngressQos(vec![netlink_packet_route::link::VlanQosMapping::Mapping(
                 0, 1,
             )]),
@@ -206,7 +273,7 @@ mod tests {
         address.header.family = AddressFamily::Inet;
         address.header.prefix_len = 24;
         address.header.index = 3;
-        address.header.flags = vec![AddressHeaderFlag::Permanent];
+        address.header.flags = AddressHeaderFlags::Permanent;
         let mut cache = netlink_packet_route::address::CacheInfo::default();
         cache.ifa_valid = u32::MAX;
         cache.ifa_preferred = u32::MAX;
@@ -292,7 +359,7 @@ mod tests {
             match field {
                 "prefix" => changed.header.prefix_len = 25,
                 "scope" => changed.header.scope = AddressScope::Host,
-                "flags" => changed.header.flags.clear(),
+                "flags" => changed.header.flags = Default::default(),
                 "local" => {
                     changed.attributes[1] = AddressAttribute::Local("192.0.2.2".parse().unwrap())
                 }
@@ -365,10 +432,10 @@ mod tests {
     #[test]
     fn loopback_kind_uses_kernel_flags_not_interface_name() {
         let mut link = LinkMessage::default();
-        link.header.flags = vec![LinkFlag::Loopback];
+        link.header.flags = LinkFlags::Loopback;
         link.attributes.push(LinkAttribute::IfName("local0".into()));
         assert_eq!(kind(&link), "loopback");
-        link.header.flags.clear();
+        link.header.flags = Default::default();
         assert_eq!(kind(&link), "device");
         link.attributes = vec![LinkAttribute::IfName("lo".into())];
         assert_eq!(kind(&link), "device");
@@ -429,7 +496,7 @@ mod tests {
             message
                 .header
                 .flags
-                .push(netlink_packet_route::route::RouteFlag::Linkdown);
+                .insert(netlink_packet_route::route::RouteFlags::Linkdown);
             assert!(decode_route(&message, &names).is_err());
             message.header.protocol = RouteProtocol::Other(PROTOCOL);
             assert_eq!(decode_route(&message, &names)?, decoded);
@@ -546,7 +613,7 @@ pub(super) fn name(link: &LinkMessage) -> String {
         .unwrap_or_default()
 }
 fn kind(link: &LinkMessage) -> String {
-    if link.header.flags.contains(&LinkFlag::Loopback) {
+    if link.header.flags.contains(LinkFlags::Loopback) {
         return "loopback".into();
     }
     for a in &link.attributes {
@@ -595,7 +662,7 @@ pub(super) fn parent(link: &LinkMessage) -> Parent {
         index: link.header.index,
         mac,
         mtu: mtu(link),
-        up: link.header.flags.contains(&LinkFlag::Up),
+        up: link.header.flags.contains(LinkFlags::Up),
     }
 }
 
@@ -623,7 +690,7 @@ fn down_configured_ethernet(
             "configured Ethernet {} changed kind",
             desired.name
         );
-        if !actual.header.flags.contains(&LinkFlag::Up) {
+        if !actual.header.flags.contains(LinkFlags::Up) {
             down.push((desired.name.clone(), actual.header.index));
         }
     }
@@ -638,8 +705,7 @@ pub(super) async fn activate_ethernet(handle: &Handle, network: &Network) -> Res
     for (name, index) in down_configured_ethernet(network, &links(handle).await?)? {
         handle
             .link()
-            .set(index)
-            .up()
+            .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
             .execute()
             .await
             .with_context(|| format!("bring configured Ethernet {name} up"))?;
@@ -783,7 +849,7 @@ fn validate_vlan_connected_route(route: &RouteMessage, addresses: &[AddressMessa
                 .header
                 .flags
                 .iter()
-                .all(|flag| *flag == netlink_packet_route::route::RouteFlag::Linkdown)
+                .all(|flag| flag == netlink_packet_route::route::RouteFlags::Linkdown)
             && route.header.source_prefix_length == 0
             && route.header.tos == 0,
         "VLAN adoption supports only ordinary kernel-connected routes"
@@ -850,7 +916,12 @@ pub(super) async fn capture_vlan_snapshot(
     let p = adoptable_vlan(handle, request).await?;
     let messages = addresses(handle, p.index).await?;
     for version in [IpVersion::V4, IpVersion::V6] {
-        let routes: Vec<RouteMessage> = handle.route().get(version).execute().try_collect().await?;
+        let routes: Vec<RouteMessage> = handle
+            .route()
+            .get(crate::linux::networking::route_query(version))
+            .execute()
+            .try_collect()
+            .await?;
         for route in routes {
             ensure!(
                 !route.attributes.iter().any(|attribute| matches!(
@@ -1059,8 +1130,8 @@ fn validate_vlan_address(message: &AddressMessage, name: &str) -> Result<()> {
             .header
             .flags
             .iter()
-            .all(|flag| *flag == AddressHeaderFlag::Permanent
-                || (ipv4 && *flag == AddressHeaderFlag::Secondary)),
+            .all(|flag| flag == AddressHeaderFlags::Permanent
+                || (ipv4 && flag == AddressHeaderFlags::Secondary)),
         "unsupported VLAN address flags"
     );
     for attribute in &message.attributes {
@@ -1070,7 +1141,7 @@ fn validate_vlan_address(message: &AddressMessage, name: &str) -> Result<()> {
             | AddressAttribute::CacheInfo(_) => true,
             AddressAttribute::Label(label) => label == name,
             AddressAttribute::Flags(flags) => flags.iter().all(|flag| {
-                *flag == AddressFlag::Permanent || (ipv4 && *flag == AddressFlag::Secondary)
+                flag == AddressFlags::Permanent || (ipv4 && flag == AddressFlags::Secondary)
             }),
             AddressAttribute::Broadcast(broadcast) => {
                 message.attributes.iter().any(|attribute| match attribute {
@@ -1118,12 +1189,12 @@ fn validate_adoptable_vlan(
     ensure!(
         link.header.flags.iter().all(|flag| matches!(
             flag,
-            LinkFlag::Up
-                | LinkFlag::Broadcast
-                | LinkFlag::Running
-                | LinkFlag::Multicast
-                | LinkFlag::LowerUp
-                | LinkFlag::Dormant
+            LinkFlags::Up
+                | LinkFlags::Broadcast
+                | LinkFlags::Running
+                | LinkFlags::Multicast
+                | LinkFlags::LowerUp
+                | LinkFlags::Dormant
         )),
         "unsupported VLAN link flags"
     );
@@ -1135,7 +1206,7 @@ fn validate_adoptable_vlan(
                     LinkInfo::Data(InfoData::Vlan(attributes)) => {
                         ensure!(
                             attributes.iter().all(|attribute| !matches!(attribute,
-                            InfoVlan::Flags((flags, _)) if *flags != 1)),
+                            InfoVlan::Flags((flags, _)) if *flags != netlink_packet_route::link::VlanFlags::ReorderHdr)),
                             "nondefault VLAN flags cannot be adopted"
                         );
                     }
@@ -1231,12 +1302,20 @@ pub async fn restore_ethernet(
                 handle.address().del(address).execute().await?;
             }
         }
-        handle.link().set(index).mtu(snapshot.mtu).execute().await?;
-        let request = handle.link().set(index);
+        handle
+            .link()
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(index)
+                    .mtu(snapshot.mtu)
+                    .build(),
+            )
+            .execute()
+            .await?;
+        let message = rtnetlink::LinkUnspec::new_with_index(index);
         if snapshot.up {
-            request.up().execute().await?;
+            handle.link().set(message.up().build()).execute().await?;
         } else {
-            request.down().execute().await?;
+            handle.link().set(message.down().build()).execute().await?;
         }
         for address in original {
             let ip = address
@@ -1273,7 +1352,7 @@ fn same_address(a: &AddressMessage, b: &AddressMessage) -> bool {
 fn same_prefix_route_flag(a: &AddressMessage, b: &AddressMessage) -> bool {
     let has_no_prefix_route = |address: &AddressMessage| {
         address.attributes.iter().any(|attribute| {
-            matches!(attribute, AddressAttribute::Flags(flags) if flags.contains(&AddressFlag::Noprefixroute))
+            matches!(attribute, AddressAttribute::Flags(flags) if flags.contains(AddressFlags::Noprefixroute))
         })
     };
     has_no_prefix_route(a) == has_no_prefix_route(b)
@@ -1373,7 +1452,11 @@ pub(super) fn vlan(link: &LinkMessage) -> Result<Option<(u32, u16)>> {
                                 "unsupported VLAN protocol"
                             ),
                             InfoVlan::Flags((value, _)) => {
-                                ensure!(*value & !1 == 0, "unsupported VLAN flags")
+                                ensure!(
+                                    (*value & !netlink_packet_route::link::VlanFlags::ReorderHdr)
+                                        .is_empty(),
+                                    "unsupported VLAN flags"
+                                )
                             }
                             InfoVlan::EgressQos(v) | InfoVlan::IngressQos(v) => {
                                 ensure!(v.is_empty(), "unsupported VLAN QoS mapping")
@@ -1424,8 +1507,8 @@ pub(super) fn address_string(address: &AddressMessage) -> Result<Option<String>>
         "unsupported point-to-point address"
     );
     ensure!(
-        !address.header.flags.contains(&AddressHeaderFlag::Tentative)
-            && !address.header.flags.contains(&AddressHeaderFlag::Dadfailed),
+        !address.header.flags.contains(AddressHeaderFlags::Tentative)
+            && !address.header.flags.contains(AddressHeaderFlags::Dadfailed),
         "address is tentative or DAD failed"
     );
     let ip = local.or(peer).context("address missing IP")?;
@@ -1534,8 +1617,12 @@ async fn check_policy_rules(handle: &Handle, allow_managed: bool) -> Result<()> 
 async fn owned_routes(handle: &Handle) -> Result<Vec<RouteMessage>> {
     let mut owned = Vec::new();
     for version in [IpVersion::V4, IpVersion::V6] {
-        let messages: Vec<RouteMessage> =
-            handle.route().get(version).execute().try_collect().await?;
+        let messages: Vec<RouteMessage> = handle
+            .route()
+            .get(crate::linux::networking::route_query(version))
+            .execute()
+            .try_collect()
+            .await?;
         for message in messages {
             let table = message
                 .attributes
@@ -1595,7 +1682,7 @@ pub(super) fn decode_owned_route(
                 .header
                 .flags
                 .iter()
-                .all(|flag| *flag == netlink_packet_route::route::RouteFlag::Linkdown)
+                .all(|flag| flag == netlink_packet_route::route::RouteFlags::Linkdown)
             && (message.header.flags.is_empty()
                 || matches!(
                     message.header.protocol,
@@ -1686,8 +1773,12 @@ pub async fn preflight(handle: &Handle, before: &Network, after: &Network) -> Re
         }
     }
     for version in [IpVersion::V4, IpVersion::V6] {
-        let messages: Vec<RouteMessage> =
-            handle.route().get(version).execute().try_collect().await?;
+        let messages: Vec<RouteMessage> = handle
+            .route()
+            .get(crate::linux::networking::route_query(version))
+            .execute()
+            .try_collect()
+            .await?;
         for message in messages {
             if message.header.protocol == RouteProtocol::Other(PROTOCOL) {
                 continue;
@@ -1776,7 +1867,7 @@ pub async fn boot_snapshot(
         }
         let mut observed = desired.clone();
         observed.mtu = mtu(link);
-        observed.up = link.header.flags.contains(&LinkFlag::Up);
+        observed.up = link.header.flags.contains(LinkFlags::Up);
         observed.addresses = addresses(handle, link.header.index)
             .await?
             .iter()
@@ -1894,7 +1985,7 @@ pub async fn verify(
         crate::ensure_unchanged(
             matches_kind(actual, &desired.kind)
                 && mtu(actual) == desired.mtu
-                && actual.header.flags.contains(&LinkFlag::Up) == desired.up,
+                && actual.header.flags.contains(LinkFlags::Up) == desired.up,
             format!("interface {} kind/MTU/up drift", desired.name),
         )?;
         if let Some(v) = &desired.vlan {
@@ -2101,16 +2192,14 @@ pub async fn reconcile(
                 "dummy" => {
                     handle
                         .link()
-                        .add()
-                        .dummy(desired.name.clone())
+                        .add(rtnetlink::LinkDummy::new(&desired.name.clone()).build())
                         .execute()
                         .await?
                 }
                 "wireguard" => {
                     handle
                         .link()
-                        .add()
-                        .wireguard(desired.name.clone())
+                        .add(rtnetlink::LinkWireguard::new(&desired.name.clone()).build())
                         .execute()
                         .await?
                 }
@@ -2123,8 +2212,14 @@ pub async fn reconcile(
                     ensure!(desired.mtu <= mtu(parent), "VLAN MTU exceeds parent");
                     handle
                         .link()
-                        .add()
-                        .vlan(desired.name.clone(), parent.header.index, vlan.id)
+                        .add(
+                            rtnetlink::LinkVlan::new(
+                                &desired.name.clone(),
+                                parent.header.index,
+                                vlan.id,
+                            )
+                            .build(),
+                        )
                         .execute()
                         .await?;
                 }
@@ -2140,21 +2235,26 @@ pub async fn reconcile(
         };
         handle
             .link()
-            .set(index)
-            .mtu(desired.mtu)
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(index)
+                    .mtu(desired.mtu)
+                    .build(),
+            )
             .execute()
             .await
             .with_context(|| format!("set MTU on {}", desired.name))?;
-        let request = handle.link().set(index);
+        let message = rtnetlink::LinkUnspec::new_with_index(index);
         if desired.up {
-            request
-                .up()
+            handle
+                .link()
+                .set(message.up().build())
                 .execute()
                 .await
                 .with_context(|| format!("bring interface {} up", desired.name))?;
         } else {
-            request
-                .down()
+            handle
+                .link()
+                .set(message.down().build())
                 .execute()
                 .await
                 .with_context(|| format!("bring interface {} down", desired.name))?;
@@ -2182,7 +2282,7 @@ pub async fn reconcile(
             request
                 .message_mut()
                 .attributes
-                .push(AddressAttribute::Flags(vec![AddressFlag::Nodad]));
+                .push(AddressAttribute::Flags(AddressFlags::Nodad));
             request
                 .execute()
                 .await
@@ -2256,15 +2356,14 @@ async fn install_route(
     } else {
         RouteScope::Link
     };
-    let mut request = handle
-        .route()
-        .add()
+    let mut message = rtnetlink::RouteMessageBuilder::<IpAddr>::new()
+        .destination_prefix(destination, length)?
         .table_id(route.table)
         .priority(route.metric)
         .protocol(RouteProtocol::Other(PROTOCOL))
         .scope(scope);
-    request = if drop {
-        request.kind(blackhole_type(&blackhole.action)?)
+    message = if drop {
+        message.kind(blackhole_type(&blackhole.action)?)
     } else {
         let index = available
             .iter()
@@ -2272,24 +2371,12 @@ async fn install_route(
             .context("route interface unavailable")?
             .header
             .index;
-        request.output_interface(index)
+        message.output_interface(index)
     };
-    match destination {
-        IpAddr::V4(ip) => {
-            let mut request = request.v4().destination_prefix(ip, length);
-            if !route.gateway.is_empty() {
-                request = request.gateway(route.gateway.parse()?);
-            }
-            request.execute().await?;
-        }
-        IpAddr::V6(ip) => {
-            let mut request = request.v6().destination_prefix(ip, length);
-            if !route.gateway.is_empty() {
-                request = request.gateway(route.gateway.parse()?);
-            }
-            request.execute().await?;
-        }
+    if !route.gateway.is_empty() {
+        message = message.gateway(route.gateway.parse()?)?;
     }
+    handle.route().add(message.build()).execute().await?;
     Ok(())
 }
 
@@ -2307,7 +2394,7 @@ async fn dhcp_static_routes(
         .collect();
     let messages: Vec<RouteMessage> = handle
         .route()
-        .get(IpVersion::V4)
+        .get(crate::linux::networking::route_query(IpVersion::V4))
         .execute()
         .try_collect()
         .await?;
@@ -2357,7 +2444,7 @@ async fn dhcp_static_routes(
     }
     let observed: Vec<RouteMessage> = handle
         .route()
-        .get(IpVersion::V4)
+        .get(crate::linux::networking::route_query(IpVersion::V4))
         .execute()
         .try_collect()
         .await?;
@@ -2408,7 +2495,7 @@ pub async fn dhcp_lease(
     let index = link.header.index;
     let routes: Vec<RouteMessage> = handle
         .route()
-        .get(IpVersion::V4)
+        .get(crate::linux::networking::route_query(IpVersion::V4))
         .execute()
         .try_collect()
         .await?;
@@ -2436,8 +2523,11 @@ pub async fn dhcp_lease(
     if mtu != 0 {
         handle
             .link()
-            .set(index)
-            .mtu(mtu)
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(index)
+                    .mtu(mtu)
+                    .build(),
+            )
             .execute()
             .await
             .with_context(|| format!("set DHCP MTU on {name}"))?;
@@ -2501,9 +2591,9 @@ pub async fn dhcp_lease(
         request
             .message_mut()
             .attributes
-            .push(AddressAttribute::Flags(vec![
-                netlink_packet_route::address::AddressFlag::Noprefixroute,
-            ]));
+            .push(AddressAttribute::Flags(
+                netlink_packet_route::address::AddressFlags::Noprefixroute,
+            ));
         request
             .execute()
             .await
@@ -2517,10 +2607,7 @@ pub async fn dhcp_lease(
             let IpAddr::V4(destination) = destination else {
                 bail!("DHCPv4 supplied an IPv6 route")
             };
-            let mut request = handle
-                .route()
-                .add()
-                .v4()
+            let mut message = rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
                 .destination_prefix(destination, length)
                 .output_interface(index)
                 .table_id(route.table)
@@ -2530,12 +2617,14 @@ pub async fn dhcp_lease(
                     RouteScope::Link
                 } else {
                     RouteScope::Universe
-                })
-                .replace();
+                });
             if !route.gateway.is_empty() {
-                request = request.gateway(route.gateway.parse()?);
+                message = message.gateway(route.gateway.parse()?);
             }
-            request
+            handle
+                .route()
+                .add(message.build())
+                .replace()
                 .execute()
                 .await
                 .with_context(|| format!("install DHCP route {} on {name}", route.destination))?;
@@ -2595,7 +2684,7 @@ pub async fn verify_dhcp(
     let mut observed = Vec::new();
     let routes: Vec<RouteMessage> = handle
         .route()
-        .get(IpVersion::V4)
+        .get(crate::linux::networking::route_query(IpVersion::V4))
         .execute()
         .try_collect()
         .await?;

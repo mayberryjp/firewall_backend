@@ -93,11 +93,11 @@ async fn set(
             .get(name)
             .with_context(|| format!("interface alias link {name} missing"))?;
         if alias(link) != *target {
-            let mut request = handle.link().set(link.header.index);
-            request
-                .message_mut()
-                .attributes
-                .push(LinkAttribute::IfAlias(target.clone()));
+            let request = handle.link().set(
+                rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                    .append_extra_attribute(LinkAttribute::IfAlias(target.clone()))
+                    .build(),
+            );
             request
                 .execute()
                 .await

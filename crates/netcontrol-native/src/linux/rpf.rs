@@ -122,8 +122,7 @@ mod tests {
             rt.block_on(async {
                 handle
                     .link()
-                    .add()
-                    .veth("lan0".into(), "peer0".into())
+                    .add(rtnetlink::LinkVeth::new(&"lan0", &"peer0").build())
                     .execute()
                     .await?;
                 let link = handle
@@ -136,8 +135,11 @@ mod tests {
                     .context("missing RPF peer")?;
                 handle
                     .link()
-                    .set(link.header.index)
-                    .setns_by_fd(destination.as_raw_fd())
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .setns_by_fd(destination.as_raw_fd())
+                            .build(),
+                    )
                     .execute()
                     .await?;
                 Ok(())
@@ -161,7 +163,15 @@ mod tests {
                         .execute()
                         .await?;
                 }
-                handle.link().set(link.header.index).up().execute().await?;
+                handle
+                    .link()
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .up()
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
                 Ok(())
             })
         })?;
@@ -222,7 +232,12 @@ mod tests {
             assert_eq!(runtime["rpf"]["rp_filter"][name], "1");
         }
         session(router_ns.clone(), |rt, handle| {
-            rt.block_on(handle.link().add().dummy("unmanaged@0".into()).execute())?;
+            rt.block_on(
+                handle
+                    .link()
+                    .add(rtnetlink::LinkDummy::new(&"unmanaged@0").build())
+                    .execute(),
+            )?;
             assert_eq!(read("unmanaged@0")?, "1");
             Ok(())
         })?;
@@ -241,7 +256,12 @@ mod tests {
         }
         session(router_ns.clone(), |rt, handle| {
             set(RpfMode::Loose)?;
-            rt.block_on(handle.link().add().dummy("external0".into()).execute())?;
+            rt.block_on(
+                handle
+                    .link()
+                    .add(rtnetlink::LinkDummy::new(&"external0").build())
+                    .execute(),
+            )?;
             Ok(())
         })?;
         assert_eq!(native.runtime(&strict)?["rpf"]["drift"], true);

@@ -3,6 +3,7 @@ use crate::model::{Network, PROTOCOL};
 use anyhow::{Context, Result, ensure};
 use futures_util::TryStreamExt;
 use netcontrol_core::{Config, DHCPClientConfig, DNSConfig, Interface};
+use netlink_packet_core::Emitable;
 use netlink_packet_route::{
     AddressFamily,
     address::{AddressAttribute, AddressScope},
@@ -11,7 +12,6 @@ use netlink_packet_route::{
     rule::{RuleAction, RuleAttribute, RuleMessage},
     tc::{TcAttribute, TcHandle},
 };
-use netlink_packet_utils::Emitable;
 use rtnetlink::{Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -363,7 +363,7 @@ pub(super) async fn capture_kernel(
     for version in [IpVersion::V4, IpVersion::V6] {
         let routes: Vec<RouteMessage> = handle
             .route()
-            .get(version.clone())
+            .get(networking::route_query(version.clone()))
             .execute()
             .try_collect()
             .await?;
@@ -670,14 +670,14 @@ async fn detach_xdp(handle: &Handle, link: &LinkMessage) -> Result<()> {
         modes.push(0);
     }
     for mode in modes {
-        let mut request = handle.link().set(link.header.index);
-        request
-            .message_mut()
-            .attributes
-            .push(LinkAttribute::Xdp(vec![
-                LinkXdp::Fd(-1),
-                LinkXdp::Flags(mode),
-            ]));
+        let request = handle.link().set(
+            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                .append_extra_attribute(LinkAttribute::Xdp(vec![
+                    LinkXdp::Fd(-1),
+                    LinkXdp::Flags(mode),
+                ]))
+                .build(),
+        );
         request
             .execute()
             .await
@@ -707,7 +707,7 @@ pub(super) async fn enforce_kernel(
         if link
             .header
             .flags
-            .contains(&netlink_packet_route::link::LinkFlag::Loopback)
+            .contains(netlink_packet_route::link::LinkFlags::Loopback)
         {
             continue;
         }
@@ -718,16 +718,22 @@ pub(super) async fn enforce_kernel(
         {
             handle
                 .link()
-                .set(link.header.index)
-                .nocontroller()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .nocontroller()
+                        .build(),
+                )
                 .execute()
                 .await?;
         }
         if !names.contains(name.as_str()) {
             handle
                 .link()
-                .set(link.header.index)
-                .down()
+                .set(
+                    rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                        .down()
+                        .build(),
+                )
                 .execute()
                 .await?;
             for address in networking::addresses(handle, link.header.index).await? {
@@ -811,7 +817,7 @@ pub(super) async fn enforce_kernel(
         }
         for route in handle
             .route()
-            .get(version)
+            .get(crate::linux::networking::route_query(version))
             .execute()
             .try_collect::<Vec<_>>()
             .await?

@@ -1255,8 +1255,7 @@ mod tests {
                 let task = tokio::spawn(connection);
                 handle
                     .link()
-                    .add()
-                    .veth("nc-offload-a".into(), "nc-offload-b".into())
+                    .add(rtnetlink::LinkVeth::new(&"nc-offload-a", &"nc-offload-b").build())
                     .execute()
                     .await?;
                 struct VethDriver(System, usize);

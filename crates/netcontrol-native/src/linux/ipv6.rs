@@ -1,12 +1,12 @@
 use super::networking;
 use anyhow::{Context, Result, ensure};
 use futures_util::TryStreamExt;
+use netlink_packet_core::{Emitable, Parseable};
 use netlink_packet_route::{
     AddressFamily,
-    address::{AddressAttribute, AddressFlag, AddressMessage, AddressMessageBuffer},
+    address::{AddressAttribute, AddressFlags, AddressMessage, AddressMessageBuffer},
     route::{RouteAttribute, RouteMessage, RouteMessageBuffer, RouteProtocol},
 };
-use netlink_packet_utils::{Emitable, Parseable};
 use rtnetlink::{Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -168,7 +168,7 @@ pub(super) async fn capture(handle: &Handle) -> Result<Snapshot> {
     }
     let routes: Vec<RouteMessage> = handle
         .route()
-        .get(IpVersion::V6)
+        .get(crate::linux::networking::route_query(IpVersion::V6))
         .execute()
         .try_collect()
         .await?;
@@ -227,9 +227,7 @@ pub(super) async fn restore_network(handle: &Handle, snapshot: &Snapshot) -> Res
                     info.tstamp = 0;
                 }
                 if let AddressAttribute::Flags(flags) = attribute {
-                    flags.retain(|flag| {
-                        !matches!(flag, AddressFlag::Tentative | AddressFlag::Dadfailed)
-                    });
+                    flags.remove(AddressFlags::Tentative | AddressFlags::Dadfailed);
                 }
             }
             if expired {
@@ -268,9 +266,13 @@ pub(super) async fn restore_network(handle: &Handle, snapshot: &Snapshot) -> Res
         route
             .attributes
             .retain(|a| !matches!(a, RouteAttribute::CacheInfo(_)));
-        let mut request = handle.route().add().v6().replace();
-        *request.message_mut() = route;
-        request.execute().await.context("restore IPv6 route")?;
+        handle
+            .route()
+            .add(route)
+            .replace()
+            .execute()
+            .await
+            .context("restore IPv6 route")?;
     }
     Ok(())
 }

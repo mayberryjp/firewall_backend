@@ -342,6 +342,12 @@
 
 ### Fixed
 
+- Update the native routing-netlink stack to decode all 240 bytes of Linux
+  `IFLA_INET6_CONF`, including `force_forwarding`, instead of repeatedly warning
+  that only 236 bytes are understood. Adapt link/route requests and typed flags;
+  preserve IPv6 policy, ownership validation and rollback. No log filtering or
+  API/configuration change. Release impact: fix; next automatic calendar version.
+
 - Complete combined-worktree validation for the unreleased diagnostics work:
   synchronize Cargo lockfile dependency edges without changing versions,
   initialize RSS test fixtures with their required capability entry, and keep
