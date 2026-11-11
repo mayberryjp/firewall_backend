@@ -185,7 +185,7 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
     use futures_util::TryStreamExt;
     use std::{
         net::UdpSocket,
-        os::fd::{FromRawFd, OwnedFd},
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
         time::Duration,
     };
     let router = Fixture::new()?;
@@ -245,33 +245,35 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                 )
                 .execute()
                 .await?;
-            handle
-                .link()
-                .add(rtnetlink::LinkVlan::new("vlan30", link.header.index, 30).build())
-                .execute()
-                .await?;
-            let vlan = handle
-                .link()
-                .get()
-                .match_name("vlan30".into())
-                .execute()
-                .try_next()
-                .await?
-                .context("DHCP client VLAN missing")?;
-            handle
-                .address()
-                .add(vlan.header.index, "10.4.30.2".parse()?, 24)
-                .execute()
-                .await?;
-            handle
-                .link()
-                .set(
-                    rtnetlink::LinkUnspec::new_with_index(vlan.header.index)
-                        .up()
-                        .build(),
-                )
-                .execute()
-                .await?;
+            for (name, id, address) in [("vlan30", 30, "10.4.30.2"), ("vlan31", 31, "10.4.31.2")] {
+                handle
+                    .link()
+                    .add(rtnetlink::LinkVlan::new(name, link.header.index, id).build())
+                    .execute()
+                    .await?;
+                let vlan = handle
+                    .link()
+                    .get()
+                    .match_name(name.into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("DHCP client VLAN missing")?;
+                handle
+                    .address()
+                    .add(vlan.header.index, address.parse()?, 24)
+                    .execute()
+                    .await?;
+                handle
+                    .link()
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(vlan.header.index)
+                            .up()
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
+            }
             Ok(())
         })
     })?;
@@ -301,17 +303,19 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                 )
                 .execute()
                 .await?;
-            handle
-                .route()
-                .add(
-                    rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
-                        .destination_prefix("10.4.30.0".parse()?, 24)
-                        .gateway("10.4.40.1".parse()?)
-                        .output_interface(link.header.index)
-                        .build(),
-                )
-                .execute()
-                .await?;
+            for network in ["10.4.30.0", "10.4.31.0"] {
+                handle
+                    .route()
+                    .add(
+                        rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                            .destination_prefix(network.parse()?, 24)
+                            .gateway("10.4.40.1".parse()?)
+                            .output_interface(link.header.index)
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
+            }
             Ok(())
         })
     })?;
@@ -328,7 +332,12 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
     let outsider = socket(server_ns.clone(), "10.4.40.42:67")?;
     let wrong_port = socket(server_ns.clone(), "10.4.40.40:68")?;
     let downstream = socket(client_ns.clone(), "0.0.0.0:68")?;
-    let send_discover = |id: u32, broadcast: bool, source_port: u16, destination_port: u16| {
+    let send_client = |id: u32,
+                       broadcast: bool,
+                       source_port: u16,
+                       destination_port: u16,
+                       client_address: Option<std::net::Ipv4Addr>,
+                       interface: &'static str| {
         let mut packet = vec![0u8; 300];
         packet[..4].copy_from_slice(&[1, 1, 6, 0]);
         packet[4..8].copy_from_slice(&id.to_be_bytes());
@@ -343,6 +352,10 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
             b'i', b'c', b'e', b'-', b'a', b'p', 60, 4, b'u', b'b', b'n', b't', 61, 7, 1, 0x74,
             0xfa, 0x29, 0x3e, 0x5d, 0x96, 255,
         ]);
+        if let Some(address) = client_address {
+            packet[12..16].copy_from_slice(&address.octets());
+            packet[242] = 3;
+        }
         let payload = packet.clone();
         session(client_ns.clone(), move |rt, handle| {
             let link = rt
@@ -350,7 +363,7 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                     handle
                         .link()
                         .get()
-                        .match_name("vlan30".into())
+                        .match_name(interface.into())
                         .execute()
                         .try_next(),
                 )?
@@ -412,6 +425,9 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
         })?;
         Ok::<_, anyhow::Error>(packet)
     };
+    let send_discover = |id, broadcast, source_port, destination_port| {
+        send_client(id, broadcast, source_port, destination_port, None, "vlan30")
+    };
     let assert_no_packet = |socket: &UdpSocket| -> Result<()> {
         match socket.recv_from(&mut [0u8; 1500]) {
             Err(error)
@@ -464,7 +480,10 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
             {"name":"vlan30","kind":"vlan","role":"lan","up":true,"mtu":1500,
              "addresses":["10.4.30.1/24"],"vlan":{"parent":"trunk0","id":30},
              "dhcp_relay":{"enabled":false,"servers":["10.4.40.40"]}},
-            {"name":"srv0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["10.4.40.1/24"]}
+            {"name":"srv0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["10.4.40.1/24"]},
+            {"name":"vlan31","kind":"vlan","role":"lan","up":true,"mtu":1500,
+             "addresses":["10.4.31.1/24"],"vlan":{"parent":"trunk0","id":31},
+             "dhcp_relay":{"enabled":false,"servers":["10.4.40.40"]}}
         ],
         "firewall":{"policy":"drop","allow_all_icmp":false,"rules":[],
             "input":{"policy":"drop","interfaces":[]}}
@@ -475,6 +494,7 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
     assert_no_packet(&upstream)?;
     let mut enabled = disabled.clone();
     enabled.interfaces[1].dhcp_relay.enabled = true;
+    enabled.interfaces[3].dhcp_relay.enabled = true;
     native.apply(&disabled, &enabled)?;
     assert_eq!(native.observe(&enabled)?, enabled);
     assert_eq!(enabled.firewall, disabled.firewall);
@@ -568,6 +588,181 @@ fn native_dhcp_relay_generated_input_permits_packets_restart_disable_and_rollbac
                 && event["transaction_id"] == "00000005")
     );
     let old_epoch = relay_log["epoch"].clone();
+    for (id, broadcast) in [(51u32, false), (52, true)] {
+        let client_address = "10.4.30.2".parse::<std::net::Ipv4Addr>()?;
+        let request = send_client(id, broadcast, 68, 67, Some(client_address), "vlan30")?;
+        let (size, peer) = upstream
+            .recv_from(&mut wire)
+            .context("zero-source Request with on-link ciaddr was not relayed")?;
+        let mut expected = request.clone();
+        expected[3] = 1;
+        expected[24..28].copy_from_slice(&[10, 4, 30, 1]);
+        assert_eq!(&wire[..size], expected);
+        assert_eq!(peer.to_string(), "10.4.30.1:67");
+        wire[0] = 2;
+        wire[3] = 0;
+        wire[242] = 5;
+        wire[16..20].copy_from_slice(&client_address.octets());
+        upstream.send_to(&wire[..size], peer)?;
+        let (length, reply_peer) = downstream
+            .recv_from(&mut wire)
+            .context("zero-source renewal ACK was not delivered to ciaddr")?;
+        assert_eq!(length, request.len());
+        assert_eq!(reply_peer.to_string(), "10.4.30.1:67");
+        assert_eq!(&wire[4..8], &id.to_be_bytes());
+        assert_eq!(&wire[12..16], &client_address.octets());
+        assert_eq!(wire[242], 5);
+    }
+    for (id, address) in [
+        (60u32, "10.4.40.2"),
+        (61, "10.4.30.0"),
+        (62, "10.4.30.255"),
+        (63, "10.4.30.1"),
+    ] {
+        send_client(id, false, 68, 67, Some(address.parse()?), "vlan30")?;
+    }
+    assert_no_packet(&upstream)?;
+    let checked = native.statistics(&enabled, "/api/v1/statistics/dhcp-relay", "")?;
+    assert_eq!(checked["totals"]["requests_forwarded"], "5");
+    assert_eq!(checked["totals"]["replies_forwarded"], "3");
+    assert_eq!(
+        checked["totals"]["rejected_by_reason"]["invalid_client_address"],
+        "4"
+    );
+    let checked_log = native.dhcp_relay_log(&netcontrol_core::DHCPRelayLogQuery::parse(
+        "interface=vlan30",
+    )?)?;
+    let events = checked_log["events"]
+        .as_array()
+        .context("missing relay events")?;
+    for id in [51u32, 52] {
+        let transaction_id = format!("{id:08x}");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "requests_forwarded"
+                    && event["message_type"] == 3
+                    && event["transaction_id"].as_str() == Some(transaction_id.as_str()))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "replies_forwarded"
+                    && event["message_type"] == 5
+                    && event["transaction_id"].as_str() == Some(transaction_id.as_str()))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "requests_received"
+                    && event["peer"] == "0.0.0.0:68"
+                    && event["transaction_id"].as_str() == Some(transaction_id.as_str()))
+        );
+    }
+    for (id, client_address) in [(90u32, "0.0.0.0"), (91, "10.4.30.2")] {
+        send_client(id, false, 68, 67, Some(client_address.parse()?), "vlan30")?;
+        let (size, peer) = upstream.recv_from(&mut wire)?;
+        wire[0] = 2;
+        wire[3] = 0;
+        wire[242] = 5;
+        wire[10] = 0x80;
+        wire[16..20].copy_from_slice(&[10, 4, 30, 2]);
+        upstream.send_to(&wire[..size], peer)?;
+        assert_no_packet(&downstream)?;
+        wire[242] = 6;
+        wire[12..20].fill(0);
+        upstream.send_to(&wire[..size], peer)?;
+        let (length, reply_peer) = downstream
+            .recv_from(&mut wire)
+            .context("valid NAK was not broadcast")?;
+        assert_eq!(length, size);
+        assert_eq!(reply_peer, peer);
+        assert_eq!(&wire[4..8], &id.to_be_bytes());
+        assert_eq!(wire[242], 6);
+        assert_eq!(&wire[12..20], &[0; 8]);
+    }
+
+    for (interface, address) in [("vlan30", "10.4.30.2"), ("vlan31", "10.4.31.2")] {
+        send_client(100, false, 68, 67, Some(address.parse()?), interface)?;
+    }
+    let mut seen_relays = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let (size, peer) = upstream
+            .recv_from(&mut wire)
+            .context("overlapping VLAN request missing")?;
+        seen_relays.insert(peer.ip());
+        assert_eq!(&wire[4..8], &100u32.to_be_bytes());
+        assert_eq!(&wire[28..34], &[0x74, 0xfa, 0x29, 0x3e, 0x5d, 0x96]);
+        let client_address: std::net::Ipv4Addr = match peer.ip().to_string().as_str() {
+            "10.4.30.1" => "10.4.30.2".parse()?,
+            "10.4.31.1" => "10.4.31.2".parse()?,
+            _ => anyhow::bail!("unexpected relay {peer}"),
+        };
+        wire[0] = 2;
+        wire[3] = 0;
+        wire[242] = 5;
+        wire[16..20].copy_from_slice(&client_address.octets());
+        upstream.send_to(&wire[..size], peer)?;
+        let (_, reply_peer) = downstream
+            .recv_from(&mut wire)
+            .context("overlapping VLAN ACK missing")?;
+        assert_eq!(reply_peer, peer);
+        assert_eq!(&wire[12..16], &client_address.octets());
+    }
+    assert_eq!(seen_relays.len(), 2);
+
+    let mut fanout = enabled.clone();
+    fanout.interfaces[1].dhcp_relay.servers = vec!["198.51.100.10".into(), "10.4.40.40".into()];
+    native.apply(&enabled, &fanout)?;
+    let generation =
+        native.statistics(&fanout, "/api/v1/statistics/dhcp-relay", "")?["generation"].clone();
+    exchange(110, &upstream, "10.4.30.1").context("failed destination stopped healthy fan-out")?;
+    send_discover(111, false, 68, 67)?;
+    let (size, peer) = upstream.recv_from(&mut wire)?;
+    let mut oversized = wire[..size].to_vec();
+    oversized.resize(2000, 0);
+    oversized[0] = 2;
+    oversized[3] = 0;
+    oversized[242] = 2;
+    oversized[16..20].copy_from_slice(&[10, 4, 30, 100]);
+    let discovery = libc::IP_PMTUDISC_DONT;
+    ensure!(
+        unsafe {
+            libc::setsockopt(
+                upstream.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &discovery as *const _ as *const _,
+                std::mem::size_of_val(&discovery) as _,
+            )
+        } == 0,
+        "disable fixture UDP PMTU: {}",
+        std::io::Error::last_os_error()
+    );
+    upstream.send_to(&oversized, peer)?;
+    assert_no_packet(&downstream)?;
+    exchange(112, &upstream, "10.4.30.1").context("client delivery failure stopped relay")?;
+    let isolated = native.statistics(&fanout, "/api/v1/statistics/dhcp-relay", "")?;
+    assert_eq!(isolated["generation"], generation);
+    assert_eq!(isolated["worker"]["state"], "running");
+    assert_eq!(isolated["worker"]["restart_count"], 0);
+    let failures = native.dhcp_relay_log(&netcontrol_core::DHCPRelayLogQuery::parse(
+        "interface=vlan30",
+    )?)?;
+    let failure_events = failures["events"]
+        .as_array()
+        .context("missing failure diagnostics")?;
+    for reason in ["to_server", "to_client_layer2"] {
+        assert!(failure_events.iter().any(|event| {
+            event["event"] == "send_errors"
+                && event["reason"] == reason
+                && event["detail"]
+                    .as_str()
+                    .is_some_and(|detail| !detail.is_empty())
+                && event["relay_address"] == "10.4.30.1"
+        }));
+    }
+    native.apply(&fanout, &enabled)?;
     drop(native);
     let mut native = Native::open(options)?;
     native.repair(&enabled)?;

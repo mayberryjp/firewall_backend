@@ -1076,6 +1076,22 @@ Before provisioning, it applies the persistent
 [conntrack host prerequisites](#conntrack-host-prerequisites). The downloaded
 installer remains self-contained; no checkout or extra helper script is needed.
 
+### Sysstat collection
+
+Fresh [installation](../install.sh) stops/disables and persistently masks
+`sysstat-collect.timer` and `sysstat-collect.service`. This disables periodic
+system activity accounting, including across reboot; historical performance
+samples will no longer be collected by these units. Existing sysstat packages,
+configuration and statistics files are preserved. Already-masked units are
+stopped, and absent units are masked to prevent later package installation
+from enabling them. Inspection/control failures, active units or nonpersistent
+masks abort installation with diagnostics.
+
+This policy applies only to the installer, not source upgrades, binary updates,
+signed packages, hardening or reset. It does not disable fwupd, cron, other
+sysstat units or custom collection jobs. Operators can explicitly unmask the
+two units and re-enable the timer if collection is wanted again.
+
 ### MOTD cleanup
 
 Fresh [installation](../install.sh) and full [source upgrade](../upgrade.sh)

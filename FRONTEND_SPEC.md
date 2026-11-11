@@ -503,6 +503,16 @@ apply MOTD cleanup. No HTTP methods/paths, schemas, permissions or status codes
 change. Update operator installation/source-upgrade help, not API client types;
 see [exact cleanup scope](docs/BUILD_AND_INSTALL.md#motd-cleanup) and
 [handoff 2026-11-09-01](docs/frontend-handoffs/2026-11-09.md#2026-11-09-01-install-and-source-upgrade-motd-cleanup).
+Fresh installation also stops/disables and persistently masks
+`sysstat-collect.timer` and `sysstat-collect.service`, including absent units,
+with stopped/persistent-mask verification. Existing statistics and packages
+are preserved, but these units no longer collect historical system activity.
+This is install-only: source upgrades, binary updates, signed packages,
+hardening and reset do not add this policy. fwupd, cron and custom collection
+jobs are unchanged. No API, authentication, schema or polling changes;
+optional installation-help disclosure only. See
+[operator scope](docs/BUILD_AND_INSTALL.md#sysstat-collection) and
+[handoff 2026-11-12-02](docs/frontend-handoffs/2026-11-12.md#2026-11-12-02-installer-disables-sysstat-collection).
 Interactive installs prompt for missing LAN interface and IPv4
 host/prefix, suggesting the second physical port and `192.168.0.1/24`.
 `--wan` overrides WAN independently; `--lan` and `--lan-address` skip their
@@ -5472,7 +5482,7 @@ history (`gap:false`, `overwritten` nonzero). `capacity` is 2048.
 Synthetic log response (identity and timestamp are illustrative):
 
 ```json
-{"scope":"native-example","epoch":"0123456789abcdef0123456789abcdef","events":[{"sequence":"1","generation":"1","timestamp":"2026-11-11T00:00:00Z","interface":"vlan10","event":"requests_forwarded","reason":"","peer":"192.0.2.10:67","message_type":1,"transaction_id":"0000002a","client_mac":"02:00:00:00:00:01"}],"next_cursor":"0123456789abcdef0123456789abcdef:1","reset":false,"gap":false,"has_more":false,"capacity":2048,"overwritten":"0"}
+{"scope":"native-example","epoch":"0123456789abcdef0123456789abcdef","events":[{"sequence":"1","generation":"1","timestamp":"2026-11-12T00:00:00Z","interface":"vlan10","event":"requests_forwarded","reason":"","detail":"","peer":"192.0.2.10:67","message_type":1,"transaction_id":"0000002a","client_mac":"02:00:00:00:00:01","client_address":"0.0.0.0","offered_address":"0.0.0.0","relay_address":"192.0.2.1","broadcast":true,"hops":1}],"next_cursor":"0123456789abcdef0123456789abcdef:1","reset":false,"gap":false,"has_more":false,"capacity":2048,"overwritten":"0"}
 ```
 
 Events include requests/replies received, successful server/client sends,
@@ -5481,18 +5491,60 @@ failure. `message_type` is numeric DHCPv4 option 53 (1 Discover, 2 Offer,
 3 Request, 4 Decline, 5 ACK, 6 NAK, 7 Release, 8 Inform), or null when no valid
 packet metadata is available. `transaction_id` is eight lowercase hex digits
 and `client_mac` is six colon-separated lowercase hex octets; both nullable.
-Invalid packets, lifecycle/expiry events may have null packet metadata.
+Invalid packets and lifecycle/socket-error events may have null packet metadata.
+Tracking-expiry events retain the tracked forwarded request's identity/header
+metadata, not a server reply or a claim that the lease failed.
+`client_address`, `offered_address` and `relay_address` are IPv4 strings for
+BOOTP `ciaddr`, `yiaddr` and `giaddr`, or null without validated packet metadata.
+Valid zero addresses remain `"0.0.0.0"`, not null. `broadcast` is the broadcast
+flag as boolean or null; `hops` is an integer 0..255 or null.
+Forward/send-error events describe the actual packet attempted on that leg;
+upstream attempts therefore include the relay's giaddr and incremented hops.
+`detail` is a string (empty when no additional explanation), at most 512
+characters, containing rejection/transport diagnostics, not a stable enum.
+Render it safely; no packet bodies, hostnames or arbitrary DHCP options are logged.
 `interface` is nullable for shared-worker events and unattributed packets
 (including unmatched replies); `peer` is a nullable IPv4 socket string, source
 on receipt/rejection and destination on forwarding/send error.
 `reason` is empty on normal receipts/forwards/start, a stable rejection category,
-`to_server|to_client|to_client_layer2` for send errors, `tracking_timeout` for
+`to_server|to_client|to_client_layer2|socket_error` for send errors, `tracking_timeout` for
 expiry, or diagnostic text (at most 512 characters) for worker failure.
 Rejection categories: `truncated_datagram`, `non_ipv4_source`, `short_packet`,
 `unmanaged_ingress`, `invalid_client_endpoint`, `invalid_client_address`,
 `invalid_client_packet`, `transaction_capacity`, `unmatched_reply`,
 `missing_binding`, `invalid_server_endpoint`, `invalid_server_packet`,
 `off_link_target`, `invalid_op`.
+
+The relay accepts a client IP source of `0.0.0.0:68` even when the DHCP header
+carries a nonzero existing client address (`ciaddr`), provided that address is
+valid on the receiving relay interface. This supports zero-source DHCP requests
+from raw-socket/container DHCP helpers; it is not a Docker-specific exemption.
+The address must remain on-link unicast and cannot be the subnet network,
+broadcast or relay address. A nonzero source must still equal `ciaddr`; zero
+`ciaddr` requires zero source. The original `ciaddr` is preserved for upstream
+processing, reply correlation and delivery. Previously this zero-source/nonzero
+`ciaddr` combination was unconditionally rejected as `invalid_client_address`.
+That reason still reports genuinely invalid addresses or nonzero-source
+mismatches. Do not label every `0.0.0.0:68` peer as an error or lease failure.
+No configuration, HTTP statuses or permissions change.
+
+Tracked requests are scoped by relay address, transaction ID and client MAC;
+the same transaction ID/MAC on different VLANs must not overwrite each other.
+Configured relay addresses remain unique. Valid DHCPNAKs use zero ciaddr/yiaddr
+and are broadcast to clients even if the request had a nonzero ciaddr or clear
+broadcast flag. ACK/Offer correlation, configured upstream/port, destination,
+giaddr and packet checks still apply; the NAK exception is not a general
+relaxation of server authentication/correlation.
+
+Individual upstream/downstream send failures do not restart the shared worker,
+erase other pending requests or stop healthy destinations. Classified asynchronous
+UDP transport errors remain unattributed `socket_error` events. Broken socket,
+receive/metadata and interface-lifecycle failures still trigger worker recovery.
+Every send-error observation remains in counters and the bounded ring; normal
+Netcontrol tracing also emits at most one send warning per interface/direction
+every 30 seconds (one shared bucket for unattributed socket errors), reset on
+worker attempts. These warnings can persist in Netcontrol diagnostics, unlike
+the RAM-only packet event ring. No per-packet success tracing is added.
 
 Counters are canonical decimal **strings**, with saturating `u64` cumulative
 counts and a current pending gauge:
@@ -5505,9 +5557,9 @@ counts and a current pending gauge:
 | `replies_forwarded` | Successful sends toward clients, including broadcast and layer-2 unicast |
 | `packets_rejected` | Worker rejection decisions, not firewall/kernel drops |
 | `rejected_by_reason` | Sparse rejection-category -> decimal-string count map |
-| `send_errors` | Failed server/client send attempts; existing worker error/retry behavior remains |
+| `send_errors` | Failed server/client send attempts and classified asynchronous UDP transport errors; not exact lost-packet counts |
 | `transactions_expired` | Tracking entries aged out after 120 seconds, not failed leases |
-| `pending_transactions` | Current transaction-ID/MAC tracking entries, not outstanding lease requests |
+| `pending_transactions` | Current relay-address/transaction-ID/MAC tracking entries, not outstanding lease requests |
 
 Replies do not remove tracking entries: multiple server replies and later DHCP
 messages remain admissible until replacement/expiry. Retransmission refreshes
@@ -7967,10 +8019,16 @@ interface DHCPRelayLogPage {
       "replies_forwarded" | "packets_rejected" | "send_errors" |
       "transactions_expired" | "worker_start" | "worker_error";
     reason: string;
+    detail: string;
     peer: string | null;
     message_type: number | null;
     transaction_id: string | null;
     client_mac: string | null;
+    client_address: string | null;
+    offered_address: string | null;
+    relay_address: string | null;
+    broadcast: boolean | null;
+    hops: number | null;
   }[];
 }
 

@@ -72,20 +72,34 @@ fn message_type(packet: &[u8]) -> u8 {
     }
     0
 }
-pub(crate) fn metadata(packet: &[u8]) -> Option<(u8, String, String)> {
-    valid(packet).then(|| {
-        (
-            message_type(packet),
-            format!(
-                "{:08x}",
-                u32::from_be_bytes(packet[4..8].try_into().unwrap())
-            ),
-            packet[28..34]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(":"),
-        )
+#[derive(Debug, PartialEq)]
+pub(crate) struct Metadata {
+    pub message_type: u8,
+    pub transaction_id: String,
+    pub client_mac: String,
+    pub client_address: Ipv4Addr,
+    pub offered_address: Ipv4Addr,
+    pub relay_address: Ipv4Addr,
+    pub broadcast: bool,
+    pub hops: u8,
+}
+pub(crate) fn metadata(packet: &[u8]) -> Option<Metadata> {
+    valid(packet).then(|| Metadata {
+        message_type: message_type(packet),
+        transaction_id: format!(
+            "{:08x}",
+            u32::from_be_bytes(packet[4..8].try_into().unwrap())
+        ),
+        client_mac: packet[28..34]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+        client_address: ip(packet, 12),
+        offered_address: ip(packet, 16),
+        relay_address: ip(packet, 24),
+        broadcast: packet[10] & 0x80 != 0,
+        hops: packet[3],
     })
 }
 
@@ -147,6 +161,10 @@ pub(crate) fn response(packet: &[u8], relay: Ipv4Addr) -> Result<(Ipv4Addr, bool
     let yi = ip(packet, 16);
     let broadcast = packet[10] & 0x80 != 0;
     if kind == 6 {
+        ensure!(
+            ci.is_unspecified() && yi.is_unspecified(),
+            "DHCPNAK must have zero ciaddr and yiaddr"
+        );
         return Ok((Ipv4Addr::BROADCAST, true));
     }
     if !ci.is_unspecified() {
@@ -158,6 +176,19 @@ pub(crate) fn response(packet: &[u8], relay: Ipv4Addr) -> Result<(Ipv4Addr, bool
     }
     ensure!(super::config::unicast(yi.into(), false), "invalid yiaddr");
     Ok((yi, false))
+}
+fn reply_matches(packet: &[u8], client: Ipv4Addr, broadcast: bool) -> Result<()> {
+    if message_type(packet) != 6 {
+        ensure!(
+            ip(packet, 12) == client,
+            "reply ciaddr does not match the tracked request"
+        );
+        ensure!(
+            (packet[10] & 0x80 != 0) == broadcast,
+            "reply broadcast flag does not match the tracked request"
+        );
+    }
+    Ok(())
 }
 pub(crate) fn key(packet: &[u8]) -> [u8; 10] {
     let mut key = [0; 10];
@@ -191,6 +222,33 @@ fn on_link(interfaces: &[String], ip: Ipv4Addr, relay: Ipv4Addr) -> bool {
         let n = u32::from(ip);
         n != network && n != (network | !mask)
     })
+}
+fn valid_client_address(
+    source: Ipv4Addr,
+    client: Ipv4Addr,
+    prefixes: &[String],
+    relay: Ipv4Addr,
+) -> bool {
+    if client.is_unspecified() {
+        source.is_unspecified()
+    } else {
+        on_link(prefixes, client, relay) && (source.is_unspecified() || source == client)
+    }
+}
+#[cfg(target_os = "linux")]
+fn recoverable_socket_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ECONNREFUSED
+                | libc::EHOSTUNREACH
+                | libc::ENETUNREACH
+                | libc::ENETDOWN
+                | libc::EHOSTDOWN
+                | libc::ENOBUFS
+                | libc::EMSGSIZE
+        )
+    )
 }
 pub(crate) fn unicast_wire(packet: &[u8], source: Ipv4Addr, target: Ipv4Addr) -> Result<Vec<u8>> {
     ensure!(packet.len() <= 65507, "DHCP packet too large");
@@ -262,25 +320,38 @@ pub(crate) fn prepare(
     }
     Ok(Box::new(move |ctx| {
         let mut buffer = vec![0u8; 65535];
-        let mut transactions: BTreeMap<[u8; 10], (u32, Instant, Ipv4Addr, u16, bool)> =
-            BTreeMap::new();
+        struct Transaction {
+            index: u32,
+            since: Instant,
+            metadata: Metadata,
+        }
+        let mut transactions: BTreeMap<(Ipv4Addr, [u8; 10]), Transaction> = BTreeMap::new();
         let mut pruned = Instant::now();
         while !ctx.stopping() {
             if pruned.elapsed() >= Duration::from_secs(1) {
                 let mut expired = Vec::new();
-                for (key, (index, since, _, _, _)) in &transactions {
-                    if since.elapsed() >= Duration::from_secs(120) {
-                        expired.push((*key, *index));
+                for (key, transaction) in &transactions {
+                    if transaction.since.elapsed() >= Duration::from_secs(120) {
+                        expired.push(*key);
                     }
                 }
-                for (key, index) in expired {
+                for key in expired {
+                    let transaction = transactions
+                        .remove(&key)
+                        .ok_or_else(|| anyhow::anyhow!("missing expired DHCP transaction"))?;
                     let name = &bindings
-                        .get(&index)
+                        .get(&transaction.index)
                         .ok_or_else(|| anyhow::anyhow!("missing DHCP relay binding"))?
                         .0;
-                    telemetry.record(Some(name), Action::Expired, "tracking_timeout", &[], None)?;
+                    telemetry.record_metadata(
+                        Some(name),
+                        Action::Expired,
+                        "tracking_timeout",
+                        Some(&transaction.metadata),
+                        None,
+                        "Relay tracking aged out after 120 seconds; this is not lease expiry",
+                    )?;
                     telemetry.track(name, false)?;
-                    transactions.remove(&key);
                 }
                 pruned = Instant::now();
             }
@@ -304,6 +375,18 @@ pub(crate) fn prepare(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::Interrupted
                 {
+                    ctx.wait(Duration::from_millis(10));
+                    continue;
+                }
+                if recoverable_socket_error(&e) {
+                    telemetry.record_detail(
+                        None,
+                        Action::SendError,
+                        "socket_error",
+                        &[],
+                        None,
+                        &format!("UDP socket reported an asynchronous transport error: {e}"),
+                    )?;
                     ctx.wait(Duration::from_millis(10));
                     continue;
                 }
@@ -331,12 +414,13 @@ pub(crate) fn prepare(
             let source = l::from_sockaddr(&src)?;
             let ingress = bindings.get(&idx).map(|binding| binding.0.as_str());
             if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-                telemetry.record(
+                telemetry.record_detail(
                     ingress,
                     Action::Rejected,
                     "truncated_datagram",
                     &[],
                     Some(source),
+                    "Receive buffer or ancillary metadata was truncated",
                 )?;
                 continue;
             }
@@ -375,52 +459,48 @@ pub(crate) fn prepare(
                 if source.port() != 68
                     || !(destination == Ipv4Addr::BROADCAST || destination == *relay)
                 {
-                    telemetry.record(
+                    telemetry.record_detail(
                         Some(name),
                         Action::Rejected,
                         "invalid_client_endpoint",
                         packet,
                         Some(source),
+                        &format!("Requests require UDP/68 and broadcast or relay destination {relay}; received destination {destination}"),
                     )?;
                     continue;
                 }
-                if source_ip.is_unspecified() {
-                    if !ip(packet, 12).is_unspecified() {
-                        telemetry.record(
-                            Some(name),
-                            Action::Rejected,
-                            "invalid_client_address",
-                            packet,
-                            Some(source),
-                        )?;
-                        continue;
-                    }
-                } else if ip(packet, 12) != source_ip || !on_link(prefixes, source_ip, *relay) {
-                    telemetry.record(
+                if !valid_client_address(source_ip, ip(packet, 12), prefixes, *relay) {
+                    telemetry.record_detail(
                         Some(name),
                         Action::Rejected,
                         "invalid_client_address",
                         packet,
                         Some(source),
+                        "Nonzero ciaddr must be on-link unicast, not network/broadcast/relay; a nonzero source must match ciaddr",
                     )?;
                     continue;
                 }
-                let Ok(wire) = request(packet, *relay) else {
-                    telemetry.record(
-                        Some(name),
-                        Action::Rejected,
-                        "invalid_client_packet",
-                        packet,
-                        Some(source),
-                    )?;
-                    continue;
+                let wire = match request(packet, *relay) {
+                    Ok(wire) => wire,
+                    Err(error) => {
+                        telemetry.record_detail(
+                            Some(name),
+                            Action::Rejected,
+                            "invalid_client_packet",
+                            packet,
+                            Some(source),
+                            &format!("{error:#}"),
+                        )?;
+                        continue;
+                    }
                 };
                 let (live, addresses) = l::interface_snapshot(name)?;
                 ensure!(
                     live == idx && addresses.contains(&IpAddr::V4(*relay)),
                     "relay interface changed"
                 );
-                if transactions.len() >= 65536 && !transactions.contains_key(&key(packet)) {
+                let transaction_key = (*relay, key(packet));
+                if transactions.len() >= 65536 && !transactions.contains_key(&transaction_key) {
                     telemetry.record(
                         Some(name),
                         Action::Rejected,
@@ -431,18 +511,18 @@ pub(crate) fn prepare(
                     continue;
                 }
                 let previous = transactions.insert(
-                    key(packet),
-                    (
-                        idx,
-                        Instant::now(),
-                        ip(packet, 12),
-                        u16::from_be_bytes([packet[10], packet[11]]),
-                        packet[3] == 0,
-                    ),
+                    transaction_key,
+                    Transaction {
+                        index: idx,
+                        since: Instant::now(),
+                        metadata: metadata(&wire).ok_or_else(|| {
+                            anyhow::anyhow!("missing valid DHCP request metadata")
+                        })?,
+                    },
                 );
-                if let Some((previous, _, _, _, _)) = previous {
+                if let Some(previous) = previous {
                     let previous_name = &bindings
-                        .get(&previous)
+                        .get(&previous.index)
                         .ok_or_else(|| anyhow::anyhow!("missing previous DHCP relay binding"))?
                         .0;
                     telemetry.track(previous_name, false)?;
@@ -454,30 +534,34 @@ pub(crate) fn prepare(
                     }
                     let peer = SocketAddr::from((*server, 67));
                     if let Err(error) = send_info(fd.as_raw_fd(), &wire, *server, 67, 0, *relay) {
-                        telemetry.record(
+                        telemetry.record_detail(
                             Some(name),
                             Action::SendError,
                             "to_server",
-                            packet,
+                            &wire,
                             Some(peer),
+                            &format!("{error:#}"),
                         )?;
-                        return Err(error);
+                        continue;
                     }
-                    telemetry.record(Some(name), Action::ToServer, "", packet, Some(peer))?;
+                    telemetry.record(Some(name), Action::ToServer, "", &wire, Some(peer))?;
                 }
             } else if packet[0] == 2 {
-                let Some((down, _, client, flags, _)) = transactions.get(&key(packet)) else {
+                let Some(transaction) = transactions.get(&(ip(packet, 24), key(packet))) else {
                     telemetry.record(None, Action::Reply, "", packet, Some(source))?;
-                    telemetry.record(
+                    telemetry.record_detail(
                         None,
                         Action::Rejected,
                         "unmatched_reply",
                         packet,
                         Some(source),
+                        "No tracked request matches this giaddr, transaction ID and client MAC",
                     )?;
                     continue;
                 };
-                let Some((name, relay, servers, prefixes)) = bindings.get(down) else {
+                let down = transaction.index;
+                let client = transaction.metadata.client_address;
+                let Some((name, relay, servers, prefixes)) = bindings.get(&down) else {
                     telemetry.record(
                         None,
                         Action::Rejected,
@@ -488,31 +572,42 @@ pub(crate) fn prepare(
                     continue;
                 };
                 telemetry.record(Some(name), Action::Reply, "", packet, Some(source))?;
-                if source.port() != 67
-                    || !servers.contains(&source_ip)
-                    || destination != *relay
-                    || ip(packet, 12) != *client
-                    || u16::from_be_bytes([packet[10], packet[11]]) != *flags
-                {
-                    telemetry.record(
+                if source.port() != 67 || !servers.contains(&source_ip) || destination != *relay {
+                    telemetry.record_detail(
                         Some(name),
                         Action::Rejected,
                         "invalid_server_endpoint",
                         packet,
                         Some(source),
+                        &format!("Reply requires a configured UDP/67 server and destination {relay}; received destination {destination}"),
                     )?;
                     continue;
                 }
-                let Ok((target, broadcast)) = response(packet, *relay) else {
-                    telemetry.record(
+                let (target, broadcast) = match response(packet, *relay) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        telemetry.record_detail(
+                            Some(name),
+                            Action::Rejected,
+                            "invalid_server_packet",
+                            packet,
+                            Some(source),
+                            &format!("{error:#}"),
+                        )?;
+                        continue;
+                    }
+                };
+                if let Err(error) = reply_matches(packet, client, transaction.metadata.broadcast) {
+                    telemetry.record_detail(
                         Some(name),
                         Action::Rejected,
-                        "invalid_server_packet",
+                        "invalid_server_endpoint",
                         packet,
                         Some(source),
+                        &format!("{error:#}"),
                     )?;
                     continue;
-                };
+                }
                 if !broadcast && !on_link(prefixes, target, *relay) {
                     telemetry.record(
                         Some(name),
@@ -525,7 +620,7 @@ pub(crate) fn prepare(
                 }
                 let (live, addresses) = l::interface_snapshot(name)?;
                 ensure!(
-                    live == *down && addresses.contains(&IpAddr::V4(*relay)),
+                    live == down && addresses.contains(&IpAddr::V4(*relay)),
                     "relay interface changed"
                 );
                 if !broadcast && client.is_unspecified() {
@@ -533,7 +628,7 @@ pub(crate) fn prepare(
                     let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
                     addr.sll_family = libc::AF_PACKET as u16;
                     addr.sll_protocol = (libc::ETH_P_IP as u16).to_be();
-                    addr.sll_ifindex = *down as i32;
+                    addr.sll_ifindex = down as i32;
                     addr.sll_halen = 6;
                     addr.sll_addr[..6].copy_from_slice(&packet[28..34]);
                     let sent = unsafe {
@@ -547,27 +642,36 @@ pub(crate) fn prepare(
                         )
                     };
                     if sent != wire.len() as isize {
-                        let error = std::io::Error::last_os_error();
-                        telemetry.record(
+                        let error = if sent < 0 {
+                            anyhow::Error::from(std::io::Error::last_os_error())
+                        } else {
+                            anyhow::anyhow!(
+                                "short DHCP layer2 send: {sent} of {} bytes",
+                                wire.len()
+                            )
+                        };
+                        telemetry.record_detail(
                             Some(name),
                             Action::SendError,
                             "to_client_layer2",
                             packet,
                             Some(SocketAddr::from((target, 68))),
+                            &format!("{error:#}"),
                         )?;
-                        anyhow::bail!("DHCP layer2 unicast failed: {error}");
+                        continue;
                     }
                 } else {
-                    if let Err(error) = send_info(fd.as_raw_fd(), packet, target, 68, *down, *relay)
+                    if let Err(error) = send_info(fd.as_raw_fd(), packet, target, 68, down, *relay)
                     {
-                        telemetry.record(
+                        telemetry.record_detail(
                             Some(name),
                             Action::SendError,
                             "to_client",
                             packet,
                             Some(SocketAddr::from((target, 68))),
+                            &format!("{error:#}"),
                         )?;
-                        return Err(error);
+                        continue;
                     }
                 }
                 telemetry.record(
@@ -625,10 +729,16 @@ pub(crate) fn prepare(
                     std::ptr::write_unaligned(libc::CMSG_DATA(c) as *mut libc::in_pktinfo, info);
                 }
                 let sent = unsafe { libc::sendmsg(fd, &out, libc::MSG_NOSIGNAL) };
+                if sent < 0 {
+                    return Err(anyhow::anyhow!(
+                        "DHCP send: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
                 ensure!(
                     sent == packet.len() as isize,
-                    "DHCP send: {}",
-                    std::io::Error::last_os_error()
+                    "short DHCP send: {sent} of {} bytes",
+                    packet.len()
                 );
                 Ok(())
             }
@@ -652,10 +762,10 @@ mod tests {
     #[test]
     fn relay_request_hops_cookie_options() {
         let p = packet();
-        assert_eq!(
-            metadata(&p),
-            Some((1, "00000000".into(), "02:00:00:00:00:00".into()))
-        );
+        let fields = metadata(&p).unwrap();
+        assert_eq!(fields.message_type, 1);
+        assert_eq!(fields.transaction_id, "00000000");
+        assert_eq!(fields.client_mac, "02:00:00:00:00:00");
         assert!(metadata(&p[..200]).is_none());
         let r = request(&p, "192.0.2.1".parse().unwrap()).unwrap();
         assert_eq!(r[3], 1);
@@ -687,6 +797,77 @@ mod tests {
             "192.0.2.5".parse::<Ipv4Addr>().unwrap()
         );
         assert!(response(&p, "192.0.2.2".parse().unwrap()).is_err());
+    }
+    #[test]
+    fn zero_source_requests_preserve_on_link_client_address_and_ack_target() {
+        let relay: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let client: Ipv4Addr = "192.0.2.20".parse().unwrap();
+        let prefixes = vec!["192.0.2.1/24".into()];
+        for broadcast in [false, true] {
+            let mut original = packet();
+            original[242] = 3;
+            original[12..16].copy_from_slice(&client.octets());
+            original[10] = if broadcast { 0x80 } else { 0 };
+            assert!(valid_client_address(
+                Ipv4Addr::UNSPECIFIED,
+                client,
+                &prefixes,
+                relay
+            ));
+            let forwarded = request(&original, relay).unwrap();
+            let mut expected = original.clone();
+            expected[3] = 1;
+            expected[24..28].copy_from_slice(&relay.octets());
+            assert_eq!(forwarded, expected);
+            assert_eq!(key(&forwarded), key(&original));
+            let mut ack = forwarded;
+            ack[0] = 2;
+            ack[3] = 0;
+            ack[242] = 5;
+            ack[16..20].copy_from_slice(&client.octets());
+            assert_eq!(response(&ack, relay).unwrap(), (client, false));
+        }
+    }
+    #[test]
+    fn client_address_admission_retains_subnet_and_source_checks() {
+        let relay = "192.0.2.1".parse().unwrap();
+        let client = "192.0.2.20".parse().unwrap();
+        let prefixes = vec!["192.0.2.1/24".into()];
+        assert!(valid_client_address(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            &prefixes,
+            relay
+        ));
+        assert!(valid_client_address(client, client, &prefixes, relay));
+        assert!(!valid_client_address(
+            client,
+            Ipv4Addr::UNSPECIFIED,
+            &prefixes,
+            relay
+        ));
+        assert!(!valid_client_address(
+            "192.0.2.21".parse().unwrap(),
+            client,
+            &prefixes,
+            relay
+        ));
+        for invalid in [
+            "198.51.100.20",
+            "192.0.2.0",
+            "192.0.2.255",
+            "192.0.2.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "0.0.0.1",
+        ] {
+            let invalid = invalid.parse().unwrap();
+            for source in [Ipv4Addr::UNSPECIFIED, invalid] {
+                assert!(!valid_client_address(source, invalid, &prefixes, relay));
+            }
+        }
     }
     #[test]
     fn server_replies_do_not_require_request_hops_to_be_echoed() {
@@ -776,6 +957,54 @@ mod tests {
         p[10] = 0;
         p[242] = 6;
         p[12..16].copy_from_slice(&[192, 0, 2, 30]);
+        assert!(response(&p, relay).is_err());
+        p[12..20].fill(0);
         assert_eq!(response(&p, relay).unwrap(), (Ipv4Addr::BROADCAST, true));
+    }
+    #[test]
+    fn nak_correlation_allows_server_broadcast_and_zero_client_address() {
+        let relay = "192.0.2.1".parse().unwrap();
+        let client = "192.0.2.20".parse().unwrap();
+        let mut reply = request(&packet(), relay).unwrap();
+        reply[0] = 2;
+        reply[242] = 6;
+        reply[10] = 0x80;
+        for requested_client in [Ipv4Addr::UNSPECIFIED, client] {
+            for requested_broadcast in [false, true] {
+                assert_eq!(
+                    response(&reply, relay).unwrap(),
+                    (Ipv4Addr::BROADCAST, true)
+                );
+                assert!(reply_matches(&reply, requested_client, requested_broadcast).is_ok());
+            }
+        }
+        reply[242] = 5;
+        reply[12..16].copy_from_slice(&client.octets());
+        reply[16..20].copy_from_slice(&client.octets());
+        assert!(reply_matches(&reply, client, true).is_ok());
+        assert!(reply_matches(&reply, client, false).is_err());
+        assert!(reply_matches(&reply, "192.0.2.21".parse().unwrap(), true).is_err());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn asynchronous_transport_errors_do_not_mask_broken_sockets() {
+        for code in [
+            libc::ECONNREFUSED,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::ENETDOWN,
+            libc::EHOSTDOWN,
+            libc::ENOBUFS,
+            libc::EMSGSIZE,
+        ] {
+            assert!(recoverable_socket_error(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL, libc::EFAULT] {
+            assert!(!recoverable_socket_error(
+                &std::io::Error::from_raw_os_error(code)
+            ));
+        }
     }
 }

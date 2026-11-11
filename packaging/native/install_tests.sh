@@ -8,6 +8,66 @@ printf -v cleanup 'rm -rf -- %q' "$temporary"
 trap "$cleanup" EXIT
 scenario=valid
 
+for sysstat_scenario in success repeat absent masked mixed inspect_failure unknown_state disable_failure \
+    stop_failure mask_failure verify_failure still_active runtime_only; do
+    (
+        sysstat_directory="$temporary/sysstat-$sysstat_scenario"
+        mkdir "$sysstat_directory"
+        systemctl() {
+            printf '%s\n' "$*" >> "$sysstat_directory/commands"
+            local action=$1 unit
+            shift
+            if [[ $action == show ]]; then
+                unit=$1
+                [[ $unit == sysstat-collect.timer || $unit == sysstat-collect.service ]] || return 1
+                if [[ ${3:-} == LoadState ]]; then
+                    case $sysstat_scenario in
+                        inspect_failure) printf 'Fixture inspection failure.\n' >&2; return 1 ;;
+                        unknown_state) printf 'error\n'; return 0 ;;
+                        absent) printf 'not-found\n'; return 4 ;;
+                        mixed) if [[ $unit == sysstat-collect.service ]]; then printf 'not-found\n'; return 4; fi ;;
+                        masked|stop_failure) printf 'masked\n'; return 0 ;;
+                    esac
+                    if [[ -e $sysstat_directory/$unit.masked ]]; then printf 'masked\n'; else printf 'loaded\n'; fi
+                else
+                    [[ $sysstat_scenario != verify_failure ]] || { printf 'Fixture verification failure.\n' >&2; return 1; }
+                    if [[ $sysstat_scenario == still_active ]]; then printf 'ActiveState=active\n'; else printf 'ActiveState=inactive\n'; fi
+                    if [[ $sysstat_scenario == runtime_only ]]; then
+                        printf 'UnitFileState=masked-runtime\n'
+                    elif [[ -e $sysstat_directory/$unit.masked ]]; then
+                        printf 'UnitFileState=masked\n'
+                    else
+                        printf 'UnitFileState=enabled\n'
+                    fi
+                fi
+                return 0
+            fi
+            [[ $action == disable || $action == stop || $action == mask ]] || return 1
+            [[ $sysstat_scenario != "${action}_failure" ]] || { printf 'Fixture %s failure.\n' "$action" >&2; return 1; }
+            if [[ ${1:-} == --now ]]; then shift; fi
+            for unit in "$@"; do
+                [[ $unit == sysstat-collect.timer || $unit == sysstat-collect.service ]] || return 1
+                if [[ $action == mask ]]; then : > "$sysstat_directory/$unit.masked"; fi
+            done
+        }
+        if configure_sysstat_collection > "$sysstat_directory/stdout" 2> "$sysstat_directory/stderr"; then
+            case $sysstat_scenario in success|repeat|absent|masked|mixed) ;; *) exit 1 ;; esac
+            if [[ $sysstat_scenario == repeat ]]; then configure_sysstat_collection || exit 1; fi
+            grep -Fxq 'mask sysstat-collect.timer sysstat-collect.service' "$sysstat_directory/commands"
+            case $sysstat_scenario in
+                absent) ! grep -Eq '^(disable|stop) ' "$sysstat_directory/commands" ;;
+                masked) grep -Fxq 'stop sysstat-collect.timer' "$sysstat_directory/commands"; grep -Fxq 'stop sysstat-collect.service' "$sysstat_directory/commands" ;;
+                mixed) grep -Fxq 'disable --now sysstat-collect.timer' "$sysstat_directory/commands" ;;
+                *) grep -Fxq 'disable --now sysstat-collect.timer sysstat-collect.service' "$sysstat_directory/commands" ;;
+            esac
+        else
+            case $sysstat_scenario in success|repeat|absent|masked|mixed) cat "$sysstat_directory/stderr" >&2; exit 1 ;; esac
+            [[ -s $sysstat_directory/stderr ]]
+        fi
+    )
+done
+printf 'Sysstat collection stop/disable, persistent masks, absent/mixed units, repeats and failure tests passed (mocked systemd).\n'
+
 for apparmor_scenario in success repeat absent existing_pin reboot unknown_kernel missing_parameter active_lsm \
     grub_failure bad_grub conflicting_grub missing_grub symlink_grub symlink_pin symlink_profiles \
     directory_failure grub_write_failure disable_failure mask_failure verify_failure; do
@@ -1103,10 +1163,11 @@ configure_host_logging() { trace+=' host-logging;'; }
 configure_snap() { trace+=' snap;'; }
 configure_motd() { trace+=' motd;'; }
 configure_ntp() { trace+=' ntp;'; }
+configure_sysstat_collection() { trace+=' sysstat;'; }
 configure_os_updates() { trace+=' os-updates;'; }
 configure_upgrade_settings() { trace+=' upgrade-settings;'; }
 install_systemd_service
-[[ $trace == ' os-updates; snap; motd; ntp;'* ]]
+[[ $trace == ' os-updates; snap; motd; ntp; sysstat;'* ]]
 [[ $trace == *'install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys;'* ]]
 [[ $trace == *'install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service;'* ]]
 [[ $trace == *'systemctl daemon-reload;'* ]]
@@ -1117,7 +1178,7 @@ trace=''
 check_systemd_unit() { return 1; }
 if install_systemd_service; then exit 1; fi
 [[ -z $trace ]]
-for failure_stage in os_updates snap motd ntp upgrade_settings service_setup logging_units reload logging; do
+for failure_stage in os_updates snap motd ntp sysstat upgrade_settings service_setup logging_units reload logging; do
     trace=''
     check_systemd_unit() { return 0; }
     configure_upgrade_settings() { trace+=' upgrade-settings;'; [[ $failure_stage != upgrade_settings ]]; }
@@ -1128,6 +1189,7 @@ for failure_stage in os_updates snap motd ntp upgrade_settings service_setup log
     configure_snap() { trace+=' snap;'; [[ $failure_stage != snap ]]; }
     configure_motd() { trace+=' motd;'; [[ $failure_stage != motd ]]; }
     configure_ntp() { trace+=' ntp;'; [[ $failure_stage != ntp ]]; }
+    configure_sysstat_collection() { trace+=' sysstat;'; [[ $failure_stage != sysstat ]]; }
     configure_os_updates() { trace+=' os-updates;'; [[ $failure_stage != os_updates ]]; }
     if install_systemd_service; then exit 1; fi
     if [[ $failure_stage == os_updates ]]; then
@@ -1144,6 +1206,10 @@ for failure_stage in os_updates snap motd ntp upgrade_settings service_setup log
     fi
     if [[ $failure_stage == ntp ]]; then
         [[ $trace == ' os-updates; snap; motd; ntp;' ]]
+        continue
+    fi
+    if [[ $failure_stage == sysstat ]]; then
+        [[ $trace == ' os-updates; snap; motd; ntp; sysstat;' ]]
         continue
     fi
     if [[ $failure_stage == upgrade_settings ]]; then

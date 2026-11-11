@@ -140,14 +140,25 @@ drift and durable transaction recovery safeguards remain enforced.
   Ethernet/DHCP header/options and request-hops validation, transaction ID plus client-MAC
   correlation, trusted upstream/source-port checks, and bounded transaction
   tracking (65,536 entries; 120 seconds). Configured client addresses must be
-  on-link unicast, not subnet broadcast/network/relay addresses. Broadcast and
-  renewals use source/interface-controlled UDP; initial unicast replies use
+  on-link unicast, not subnet broadcast/network/relay addresses. Zero-source
+  requests may carry an existing on-link `ciaddr`; the relay
+  preserves it for upstream processing, transaction matching and ACK delivery.
+  A nonzero IP source must still equal `ciaddr`; a zero `ciaddr` requires a zero
+  source. Accepting `0.0.0.0` as the IP source does not bypass the on-link check
+  for a nonzero `ciaddr` (see [RFC 1542 section 4.1](https://www.rfc-editor.org/rfc/rfc1542#section-4.1)).
+  Broadcast replies and renewals use source/interface-controlled UDP; initial unicast replies use
   AF_PACKET with the client's Ethernet address and valid IPv4/UDP checksums.
   Requests require UDP/68, replies UDP/67. Requires privileged bind and raw
   packet permission. DHCPv6, chained relays, and option-82 insertion are absent.
   Server reply hops are ignored: RFC 2131 table 3 specifies zero for Offers,
   ACKs and NAKs, not an echo of the relay's incremented request hop count.
   Reply identity, upstream and giaddr checks still apply.
+  Valid NAKs with zero ciaddr/yiaddr are broadcast regardless of the tracked
+  request's ciaddr/broadcast flag; ACK/Offer matching stays strict. Transactions
+  include the unique relay address as well as transaction ID/MAC, isolating VLANs.
+  Individual upstream or client-send failures retain tracking and continue other
+  packets/destinations. Classified asynchronous UDP transport errors are logged
+  without restarting; broken sockets/receive/interface failures still recover.
   The native backend derives narrow client/server input permits from enabled
   relay settings in its atomic firewall transaction; this worker does not mutate
   firewall configuration. Core validation, native rules and the worker share
@@ -159,8 +170,13 @@ drift and durable transaction recovery safeguards remain enforced.
   retries/reconfiguration but not daemon restart; counters reset per preparation
   attempt. Reception, forwarding, rejections, send errors, pending entries and
   120-second tracking expiry are observations, not proof of leases or remote
-  receipt. Pruning runs on idle loops too. No disk log, payload capture or child
-  processes. See the [API contract](../../FRONTEND_SPEC.md#dhcp-relay-diagnostics)
+  receipt. Pruning runs on idle loops too; expiry events retain tracked request
+  identity. Events include validated ciaddr/yiaddr/giaddr, broadcast/hops and
+  bounded diagnostic detail, without payloads, hostnames or arbitrary options.
+  The packet ring remains RAM-only. Send warnings also enter normal Netcontrol
+  tracing, rate-limited to one per interface/direction every 30 seconds per
+  worker attempt; API events/counters are not throttled. No child processes.
+  See the [API contract](../../FRONTEND_SPEC.md#dhcp-relay-diagnostics)
   for cursor gaps, filtering, nullability and counter semantics.
 * **NTP:** host UDP poll client, one resolved endpoint per configured server,
   sixty-four-second polling and three-second response deadlines. Validates

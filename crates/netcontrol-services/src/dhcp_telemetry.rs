@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 pub(crate) const CAPACITY: usize = 2048;
@@ -91,6 +92,7 @@ struct State {
     events: VecDeque<Value>,
     totals: Counts,
     interfaces: BTreeMap<String, Counts>,
+    send_warnings: BTreeMap<(Option<String>, String), Instant>,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,7 @@ impl Default for Telemetry {
             events: VecDeque::new(),
             totals: Counts::default(),
             interfaces: BTreeMap::new(),
+            send_warnings: BTreeMap::new(),
         })))
     }
 }
@@ -124,6 +127,7 @@ impl Telemetry {
         state.since = Some(crate::worker::now());
         state.totals = Counts::default();
         state.interfaces = interfaces.map(|name| (name, Counts::default())).collect();
+        state.send_warnings.clear();
         Ok(())
     }
 
@@ -167,6 +171,31 @@ impl Telemetry {
         packet: &[u8],
         peer: Option<SocketAddr>,
     ) -> Result<()> {
+        self.record_detail(interface, action, reason, packet, peer, "")
+    }
+
+    pub fn record_detail(
+        &self,
+        interface: Option<&str>,
+        action: Action,
+        reason: &str,
+        packet: &[u8],
+        peer: Option<SocketAddr>,
+        detail: &str,
+    ) -> Result<()> {
+        let metadata = super::dhcp::metadata(packet);
+        self.record_metadata(interface, action, reason, metadata.as_ref(), peer, detail)
+    }
+
+    pub fn record_metadata(
+        &self,
+        interface: Option<&str>,
+        action: Action,
+        reason: &str,
+        metadata: Option<&super::dhcp::Metadata>,
+        peer: Option<SocketAddr>,
+        detail: &str,
+    ) -> Result<()> {
         let mut state = self
             .0
             .lock()
@@ -181,20 +210,52 @@ impl Telemetry {
             .ok_or_else(|| anyhow!("DHCP relay log sequence exhausted"))?;
         let sequence = state.sequence;
         let generation = state.generation;
-        let metadata = super::dhcp::metadata(packet);
+        let warn = if matches!(action, Action::SendError) {
+            let key = (interface.map(str::to_owned), reason.to_owned());
+            if state
+                .send_warnings
+                .get(&key)
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+            {
+                state.send_warnings.insert(key, Instant::now());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let detail: String = detail.chars().take(512).collect();
         let event = json!({
             "sequence":sequence.to_string(), "generation":generation.to_string(),
             "timestamp":crate::worker::now(), "interface":interface,
             "event":action.name(), "reason":reason.chars().take(512).collect::<String>(), "peer":peer,
-            "message_type":metadata.as_ref().map(|m|m.0),
-            "transaction_id":metadata.as_ref().map(|m|&m.1),
-            "client_mac":metadata.as_ref().map(|m|&m.2),
+            "detail": detail,
+            "message_type":metadata.map(|m|m.message_type),
+            "transaction_id":metadata.map(|m|&m.transaction_id),
+            "client_mac":metadata.map(|m|&m.client_mac),
+            "client_address":metadata.map(|m|m.client_address),
+            "offered_address":metadata.map(|m|m.offered_address),
+            "relay_address":metadata.map(|m|m.relay_address),
+            "broadcast":metadata.map(|m|m.broadcast),
+            "hops":metadata.map(|m|m.hops),
         });
         if state.events.len() == CAPACITY {
             state.events.pop_front();
             state.overwritten = state.overwritten.saturating_add(1);
         }
         state.events.push_back(event);
+        drop(state);
+        if warn {
+            tracing::warn!(
+                interface = interface.unwrap_or("-"),
+                peer = ?peer,
+                stage = reason,
+                error = %detail,
+                transaction_id = metadata.map(|m|m.transaction_id.as_str()),
+                "DHCP relay send failed; continuing other packets and destinations"
+            );
+        }
         Ok(())
     }
 
@@ -277,6 +338,121 @@ impl Telemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_and_expiry_details_are_retained_without_logging_payloads() {
+        let telemetry = Telemetry::default();
+        telemetry.begin(["lan".into()].into_iter()).unwrap();
+        let metadata = super::super::dhcp::Metadata {
+            message_type: 3,
+            transaction_id: "0000002a".into(),
+            client_mac: "02:00:00:00:00:01".into(),
+            client_address: "192.0.2.20".parse().unwrap(),
+            offered_address: "0.0.0.0".parse().unwrap(),
+            relay_address: "192.0.2.1".parse().unwrap(),
+            broadcast: true,
+            hops: 1,
+        };
+        telemetry
+            .record_metadata(
+                Some("lan"),
+                Action::Expired,
+                "tracking_timeout",
+                Some(&metadata),
+                None,
+                &"x".repeat(600),
+            )
+            .unwrap();
+        telemetry
+            .record(None, Action::WorkerStart, "", &[], None)
+            .unwrap();
+        let page = telemetry
+            .log(&DHCPRelayLogQuery::parse("").unwrap())
+            .unwrap();
+        let event = &page["events"][0];
+        assert_eq!(event["transaction_id"], "0000002a");
+        assert_eq!(event["client_mac"], "02:00:00:00:00:01");
+        assert_eq!(event["client_address"], "192.0.2.20");
+        assert_eq!(event["offered_address"], "0.0.0.0");
+        assert_eq!(event["relay_address"], "192.0.2.1");
+        assert_eq!(event["broadcast"], true);
+        assert_eq!(event["hops"], 1);
+        assert_eq!(event["detail"].as_str().unwrap().len(), 512);
+        assert!(event.get("payload").is_none());
+        for field in [
+            "client_address",
+            "offered_address",
+            "relay_address",
+            "broadcast",
+            "hops",
+        ] {
+            assert!(page["events"][1][field].is_null());
+        }
+        assert_eq!(page["events"][1]["detail"], "");
+    }
+
+    #[test]
+    fn send_warning_throttling_does_not_drop_api_events_or_counters() {
+        let telemetry = Telemetry::default();
+        telemetry.begin(["lan".into()].into_iter()).unwrap();
+        let key = (Some("lan".into()), "to_server".into());
+        telemetry
+            .record_detail(
+                Some("lan"),
+                Action::SendError,
+                "to_server",
+                &[],
+                None,
+                "synthetic route failure",
+            )
+            .unwrap();
+        let first = telemetry.0.lock().unwrap().send_warnings[&key];
+        for _ in 0..3 {
+            telemetry
+                .record_detail(
+                    Some("lan"),
+                    Action::SendError,
+                    "to_server",
+                    &[],
+                    None,
+                    "synthetic route failure",
+                )
+                .unwrap();
+        }
+        assert_eq!(telemetry.0.lock().unwrap().send_warnings[&key], first);
+        telemetry
+            .0
+            .lock()
+            .unwrap()
+            .send_warnings
+            .insert(key.clone(), Instant::now() - Duration::from_secs(31));
+        telemetry
+            .record_detail(
+                Some("lan"),
+                Action::SendError,
+                "to_server",
+                &[],
+                None,
+                "synthetic route failure",
+            )
+            .unwrap();
+        assert!(telemetry.0.lock().unwrap().send_warnings[&key] >= first);
+        assert_eq!(
+            telemetry.statistics().unwrap()["totals"]["send_errors"],
+            "5"
+        );
+        assert_eq!(
+            telemetry
+                .log(&DHCPRelayLogQuery::parse("").unwrap())
+                .unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        telemetry.begin(["lan".into()].into_iter()).unwrap();
+        assert!(telemetry.0.lock().unwrap().send_warnings.is_empty());
+    }
 
     #[test]
     fn relay_log_is_bounded_and_reports_cursor_gaps_resets_and_filters() {

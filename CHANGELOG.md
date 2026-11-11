@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- Fresh installation stops/disables and persistently masks the sysstat
+  collection timer and service, including when not installed yet. Preserve
+  existing statistics and packages; fail explicitly if stopped/persistent-mask
+  verification fails. Upgrade paths, fwupd and cron are unchanged.
+  Release impact: breaking installer host policy; next automatic calendar
+  version. Optional installation-help disclosure:
+  [handoff 2026-11-12-02](docs/frontend-handoffs/2026-11-12.md#2026-11-12-02-installer-disables-sysstat-collection).
+
 ### Added
 
 - Read-only RSS default-context table/hash/transform details and physical-device
@@ -360,6 +370,26 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Fix relayed DHCPNAK correlation/broadcast delivery, isolate transactions by
+  relay address plus transaction ID/MAC across VLANs, and keep healthy
+  destinations and pending requests running after per-packet send failures.
+  Classify asynchronous UDP transport errors separately from broken sockets.
+  Add fixed-header/expiry identity and bounded error detail to relay API events,
+  plus rate-limited Netcontrol send warnings without success-packet tracing.
+  Release impact: fixes and additive diagnostic fields; next automatic calendar
+  version. Required frontend client/diagnostics update:
+  [handoff 2026-11-12-03](docs/frontend-handoffs/2026-11-12.md#2026-11-12-03-dhcp-relay-reliability-and-diagnostic-detail).
+
+- Accept zero-source DHCP requests carrying an existing on-link client address
+  (`ciaddr`) instead of unconditionally rejecting them as
+  `invalid_client_address`. Preserve `ciaddr`, server/reply validation and
+  off-link/network/broadcast/relay-address and nonzero-source mismatch checks.
+  Add portable admission tests and a raw-packet namespace regression covering
+  forwarding, ACK delivery, negative cases and relay restart/rollback.
+  Release impact: fix; next automatic calendar version. No API/schema change;
+  optional frontend diagnostics guidance:
+  [handoff 2026-11-12-01](docs/frontend-handoffs/2026-11-12.md#2026-11-12-01-zero-source-dhcp-requests-with-existing-client-addresses).
 
 - Remove 68 redundant borrows from native netlink integration fixtures so
   all-targets Clippy passes without suppressing warnings. Test-only CI fix;

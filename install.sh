@@ -181,6 +181,23 @@ configure_snap() {
     configure_masked_units Snap snapd.service snapd.socket
 }
 
+configure_sysstat_collection() (
+    set -euo pipefail
+    local unit status
+    local -a units=(sysstat-collect.timer sysstat-collect.service)
+    configure_masked_units Sysstat "${units[@]}" || exit 1
+    systemctl mask "${units[@]}" || exit 1
+    for unit in "${units[@]}"; do
+        status=$(systemctl show "$unit" --property ActiveState --property UnitFileState) || exit 1
+        if ! grep -Fxq 'UnitFileState=masked' <<< "$status" ||
+           ! grep -Eq '^ActiveState=(inactive|failed)$' <<< "$status"; then
+            printf 'Sysstat unit %s is not stopped and persistently masked.\n' "$unit" >&2
+            exit 1
+        fi
+    done
+    installer_message success 'Sysstat activity collection stopped and persistently masked; existing statistics preserved.'
+)
+
 configure_apparmor() (
     set -euo pipefail
     local root=${1:-/} path parent work previous=false enabled status
@@ -548,6 +565,7 @@ install_systemd_service() {
     configure_snap || return 1
     configure_motd || return 1
     configure_ntp || return 1
+    configure_sysstat_collection || return 1
     install -d -m 0700 /var/lib/netcontrol /var/lib/netcontrol/services /etc/netcontrol/keys || return 1
     install -m 0644 netcontrold.service /etc/systemd/system/netcontrold.service || return 1
     configure_upgrade_settings || return 1
@@ -877,6 +895,7 @@ main() {
             'Disables Snap, competing syslog receivers and automatic OS updates, including security fixes.' \
             'Removes MOTD login messages/generators and stops/masks MOTD services.' \
             'Stops/masks OS NTP clients; Netcontrol NTP remains disabled until explicitly configured.' \
+            'Stops/masks the sysstat collection timer and service; preserves existing statistics.' \
             'Disables AppArmor via GRUB; if active, stops for manual reboot/rerun before proceeding.' \
             'Persistently masks AppArmor service; preserves all packages, profiles, caches and APT preferences.' \
             'Schedule manual OS patching. LAN clients need static addresses; no DHCP/DNS server is installed.' \
