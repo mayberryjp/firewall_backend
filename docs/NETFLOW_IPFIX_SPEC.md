@@ -140,23 +140,31 @@ A flow is exported when any of these happens, then removed from the table:
 | Maximum life | Older than `maxlife` seconds (default 3600) since the first packet |
 | Capacity | The table is full and a new flow arrives: the least recently updated flow is exported early |
 | Counter overflow | Versions 1 and 5 only: a flow nearing the 32-bit packet/byte limit is exported early |
-| Shutdown | All remaining flows are flushed when the worker stops |
+| Shutdown | Best-effort flush in batches of at most 64 flows, with a two-second total deadline; incomplete flush/send failure is explicitly logged |
 
 A timeout of `0` disables that timeout (except `general`, which must be >= 1).
-`expint` is how often the table is scanned, default 1 second; `expint: 0` scans on
-every capture poll. Status counters refresh on the same scan. Idle flows can
-therefore be exported up to one scan interval late.
+`expint` controls scheduled expiry checks, default 1 second; `expint: 0` checks on
+every capture poll. Each maintenance iteration removes at most 64 due flows from
+an ordered deadline index, rather than scanning the whole table. A due backlog
+continues on subsequent capture iterations without waiting another `expint`.
+Status counters refresh during these checks. Export delay includes the initial
+check interval, backlog draining and scheduling/export cost; it is not bounded
+by `expint` alone.
 
-Export packets hold at most 24 records (v1) or 30 (v5, v9, IPFIX). A batch must be
-delivered within 2 seconds and each UDP write has a 250 ms timeout; failure puts the
-worker in `error` (section 5).
+Export packets hold at most 24 records (v1) or 30 (v5, v9, IPFIX). UDP writes are
+nonblocking, without the former per-write 250 ms wait. A normal batch has a
+two-second local-send deadline; encode/send/deadline failure puts the worker in
+`error` (section 5). Local send success does not prove collector delivery.
 
 Capacity and counter-overflow expirations are coalesced at the end of the current
 receive batch (up to 64 frames), with at most 64 pending records, then split into
 the same wire-format record limits. They do not require one UDP datagram per
-expired flow. Flows are tracked in a randomly seeded hash table with a separate
-least-recently-updated ordered index. Timeout classes are cached at worker
-preparation; packet updates and expiry scans each use one monotonic timestamp.
+expired flow. Flows use ordered trees for keys, least-recently-updated entries
+and expiry deadlines. Removal releases tree nodes instead of retaining a
+high-water hash-bucket allocation; this does not promise immediate OS/RSS
+reclamation by the allocator. Every update/removal synchronizes both indexes.
+Timeout classes are cached at worker preparation; packet updates and expiry
+checks each use one monotonic timestamp.
 Flow limits, timeout precedence, sampling, counters and protocol schemas are
 unchanged; record ordering is not a collector contract.
 
@@ -291,8 +299,8 @@ Each exporter requests a 4 MiB socket receive buffer. Linux caps the request at
 On hosts with a lower limit, operators can review that sysctl and raise it to at
 least 4,194,304 bytes before restarting exporters if the memory budget permits.
 The daemon does not modify host sysctls. Buffering absorbs bursts, not sustained
-overload: capture and export still share a thread, so CPU contention, flow scans
-and slow UDP writes can still produce drops. Increasing application sampling
+overload: capture and export still share a thread, so CPU contention and export
+work can still produce drops despite bounded expiry/nonblocking writes. Increasing application sampling
 does not reduce the packets initially queued by the kernel.
 
 `dropped_packets` is the cumulative number of packets the kernel dropped from the

@@ -90,6 +90,7 @@ fn native_counter_worker_persists_history_and_joins() {
                         directory.clone(),
                         netcontrol_core::VNStatConfig::default(),
                         Default::default(),
+                        Default::default(),
                     )
                 }
             },
@@ -107,13 +108,19 @@ fn native_counter_worker_persists_history_and_joins() {
         server.recv(&mut buffer)?;
         let sampled = Instant::now();
         while sampled.elapsed() < Duration::from_secs(8) {
-            if counters::Database::load(&path, "host")?
-                .interfaces
-                .get("lo")
-                .is_some_and(|value| value.total.rx_packets > 0)
+            if worker.snapshot()["interfaces"]["lo"]["total"]["rx_packets"]
+                .as_u64()
+                .is_some_and(|packets| packets > 0)
             {
                 break;
             }
+            ensure!(
+                counters::Database::load(&path, "host")?.interfaces["lo"]
+                    .total
+                    .rx_packets
+                    == 0,
+                "counter snapshot changed before its checkpoint interval"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         worker.shutdown()?;
@@ -150,6 +157,7 @@ fn native_counter_worker_persists_history_and_joins() {
                     counters::prepare(
                         directory.clone(),
                         netcontrol_core::VNStatConfig::default(),
+                        Default::default(),
                         Default::default(),
                     )
                 }
@@ -304,6 +312,86 @@ fn native_af_packet_drops_report_incomplete_statistics_and_keep_exporting() {
         Ok(())
     });
 }
+#[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
+fn native_flow_expiry_backlog_drains_without_waiting_another_export_interval() {
+    isolated(|| {
+        let collector = UdpSocket::bind("127.0.0.1:2055")?;
+        collector.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let target = UdpSocket::bind("127.0.0.1:25001")?;
+        let destination = target.local_addr()?;
+        let senders: Vec<_> = (0..130)
+            .map(|_| UdpSocket::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<_>>()?;
+        let ports = senders
+            .iter()
+            .map(|sender| sender.local_addr().map(|address| address.port()))
+            .collect::<std::io::Result<std::collections::BTreeSet<_>>>()?;
+        let config = config::Flow {
+            name: "expiry-test".into(),
+            enabled: true,
+            interface: "lo".into(),
+            collector: "127.0.0.1:2055".into(),
+            export_version: 5,
+            sampling_rate: 1,
+            max_flows: 512,
+            snaplen: 128,
+            promiscuous: false,
+            capture_filter: String::new(),
+            timeouts: std::collections::BTreeMap::from([
+                ("general".into(), 1),
+                ("expint".into(), 2),
+            ]),
+        };
+        let mut worker =
+            worker::Worker::start("flow-expiry-test".into(), None, json!({}), move || {
+                let run = flow::prepare(config.clone(), true)?;
+                for sender in &senders {
+                    sender.send_to(&[0; 16], destination)?;
+                }
+                Ok(run)
+            })?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut first_export = None::<Instant>;
+        let mut buffer = [0; 2048];
+        while seen.len() < ports.len() {
+            let count = collector.recv(&mut buffer)?;
+            let start = *first_export.get_or_insert_with(Instant::now);
+            collector.set_read_timeout(Some(Duration::from_millis(750)))?;
+            ensure!(
+                start.elapsed() < Duration::from_secs(1),
+                "expiry backlog waited another two-second scan interval"
+            );
+            let records = usize::from(u16::from_be_bytes(buffer[2..4].try_into()?));
+            ensure!(
+                count == 24 + records * 48 && records <= 30,
+                "invalid export size"
+            );
+            ensure!(
+                u32::from_be_bytes(buffer[16..20].try_into()?) as usize == seen.len(),
+                "expiry sequence skipped records"
+            );
+            for record in buffer[24..count].chunks_exact(48) {
+                let port = u16::from_be_bytes(record[32..34].try_into()?);
+                ensure!(
+                    ports.contains(&port) && seen.insert(port),
+                    "lost or duplicate expiry record"
+                );
+                ensure!(
+                    u32::from_be_bytes(record[16..20].try_into()?) == 2,
+                    "expiry lost captured packets"
+                );
+            }
+        }
+        worker.shutdown()?;
+        ensure!(
+            worker.snapshot()["dropped_packets"] == "0",
+            "expiry fixture lost capture packets"
+        );
+        Ok(())
+    });
+}
+
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
 fn native_flow_capacity_exports_are_batched_and_lossless() {

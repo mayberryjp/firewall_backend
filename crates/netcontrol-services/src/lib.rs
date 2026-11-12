@@ -72,6 +72,7 @@ pub struct Services {
     workers: BTreeMap<String, Worker>,
     error: Option<String>,
     reporting_identity: std::sync::Arc<std::sync::RwLock<netcontrol_core::SystemConfig>>,
+    traffic_history: counters::History,
     #[cfg(target_os = "linux")]
     _ownership: std::fs::File,
     #[cfg(target_os = "linux")]
@@ -151,6 +152,7 @@ impl Services {
             workers: BTreeMap::new(),
             error: None,
             reporting_identity: Default::default(),
+            traffic_history: Default::default(),
             #[cfg(target_os = "linux")]
             _ownership: ownership,
             #[cfg(target_os = "linux")]
@@ -360,11 +362,19 @@ impl Services {
                 let dir = self.options.state_directory.clone();
                 let config = c.vnstat.clone();
                 let identity = self.reporting_identity.clone();
+                let history = self.traffic_history.clone();
                 self.insert(
                     "vnstat",
                     host.clone(),
                     json!({"name":"vnstat","scope":"host","schema":counters::SCHEMA}),
-                    move || counters::prepare(dir.clone(), config.clone(), identity.clone()),
+                    move || {
+                        counters::prepare(
+                            dir.clone(),
+                            config.clone(),
+                            identity.clone(),
+                            history.clone(),
+                        )
+                    },
                 )?;
             }
             let relays: Vec<_> = c
@@ -635,10 +645,11 @@ impl Services {
                 state["state"] == "running" && state["collected_at"].is_string(),
                 "traffic history unavailable: {state}"
             );
-            let database = counters::Database::load(
-                &self.options.state_directory.join(counters::FILE_NAME),
-                "host",
-            )?;
+            let history = self
+                .traffic_history
+                .read()
+                .map_err(|_| anyhow::anyhow!("traffic history lock poisoned"))?;
+            let database = history.as_ref().context("traffic history unavailable")?;
             let mut value = serde_json::to_value(database)?;
             stringify_counts(&mut value);
             return Ok(value);
@@ -1157,6 +1168,19 @@ mod tests {
                 serde_json::to_vec(&db).unwrap(),
             )
             .unwrap();
+            db.observe(
+                "synthetic-boot",
+                "4:4026533000",
+                "lan0",
+                3,
+                counters::Counts {
+                    rx_bytes: 140,
+                    ..Default::default()
+                },
+                "2026-10-19T06:00:05Z",
+            )
+            .unwrap();
+            *services.traffic_history.write().unwrap() = Some(db);
             let worker = Worker::start(
                 "vnstat".into(),
                 None,
@@ -1176,10 +1200,18 @@ mod tests {
             .unwrap();
         assert_eq!(both["schema"], counters::SCHEMA);
         assert_eq!(both["scope"], "host");
-        assert_eq!(both["interfaces"]["lan0"]["last"]["rx_bytes"], "120");
+        assert_eq!(both["interfaces"]["lan0"]["last"]["rx_bytes"], "140");
         assert_eq!(
             both["interfaces"]["lan0"]["day"]["counts"]["rx_bytes"],
-            "20"
+            "40"
+        );
+        assert_eq!(
+            counters::Database::load(&directory.join(counters::FILE_NAME), "host")
+                .unwrap()
+                .interfaces["lan0"]
+                .last
+                .rx_bytes,
+            120
         );
         assert_eq!(both["sent_datagrams"], "0");
         assert_eq!(both, services.statistics("/statistics/vnstat", "").unwrap());

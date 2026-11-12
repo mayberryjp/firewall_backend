@@ -97,6 +97,38 @@ pub(crate) struct Database {
 }
 pub(crate) const SCHEMA: &str = "netcontrol-services/counters/v2";
 pub(crate) const FILE_NAME: &str = "traffic-host-v2.json";
+pub(crate) type History = std::sync::Arc<std::sync::RwLock<Option<Database>>>;
+#[cfg(any(test, target_os = "linux"))]
+const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Default)]
+struct Checkpoint {
+    saved_at: Option<std::time::Instant>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl Checkpoint {
+    fn persist(
+        &mut self,
+        database: &Database,
+        path: &Path,
+        now: std::time::Instant,
+        force: bool,
+    ) -> Result<bool> {
+        if force
+            || self
+                .saved_at
+                .is_none_or(|last| now.duration_since(last) >= SAVE_INTERVAL)
+        {
+            database.persist(path)?;
+            self.saved_at = Some(now);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
 impl Database {
     pub fn load(path: &Path, scope: &str) -> Result<Self> {
         match std::fs::symlink_metadata(path) {
@@ -463,13 +495,14 @@ pub(crate) fn prepare(
     directory: PathBuf,
     config: netcontrol_core::VNStatConfig,
     reporting_identity: std::sync::Arc<std::sync::RwLock<netcontrol_core::SystemConfig>>,
+    history: History,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     let path = directory.join(FILE_NAME);
     ensure!(
         path.exists() || !directory.join("traffic-host-v1.json").exists(),
         "prior traffic-host-v1.json retained; explicit operator archival is required before starting new calendar accounting"
     );
-    let mut database = Database::load(&path, "host")?;
+    let database = Database::load(&path, "host")?;
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
         .trim()
         .to_owned();
@@ -479,10 +512,18 @@ pub(crate) fn prepare(
     let namespace = format!("{}:{}", ns.dev(), ns.ino());
     read()?;
     Ok(Box::new(move |ctx| {
+        *history
+            .write()
+            .map_err(|_| anyhow::anyhow!("traffic history lock poisoned"))? = Some(database);
+        let mut checkpoint = Checkpoint::default();
         while !ctx.stopping() {
             let current = read()?;
             let calendar = local_now()?;
             let now = calendar.format(&time::format_description::well_known::Rfc3339)?;
+            let mut retained = history
+                .write()
+                .map_err(|_| anyhow::anyhow!("traffic history lock poisoned"))?;
+            let database = retained.as_mut().context("traffic history unavailable")?;
             for (name, value) in &mut database.interfaces {
                 if !current.contains_key(name) {
                     value.present = false;
@@ -491,6 +532,7 @@ pub(crate) fn prepare(
             for (name, (index, counts)) in current {
                 database.observe(&boot, &namespace, &name, index, counts, &now)?;
             }
+            let report_date = database.last_report_date.clone();
             if let Some(collector) = &config.collector {
                 if database.report_due(calendar) {
                     if let Err(error) = database.report(collector, &reporting_identity, calendar) {
@@ -499,7 +541,12 @@ pub(crate) fn prepare(
                     }
                 }
             }
-            database.persist(&path)?;
+            checkpoint.persist(
+                database,
+                &path,
+                std::time::Instant::now(),
+                database.last_report_date != report_date,
+            )?;
             ctx.update(|s| {
                 s["collected_at"] = serde_json::json!(now);
                 s["interfaces"] = serde_json::to_value(&database.interfaces).unwrap();
@@ -510,14 +557,152 @@ pub(crate) fn prepare(
                 s["sent_datagrams"] = serde_json::json!(database.sent_datagrams.to_string());
                 s["failed_datagrams"] = serde_json::json!(database.failed_datagrams.to_string());
             });
+            drop(retained);
             ctx.wait(std::time::Duration::from_secs(5));
         }
+        history
+            .read()
+            .map_err(|_| anyhow::anyhow!("traffic history lock poisoned"))
+            .and_then(|retained| checkpoint.persist(retained.as_ref().context("traffic history unavailable")?, &path, std::time::Instant::now(), true))
+            .inspect_err(|error| {
+                tracing::error!(%error, "final traffic accounting save failed; uncheckpointed observations may be lost");
+            })?;
         Ok(())
     }))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn checkpoints_keep_sampling_batch_saves_and_preserve_removed_totals() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("traffic-checkpoint-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory)?;
+        let path = directory.join(FILE_NAME);
+        let mut database = Database::load(&path, "host")?;
+        let mut checkpoint = Checkpoint::default();
+        let start = std::time::Instant::now();
+        database.observe(
+            "boot",
+            "ns",
+            "removed",
+            2,
+            Counts::default(),
+            "2026-11-12T00:00:00Z",
+        )?;
+        assert!(checkpoint.persist(&database, &path, start, false)?);
+        let first = std::fs::read(&path)?;
+        for seconds in (5..=60).step_by(5) {
+            database.observe(
+                "boot",
+                "ns",
+                "removed",
+                2,
+                Counts {
+                    rx_bytes: seconds * 100,
+                    ..Counts::default()
+                },
+                &format!("2026-11-12T00:{:02}:{:02}Z", seconds / 60, seconds % 60),
+            )?;
+            let saved = checkpoint.persist(
+                &database,
+                &path,
+                start + std::time::Duration::from_secs(seconds),
+                false,
+            )?;
+            assert_eq!(saved, seconds == 60);
+            if !saved {
+                assert_eq!(std::fs::read(&path)?, first);
+            }
+        }
+        database.interfaces.get_mut("removed").unwrap().present = false;
+        assert!(checkpoint.persist(
+            &database,
+            &path,
+            start + std::time::Duration::from_secs(65),
+            true
+        )?);
+        let restored = Database::load(&path, "host")?;
+        assert_eq!(restored.interfaces["removed"].total.rx_bytes, 6000);
+        assert!(!restored.interfaces["removed"].present);
+        assert_eq!(restored.history.len(), 13);
+        let saved = std::fs::read(&path)?;
+        let last = checkpoint.saved_at;
+        std::fs::write(path.with_extension("pending"), b"unresolved")?;
+        assert!(
+            checkpoint
+                .persist(
+                    &database,
+                    &path,
+                    start + std::time::Duration::from_secs(125),
+                    false
+                )
+                .is_err()
+        );
+        assert!(
+            checkpoint
+                .persist(
+                    &database,
+                    &path,
+                    start + std::time::Duration::from_secs(125),
+                    true
+                )
+                .is_err()
+        );
+        assert_eq!(checkpoint.saved_at, last);
+        assert_eq!(std::fs::read(&path)?, saved);
+        assert_eq!(
+            std::fs::read(path.with_extension("pending"))?,
+            b"unresolved"
+        );
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn traffic_worker_flushes_on_clean_shutdown_before_next_checkpoint() -> Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("traffic-shutdown-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory)?;
+        let path = directory.join(FILE_NAME);
+        let target = directory.clone();
+        let identity = std::sync::Arc::new(std::sync::RwLock::new(
+            netcontrol_core::SystemConfig::default(),
+        ));
+        let mut worker = super::super::worker::Worker::start(
+            "checkpoint-test".into(),
+            None,
+            serde_json::json!({}),
+            move || {
+                prepare(
+                    target.clone(),
+                    netcontrol_core::VNStatConfig::default(),
+                    identity.clone(),
+                    Default::default(),
+                )
+            },
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker.snapshot()["collected_at"].is_null() {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "traffic worker did not collect: {}",
+                worker.snapshot()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(path.exists());
+        std::fs::remove_file(&path)?;
+        worker.shutdown()?;
+        let restored = Database::load(&path, "host")?;
+        assert!(!restored.interfaces.is_empty());
+        assert_eq!(worker.snapshot()["state"], "stopped");
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
     #[test]
     fn counters_baseline_delta_reset_and_boot() {
         let mut db = Database {
@@ -859,6 +1044,7 @@ mod tests {
         let error = prepare(
             directory.clone(),
             netcontrol_core::VNStatConfig::default(),
+            Default::default(),
             Default::default(),
         )
         .err()

@@ -19,6 +19,7 @@ pub(crate) struct Flow {
     pub last: u32,
     pub flags: u8,
     pub changed: std::time::Instant,
+    expiry: Option<std::time::Instant>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -81,20 +82,24 @@ impl ExportCounters {
 
 #[cfg(any(target_os = "linux", test))]
 struct FlowTable {
-    flows: std::collections::HashMap<Key, Flow>,
+    flows: BTreeMap<Key, Flow>,
     oldest: std::collections::BTreeSet<(std::time::Instant, Key)>,
+    expiry: std::collections::BTreeSet<(std::time::Instant, Key)>,
     capacity: usize,
     fixed_counters: bool,
+    timeouts: FlowTimeouts,
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl FlowTable {
-    fn new(capacity: usize, fixed_counters: bool) -> Self {
+    fn new(capacity: usize, fixed_counters: bool, timeouts: FlowTimeouts) -> Self {
         Self {
-            flows: std::collections::HashMap::new(),
+            flows: BTreeMap::new(),
             oldest: std::collections::BTreeSet::new(),
+            expiry: std::collections::BTreeSet::new(),
             capacity,
             fixed_counters,
+            timeouts,
         }
     }
 
@@ -108,11 +113,11 @@ impl FlowTable {
     ) -> Option<(Key, Flow)> {
         let mut evicted = None;
         if self.flows.len() >= self.capacity && !self.flows.contains_key(&key) {
-            let (_, old) = self
+            let (_, old) = *self
                 .oldest
-                .pop_first()
+                .first()
                 .expect("full flow table has an oldest flow");
-            evicted = Some(self.flows.remove_entry(&old).expect("oldest flow exists"));
+            evicted = self.remove(&old);
         }
         let fresh = || Flow {
             bytes: 0,
@@ -121,11 +126,15 @@ impl FlowTable {
             last: uptime,
             flags: 0,
             changed: now,
+            expiry: None,
         };
         let flow = match self.flows.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
+            std::collections::btree_map::Entry::Occupied(entry) => {
                 let flow = entry.into_mut();
                 self.oldest.remove(&(flow.changed, key));
+                if let Some(deadline) = flow.expiry {
+                    self.expiry.remove(&(deadline, key));
+                }
                 if self.fixed_counters
                     && (flow.bytes + u64::from(bytes) > u64::from(u32::MAX)
                         || flow.packets == u64::from(u32::MAX))
@@ -134,13 +143,19 @@ impl FlowTable {
                 }
                 flow
             }
-            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(fresh()),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(fresh()),
         };
         flow.bytes += u64::from(bytes);
         flow.packets += 1;
         flow.last = uptime;
         flow.flags |= flags;
         flow.changed = now;
+        flow.expiry = self
+            .timeouts
+            .deadline(&key, flow, now, uptime, self.fixed_counters);
+        if let Some(deadline) = flow.expiry {
+            self.expiry.insert((deadline, key));
+        }
         self.oldest.insert((now, key));
         evicted
     }
@@ -148,11 +163,29 @@ impl FlowTable {
     fn remove(&mut self, key: &Key) -> Option<(Key, Flow)> {
         let item = self.flows.remove_entry(key)?;
         self.oldest.remove(&(item.1.changed, item.0));
+        if let Some(deadline) = item.1.expiry {
+            self.expiry.remove(&(deadline, item.0));
+        }
         Some(item)
+    }
+
+    fn expired_batch(&mut self, now: std::time::Instant, limit: usize) -> Vec<(Key, Flow)> {
+        let mut batch = Vec::new();
+        while batch.len() < limit {
+            let Some(&(deadline, key)) = self.expiry.first() else {
+                break;
+            };
+            if deadline > now {
+                break;
+            }
+            batch.push(self.remove(&key).expect("expiry index references a flow"));
+        }
+        batch
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy)]
 struct FlowTimeouts {
     general: std::time::Duration,
     tcp: std::time::Duration,
@@ -184,14 +217,14 @@ impl FlowTimeouts {
         }
     }
 
-    fn expired(
+    fn deadline(
         &self,
         key: &Key,
         flow: &Flow,
         now: std::time::Instant,
         uptime: u32,
         fixed_counters: bool,
-    ) -> bool {
+    ) -> Option<std::time::Instant> {
         let idle = match key.proto {
             6 if flow.flags & 4 != 0 => self.tcp_rst,
             6 if flow.flags & 1 != 0 => self.tcp_fin,
@@ -200,12 +233,30 @@ impl FlowTimeouts {
             1 | 58 => self.icmp,
             _ => self.general,
         };
-        (!idle.is_zero() && now.duration_since(flow.changed) >= idle)
-            || (self.maxlife_ms > 0
-                && u64::from(uptime.wrapping_sub(flow.first)) >= self.maxlife_ms)
-            || (fixed_counters
-                && (flow.bytes > u64::from(u32::MAX) - 65535
-                    || flow.packets >= u64::from(u32::MAX)))
+        let idle = (!idle.is_zero()).then(|| flow.changed + idle);
+        let maxlife = (self.maxlife_ms > 0).then(|| {
+            now + std::time::Duration::from_millis(
+                self.maxlife_ms
+                    .saturating_sub(u64::from(uptime.wrapping_sub(flow.first))),
+            )
+        });
+        let counters = (fixed_counters
+            && (flow.bytes > u64::from(u32::MAX) - 65535 || flow.packets >= u64::from(u32::MAX)))
+        .then_some(now);
+        [idle, maxlife, counters].into_iter().flatten().min()
+    }
+
+    #[cfg(test)]
+    fn expired(
+        &self,
+        key: &Key,
+        flow: &Flow,
+        now: std::time::Instant,
+        uptime: u32,
+        fixed_counters: bool,
+    ) -> bool {
+        self.deadline(key, flow, now, uptime, fixed_counters)
+            .is_some_and(|deadline| deadline <= now)
     }
 }
 
@@ -654,13 +705,13 @@ pub(crate) fn prepare(
         "[::]:0"
     })?;
     socket.connect(collector)?;
-    socket.set_write_timeout(Some(Duration::from_millis(250)))?;
+    socket.set_nonblocking(true)?;
     Ok(Box::new(move |ctx| {
         let start = Instant::now();
         let mut capture = CaptureBatch::new(config.snaplen);
         let mut pending = Vec::with_capacity(CAPTURE_BATCH);
         let fixed_counters = [1, 5].contains(&config.export_version);
-        let mut table = FlowTable::new(config.max_flows, fixed_counters);
+        let mut table = FlowTable::new(config.max_flows, fixed_counters, timeouts);
         let mut sampled = 0u64;
         let mut sequence = 0u32;
         let mut exports = ExportCounters::default();
@@ -675,6 +726,7 @@ pub(crate) fn prepare(
         });
         let domain = rand::random::<u32>();
         let mut last_flush = Instant::now();
+        let mut draining = false;
         let export = |batch: &[(Key, Flow)],
                       sequence: &mut u32,
                       exports: &mut ExportCounters|
@@ -767,16 +819,13 @@ pub(crate) fn prepare(
                     break;
                 }
             }
-            if last_flush.elapsed() >= timeouts.scan_interval {
+            if draining || last_flush.elapsed() >= timeouts.scan_interval {
                 let now = Instant::now();
-                let uptime = now.duration_since(start).as_millis() as u32;
-                let keys: Vec<Key> = table
-                    .flows
-                    .iter()
-                    .filter(|(k, v)| timeouts.expired(k, v, now, uptime, fixed_counters))
-                    .map(|(k, _)| *k)
-                    .collect();
-                let batch: Vec<_> = keys.into_iter().filter_map(|k| table.remove(&k)).collect();
+                let batch = table.expired_batch(now, CAPTURE_BATCH);
+                draining = table
+                    .expiry
+                    .first()
+                    .is_some_and(|(deadline, _)| *deadline <= now);
                 export(&batch, &mut sequence, &mut exports)?;
                 last_flush = Instant::now();
                 // PACKET_STATISTICS is reset by getsockopt; accumulate drops explicitly.
@@ -803,11 +852,27 @@ pub(crate) fn prepare(
             }
             wait_for_capture(fd.as_raw_fd())?;
         }
-        export(
-            &table.flows.into_iter().collect::<Vec<_>>(),
-            &mut sequence,
-            &mut exports,
-        )?;
+        let shutdown = Instant::now();
+        while !table.flows.is_empty() {
+            if shutdown.elapsed() >= Duration::from_secs(2) {
+                tracing::warn!(
+                    remaining_flows = table.flows.len(),
+                    "NetFlow shutdown export exceeded two seconds; remaining records were not exported"
+                );
+                anyhow::bail!("NetFlow shutdown export deadline exceeded");
+            }
+            let mut batch = Vec::with_capacity(CAPTURE_BATCH);
+            while batch.len() < CAPTURE_BATCH {
+                let Some(&(_, key)) = table.oldest.first() else {
+                    break;
+                };
+                batch.push(table.remove(&key).expect("oldest flow exists"));
+            }
+            if let Err(error) = export(&batch, &mut sequence, &mut exports) {
+                tracing::warn!(%error, remaining_flows = table.flows.len() + batch.len(), "NetFlow final export failed; remaining records were not exported");
+                return Err(error);
+            }
+        }
         Ok(())
     }))
 }
@@ -836,6 +901,7 @@ mod tests {
                             last: 2,
                             flags: 0,
                             changed: std::time::Instant::now(),
+                            expiry: None,
                         },
                     )
                 })
@@ -879,6 +945,7 @@ mod tests {
             last: 2,
             flags: 0,
             changed: std::time::Instant::now(),
+            expiry: None,
         };
         let batch = vec![(flow_test_key(1), flow); 31];
         let mut counters = ExportCounters::default();
@@ -939,6 +1006,7 @@ mod tests {
                 last: 0,
                 flags: 0,
                 changed: std::time::Instant::now(),
+                expiry: None,
             },
         )];
         counters.export(&batch, 5, |_| Ok(72)).unwrap();
@@ -977,14 +1045,124 @@ mod tests {
         assert!(table.flows.len() <= table.capacity);
         for (key, flow) in &table.flows {
             assert!(table.oldest.contains(&(flow.changed, *key)));
+            if let Some(deadline) = flow.expiry {
+                assert!(table.expiry.contains(&(deadline, *key)));
+            }
         }
+        assert_eq!(
+            table.expiry.len(),
+            table
+                .flows
+                .values()
+                .filter(|flow| flow.expiry.is_some())
+                .count()
+        );
+    }
+
+    fn test_table(capacity: usize, fixed: bool) -> FlowTable {
+        FlowTable::new(capacity, fixed, FlowTimeouts::new(&BTreeMap::new()))
+    }
+
+    #[test]
+    fn indexed_expiry_drains_large_peaks_in_bounded_batches_without_stale_entries() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut table = test_table(20_000, false);
+        for index in 0..20_000 {
+            table.record(flow_test_key(index), 64, 0x10, now, 0);
+        }
+        assert!(
+            table
+                .expired_batch(now + Duration::from_secs(59), 17)
+                .is_empty()
+        );
+        let mut exported = 0;
+        while !table.flows.is_empty() {
+            let batch = table.expired_batch(now + Duration::from_secs(60), 17);
+            assert!(!batch.is_empty() && batch.len() <= 17);
+            exported += batch.iter().map(|(_, flow)| flow.packets).sum::<u64>();
+            assert_flow_index(&table);
+        }
+        assert_eq!(exported, 20_000);
+        assert!(table.oldest.is_empty() && table.expiry.is_empty());
+        table.record(
+            flow_test_key(1),
+            128,
+            0x10,
+            now + Duration::from_secs(61),
+            61_000,
+        );
+        assert!(
+            table
+                .expired_batch(now + Duration::from_secs(120), 17)
+                .is_empty()
+        );
+        assert_eq!(
+            table
+                .expired_batch(now + Duration::from_secs(121), 17)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn indexed_expiry_updates_idle_flags_maxlife_and_disabled_deadlines() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let key = flow_test_key(1);
+        let mut table = FlowTable::new(
+            1,
+            false,
+            FlowTimeouts::new(&BTreeMap::from([
+                ("tcp".into(), 10),
+                ("tcp.rst".into(), 1),
+                ("maxlife".into(), 15),
+            ])),
+        );
+        table.record(key, 40, 0x10, now, u32::MAX - 500);
+        table.record(key, 40, 0x10, now + Duration::from_secs(9), 8499);
+        assert_flow_index(&table);
+        assert!(
+            table
+                .expired_batch(now + Duration::from_secs(10), 64)
+                .is_empty()
+        );
+        assert!(
+            table
+                .expired_batch(now + Duration::from_secs(14), 64)
+                .is_empty()
+        );
+        assert_eq!(
+            table.expired_batch(now + Duration::from_secs(15), 64).len(),
+            1
+        );
+        table.record(key, 40, 0x10, now, 0);
+        table.record(key, 40, 4, now + Duration::from_secs(1), 1000);
+        assert_flow_index(&table);
+        assert_eq!(
+            table.expired_batch(now + Duration::from_secs(2), 64).len(),
+            1
+        );
+        let mut table = FlowTable::new(
+            1,
+            false,
+            FlowTimeouts::new(&BTreeMap::from([("tcp".into(), 0), ("maxlife".into(), 0)])),
+        );
+        table.record(key, 40, 0x10, now, 0);
+        assert!(table.expiry.is_empty());
+        assert!(
+            table
+                .expired_batch(now + Duration::from_secs(86400), 64)
+                .is_empty()
+        );
+        assert_flow_index(&table);
     }
 
     #[test]
     fn flow_table_preserves_counts_flags_lru_and_removal() {
         use std::time::{Duration, Instant};
         let now = Instant::now();
-        let mut table = FlowTable::new(2, true);
+        let mut table = test_table(2, true);
         let a = flow_test_key(1);
         let b = flow_test_key(2);
         let c = flow_test_key(3);
@@ -1021,7 +1199,7 @@ mod tests {
         for fixed in [false, true] {
             let now = Instant::now();
             let key = flow_test_key(1);
-            let mut table = FlowTable::new(1, fixed);
+            let mut table = test_table(1, fixed);
             table.record(key, 40, 1, now, 1);
             table.flows.get_mut(&key).unwrap().bytes = u64::from(u32::MAX) - 10;
             let evicted = table.record(key, 64, 0x10, now + Duration::from_millis(1), 2);
@@ -1053,7 +1231,7 @@ mod tests {
     fn flow_timeouts_preserve_classes_priority_defaults_and_disabled_values() {
         use std::time::{Duration, Instant};
         let now = Instant::now();
-        let mut table = FlowTable::new(1, false);
+        let mut table = test_table(1, false);
         let key = flow_test_key(1);
         table.record(key, 40, 0, now, 0);
         let mut flow = table.remove(&key).unwrap().1;
@@ -1111,7 +1289,7 @@ mod tests {
         use std::time::Instant;
         let now = Instant::now();
         let key = flow_test_key(1);
-        let mut table = FlowTable::new(1, true);
+        let mut table = test_table(1, true);
         table.record(key, 40, 0, now, u32::MAX - 500);
         let mut flow = table.remove(&key).unwrap().1;
         let timeouts =
@@ -1138,7 +1316,7 @@ mod tests {
         const PACKETS: u32 = 1_000_000;
         let keys: Vec<_> = (0..CAPACITY as u32).map(flow_test_key).collect();
         for churn in [false, true] {
-            let mut table = FlowTable::new(CAPACITY, true);
+            let mut table = test_table(CAPACITY, true);
             let mut evicted = 0;
             let begin = Instant::now();
             for packet in 0..PACKETS {
@@ -1211,6 +1389,7 @@ mod tests {
             last: 0x55667788,
             flags: 0x13,
             changed: std::time::Instant::now(),
+            expiry: None,
         };
         let epoch = std::time::UNIX_EPOCH + std::time::Duration::new(0x10203040, 100000000);
         let p = v1(&[(key, flow.clone())], 0x99aabbcc, epoch).unwrap();
@@ -1263,6 +1442,7 @@ mod tests {
             last: 2,
             flags,
             changed: std::time::Instant::now(),
+            expiry: None,
         };
         let p = v5(&[(k, f)], 3, 7, std::time::UNIX_EPOCH, 1).unwrap();
         assert_eq!(p.len(), 72);
@@ -1320,6 +1500,7 @@ mod tests {
             last: 150,
             flags,
             changed: std::time::Instant::now(),
+            expiry: None,
         };
         assert!(v5(&[(key, flow.clone())], 200, 7, std::time::UNIX_EPOCH, 1).is_err());
         for version in [9, 10] {

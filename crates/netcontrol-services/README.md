@@ -279,6 +279,13 @@ drift and durable transaction recovery safeguards remain enforced.
   creation, fsync, atomic rename and directory fsync; an unresolved `.pending`
   file causes an explicit error and requires operator review. Invalid/incompatible
   records are never deleted, reset, migrated, or interpreted as Go/vnStat data.
+  Keep the live database in shared memory for five-second API/runtime freshness.
+  Save the initial sample, then checkpoint at least 60 seconds apart, plus an
+  immediate checkpoint when the daily report-attempt date changes and a final
+  clean-shutdown save. Save failures are explicit, including at shutdown.
+  Abrupt termination can lose recent uncheckpointed observations (normally
+  roughly a minute, subject to sampling, scheduling and storage delays).
+  Preserve every historical interface total; no automatic deletion is added.
   `vnstat.collector` defaults to null (collection only). A configured literal
   unicast UDP IP:port enables reporting at the first sample during local 23:59.
   One datagram per present interface contains `hostname.domain|ONELINE\n`; ONELINE
@@ -313,21 +320,26 @@ drift and durable transaction recovery safeguards remain enforced.
   timezone cache. This is output-format compatibility, not vnStat DB compatibility.
 * **NetFlow:** AF_PACKET Ethernet/VLAN capture and NetFlow v1/v5/v9/IPFIX UDP export,
   bounded flow capacity, configured sampling, idle/protocol/flag/maxlife/export
-  timeouts, and shutdown flushing. Excludes its collector traffic to avoid
+  timeouts, and best-effort shutdown flushing. Excludes its collector traffic to avoid
   export feedback. Capture uses nonblocking batches of up to 64 packets per
   `recvmmsg`, with at most 256 packets between maintenance checks. A readiness
   poll waits up to 10 ms only when no capture is ready; queued traffic is drained
   without the former unconditional 10 ms sleep. Each exporter requests a 4 MiB
   socket receive buffer (Linux caps this at `net.core.rmem_max` and doubles the
   accepted value for socket accounting) and uses at most 64 times `snaplen`
-  bytes of userspace packet storage. Flow accounting uses a randomly seeded
-  hash table with an ordered least-recently-updated index; the configured
-  `max_flows` limit is unchanged. Timeout classes are resolved once at startup,
-  with one monotonic timestamp per packet update and per expiry scan.
+  bytes of userspace packet storage. Flow accounting uses ordered key, LRU and
+  deadline trees, releasing nodes as flows leave instead of retaining peak
+  hash-bucket capacity; the configured `max_flows` limit is unchanged.
+  Timeout classes are resolved once at startup, with one monotonic timestamp
+  per packet update and per expiry check. Each maintenance iteration expires
+  at most 64 flows; a due backlog continues without waiting another `expint`.
   Capacity/counter-rollover exports are coalesced at the end of each receive
   batch, with at most 64 pending records, rather than sending each early-expired
   flow separately. No host sysctl is changed. Capture and
-  export still share a worker; CPU overload, long scans or slow export can
+  UDP sends are nonblocking with a two-second normal batch deadline. Shutdown
+  drains batches of at most 64 flows within a two-second total deadline, logging
+  incomplete flush/send failure rather than guaranteeing every flow exports.
+  Export still shares a worker with capture; CPU overload or export work can
   still cause loss. AF_PACKET capture drops do not stop the worker or export.
   Runtime reports cumulative `dropped_packets` as an exact decimal string and
   `statistics_complete: false` after any observed drop; flow totals may undercount

@@ -73,6 +73,10 @@ present interface during local 23:59, with daily/monthly/lifetime observed
 totals. The prefix uses committed `system.hostname` and `system.domain`;
 an empty domain sends hostname only, and an unmanaged hostname uses the kernel
 name. Reporting is approximate and best-effort, not a delivery guarantee.
+Samples/API history refresh every five seconds; disk checkpoints normally occur
+every 60 seconds, with initial/report-date/final clean-shutdown saves. Abrupt
+termination can lose uncheckpointed observations; historical interface totals
+are preserved without automatic pruning.
 See the [traffic contract](FRONTEND_SPEC.md#native-traffic-history) and
 [example](examples/appliance-services.json) for configuration and retained-state
 requirements; there is no vnStat daemon, cron or netcat dependency.

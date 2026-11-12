@@ -1695,6 +1695,14 @@ No subprocess, third-party collector, eBPF program, BTF, tracefs, or provider
 integration is involved. Packet payloads/endpoints are not stored or exported.
 Headers are observed before firewall acceptance/checksum validation; observations
 do not prove packet acceptance, delivery or application behavior.
+The kernel excludes outgoing copies, direct non-TCP IPv4/IPv6 traffic and IPv4
+fragments from this diagnostic socket. IPv4 TCP, direct IPv6 TCP and supported
+IPv6 extension-header candidates remain observable. IPv6 hop-by-hop/routing/
+destination/AH candidates pass conservatively to the bounded userspace decoder,
+which ignores non-TCP/unsupported chains and fragments; not all non-TCP extension
+traffic is eliminated before copying. Forwarded TCP ingress remains observable.
+This filter is not applied to NetFlow, which still captures both directions and
+its configured protocols. No firewall rules, forwarding or offloads are changed.
 
 Envelope:
 - `schema: "netcontrol-link-diagnostics/v1"`, opaque backend `scope`.
@@ -2944,6 +2952,14 @@ The first sample establishes a baseline; it is not previous lifetime usage.
 Only the latest 10,000 per-interface history records are retained, while
 cumulative totals persist; removed interfaces and reset boundaries remain visible.
 Daily/monthly buckets retain the current periods independently of history pruning.
+API history still exposes the live five-second samples, independently of disk
+checkpointing. Save the initial sample, normally checkpoint every 60 seconds,
+immediately save a changed daily report-attempt date, and attempt a final save
+on clean shutdown. Persistence failures remain explicit; final-save failures
+are logged. Abrupt termination can lose recent uncheckpointed observations,
+normally roughly a minute but not a strict bound under sampling/scheduling/I/O
+delays. There is no automatic deletion of historical interface totals and no
+storage schema change. Do not equate API freshness with crash durability.
 Polling deltas belong to the calendar period in which they are observed; midnight,
 restart and reset accounting is approximate. Initial/partially observed days are
 not complete historical usage. Do not sum overlapping interfaces.
@@ -6959,6 +6975,15 @@ Flow packet/byte totals are not multiplied by `sampling_rate`, and active
 unexported flows do not contribute. UDP success is local socket acceptance, not
 collector receipt; never display these as acknowledged delivery. Poll the existing
 status endpoint with `state.read`; no new write/reset endpoint is introduced.
+Timeout expiry uses ordered indexes and at most 64 records per maintenance
+iteration, not full-table scans; a due backlog drains between capture iterations
+without another `expint` wait. The export interval alone is not a maximum export
+delay under backlog. UDP sends are nonblocking; normal encode/send/deadline
+errors still fail the worker. Shutdown flushing is best-effort in batches of
+at most 64 records with a two-second total deadline; incomplete flush/send
+failure is explicitly logged. Stopped totals reflect successful local sends,
+not guaranteed export of every formerly active flow. No field/type, sampling,
+protocol-filter, permission or endpoint changes accompany these timing changes.
 
 Native AF_PACKET packet drops no longer stop export or fail service verification
 by themselves. Runtime/status rows expose `dropped_packets` (exact unsigned decimal

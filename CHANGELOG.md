@@ -4,6 +4,20 @@
 
 ### Changed
 
+- Reduce continuous monitoring overhead: kernel-filter direct non-TCP,
+  IPv4-fragment and outgoing diagnostic packet copies while retaining forwarded
+  TCP/IPv6-extension coverage; replace NetFlow full-table expiry/high-water
+  hash storage with ordered indexes and 64-record expiry batches, nonblocking
+  export and a two-second best-effort shutdown flush. Keep traffic sampling/API
+  freshness at five seconds while batching durable saves to 60 seconds, plus
+  initial/report-date/final saves; retain all historical interface totals.
+  Abrupt-stop durability and shutdown export timing change; HTTP/wire/storage
+  schemas do not. Release impact: breaking operational timing/durability
+  contract plus efficiency fixes; next automatic calendar version.
+  These are not a confirmed diagnosis/fix for reported voice interruptions.
+  Optional frontend help:
+  [handoff 2026-11-12-04](docs/frontend-handoffs/2026-11-12.md#2026-11-12-04-monitoring-overhead-and-traffic-checkpoints).
+
 - Fresh installation stops/disables and persistently masks the sysstat
   collection timer and service, including when not installed yet. Preserve
   existing statistics and packages; fail explicitly if stopped/persistent-mask

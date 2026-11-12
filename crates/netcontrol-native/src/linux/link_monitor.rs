@@ -147,6 +147,133 @@ mod tests {
     };
 
     #[test]
+    #[ignore = "requires NETCONTROL_INTEGRATION=1 and packet sockets in a disposable container"]
+    fn native_link_diagnostics_filters_irrelevant_and_outgoing_packets_in_kernel() -> Result<()> {
+        ensure!(
+            std::env::var("NETCONTROL_INTEGRATION").as_deref() == Ok("1"),
+            "integration opt-in required"
+        );
+        super::super::session(namespace()?, |runtime, handle| {
+            runtime.block_on(async {
+                let link = handle
+                    .link()
+                    .get()
+                    .match_name("lo".into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("loopback missing")?;
+                handle
+                    .link()
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .up()
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            let receiver = packet_socket()?;
+            let sender = socket(libc::AF_PACKET, libc::SOCK_DGRAM, 0)?;
+            let mut ipv4 = vec![0u8; 40];
+            ipv4[0] = 0x45;
+            ipv4[2..4].copy_from_slice(&40u16.to_be_bytes());
+            ipv4[9] = 6;
+            ipv4[32] = 0x50;
+            ipv4[33] = 0x10;
+            let mut ipv6 = vec![0u8; 60];
+            ipv6[0] = 0x60;
+            ipv6[4..6].copy_from_slice(&20u16.to_be_bytes());
+            ipv6[6] = 6;
+            ipv6[52] = 0x50;
+            ipv6[53] = 0x10;
+            let mut extension = ipv6[..40].to_vec();
+            extension[4..6].copy_from_slice(&28u16.to_be_bytes());
+            extension[6] = 60;
+            extension.extend([6, 0, 0, 0, 0, 0, 0, 0]);
+            extension.extend(&ipv6[40..]);
+            for protocol in [17, 1, 47] {
+                let mut packet = ipv4.clone();
+                packet[9] = protocol;
+                inject(&sender, 0x0800, &packet)?;
+            }
+            for protocol in [17, 58, 44] {
+                let mut packet = ipv6.clone();
+                packet[6] = protocol;
+                inject(&sender, 0x86dd, &packet)?;
+            }
+            let mut fragment = ipv4.clone();
+            fragment[6] = 0x20;
+            inject(&sender, 0x0800, &fragment)?;
+            for (protocol, packet) in [(0x0800, &ipv4), (0x86dd, &ipv6), (0x86dd, &extension)] {
+                inject(&sender, protocol, packet)?;
+            }
+            let mut received = Vec::new();
+            loop {
+                let mut bytes = [0; 256];
+                let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+                let mut length = std::mem::size_of_val(&address) as libc::socklen_t;
+                let count = unsafe {
+                    libc::recvfrom(
+                        receiver.as_raw_fd(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                        0,
+                        (&mut address as *mut libc::sockaddr_ll).cast(),
+                        &mut length,
+                    )
+                };
+                if count < 0 {
+                    ensure!(
+                        io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock,
+                        "capture receive failed"
+                    );
+                    break;
+                }
+                ensure!(
+                    address.sll_pkttype != libc::PACKET_OUTGOING,
+                    "outgoing packet reached userspace"
+                );
+                ensure!(
+                    header(address.sll_ifindex as u32, &bytes[..count as usize])?.is_some(),
+                    "irrelevant packet reached userspace"
+                );
+                received.push(bytes[..count as usize].to_vec());
+                ensure!(received.len() <= 3, "unexpected packet copies");
+            }
+            ensure!(
+                received == vec![ipv4, ipv6, extension],
+                "kernel filter lost TCP or admitted irrelevant traffic"
+            );
+            Ok(())
+        })
+    }
+
+    fn inject(sender: &OwnedFd, protocol: u16, packet: &[u8]) -> Result<()> {
+        let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        address.sll_family = libc::AF_PACKET as u16;
+        address.sll_protocol = protocol.to_be();
+        address.sll_ifindex = unsafe { libc::if_nametoindex(c"lo".as_ptr()) } as i32;
+        ensure!(address.sll_ifindex > 0, "missing loopback");
+        ensure!(
+            unsafe {
+                libc::sendto(
+                    sender.as_raw_fd(),
+                    packet.as_ptr().cast(),
+                    packet.len(),
+                    0,
+                    (&address as *const libc::sockaddr_ll).cast(),
+                    std::mem::size_of_val(&address) as libc::socklen_t,
+                )
+            } == packet.len() as isize,
+            "inject packet: {}",
+            io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn stale_and_failed_samples_cannot_look_healthy_or_refresh_timestamps() -> Result<()> {
         let monitor = Monitor {
             state: Arc::new(Mutex::new((
@@ -358,11 +485,15 @@ mod tests {
             "integration opt-in required"
         );
         let packet = packet_socket()?;
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0")?;
-        sender.connect(receiver.local_addr()?)?;
+        let sender = socket(libc::AF_PACKET, libc::SOCK_DGRAM, 0)?;
+        let mut tcp = [0u8; 40];
+        tcp[0] = 0x45;
+        tcp[2..4].copy_from_slice(&40u16.to_be_bytes());
+        tcp[9] = 6;
+        tcp[32] = 0x50;
+        tcp[33] = 0x10;
         for _ in 0..30_000 {
-            sender.send(&[0u8; 1024])?;
+            inject(&sender, 0x0800, &tcp)?;
         }
         let mut capture = Capture::default();
         let mut baseline = Baseline::default();
@@ -511,6 +642,7 @@ fn option<T>(fd: &OwnedFd, level: i32, name: i32, value: &T) -> Result<()> {
 
 fn packet_socket() -> Result<OwnedFd> {
     let fd = socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0)?;
+    option(&fd, libc::SOL_PACKET, libc::PACKET_IGNORE_OUTGOING, &1i32)?;
     option(
         &fd,
         libc::SOL_SOCKET,
@@ -528,27 +660,94 @@ fn packet_socket() -> Result<OwnedFd> {
         },
         libc::sock_filter {
             code: 0x15,
-            jt: 1,
+            jt: 2,
             jf: 0,
             k: 0x0800,
         },
         libc::sock_filter {
             code: 0x15,
-            jt: 0,
-            jf: 1,
+            jt: 5,
+            jf: 0,
             k: 0x86dd,
         },
         libc::sock_filter {
             code: 0x06,
             jt: 0,
             jf: 0,
-            k: 256,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: 0x30,
+            jt: 0,
+            jf: 0,
+            k: 9,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 8,
+            k: 6,
+        },
+        libc::sock_filter {
+            code: 0x28,
+            jt: 0,
+            jf: 0,
+            k: 6,
+        },
+        libc::sock_filter {
+            code: 0x45,
+            jt: 6,
+            jf: 7,
+            k: 0x3fff,
+        },
+        libc::sock_filter {
+            code: 0x30,
+            jt: 0,
+            jf: 0,
+            k: 6,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 5,
+            jf: 0,
+            k: 6,
+        },
+        // Keep supported IPv6 extension chains for the bounded userspace decoder.
+        libc::sock_filter {
+            code: 0x15,
+            jt: 4,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 3,
+            jf: 0,
+            k: 43,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 2,
+            jf: 0,
+            k: 60,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 1,
+            jf: 0,
+            k: 51,
         },
         libc::sock_filter {
             code: 0x06,
             jt: 0,
             jf: 0,
             k: 0,
+        },
+        libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: 256,
         },
     ];
     let program = libc::sock_fprog {
