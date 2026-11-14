@@ -126,6 +126,13 @@ pub fn snapshot(
             "unexpected nftables table"
         );
         let chain = c_string(&bytes[field(&fields, 2)?])?.to_owned();
+        if chain == "experience_drop" {
+            ensure!(
+                &bytes[field(&fields, 7)?] == b"netcontrol-experience-v1",
+                "foreign rule in experience accounting chain"
+            );
+            continue;
+        }
         let handle_bytes = &bytes[field(&fields, 3)?];
         ensure!(handle_bytes.len() == 8, "invalid nftables rule handle");
         let handle = u64::from_be_bytes(handle_bytes.try_into()?);

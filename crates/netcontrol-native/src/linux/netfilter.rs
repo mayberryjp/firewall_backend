@@ -148,6 +148,19 @@ pub(super) fn fingerprint_excluding(
     owned_rules: &[Vec<u8>],
     lease: Option<&[u8]>,
 ) -> Result<String> {
+    fingerprint_owned_table("netcontrol", owned_rules, lease)
+}
+
+#[cfg(feature = "nftables")]
+pub(super) fn experience_fingerprint() -> Result<String> {
+    fingerprint_owned_table(super::experience_kernel::TABLE, &[], None)
+}
+
+fn fingerprint_owned_table(
+    table_name: &str,
+    owned_rules: &[Vec<u8>],
+    lease: Option<&[u8]>,
+) -> Result<String> {
     let mut records = Vec::new();
     let mut seen_owned = std::collections::BTreeSet::new();
     let mut rule_chains: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
@@ -161,7 +174,7 @@ pub(super) fn fingerprint_excluding(
                 .iter()
                 .find(|(kind, _)| kind & 0x3fff == 1)
                 .context("table name missing")?;
-            Ok(c_string(&name.1)? == "netcontrol")
+            Ok(c_string(&name.1)? == table_name)
         })
         .collect::<Result<Vec<_>>>()?
         .into_iter()
@@ -174,7 +187,12 @@ pub(super) fn fingerprint_excluding(
         let messages = if message == 1 {
             tables.clone()
         } else {
-            dump(message, true)?
+            dump_messages(
+                10,
+                message,
+                libc::NFPROTO_INET as u8,
+                &super::nft_wire::attribute(1, format!("{table_name}\0").as_bytes()),
+            )?
         };
         for payload in messages {
             ensure!(
@@ -186,10 +204,18 @@ pub(super) fn fingerprint_excluding(
             let Some(table) = attrs.iter().find(|(kind, _)| kind & 0x3fff == table_kind) else {
                 bail!("nftables object missing table name");
             };
-            if c_string(&table.1)? != "netcontrol" {
+            if c_string(&table.1)? != table_name {
                 continue;
             }
             if message == 10 {
+                #[cfg(feature = "nftables")]
+                if super::experience_kernel::is_set(&payload)?
+                    || table_name == super::experience_kernel::TABLE
+                {
+                    let normalized = super::experience_kernel::normalize_set(&payload, table_name)?;
+                    records.push([message.to_ne_bytes().to_vec(), normalized].concat());
+                    continue;
+                }
                 if let Some(expected) = lease {
                     if normalized_set(&payload)? == normalized_set(expected)? {
                         super::path_test::validate_lease_elements()?;
@@ -398,7 +424,7 @@ pub fn delete_connections(target: Option<(u32, &netcontrol_core::ConnectionTarge
         Some((id, target)) => crate::conntrack::delete_attributes(id, target)?,
         None => (libc::AF_UNSPEC as u8, Vec::new()),
     };
-    exchange(1, 2, family, &attrs, true)?;
+    exchange(1, 2, family, &attrs, true, None)?;
     Ok(())
 }
 
@@ -408,7 +434,18 @@ pub(super) fn dump_messages(
     family: u8,
     attrs: &[u8],
 ) -> Result<Vec<Vec<u8>>> {
-    exchange(subsystem, message, family, attrs, false)
+    exchange(subsystem, message, family, attrs, false, None)
+}
+
+type Visitor<'a> = &'a mut dyn FnMut(&[u8]) -> Result<()>;
+pub(super) fn visit_messages(
+    subsystem: u16,
+    message: u16,
+    family: u8,
+    attrs: &[u8],
+    visit: Visitor<'_>,
+) -> Result<()> {
+    exchange(subsystem, message, family, attrs, false, Some(visit)).map(|_| ())
 }
 
 fn delete_acknowledgement(payload: &[u8], request: &[u8]) -> Result<()> {
@@ -433,6 +470,7 @@ fn exchange(
     family: u8,
     attrs: &[u8],
     ack: bool,
+    visit: Option<Visitor<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
     let mut request = Vec::new();
     request.extend((20u32 + attrs.len() as u32).to_ne_bytes());
@@ -442,13 +480,13 @@ fn exchange(
     request.extend(0u32.to_ne_bytes());
     request.extend([family, 0, 0, 0]);
     request.extend(attrs);
-    exchange_request(&request, subsystem, ack, None)
+    exchange_request(&request, subsystem, ack, None, visit)
 }
 
 pub(super) fn send_batch(request: &[u8], last_sequence: u32) -> Result<()> {
     let mut request = request.to_vec();
     prepare_batch(&mut request, last_sequence)?;
-    exchange_request(&request, 10, true, Some(last_sequence))?;
+    exchange_request(&request, 10, true, Some(last_sequence), None)?;
     Ok(())
 }
 
@@ -557,6 +595,7 @@ fn exchange_request(
     subsystem: u16,
     ack: bool,
     batch_sequence: Option<u32>,
+    mut visit: Option<Visitor<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
     let mut headers = BTreeMap::new();
     if batch_sequence.is_some() {
@@ -651,6 +690,7 @@ fn exchange_request(
     );
     let mut result = Vec::new();
     let mut total = 0usize;
+    let mut records = 0usize;
     let default_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let deadline = DEADLINE
         .get()
@@ -728,7 +768,12 @@ fn exchange_request(
                     } else {
                         &request
                     };
-                    delete_acknowledgement(payload, header)?;
+                    delete_acknowledgement(payload, header).with_context(|| {
+                        format!(
+                            "netfilter command sequence {sequence}, type {:04x}",
+                            u16::from_ne_bytes([header[4], header[5]])
+                        )
+                    })?;
                     if batch_sequence.is_none_or(|last| sequence == last) {
                         return Ok(result);
                     }
@@ -757,10 +802,15 @@ fn exchange_request(
                     "unexpected conntrack dump record"
                 );
                 ensure!(
-                    subsystem != 1 || result.len() < 100_000,
+                    subsystem != 1 || records < 100_000,
                     "conntrack snapshot exceeds 100000 entries"
                 );
-                result.push(payload.to_vec());
+                records += 1;
+                if let Some(visit) = visit.as_mut() {
+                    visit(payload)?;
+                } else {
+                    result.push(payload.to_vec());
+                }
             }
             let aligned = (length + 3) & !3;
             ensure!(aligned <= data.len(), "short netlink message padding");

@@ -149,7 +149,15 @@ pub struct Manager {
     engine: Arc<Mutex<Engine>>,
     sando: Arc<crate::sando::Manager>,
     status: Mutex<Status>,
+    delivery: tokio::sync::Mutex<()>,
     mode: Mode,
+}
+
+pub struct TestMessage {
+    config: DiscordConfig,
+    backend_version: String,
+    config_version: String,
+    payload: Value,
 }
 
 impl Manager {
@@ -182,6 +190,7 @@ impl Manager {
             engine,
             sando,
             mode,
+            delivery: tokio::sync::Mutex::new(()),
             status: Mutex::new(Status {
                 enabled: config.enabled,
                 notify_broadcast: config.notify_broadcast,
@@ -220,6 +229,95 @@ impl Manager {
         }))
     }
 
+    pub fn prepare_test(&self, engine: &Engine) -> Result<TestMessage> {
+        ensure!(
+            self.mode == Mode::Native,
+            "Discord test requires native Linux host mode"
+        );
+        let saved = engine.saved_configuration();
+        let backend_version = netcontrol_core::RELEASE_VERSION.to_string();
+        let config_version = engine.committed_revision().to_string();
+        Ok(TestMessage {
+            config: saved.discord.clone(),
+            backend_version: backend_version.clone(),
+            config_version: config_version.clone(),
+            payload: json!({
+                "allowed_mentions": {"parse": []},
+                "embeds": [{
+                    "author": {"name": firewall_name(&saved.system)},
+                    "title": "Netcontrol Discord test",
+                    "fields": [
+                        {"name": "Backend version", "value": backend_version},
+                        {"name": "Config version", "value": config_version}
+                    ]
+                }]
+            }),
+        })
+    }
+
+    pub async fn send_test(&self, test: TestMessage) -> Result<Value> {
+        let client = Self::discord_client()?;
+        let url = self
+            .secrets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Discord private store unavailable"))?
+            .get(&test.config.webhook_ref)?;
+        self.send_test_to(test, &client, &url).await
+    }
+
+    async fn send_test_to(&self, test: TestMessage, client: &Client, url: &str) -> Result<Value> {
+        let _delivery = self.delivery.lock().await;
+        ensure!(
+            !self.configuration_is_changed(&test.config),
+            "Discord configuration changed before test delivery"
+        );
+        {
+            let status = self
+                .status
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
+            ensure!(
+                matches!(status.state, "ready" | "paused" | "disabled"),
+                "Discord worker is not available for testing"
+            );
+        }
+        let (_stop, receiver) = watch::channel(false);
+        let outcome = tokio::select! {
+            _ = self.configuration_changed(&test.config) =>
+                Outcome::Failed("Discord configuration changed during test delivery".into()),
+            result = deliver(client, url, &test.payload, receiver) => result?,
+        };
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
+        ensure!(
+            matches!(status.state, "ready" | "paused" | "disabled"),
+            "Discord worker became unavailable during testing"
+        );
+        match outcome {
+            Outcome::Delivered => {
+                ensure!(
+                    !self.configuration_is_changed(&test.config),
+                    "Discord configuration changed after test delivery"
+                );
+                status.failed = "0".into();
+                status.error = None;
+                Ok(json!({
+                    "delivered": true,
+                    "backend_version": test.backend_version,
+                    "config_version": test.config_version,
+                    "failed": status.failed
+                }))
+            }
+            Outcome::Failed(error) => {
+                status.error = Some(error.clone());
+                anyhow::bail!("{error}")
+            }
+            Outcome::Stopped => anyhow::bail!("Discord test delivery stopped"),
+        }
+    }
+
     pub async fn run(self: Arc<Self>, stop: watch::Receiver<bool>) -> Result<()> {
         let result = self.worker(stop).await;
         if let Err(error) = &result {
@@ -235,25 +333,9 @@ impl Manager {
     }
 
     async fn worker(&self, mut stop: watch::Receiver<bool>) -> Result<()> {
-        let client = Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .user_agent("netcontrol-discord")
-            .build()?;
+        let client = Self::discord_client()?;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let (mut delivered, mut failed) = {
-            let status = self
-                .status
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
-            (
-                status.delivered.parse::<u64>()?,
-                status.failed.parse::<u64>()?,
-            )
-        };
         'worker: loop {
             tokio::select! {
                 _ = stop.changed() => break,
@@ -321,6 +403,10 @@ impl Manager {
                     .get(&config.webhook_ref)?
             };
             let payloads = messages(&hostname, &records, &names)?;
+            let _delivery = tokio::select! {
+                _ = stop.changed() => break,
+                guard = self.delivery.lock() => guard,
+            };
             let mut offset = 0;
             for payload in payloads {
                 let batch = payload["embeds"]
@@ -358,7 +444,9 @@ impl Manager {
                     .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?;
                 status.last_drop_id = Some(records[offset - 1].id.clone());
                 if let Some(error) = error {
-                    failed = failed
+                    let failed = status
+                        .failed
+                        .parse::<u64>()?
                         .checked_add(count)
                         .context("Discord failure counter exhausted")?;
                     status.failed = failed.to_string();
@@ -366,7 +454,9 @@ impl Manager {
                     status.delivery_failed(error);
                     break;
                 } else {
-                    delivered = delivered
+                    let delivered = status
+                        .delivered
+                        .parse::<u64>()?
                         .checked_add(count)
                         .context("Discord delivery counter exhausted")?;
                     status.delivered = delivered.to_string();
@@ -379,6 +469,16 @@ impl Manager {
             .map_err(|_| anyhow::anyhow!("Discord status unavailable"))?
             .state = "stopped";
         Ok(())
+    }
+
+    fn discord_client() -> Result<Client> {
+        Ok(Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .user_agent("netcontrol-discord")
+            .build()?)
     }
 
     async fn configuration_changed(&self, original: &DiscordConfig) {
@@ -679,7 +779,7 @@ mod tests {
             crate::sando::Manager::open(&directory.path().join("sando"), engine.clone())?,
         )?;
         let mut app = App::new(
-            engine,
+            engine.clone(),
             Authentication::Scoped(vec![
                 Credential {
                     name: "reader".into(),
@@ -740,6 +840,7 @@ mod tests {
         let (status, body) = api(&service, "POST", endpoint, "operator", payload).await;
         assert_eq!(status, 201);
         assert!(valid_id(body["webhook_ref"].as_str().unwrap()));
+        let reference = body["webhook_ref"].as_str().unwrap().to_owned();
         assert!(!body.to_string().contains("synthetic_token"));
         let endpoint = "/api/v1/services/discord/status";
         let (status, body) = api(&service, "GET", endpoint, "reader", Value::Null).await;
@@ -751,6 +852,189 @@ mod tests {
             api(&service, "GET", endpoint, "reader", json!({})).await.0,
             400
         );
+        let endpoint = "/api/v1/services/discord/test";
+        for (method, token, body, expected) in [
+            ("POST", "", Value::Null, 401),
+            ("POST", "reader", Value::Null, 403),
+            ("GET", "operator", Value::Null, 405),
+            ("POST", "operator", json!({}), 400),
+            ("POST", "operator", Value::Null, 409),
+        ] {
+            assert_eq!(
+                api(&service, method, endpoint, token, body).await.0,
+                expected
+            );
+        }
+        assert_eq!(
+            api(
+                &service,
+                "POST",
+                &format!("{endpoint}?x=1"),
+                "operator",
+                Value::Null
+            )
+            .await
+            .0,
+            400
+        );
+        let permissions = vec!["transactions.write".into(), "discord.write".into()];
+        let id = {
+            let mut engine = engine.lock().unwrap();
+            let mut config = engine.saved_configuration().clone();
+            config.discord.webhook_ref = reference;
+            let body = serde_json::to_vec(&json!({
+                "base_revision": engine.committed_revision(),
+                "confirm_timeout_seconds": 30, "config": config
+            }))?;
+            let reply = engine.request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "operator",
+                &permissions,
+                &body,
+            );
+            assert_eq!(reply.status, 202, "{}", reply.body);
+            reply.body["id"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(
+            api(&service, "POST", endpoint, "operator", Value::Null)
+                .await
+                .0,
+            409
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .request(
+                    "POST",
+                    &format!("/api/v1/transactions/{id}/confirm"),
+                    "",
+                    "operator",
+                    &permissions,
+                    &[]
+                )
+                .status,
+            200
+        );
+        assert_eq!(
+            api(&service, "POST", endpoint, "operator", Value::Null)
+                .await
+                .0,
+            503
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discord_test_sends_versions_and_clears_only_delivery_failures_after_success()
+    -> Result<()> {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        let directory = tempfile::tempdir()?;
+        let engine = Arc::new(Mutex::new(Engine::open(
+            &directory.path().join("state.json"),
+            Box::new(netcontrol_core::Simulator::new()),
+        )?));
+        let manager = Manager::open(
+            &directory.path().join("discord"),
+            engine.clone(),
+            Mode::Native,
+            crate::sando::Manager::open(&directory.path().join("sando"), engine.clone())?,
+        )?;
+        {
+            let mut status = manager.status.lock().unwrap();
+            status.state = "disabled";
+            status.failed = "7".into();
+            status.delivered = "3".into();
+            status.last_drop_id = Some("10".into());
+            status.error = Some("synthetic previous failure".into());
+        }
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        type CaptureState = (Arc<Mutex<Vec<Value>>>, Arc<Manager>);
+        let service = Router::new()
+            .route(
+                "/webhook",
+                post(
+                    |State((captured, manager)): State<CaptureState>,
+                     Json(payload): Json<Value>| async move {
+                        assert!(manager.delivery.try_lock().is_err());
+                        assert!(manager.engine.try_lock().is_ok());
+                        assert_eq!(manager.status().unwrap()["failed"], "7");
+                        let mut captured = captured.lock().unwrap();
+                        captured.push(payload);
+                        if captured.len() == 1 {
+                            StatusCode::BAD_GATEWAY
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
+            .with_state((captured.clone(), manager.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/webhook", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, service).await });
+        let prepare = || manager.prepare_test(&engine.lock().unwrap());
+        let expected_revision = engine.lock().unwrap().committed_revision().to_string();
+        let failed = manager.send_test_to(prepare()?, &Client::new(), &url).await;
+        let after_failure = manager.status()?;
+        let delivered = manager.send_test_to(prepare()?, &Client::new(), &url).await;
+        server.abort();
+        let _ = server.await;
+        assert!(failed.unwrap_err().to_string().contains("HTTP 502"));
+        assert_eq!(after_failure["failed"], "7");
+        assert!(after_failure["error"].is_string());
+        assert_eq!(
+            delivered?,
+            json!({
+                "delivered": true, "backend_version": netcontrol_core::RELEASE_VERSION.to_string(),
+                "config_version": expected_revision, "failed": "0"
+            })
+        );
+        let status = manager.status()?;
+        assert_eq!(status["failed"], "0");
+        assert_eq!(status["error"], Value::Null);
+        assert_eq!(status["delivered"], "3");
+        assert_eq!(status["last_drop_id"], "10");
+        assert_eq!(status["state"], "disabled");
+        assert_eq!(status["enabled"], false);
+        let monitor = crate::health::Monitor::default();
+        monitor.observe(Some(&json!({})), &[("discord", after_failure)], false);
+        assert_eq!(
+            monitor.snapshot()["active_alerts"][0]["code"],
+            "service_warning"
+        );
+        monitor.observe(Some(&json!({})), &[("discord", status)], false);
+        assert_eq!(monitor.snapshot()["active_alerts"], json!([]));
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 2);
+            assert_eq!(captured[1]["allowed_mentions"]["parse"], json!([]));
+            assert_eq!(
+                captured[1]["embeds"][0]["fields"],
+                json!([
+                    {"name":"Backend version","value":netcontrol_core::RELEASE_VERSION.to_string()},
+                    {"name":"Config version","value":expected_revision}
+                ])
+            );
+        }
+        manager.status.lock().unwrap().state = "error";
+        manager.status.lock().unwrap().error = Some("worker failed".into());
+        assert!(
+            manager
+                .send_test_to(prepare()?, &Client::new(), &url)
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.status()?["error"], "worker failed");
+        let simulator = Manager::open(
+            &directory.path().join("simulated-discord"),
+            engine.clone(),
+            Mode::Simulated,
+            crate::sando::Manager::open(&directory.path().join("simulated-sando"), engine.clone())?,
+        )?;
+        assert!(simulator.prepare_test(&engine.lock().unwrap()).is_err());
         Ok(())
     }
 

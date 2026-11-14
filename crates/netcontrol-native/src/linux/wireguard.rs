@@ -158,7 +158,7 @@ fn settings(
     value: &Value,
     dns: &super::wireguard_dns::Cache,
     ipv6: bool,
-    resolve_dns: bool,
+    cached_dns: bool,
 ) -> Result<(Key, u16, Vec<PeerConfigBuilder>)> {
     let reference = value["key_ref"]
         .as_str()
@@ -212,8 +212,10 @@ fn settings(
                     );
                     builder = builder.set_endpoint(address);
                 }
-                Some(netcontrol_core::WireGuardEndpoint::Dns { .. }) if resolve_dns => {
-                    builder = builder.set_endpoint(dns.resolve(endpoint, ipv6)?);
+                Some(netcontrol_core::WireGuardEndpoint::Dns { .. }) if cached_dns => {
+                    if let Some(address) = dns.cached(endpoint, ipv6)? {
+                        builder = builder.set_endpoint(address);
+                    }
                 }
                 _ => {}
             }
@@ -237,7 +239,7 @@ fn settings(
 
 impl Control {
     pub fn validate(&self, value: &Value, ipv6: bool) -> Result<()> {
-        settings(&self.keys, value, &self.dns, ipv6, true)?;
+        settings(&self.keys, value, &self.dns, ipv6, false)?;
         Ok(())
     }
 
@@ -414,6 +416,41 @@ mod tests {
             std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn structural_validation_does_not_require_dns_and_cold_apply_keeps_static_peer_settings() {
+        let fixture = Keys::new();
+        fixture.write(&Key([7u8; 32]).to_base64(), 0o600);
+        let mut dns = super::super::wireguard_dns::Cache::new(fixture.0.join("dns.json")).unwrap();
+        dns.set_resolver(std::sync::Arc::new(|_, _, _| {
+            panic!("DNS must only run in the refresh worker")
+        }));
+        let control = Control {
+            keys: fixture.0.clone(),
+            dns,
+        };
+        let value = json!({
+            "key_ref":"key", "listen_port":51820,
+            "peers":[{"public_key":Key([8u8; 32]).to_base64(),
+                "endpoint":"vpn.example.test:51820",
+                "persistent_keepalive_seconds":25,
+                "allowed_ips":["192.0.2.0/24"]}]
+        });
+        control.validate(&value, false).unwrap();
+        assert!(
+            !fixture.0.join("dns.json").exists(),
+            "preflight must not perform DNS"
+        );
+        let (_, _, peers) = settings(&fixture.0, &value, &control.dns, false, true).unwrap();
+        let peer = peers.into_iter().next().unwrap().into_peer_config();
+        assert!(peer.endpoint.is_none());
+        assert_eq!(peer.persistent_keepalive_interval, Some(25));
+        assert_eq!(peer.allowed_ips.len(), 1);
+        assert_eq!(peer.public_key, Key([8u8; 32]));
+        let mut invalid = value;
+        invalid["peers"][0]["endpoint"] = json!("invalid hostname:51820");
+        assert!(control.validate(&invalid, false).is_err());
     }
 
     #[test]

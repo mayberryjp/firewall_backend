@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 pub const PERMISSIONS: &[&str] = &[
@@ -381,6 +382,7 @@ pub struct Engine {
     dynamic_dns_secrets: Option<BTreeSet<String>>,
     discord_webhooks: Option<BTreeSet<String>>,
     timezone_check: Option<TimezoneCheck>,
+    confirmation_timer: Option<Instant>,
     #[cfg(test)]
     now: Option<DateTime<Utc>>,
 }
@@ -469,6 +471,18 @@ impl Engine {
         backend
             .configure_reporting_identity(&state.desired.system)
             .context("configure committed reporting identity")?;
+        let confirmation_timer = state
+            .active_transaction
+            .as_ref()
+            .and_then(|id| state.transactions.get(id))
+            .and_then(|t| t.confirmation_deadline.map(|deadline| (t, deadline)))
+            .map(|(t, deadline)| -> Result<Instant> {
+                let remaining = (deadline - Utc::now())
+                    .min(deadline - t.submitted_at)
+                    .max(Duration::zero());
+                Ok(Instant::now() + remaining.to_std()?)
+            })
+            .transpose()?;
         let mut e = Self {
             store,
             state,
@@ -480,6 +494,7 @@ impl Engine {
             dynamic_dns_secrets: None,
             discord_webhooks: None,
             timezone_check: None,
+            confirmation_timer,
             #[cfg(test)]
             now: None,
         };
@@ -510,10 +525,7 @@ impl Engine {
                 );
                 e.commit_verified(&id, &t, &t.actor, e.now())
                     .map_err(|error| anyhow::anyhow!(error.error))?;
-            } else if t.status != "pending_confirmation"
-                || t.confirmation_deadline
-                    .is_some_and(|deadline| e.now() >= deadline)
-            {
+            } else if t.status != "pending_confirmation" || e.confirmation_expired(&t) {
                 // Failure remains durable and blocks new writes; the operator can retry rollback.
                 let _ = e.rollback(&id, "startup recovery");
             }
@@ -548,14 +560,26 @@ impl Engine {
             .unwrap_or_else(|| self.state.desired.clone())
     }
     fn persist(&mut self, next: State) -> Result<()> {
+        validate_state(&next).context("refuse invalid journal update")?;
         if let Err(e) = self.store.save(&next) {
             if e.is::<crate::store::DurabilityError>() {
                 self.closed = true;
             }
             return Err(e);
         }
+        if next.active_transaction != self.state.active_transaction {
+            self.confirmation_timer = None;
+        }
         self.state = next;
         Ok(())
+    }
+    fn confirmation_expired(&self, t: &Transaction) -> bool {
+        t.confirmation_deadline.is_some_and(|deadline| {
+            self.now() >= deadline
+                || self
+                    .confirmation_timer
+                    .is_some_and(|timer| Instant::now() >= timer)
+        })
     }
     fn finish_vlan_adoption(&mut self) -> Result<()> {
         let Some(intent) = self.state.vlan_adoption.clone() else {
@@ -600,10 +624,7 @@ impl Engine {
             bail!("engine is shut down");
         }
         if let Some(t) = self.active() {
-            if t.status == "pending_confirmation"
-                && t.confirmation_deadline
-                    .is_some_and(|deadline| self.now() >= deadline)
-            {
+            if t.status == "pending_confirmation" && self.confirmation_expired(t) {
                 let id = t.id.clone();
                 self.rollback(&id, "confirmation timeout")?;
             }
@@ -611,6 +632,10 @@ impl Engine {
         self.backend
             .configure_reporting_identity(&self.state.desired.system)
             .context("configure committed reporting identity")?;
+        let paused = self.configuration_busy();
+        self.backend
+            .configure_host_experience(&self.state.desired, self.state.revision, paused)
+            .context("configure protected-host observation")?;
         Ok(())
     }
     /// Leaves pending confirmations durable for deadline-aware restart recovery.
@@ -618,8 +643,10 @@ impl Engine {
         if !self.closed {
             self.backend.shutdown_path_test()?;
             self.tick()?;
+            let experience = self.backend.shutdown_host_experience();
             self.store.save(&self.state)?;
             self.closed = true;
+            experience?;
         }
         Ok(())
     }
@@ -1382,6 +1409,15 @@ impl Engine {
             || self.backend.path_test_active()
     }
 
+    pub fn prepare_host_experience(
+        &mut self,
+        path: &str,
+        query: &str,
+    ) -> Result<crate::ExperienceRead> {
+        ensure!(!self.closed, "engine is shut down");
+        self.backend.prepare_host_experience(path, query)
+    }
+
     pub fn begin_restart(&mut self) -> Result<()> {
         ensure!(
             !self.closed && !self.configuration_busy(),
@@ -1684,6 +1720,11 @@ impl Engine {
         if self.active().is_some() {
             return Err(ApiError::new(409, "configuration conflict"));
         }
+        let now = self.now();
+        self.state
+            .revision
+            .next(now.date_naive())
+            .map_err(service_error)?;
         if !matches!(mode, ApplyMode::FactoryReset) {
             let observed = self
                 .backend
@@ -1705,7 +1746,6 @@ impl Engine {
                 }
             }
         }
-        let now = self.now();
         let mut id = [0u8; 16];
         rand::thread_rng()
             .try_fill_bytes(&mut id)
@@ -1742,8 +1782,14 @@ impl Engine {
         let mut next = self.state.clone();
         next.active_transaction = Some(id.clone());
         next.transactions.insert(id.clone(), t.clone());
+        let confirmation_timer = t
+            .confirmation_deadline
+            .map(|deadline| -> Result<Instant> { Ok(Instant::now() + (deadline - now).to_std()?) })
+            .transpose()
+            .map_err(internal_error)?;
         self.persist(next)
             .map_err(|e| internal_error(format!("persist intent: {e}")))?;
+        self.confirmation_timer = confirmation_timer;
         let applied = (|| -> Result<()> {
             if matches!(mode, ApplyMode::FactoryReset) {
                 self.backend.factory_reset(&t.previous, &t.candidate)?;
@@ -1756,8 +1802,7 @@ impl Engine {
                 "post-apply verification mismatch"
             );
             ensure!(
-                t.confirmation_deadline
-                    .is_none_or(|deadline| self.now() < deadline),
+                !self.confirmation_expired(&t),
                 "confirmation deadline elapsed while applying"
             );
             Ok(())
@@ -1806,10 +1851,10 @@ impl Engine {
         {
             return Err(ApiError::new(409, "configuration conflict").transaction(t));
         }
-        let deadline = t
-            .confirmation_deadline
-            .ok_or_else(|| service_error("confirmation transaction has no deadline"))?;
-        if self.now() >= deadline {
+        if t.confirmation_deadline.is_none() {
+            return Err(service_error("confirmation transaction has no deadline"));
+        }
+        if self.confirmation_expired(&t) {
             let _ = self.rollback(id, "confirmation expired");
             return Err(ApiError::new(409, "confirmation expired")
                 .transaction(self.state.transactions.get(id).cloned().unwrap_or(t)));
@@ -1822,7 +1867,7 @@ impl Engine {
             return Err(ApiError::new(409, "candidate drifted before confirmation").transaction(t));
         }
         let committed_at = self.now();
-        if committed_at >= deadline {
+        if self.confirmation_expired(&t) {
             let _ = self.rollback(id, "confirmation expired during verification");
             return Err(ApiError::new(409, "confirmation expired")
                 .transaction(self.state.transactions.get(id).cloned().unwrap_or(t)));
@@ -2626,10 +2671,6 @@ fn validate_state(s: &State) -> Result<()> {
                 validate_conntrack_ownership(&t.previous, &t.candidate)?;
             }
         }
-        ensure!(
-            t.submitted_at >= s.initialized_at,
-            "transaction predates journal initialization"
-        );
         if [
             "applying",
             "applying_local",
@@ -2650,8 +2691,9 @@ fn validate_state(s: &State) -> Result<()> {
         if t.status == "committed" {
             ensure!(
                 t.base_revision < s.revision
-                    && t.committed_at.is_some_and(|at| at >= t.submitted_at
-                        && t.confirmation_deadline.is_none_or(|deadline| at < deadline))
+                    && t.committed_at.is_some_and(|at| t
+                        .confirmation_deadline
+                        .is_none_or(|deadline| at < deadline))
                     && !t.committed_by.trim().is_empty(),
                 "invalid committed transaction metadata"
             );

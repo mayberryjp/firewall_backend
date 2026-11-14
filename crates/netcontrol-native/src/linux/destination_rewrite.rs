@@ -1,27 +1,8 @@
+use super::nft_wire::{attribute, expression, number};
 use anyhow::{Result, ensure};
 use netcontrol_core::DestinationRewriteRule;
 use rustables::{Batch, sys::*};
 use std::net::IpAddr;
-
-fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
-    let length = 4 + value.len();
-    let mut output = Vec::with_capacity((length + 3) & !3);
-    output.extend((length as u16).to_ne_bytes());
-    output.extend(kind.to_ne_bytes());
-    output.extend(value);
-    output.resize((length + 3) & !3, 0);
-    output
-}
-
-fn number(kind: u16, value: u32) -> Vec<u8> {
-    attribute(kind, &value.to_be_bytes())
-}
-
-fn expression(name: &str, data: Vec<u8>) -> Vec<u8> {
-    let mut value = attribute(NFTA_EXPR_NAME, format!("{name}\0").as_bytes());
-    value.extend(attribute(NFTA_EXPR_DATA | 0x8000, &data));
-    attribute(NFTA_LIST_ELEM | 0x8000, &value)
-}
 
 fn compare(value: &[u8]) -> Vec<u8> {
     expression(
@@ -149,16 +130,38 @@ fn rule(
     Ok(message)
 }
 
-pub fn send(batch: Batch, rules: &[DestinationRewriteRule], generation: &str) -> Result<()> {
+pub fn send(
+    batch: Batch,
+    rules: &[DestinationRewriteRule],
+    generation: &str,
+    telemetry_sets: &[(u16, u16, Vec<u8>)],
+    telemetry_rules: &[(u16, u16, Vec<u8>)],
+) -> Result<()> {
     let mut bytes = batch.finalize();
     ensure!(bytes.len() >= 40, "short nftables batch");
     let mut end = bytes.split_off(bytes.len() - 20);
     let mut sequence = u32::from_ne_bytes(end[8..12].try_into()?);
+    let mut insertion = 20;
+    for _ in 0..3 {
+        let length = u32::from_ne_bytes(bytes[insertion..insertion + 4].try_into()?) as usize;
+        insertion += (length + 3) & !3;
+    }
+    let extra = telemetry_sets
+        .iter()
+        .flat_map(|(kind, flags, attrs)| super::nft_wire::message(*kind, *flags, 1, attrs))
+        .collect::<Vec<_>>();
+    bytes.splice(insertion..insertion, extra);
+    sequence += telemetry_sets.len() as u32;
     for (index, item) in rules.iter().enumerate() {
         bytes.extend(rule(item, sequence, generation, index)?);
         sequence += 1;
     }
+    for (kind, flags, attrs) in telemetry_rules {
+        bytes.extend(super::nft_wire::message(*kind, *flags, sequence, attrs));
+        sequence += 1;
+    }
     end[8..12].copy_from_slice(&sequence.to_ne_bytes());
     bytes.extend(end);
-    super::netfilter::send_batch(&bytes, sequence - 1)
+    let last_sequence = super::nft_wire::resequence(&mut bytes)?;
+    super::netfilter::send_batch(&bytes, last_sequence)
 }

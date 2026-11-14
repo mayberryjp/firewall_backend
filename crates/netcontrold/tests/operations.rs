@@ -66,6 +66,24 @@ impl Fixture {
         }
     }
     async fn request(&self, method: &str, path: &str, body: Value, token: &str) -> (u16, Value) {
+        self.request_body(
+            method,
+            path,
+            Body::from(serde_json::to_vec(&body).unwrap()),
+            token,
+        )
+        .await
+    }
+    async fn get(&self, path: &str, token: &str) -> (u16, Value) {
+        self.request_body("GET", path, Body::empty(), token).await
+    }
+    async fn request_body(
+        &self,
+        method: &str,
+        path: &str,
+        body: Body,
+        token: &str,
+    ) -> (u16, Value) {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
@@ -74,17 +92,161 @@ impl Fixture {
             request = request.header("authorization", format!("Bearer {token}"));
         }
         let reply = netcontrold::http::router(self.app.clone())
-            .oneshot(
-                request
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
+            .oneshot(request.body(body).unwrap())
             .await
             .unwrap();
         let status = reply.status().as_u16();
         let bytes = to_bytes(reply.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
     }
+}
+
+#[tokio::test]
+async fn host_experience_authentication_contract_and_unsupported_mode() {
+    let f = Fixture::new();
+    let latest = "/api/v1/statistics/host-experience/latest";
+    let history = "/api/v1/statistics/host-experience/history";
+    assert_eq!(f.get(latest, "").await.0, 401);
+    assert_eq!(f.get(latest, "synthetic-operator").await.0, 403);
+    assert_eq!(
+        f.request("POST", latest, json!({}), "synthetic-reader")
+            .await
+            .0,
+        405
+    );
+    assert_eq!(
+        f.request("GET", latest, Value::Null, "synthetic-reader")
+            .await
+            .0,
+        400
+    );
+    for path in [
+        format!("{latest}?limit=257"),
+        format!("{latest}?unknown=true"),
+        format!("{latest}?address=2001:0db8::1"),
+        format!("{latest}?limit=1&limit=1"),
+        history.into(),
+        format!("{history}?address=192.0.2.20&interface=lan0"),
+    ] {
+        let reply = f.get(&path, "synthetic-reader").await;
+        assert_eq!(reply.0, 400, "{path}: {}", reply.1);
+    }
+    for path in [latest.into(), format!("{history}?address=192.0.2.20")] {
+        let reply = f.get(&path, "synthetic-reader").await;
+        assert_eq!(reply.0, 503, "{path}: {}", reply.1);
+        assert!(reply.1["error"].as_str().unwrap().contains("native"));
+    }
+}
+
+#[tokio::test]
+async fn host_experience_reads_release_engine_lock_and_bound_concurrency() {
+    use netcontrol_core::{Backend, Config, ExperienceRead, HostExperienceError};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::{Duration, Instant},
+    };
+    struct Slow {
+        simulator: Simulator,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<AtomicBool>,
+    }
+    impl Backend for Slow {
+        fn scope(&self) -> anyhow::Result<String> {
+            self.simulator.scope()
+        }
+        fn observe(&mut self, c: &Config) -> anyhow::Result<Config> {
+            self.simulator.observe(c)
+        }
+        fn apply(&mut self, a: &Config, b: &Config) -> anyhow::Result<()> {
+            self.simulator.apply(a, b)
+        }
+        fn runtime(&mut self, c: &Config) -> anyhow::Result<Value> {
+            self.simulator.runtime(c)
+        }
+        fn statistics(&mut self, c: &Config, p: &str, q: &str) -> anyhow::Result<Value> {
+            self.simulator.statistics(c, p, q)
+        }
+        fn repair(&mut self, c: &Config) -> anyhow::Result<Value> {
+            self.simulator.repair(c)
+        }
+        fn prepare_host_experience(
+            &mut self,
+            _: &str,
+            query: &str,
+        ) -> anyhow::Result<ExperienceRead> {
+            if query == "cursor=stale" {
+                return Ok(Box::new(|| {
+                    Err(HostExperienceError {
+                        status: 409,
+                        message: "expired fixture collection".into(),
+                    }
+                    .into())
+                }));
+            }
+            if query == "cursor=oversize" {
+                return Ok(Box::new(|| {
+                    Ok(json!({"hosts":[],"oversized":"x".repeat(4<<20)}))
+                }));
+            }
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Ok(Box::new(move || {
+                started.send(())?;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !release.load(Ordering::Acquire) {
+                    anyhow::ensure!(Instant::now() < deadline, "fixture experience read timeout");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(
+                    json!({"schema":netcontrol_core::experience::SCHEMA,"hosts":[],"status":"starting"}),
+                )
+            }))
+        }
+    }
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let f = Fixture::with_backend(Box::new(Slow {
+        simulator: Simulator::new(),
+        started,
+        release: release.clone(),
+    }));
+    let path = "/api/v1/statistics/host-experience/latest";
+    let (a, b, c, d, ()) = tokio::join!(
+        f.get(path, "synthetic-reader"),
+        f.get(path, "synthetic-reader"),
+        f.get(path, "synthetic-reader"),
+        f.get(path, "synthetic-reader"),
+        async {
+            for _ in 0..4 {
+                tokio::time::timeout(Duration::from_secs(2), starts.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(
+                f.app.engine.try_lock().is_ok(),
+                "experience read held configuration engine lock"
+            );
+            let reply = f.get(path, "synthetic-reader").await;
+            release.store(true, Ordering::Release);
+            assert_eq!(reply.0, 429, "{}", reply.1);
+        }
+    );
+    for reply in [a, b, c, d] {
+        assert_eq!(reply.0, 200, "{}", reply.1);
+    }
+    assert_eq!(
+        f.get(&format!("{path}?cursor=stale"), "synthetic-reader")
+            .await
+            .0,
+        409
+    );
+    assert_eq!(
+        f.get(&format!("{path}?cursor=oversize"), "synthetic-reader")
+            .await
+            .0,
+        503
+    );
 }
 
 #[tokio::test]

@@ -19,6 +19,7 @@ pub use path_test::{
 mod dynamic_dns;
 pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;
+pub mod experience;
 mod interface_capabilities;
 pub use interface_capabilities::*;
 mod mdns;
@@ -79,6 +80,20 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    fn configure_host_experience(
+        &mut self,
+        _config: &Config,
+        _revision: Version,
+        _paused: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn prepare_host_experience(&mut self, _path: &str, _query: &str) -> Result<ExperienceRead> {
+        anyhow::bail!("host experience requires native Linux host mode")
+    }
+    fn shutdown_host_experience(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn syslog_capture_active(&self) -> bool {
         false
     }
@@ -182,6 +197,19 @@ pub trait Backend: Send {
     fn statistics(&mut self, config: &Config, path: &str, query: &str) -> Result<Value>;
     fn repair(&mut self, config: &Config) -> Result<Value>;
 }
+
+pub type ExperienceRead = Box<dyn FnOnce() -> Result<Value> + Send>;
+#[derive(Debug)]
+pub struct HostExperienceError {
+    pub status: u16,
+    pub message: String,
+}
+impl std::fmt::Display for HostExperienceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl std::error::Error for HostExperienceError {}
 
 #[cfg(test)]
 mod model_tests;

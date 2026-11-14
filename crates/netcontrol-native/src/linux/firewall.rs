@@ -128,7 +128,10 @@ fn matching(
         if logging {
             rule = rule.with_expr(Log::new(Some(super::deny_log::GROUP), Some(prefix))?);
         }
-        rule.drop()
+        rule.with_expr(Immediate::new_verdict(VerdictKind::Jump {
+            chain: super::experience_kernel::DROP_CHAIN.to_owned(),
+        }))
+        .drop()
     } else if plan.action == "return" {
         rule.with_expr(Immediate::new_verdict(VerdictKind::Return))
     } else {
@@ -227,6 +230,9 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
     batch.add(&table, MsgType::Add);
     batch.add(&table, MsgType::Del);
     batch.add(&table, MsgType::Add);
+    Chain::new(&table)
+        .with_name(super::experience_kernel::DROP_CHAIN)
+        .add_to_batch(&mut batch);
     let forward = Chain::new(&table)
         .with_name("forward")
         .with_type(ChainType::Filter)
@@ -363,6 +369,7 @@ pub fn apply(value: &Value, interfaces: &[crate::model::Link]) -> Result<()> {
                 .add_to_batch(&mut batch);
         }
     }
-    super::destination_rewrite::send(batch, &rewrites, generation)?;
+    let (sets, rules) = super::experience_kernel::drop_layout(value, interfaces)?;
+    super::destination_rewrite::send(batch, &rewrites, generation, &sets, &rules)?;
     Ok(())
 }

@@ -262,6 +262,36 @@ impl Manager {
         Ok(names)
     }
 
+    pub(crate) fn host_experience_metadata(
+        &self,
+        config: &netcontrol_core::SandoConfig,
+    ) -> Result<BTreeMap<IpAddr, Value>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
+        let snapshot = &state.snapshot;
+        if snapshot.source_url != config.api_url || snapshot.last_success_at.is_none() {
+            return Ok(BTreeMap::new());
+        }
+        let stale = snapshot.error.is_some()
+            || snapshot
+                .last_success_at
+                .is_some_and(|at| Utc::now().signed_duration_since(at).num_seconds() > 7200);
+        let mut result = BTreeMap::new();
+        for host in &snapshot.hosts {
+            let value = json!({
+                "host_name":host.host_name,"icon":host.icon,"classification":host.classification,
+                "status":if stale{"stale"}else{"available"},
+                "last_success_at":snapshot.last_success_at,"error":snapshot.error
+            });
+            for ip in &host.addresses {
+                result.insert(*ip, value.clone());
+            }
+        }
+        Ok(result)
+    }
+
     fn status_for(
         &self,
         config: &netcontrol_core::SandoConfig,
@@ -533,6 +563,45 @@ mod tests {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[test]
+    fn experience_metadata_requires_current_success_and_reports_staleness() {
+        let (_directory, manager) = fixture();
+        let (hosts, _) = project(&inventory()).unwrap();
+        let config = netcontrol_core::SandoConfig {
+            api_url: "https://sando.example.test".into(),
+            ..Default::default()
+        };
+        let ip = hosts[0].addresses[0];
+        manager.state.lock().unwrap().snapshot = Snapshot {
+            source_url: config.api_url.clone(),
+            hosts,
+            last_success_at: Some(Utc::now()),
+            ..Default::default()
+        };
+        let metadata = manager.host_experience_metadata(&config).unwrap();
+        assert_eq!(metadata[&ip]["status"], "available");
+        assert_eq!(metadata[&ip]["classification"], "Camera");
+        manager.state.lock().unwrap().snapshot.last_success_at =
+            Some(Utc::now() - chrono::Duration::hours(3));
+        assert_eq!(
+            manager.host_experience_metadata(&config).unwrap()[&ip]["status"],
+            "stale"
+        );
+        manager.state.lock().unwrap().snapshot.last_success_at = Some(Utc::now());
+        manager.state.lock().unwrap().snapshot.error = Some("synthetic sync failure".into());
+        assert_eq!(
+            manager.host_experience_metadata(&config).unwrap()[&ip]["status"],
+            "stale"
+        );
+        manager.state.lock().unwrap().snapshot.source_url = "https://other.example.test".into();
+        assert!(
+            manager
+                .host_experience_metadata(&config)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

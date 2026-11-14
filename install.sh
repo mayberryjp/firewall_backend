@@ -465,7 +465,7 @@ configure_logging_units() (
     work=$(mktemp -d) || exit 1
     trap '[[ -z $staged ]] || rm -f -- "$staged"; rm -rf -- "$work"' EXIT
     printf '[Unit]\nDescription=Netcontrol journald syslog receiver\nPartOf=netcontrold.service\n\n[Socket]\nListenDatagram=/run/systemd/journal/syslog\nSocketMode=0600\nService=netcontrold.service\nFileDescriptorName=netcontrol-syslog\nRemoveOnStop=yes\n' > "$work/netcontrol-syslog.socket" || exit 1
-    printf '[Journal]\nForwardToSyslog=yes\nMaxLevelSyslog=debug\nReadKMsg=yes\n' > "$work/90-netcontrol-syslog.conf" || exit 1
+    printf '[Journal]\nForwardToSyslog=yes\nMaxLevelSyslog=debug\nReadKMsg=yes\nStorage=persistent\nSystemMaxUse=128M\nSystemKeepFree=256M\nRuntimeMaxUse=32M\nMaxRetentionSec=7day\n' > "$work/90-netcontrol-syslog.conf" || exit 1
     for relative in systemd/system/netcontrol-syslog.socket systemd/journald.conf.d/90-netcontrol-syslog.conf; do
         destination="$root/$relative"
         directory=${destination%/*}
@@ -542,6 +542,10 @@ configure_host_logging() (
     }
     systemctl restart systemd-journald.service || {
         printf 'Cannot activate journald syslog forwarding; deployment aborted.\n' >&2
+        exit 1
+    }
+    journalctl --flush || {
+        printf 'Cannot flush persistent host journal; deployment aborted.\n' >&2
         exit 1
     }
 )

@@ -340,6 +340,40 @@ pub fn snapshot(payloads: &[Vec<u8>], query: &ConnectionQuery) -> Result<Value> 
     }))
 }
 
+pub(crate) fn add_host_counts(
+    payload: &[u8],
+    protected: &std::collections::BTreeSet<IpAddr>,
+    result: &mut std::collections::BTreeMap<IpAddr, [u64; 3]>,
+) -> Result<()> {
+    let entry = decode(payload)?;
+    let addresses = std::collections::BTreeSet::from([
+        entry.original.source,
+        entry.original.destination,
+        entry.reply.source,
+        entry.reply.destination,
+    ]);
+    for address in addresses.intersection(protected) {
+        let counts = result.entry(*address).or_insert([0u64; 3]);
+        counts[0] += 1;
+        counts[1] += u64::from(entry.protocol == 6 && entry.tcp_state == Some(3));
+        counts[2] += u64::from(!entry.seen_reply);
+    }
+    Ok(())
+}
+
+pub(crate) fn original_destination(payload: &[u8], host: IpAddr) -> Result<Option<(IpAddr, u16)>> {
+    ensure!(payload.len() >= 4, "conntrack capture header missing");
+    let attrs = attributes(&payload[4..])?;
+    let (_, original) = tuple(required(&attrs, 1)?, payload[0])?;
+    Ok(if original.source == host {
+        original
+            .destination_port
+            .map(|port| (original.destination, port))
+    } else {
+        None
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +467,29 @@ mod tests {
             }
         }
         bytes
+    }
+    #[test]
+    fn streamed_host_counts_deduplicate_nat_tuple_perspectives() {
+        let protected = ["192.0.2.10", "198.51.100.20", "203.0.113.10", "192.0.2.99"]
+            .map(|ip| ip.parse().unwrap())
+            .into_iter()
+            .collect();
+        let mut counts = std::collections::BTreeMap::new();
+        add_host_counts(&record(false), &protected, &mut counts).unwrap();
+        assert_eq!(counts.len(), 3);
+        for value in counts.values() {
+            assert_eq!(*value, [1, 1, 0]);
+        }
+        assert!(add_host_counts(&[2, 0, 0], &protected, &mut counts).is_err());
+        assert_eq!(
+            original_destination(&record(false), "192.0.2.10".parse().unwrap()).unwrap(),
+            Some(("198.51.100.20".parse().unwrap(), 443))
+        );
+        assert!(
+            original_destination(&record(false), "203.0.113.10".parse().unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
     #[test]
     fn conntrack_preserves_nat_state_and_precise_directional_counters() {

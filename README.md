@@ -189,14 +189,19 @@ and [frontend handoff](docs/frontend-handoffs/2026-10-30.md#2026-10-30-09-fixed-
 
 WireGuard peers accept DNS endpoints such as `vpn.example.test:51820`, as well
 as canonical numeric IP endpoints. Use lowercase ASCII hostnames and an explicit
-port 1..65535. The backend resolves enabled peers immediately and refreshes DNS
-every 60 seconds, retaining a still-advertised address to avoid unnecessary churn.
+port 1..65535. Structural validation and network restoration never perform DNS
+queries. The background worker resolves enabled peers immediately after startup
+and refreshes DNS every 60 seconds, retaining a still-advertised address to avoid unnecessary churn.
 Global IPv6 disablement restricts resolution to IPv4.
 
 Successful selections persist in private native state for restart/rollback.
 Later DNS failures retain the last address and appear in
-`GET /api/v1/state` under `runtime.wireguard_dns`. First use requires working
-underlay DNS independent of the tunnel. Disabled peers are not resolved.
+`GET /api/v1/state` under `runtime.wireguard_dns`. Without a cached address, the
+peer is installed with its keys, AllowedIPs and keepalives but awaits DNS;
+`resolved_endpoint` and `last_success_unix_ms` are null. A failed first lookup
+records an error and retries without aborting configuration apply or startup.
+Underlay DNS must eventually work independently of the tunnel for it to connect.
+Disabled peers are not resolved.
 Updates change only peer endpoints, preserving keys, AllowedIPs/BGP prefixes
 and keepalives. Numeric endpoints retain strict drift checks; DNS-selected
 addresses and authenticated roaming are dynamic runtime state.
@@ -372,6 +377,37 @@ traffic, other firewall owners and non-firewall drops are excluded.
 See the [API contract](FRONTEND_SPEC.md#firewall-deny-log) and
 [kernel/storage prerequisites](docs/BUILD_AND_INSTALL.md#firewall-deny-logging).
 
+## Protected-host network experience
+
+Native Linux host mode automatically collects explicitly configured firewall
+hosts behind observed, up, managed LAN interfaces. Each canonical IP has its own
+ten-second series, retained for one hour in private SQLite storage at
+`<services-state-dir>/host-experience/experience.sqlite`. No active probes or
+external collector programs are used.
+
+`GET /api/v1/statistics/host-experience/latest` and
+`GET /api/v1/statistics/host-experience/history?address=192.0.2.20` require
+`state.read` and no body. Latest supports `address`, `interface`, `limit`
+1..256 (default 100) and opaque collection-pinned `cursor`; history returns
+360 observed/missing ten-second slots. Four reads may run concurrently.
+
+Return host-perspective packets/bytes/rates, managed policy drops, connection
+gauges, observed TCP repeats/window pressure/passive ACK timings, ordinary
+UDP/TCP DNS latency/unanswered observations, last seen, interface/VLAN and
+cached Sando metadata. Counts are decimal strings; missing evidence stays null.
+The explainable score is a Netcontrol heuristic, not UniFi/Wi-Fi telemetry.
+Managed drops never penalize it. Capture loss/capacity pressure prevents false
+ratings; last seen is traffic observation, not reachability or uptime.
+
+See the [implemented contract and limits](docs/PROTECTED_HOST_EXPERIENCE_SPEC.md)
+and [frontend handoff](docs/frontend-handoffs/2026-11-14.md#2026-11-14-04-protected-host-experience-implementation).
+Deployment requires owned nftables counter/last-expression sets, NFLOG group 101
+with timestamps/sequence/conntrack metadata, and owner-only writable storage.
+The revised main-file budget is 2 GiB plus a bounded 32 MiB WAL; freed pages are
+reused, not continually vacuumed. Simulator/lab-namespace mode is unsupported.
+Appliance throughput, forwarding latency and NIC/offload acceptance remain
+deployment checks; namespace/unit tests do not certify physical performance.
+
 ## Discord first-seen drop alerts
 
 Optional `discord.enabled` sends Discord webhook notifications for the first
@@ -399,6 +435,16 @@ are private and never enter configuration exports. Read delivery/errors with
 `GET /api/v1/services/discord/status` (`state.read`). Native host mode only;
 simulator mode never posts. The worker is supervised and can be restarted with
 the existing managed-process action without resetting identities.
+
+`POST /api/v1/services/discord/test` (`discord.write`, no query/body) sends the
+firewall name, compiled backend version and committed configuration revision to
+the saved webhook, including while automatic alerts are disabled. Native host
+mode and an available worker are required; simulator mode never sends.
+Only successful Discord acceptance clears the delivery error and failure count;
+health warnings recover on the next sample. Preserve delivered-alert counts,
+seen identities and notification settings. Failures remain explicit and do not
+clear counts. Do not automatically retry test requests or use them to recover a
+stopped worker. See the [test contract](FRONTEND_SPEC.md#discord-first-seen-drop-alerts).
 
 Alerts include packet metadata, not payloads, and batch up to ten first-seen
 entries with mentions disabled. Identify the firewall as `hostname.domain` when
@@ -1117,6 +1163,47 @@ Use console access during provisioning. See the
 download command uses the installer currently published on `main`; local script
 edits are not available there until an authorized push. Initial internet
 addressing, gateway and DNS must work before downloading/installing.
+
+## Startup durability and boot diagnostics
+
+Saved timestamps describe observed UTC wall-clock values, not a reliable ordering
+of events. Archived rollback records may predate journal initialization, and a
+same-day clock correction may put confirmation before submission. Neither
+invalidates an otherwise intact journal. Configuration validation, checksums,
+ownership, revision chains and rollback invariants remain strict; history is
+not re-dated, deleted or reset. A UTC date older than the committed configuration
+revision rejects new submissions with `503` before native application.
+
+Confirmation is bounded by both the saved UTC deadline and a process-monotonic
+timer. Restart reconstructs the remaining budget, capped at the original
+10..300 seconds; it cannot recover elapsed monotonic time across a reboot.
+Clock corrections do not rewrite the displayed UTC deadline. Server transaction
+state, not a browser countdown, is authoritative.
+
+Networking reconciliation detects a same-parent/tag VLAN under a conflicting
+name before removing managed routes/rules. It identifies both names and refuses
+to rename/delete an unowned link. Resolve actual ownership from console or an
+SSH-independent recovery job; never delete the active management VLAN as a
+guess. This is not automatic adoption or a promise of interruption-free apply.
+
+Full Ubuntu installation/source upgrade now enables persistent journald storage,
+with a 128 MiB disk-use target, 256 MiB keep-free reserve, 32 MiB runtime target
+and seven-day retention, and explicitly flushes the current boot. Operator
+overrides and disk pressure can limit retention. HTTPS binary-only upgrades do
+not install that policy. See [host logging](docs/BUILD_AND_INSTALL.md#host-logging-ownership).
+Check retained boots and private host evidence after an incident:
+
+```sh
+journalctl --list-boots --no-pager; journalctl -k -b -1 --no-pager; journalctl -u netcontrold -b -1 -n 100 --no-pager
+```
+
+If the prior boot is absent, do not infer a crash cause. Check current-boot kernel
+messages, firmware-supported `/sys/fs/pstore`, and the separately retained
+[daemon/socket history](FRONTEND_SPEC.md#persistent-log-viewing-apis).
+Redact sensitive details before sharing. A daemon/watchdog failure, loss of
+management forwarding, OOM event and kernel hang need different evidence.
+The reported overnight failures are not diagnosed or proven fixed by these
+startup changes.
 
 ## Install on Alpine
 

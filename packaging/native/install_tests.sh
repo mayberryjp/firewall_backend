@@ -873,7 +873,7 @@ for logging_setup in success repeat symlink_file symlink_directory publish_failu
         if [[ $logging_setup == repeat ]]; then configure_logging_units "$logging_root" || exit 1; fi
     ); then
         [[ $logging_setup == success || $logging_setup == repeat ]] || exit 1
-        [[ $(< "$logging_root/systemd/journald.conf.d/90-netcontrol-syslog.conf") == $'[Journal]\nForwardToSyslog=yes\nMaxLevelSyslog=debug\nReadKMsg=yes' ]]
+        [[ $(< "$logging_root/systemd/journald.conf.d/90-netcontrol-syslog.conf") == $'[Journal]\nForwardToSyslog=yes\nMaxLevelSyslog=debug\nReadKMsg=yes\nStorage=persistent\nSystemMaxUse=128M\nSystemKeepFree=256M\nRuntimeMaxUse=32M\nMaxRetentionSec=7day' ]]
         for directive in PartOf=netcontrold.service ListenDatagram=/run/systemd/journal/syslog SocketMode=0600 Service=netcontrold.service FileDescriptorName=netcontrol-syslog RemoveOnStop=yes; do
             grep -Fxq "$directive" "$logging_root/systemd/system/netcontrol-syslog.socket"
         done
@@ -885,7 +885,7 @@ for logging_setup in success repeat symlink_file symlink_directory publish_failu
 done
 printf 'Managed journald forwarding and socket-unit persistence, idempotency and safe publication tests passed.\n'
 
-for logging_scenario in stopped repeat missing query_failure mask_failure active_failure still_active unknown_state masked_alias error_enabled input_failure restart_failure regular symlink; do
+for logging_scenario in stopped repeat missing query_failure mask_failure active_failure still_active unknown_state masked_alias error_enabled input_failure restart_failure flush_failure regular symlink; do
     logging_directory="$temporary/logging-$logging_scenario"
     mkdir "$logging_directory"
     printf 'preserve\n' > "$logging_directory/operator"
@@ -923,11 +923,16 @@ for logging_scenario in stopped repeat missing query_failure mask_failure active
                 *) return 1 ;;
             esac
         }
+        journalctl() {
+            printf 'journalctl %s\n' "$*" >> "$logging_directory/commands"
+            [[ $* == --flush && $logging_scenario != flush_failure ]]
+        }
         configure_host_logging "$logging_directory/log" "$logging_directory/unix"
     ); then
         case $logging_scenario in stopped|repeat|missing|masked_alias) ;; *) exit 1 ;; esac
         grep -Fxq 'start systemd-journald-dev-log.socket' "$logging_directory/commands"
         grep -Fxq 'restart systemd-journald.service' "$logging_directory/commands"
+        grep -Fxq 'journalctl --flush' "$logging_directory/commands"
     else
         case $logging_scenario in stopped|repeat|missing|masked_alias) exit 1 ;; esac
     fi

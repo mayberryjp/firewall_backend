@@ -55,6 +55,10 @@ mod deny_log;
 mod destination_rewrite;
 mod dhcp_client;
 mod dhcp_monitors;
+#[cfg(feature = "nftables")]
+mod experience;
+#[cfg(feature = "nftables")]
+mod experience_kernel;
 #[cfg(all(test, feature = "nftables"))]
 mod host_integration;
 #[cfg(all(test, feature = "nftables"))]
@@ -64,6 +68,8 @@ mod ipv6;
 mod link_monitor;
 mod netfilter;
 mod networking;
+#[cfg_attr(not(feature = "nftables"), allow(dead_code))]
+mod nft_wire;
 mod offloads;
 mod panic_reboot;
 mod path_test;
@@ -90,6 +96,8 @@ pub(super) fn wireguard_public_key(root: &Path, reference: &str) -> Result<Strin
 }
 
 pub struct Native {
+    #[cfg(feature = "nftables")]
+    experience: Option<Arc<experience::Manager>>,
     netcontrol_log: netcontrol_core::DiskLog,
     panic_reboot: Option<panic_reboot::Guard>,
     path_test: path_test::Manager,
@@ -395,6 +403,15 @@ impl Native {
             )?,
             bgp: bgp::Manager::new(namespace.clone(), state.clone())?,
             link_monitor: link_monitor::Monitor::new(namespace.clone())?,
+            #[cfg(feature = "nftables")]
+            experience: if options.namespace.is_empty() {
+                Some(experience::Manager::open(
+                    namespace.clone(),
+                    options.services_state.join("host-experience"),
+                )?)
+            } else {
+                None
+            },
             deny_log: deny_log::Monitor::new(namespace.clone(), state.join("deny-log"))?,
             dhcp,
             dhcp_monitors,
@@ -1964,6 +1981,10 @@ impl Backend for Native {
     }
 
     fn apply(&mut self, before: &Config, after: &Config) -> Result<()> {
+        #[cfg(feature = "nftables")]
+        if let Some(manager) = &self.experience {
+            manager.pause()?;
+        }
         self.path_test.ensure_idle()?;
         let alias_config = after;
         (|| -> Result<()> {
@@ -2155,6 +2176,10 @@ impl Backend for Native {
             rt.block_on(networking::parent_status(handle, &parents))
         })?;
         let mut value = self.services.status();
+        #[cfg(feature = "nftables")]
+        if let Some(manager) = &self.experience {
+            value["host_experience"] = manager.status()?;
+        }
         let mut bgp = self.bgp.snapshot()?;
         let summary = bgp.as_object_mut().context("BGP status missing")?;
         summary.remove("routes");
@@ -2213,6 +2238,40 @@ impl Backend for Native {
         })?;
         value["path_test"] = self.path_test.status()?;
         Ok(value)
+    }
+
+    fn configure_host_experience(
+        &mut self,
+        config: &Config,
+        revision: netcontrol_core::Version,
+        paused: bool,
+    ) -> Result<()> {
+        #[cfg(feature = "nftables")]
+        if let Some(manager) = &self.experience {
+            manager.configure(config, revision, paused)?;
+        }
+        #[cfg(not(feature = "nftables"))]
+        let _ = (config, revision, paused);
+        Ok(())
+    }
+    fn prepare_host_experience(
+        &mut self,
+        path: &str,
+        query: &str,
+    ) -> Result<netcontrol_core::ExperienceRead> {
+        #[cfg(feature = "nftables")]
+        if let Some(manager) = &self.experience {
+            return manager.prepare_read(path, query);
+        }
+        let _ = (path, query);
+        anyhow::bail!("host experience requires native Linux host mode with nftables")
+    }
+    fn shutdown_host_experience(&mut self) -> Result<()> {
+        #[cfg(feature = "nftables")]
+        if let Some(manager) = &self.experience {
+            manager.shutdown()?;
+        }
+        Ok(())
     }
 
     fn delete_connections(

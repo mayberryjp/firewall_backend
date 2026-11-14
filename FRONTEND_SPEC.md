@@ -158,6 +158,14 @@ It preserves configuration/history, rejects active or invalid state and does
 not add numeric aliases to the API. After conversion, refetch current state and
 history; invalidate cached numeric revision IDs/cursors and re-review stale drafts.
 
+Submission/commit timestamps retain observed UTC values. An archived rollback
+before initialization or same-day commit before submission is not corruption;
+do not infer revision ordering from wall-clock timestamps. Checksums, normalized
+configuration, canonical revision chains, active pointers and recovery remain
+strict. New transaction submission/revision restore returns `503` if the current
+UTC date predates the saved revision, before native application; preserve drafts
+and show the clock error rather than automatically resubmitting.
+
 Identity and scoped-auth files require their own `schema: 1` JSON roots; these
 are not the network-state envelope. A scoped file is
 `{"schema":1,"credentials":[{"name":"dashboard","token_sha256":"<64 hex characters>","permissions":["state.read"]}]}`.
@@ -332,6 +340,85 @@ make a service reachable. Native namespace fixtures are not complete
 VLAN/nftables/MLD, device interoperability, load, reboot or appliance acceptance.
 The earlier planning item is superseded by
 [implementation handoff 2026-10-25-17](docs/frontend-handoffs/2026-10-25.md#2026-10-25-17-native-mdns-implementation).
+
+### 1.6 Protected-host network experience
+
+**Implemented, unreleased.** Native Linux host mode collects explicitly configured
+firewall-host IPs behind actual managed LAN attachments, independent of dashboard
+polling. One canonical IP is one series; IPv4/IPv6 remain separate. This does not
+inventory arbitrary LAN/Sando clients or provide Wi-Fi/radio/OS-uptime telemetry.
+No new editable configuration, probe controls or permission are introduced.
+
+Both routes require authenticated `state.read`, no body, and return no-store
+`schema:"netcontrol-host-experience/v1"`:
+
+| Method/path | Query | Result |
+| --- | --- | --- |
+| `GET /api/v1/statistics/host-experience/latest` | Optional canonical `address`, existing managed-LAN `interface`, canonical `limit` 1..256 (default 100), opaque `cursor` <=1024 bytes | Current eligible host rows; one pinned completed collection, numeric IP ordering, `next_cursor:string|null` |
+| `GET /api/v1/statistics/host-experience/history` | Required canonical `address` only | Exactly 360 chronological ten-second observed/missing slots; at most one hour, no pagination |
+
+Common fields: `kind`, `interval_seconds:10`, `retention_seconds:3600`,
+`collection_id:string|null`, `collected_at:string|null`, `age_ms:number|null`,
+`status:starting|available|partial|stale|unavailable`, `error:string|null`,
+`clock_discontinuity:boolean` and `collector` source/loss/eligibility diagnostics.
+Latest `hosts[]` include `ip_address`, `address_family:ipv4|ipv6`,
+`configured_host_id`, `configured_name`, `currently_protected`, nullable
+`interface:{name,index,kind,vlan_id:number|null}`, metadata, `sample:Sample|null`
+and `retained_usage:{sent_bytes,received_bytes,coverage_seconds,complete}`.
+Usage totals are nullable decimal strings across retained IP epochs, not
+lifetime/24-hour usage or guaranteed physical-device identity.
+
+Metadata is `{host_name,icon,classification,status,last_success_at,error}`;
+text/timestamp fields are nullable and status is `available|stale|unavailable`.
+Only the currently configured Sando source's successful exact-IP cache is used;
+sync errors or success older than two hours make it stale. Classification is
+original-case local-description text, not a device-type enum. Render it as text;
+map known icon IDs safely. Measurements do not require Sando.
+
+Samples retain configured identity/name, configuration revision, observation
+epoch, UTC `start_at`/`end_at`, actual `measured_duration_ms`, interface, activity,
+actual `last_seen_at`, `traffic`, `firewall`, `connections`, `tcp`, `dns`,
+`experience` and `coverage`. Counts/traffic bytes are decimal strings or null;
+rates are numeric bps, latencies/variation numeric ms. Upload is sent; download
+is received. Traffic includes dropped sent attempts; transport analysis only
+uses accepted exchanges. Managed policy drops are advisory, not score penalties.
+Connection counts are non-atomic shared inventory gauges: nullable
+`observed_at` and `measurement_duration_ms` describe actual collection timing;
+unready, failed, old (>2500 ms) or previous-generation snapshots produce null
+gauges, never fabricated zero. Timing p50/p95 values are bounded-histogram
+estimates; ACK variation is not RTP/one-way jitter.
+
+Experience is `excellent|good|fair|poor|unknown`, nullable score 0..100,
+`status:rated|idle|insufficient_data|incomplete|unavailable`,
+`confidence:high|limited|none`, versioned algorithm, contributors and reasons.
+Use stored results, not a client-side rescore. The minimum eligible component
+score over up to six contiguous complete buckets determines the level; gaps,
+idle traffic and absent evidence do not default to excellent.
+Full metric fields, scoring thresholds and valid synthetic JSON are in the
+[detailed contract](docs/PROTECTED_HOST_EXPERIENCE_SPEC.md#5-ten-second-metric-contract).
+
+History returns `host`, aligned `window:{start_at,end_at}`, `expected_slots:360`,
+`returned_samples` 0..360, `coverage_complete` and `samples[]` containing
+`{start_at,end_at,status:observed|missing,sample}`. Missing is null, not zero.
+Removed-IP history retains its configured name and `currently_protected:false`
+until expiry. Never relabel an old sample to a new owner/interface.
+
+Errors: `401`/`403` authentication/scope, `405` method, `400` body or invalid/
+duplicate/noncanonical/unknown query/cursor, `404` unknown interface or absent
+eligible/retained history, `422` known non-LAN interface, `409` expired/changed
+paging snapshot (restart latest), `429` four reads already active, `503`
+unsupported mode, unavailable worker/storage, storage contention or response
+over 4 MiB. Simulator and lab namespaces do not fabricate measurements.
+
+Poll latest non-overlapping every ten seconds while visible; finish its cursor
+pages before replacing the table. Fetch history only for selected rows. Plot
+gaps; show freshness/coverage/metadata separately and preserve unknown values.
+No AP/vendor, encrypted-DNS visibility, online/offline or 24-hour claims.
+Deploy an accepting native build with the nftables/NFLOG/private-storage
+prerequisites first; physical forwarding/offload/load acceptance is still required.
+Required frontend action is tracked in
+[handoff 2026-11-14-04](docs/frontend-handoffs/2026-11-14.md#2026-11-14-04-protected-host-experience-implementation),
+**Pending frontend review**, not sent or implemented.
 
 ## 2. Product and interaction principles
 
@@ -6410,6 +6497,8 @@ invalid query/body `400`, unavailable manager/status `503`. Response:
 `state` is `starting|disabled|simulated|unavailable|paused|ready|error|stopped`;
 `delivered`/`failed` are decimal-string **alert-entry** counts (not message or
 packet counts), retained through manager restarts within the daemon session.
+An explicitly successful Discord test resets `failed` to `"0"`; ordinary
+successful alert delivery does not reset this count.
 `last_drop_id` and `error` are nullable strings. No raw URL is returned.
 Delivery failures leave the active worker `ready` with a nonnull `error`, a
 failure count and a `service_warning` health alert; a later successful delivery
@@ -6423,6 +6512,41 @@ authoritative committed settings and do not overwrite a pending draft from statu
 The `discord` manager participates in daemon health/task supervision and
 `POST /api/v1/processes/restart {"target":"discord"}` (`system.restart`,
 normal `202` scheduling); restarting does not enable it or reset seen identities.
+
+**`POST /api/v1/services/discord/test`** requires an API key with `discord.write`
+and accepts no query or body (including no `{}`). Sends one test embed to the
+**committed** `discord.webhook_ref`, even when automatic alerts or drop capture
+are disabled. No raw URL or candidate reference is accepted. Native Linux host
+mode and an available worker (`ready`, `paused` or `disabled`) are required;
+simulator/unsupported modes never post. The embed includes the firewall name,
+compiled backend software version and committed configuration revision captured
+when the request is prepared. These are independent canonical calendar versions.
+Mentions are disabled; no drop records, device labels or secrets are included.
+
+Success is `200` only after Discord returns HTTP `200`/`204`:
+
+```json
+{"delivered":true,"backend_version":"2026.11.14.1","config_version":"2026.11.14.3","failed":"0"}
+```
+
+Both versions and `failed` are strings; `delivered` here is a boolean, unlike
+the status endpoint's alert-entry counter. On success, clear Discord's failure
+count and delivery error, so its delivery warning disappears at the next normal
+health collection (normally within two seconds). Preserve the alert delivery
+count, last drop ID, permanent deduplication, notification flags and worker state.
+Serialize tests with alert sends; later failures remain visible and cannot
+restore a pre-test local counter. Tests do not restart/recover a failed worker,
+enable alerts, resend historical drops or clear other components' warnings.
+
+Errors: `401`/`403` authentication/permission, `405` wrong method, `400`
+query/body, `409` active configuration transaction/upgrade or no saved webhook,
+and `503` unavailable mode/manager/worker/storage, configuration changes during
+delivery or failed Discord delivery. Delivery errors are redacted and leave
+failure counts intact; a failed send records a Discord delivery error. Existing
+bounded HTTPS/no-redirect/timeouts and rate-limit-only retry behavior apply.
+Do not automatically retry this side-effecting endpoint; an interrupted request
+or configuration change can occur after Discord has already accepted a message.
+Render explicit success/failure and refresh Discord status/platform health.
 
 Frontend required work: add a global toggle, independent default-off
 **Notify broadcast drops** and **Notify TCP FIN/RST/empty ACK-only drops**
@@ -6845,9 +6969,15 @@ The backend, not the browser, resolves enabled DNS peers using its existing
 bounded native `/etc/hosts` and `/etc/resolv.conf` UDP A/AAAA resolver in the
 managed namespace. It supports untruncated replies/CNAMEs, not TCP fallback,
 DNS-over-HTTPS or browser DNS. Resolver reachability must not depend on the
-tunnel being bootstrapped. First use needs a usable answer; a cold lookup or
-cache-persistence failure fails the normal transaction (`500`, with its
-transaction/rollback outcome), not a silently empty endpoint.
+tunnel being bootstrapped. Structural preflight and synchronous apply do not
+query DNS. Apply uses the last cached address when present; a never-resolved peer
+is installed without a selected endpoint, retaining its keys, AllowedIPs and
+keepalive configuration. Startup/apply may succeed while that peer awaits DNS.
+A cold lookup failure records per-peer error/attempt metadata and retries in the
+worker; it does not fail the configuration transaction or daemon startup.
+Malformed configuration/keys and unsafe/corrupt saved caches still fail explicitly.
+Cache-persistence or namespace failures stop the worker and expose its error,
+not fabricated successful resolution.
 
 Automatic refresh runs immediately and then waits 60 seconds between cycles,
 plus lookup/processing time; DNS TTL does not change this interval. Retain the
@@ -6872,11 +7002,15 @@ do not replace it with a runtime IP or resolve it in the frontend.
   False with no DNS peers is normal; a worker-level error is not successful DNS.
 - `peers: []` for no enabled DNS peers; otherwise one row per interface/public-key
   identity with `interface`, `public_key`, configured `endpoint`,
-  `ipv6_enabled`, `resolved_endpoint` (numeric socket string),
-  `last_attempt_unix_ms`, `last_success_unix_ms` (nonnullable Unix ms numbers),
+  `ipv6_enabled`, `resolved_endpoint` (numeric socket string or null),
+  `last_attempt_unix_ms`, `last_success_unix_ms` (Unix ms numbers or null),
   and nullable `error`. Selected cache state is not a connectivity guarantee;
   actual roaming endpoints remain under `runtime.wireguard[].peers[].endpoint`.
 - Show refresh failures and last success separately from handshake/traffic.
+  A null selected endpoint means waiting/unavailable, not connected. Attempt time
+  is null before the first attempt; success time remains null until resolution
+  and endpoint installation succeed. Show initial DNS errors and retry state
+  even when `running` is true; that flag describes the worker, not the tunnel.
   Keep the configured name visible alongside selected/actual addresses.
   Simulators need not report this native-only measurement; do not fabricate it.
 
@@ -7136,6 +7270,11 @@ The UI cannot promise independently observable real-time progress.
   acknowledge their connectivity checks; the backend does not test reachability.
 - Show the server's absolute UTC deadline, a localized timestamp, and a countdown.
   Use the absolute deadline, not a timer starting at response receipt.
+  The backend also enforces a process-monotonic budget; after restart its
+  reconstructed budget cannot exceed the original 10..300 seconds. Wall-clock
+  corrections can make the visible deadline inaccurate without extending that
+  budget in the running process. Always reconcile server transaction state;
+  the original UTC deadline is not rewritten.
 - Browser time is approximate; use an exposed valid HTTP `Date` value as an
   optional skew estimate and disclose uncertainty. Never use the countdown as
   authority. At zero, show **Deadline reached; awaiting server outcome**, stop
@@ -7309,6 +7448,8 @@ Paths below are relative to `/api/v1`.
 | GET | `/interface-capabilities` | Persisted `InterfaceCapabilitySnapshot \| null`; `state.read`, no implicit scan |
 | GET | `/interface-capabilities/refresh` | No body/query -> `200 InterfaceCapabilitySnapshot`; `state.read` + `interfaces.write`, explicit passive scan and durable save; never auto-run/prefetch/poll |
 | GET | `/statistics/performance` | No body/query -> live host CPU/IRQ/softnet, physical/WireGuard RX queues and physical-only RPS trial evidence; `state.read`, no tuning or persisted scan |
+| GET | `/statistics/host-experience/latest` | Configured LAN IPs, latest pinned ten-second samples/metadata/usage and opaque paging; `state.read` |
+| GET | `/statistics/host-experience/history` | Required canonical `address`, 360 observed/missing ten-second slots in one hour; `state.read` |
 | GET | `/kernel/tunables` | Desired/configured/effective/observed/original kernel maps, including explicit RPS masks and native read-only identity evidence |
 | GET | `/interfaces/{name}` | One observed `Interface` |
 | POST | `/processes/restart` | `{target}` -> targeted worker `200` or manager/daemon scheduling `202`; `system.restart` |
@@ -7338,6 +7479,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/statistics/dhcp-relay` | Shared-worker and per-interface `DHCPRelayStatistics`; `state.read`, no body/query |
 | POST | `/services/discord/webhooks` | Private `{webhook_url}` upload -> `201 {webhook_ref}`; `discord.write` |
 | GET | `/services/discord/status` | First-seen alert delivery state/counts, no secret; `state.read` |
+| POST | `/services/discord/test` | No query/body; send committed version test and clear Discord delivery failures on success; `discord.write` |
 | GET | `/gateway-monitors` | Observed `GatewayMonitor[]` metadata |
 | GET | `/statistics/gateways` | `{sample, monitors: GatewayMonitorStatistics[]}` |
 | GET | `/statistics/gateways/{name}` | `{sample, monitor: GatewayMonitorStatistics}` |

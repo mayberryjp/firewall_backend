@@ -188,6 +188,42 @@ mod tests {
     }
 
     #[test]
+    fn vlan_creation_checks_only_conflicting_parent_tag_and_protocol_without_mutation() {
+        let (mut link, parent, _) = adoption_links();
+        for attribute in &mut link.attributes {
+            if let LinkAttribute::IfName(name) = attribute {
+                *name = "eth0.50".into();
+            }
+        }
+        let mut available = vec![parent, link];
+        let original = available.clone();
+        let error = check_vlan_creation(&available, "vlan50", "eth0", 50).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("VLAN vlan50 tag 50 on eth0 conflicts with existing eth0.50")
+        );
+        assert_eq!(available, original);
+        check_vlan_creation(&available, "eth0.50", "eth0", 50).unwrap();
+        check_vlan_creation(&available, "vlan20", "eth0", 20).unwrap();
+        check_vlan_creation(&available, "child", "new-parent", 50).unwrap();
+        for attribute in &mut available[1].attributes {
+            if let LinkAttribute::LinkInfo(info) = attribute {
+                for info in info {
+                    if let LinkInfo::Data(InfoData::Vlan(attributes)) = info {
+                        for attribute in attributes {
+                            if let InfoVlan::Protocol(protocol) = attribute {
+                                *protocol = VlanProtocol::Ieee8021Ad;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        check_vlan_creation(&available, "vlan50", "eth0", 50).unwrap();
+    }
+
+    #[test]
     fn vlan_adoption_requires_exact_unmastered_nonstacked_standard_identity() {
         let (link, parent, request) = adoption_links();
         validate_adoptable_vlan(&link, &parent, &request).unwrap();
@@ -1743,8 +1779,53 @@ pub(super) fn decode_owned_route(
     })
 }
 
+fn check_vlan_creation(
+    available: &[LinkMessage],
+    desired_name: &str,
+    parent_name: &str,
+    id: u16,
+) -> Result<()> {
+    let Some(parent) = available.iter().find(|link| name(link) == parent_name) else {
+        // A new virtual parent is created earlier by ordered_links.
+        return Ok(());
+    };
+    for link in available {
+        if name(link) != desired_name
+            && kind(link) == "vlan"
+            && link.attributes.iter().any(|attribute| {
+                matches!(attribute, LinkAttribute::Link(index) if *index == parent.header.index)
+            })
+        {
+            ensure!(
+                link.attributes.iter().any(|attribute| matches!(
+                    attribute,
+                    LinkAttribute::LinkInfo(info) if info.iter().any(|info| matches!(
+                        info,
+                        LinkInfo::Data(InfoData::Vlan(attributes)) if attributes.iter().any(|attribute| matches!(
+                            attribute, InfoVlan::Protocol(protocol) if *protocol != VlanProtocol::Ieee8021Q
+                        ))
+                    ))
+                )) || vlan(link)? != Some((parent.header.index, id)),
+                "VLAN {desired_name} tag {id} on {parent_name} conflicts with existing {}; refusing to rename or delete an unowned link",
+                name(link)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn check_vlan_creations(available: &[LinkMessage], after: &Network) -> Result<()> {
+    for desired in &after.interfaces {
+        if let Some(vlan) = &desired.vlan {
+            check_vlan_creation(available, &desired.name, &vlan.parent, vlan.id)?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn preflight(handle: &Handle, before: &Network, after: &Network) -> Result<()> {
     let available = links(handle).await?;
+    check_vlan_creations(&available, after)?;
     for desired in &after.interfaces {
         let existing = available.iter().find(|l| name(l) == desired.name);
         let previous = before.interfaces.iter().find(|l| l.name == desired.name);
@@ -2049,6 +2130,7 @@ pub async fn reconcile(
         .map(|l| l.name.clone())
         .collect();
     let mut available = links(handle).await?;
+    check_vlan_creations(&available, after)?;
     // Remove obsolete owned rules/routes before link changes. Retain matching entries
     // so an unrelated edit does not create an avoidable routing outage.
     let mut present_rules = BTreeSet::new();
@@ -2221,7 +2303,13 @@ pub async fn reconcile(
                             .build(),
                         )
                         .execute()
-                        .await?;
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "create VLAN {} tag {} on {}",
+                                desired.name, vlan.id, vlan.parent
+                            )
+                        })?;
                 }
                 _ => bail!("unsupported native link kind"),
             }

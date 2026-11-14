@@ -4391,6 +4391,114 @@ fn native_network_only_change_restarts_the_services_it_stopped() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires NETCONTROL_INTEGRATION=1 and isolated Linux namespace/net_admin privileges"]
+fn native_vlan_collision_preserves_existing_routes_and_management_link() -> Result<()> {
+    use futures_util::TryStreamExt;
+    use netlink_packet_route::route::{RouteProtocol, RouteScope};
+    use rtnetlink::IpVersion;
+    let fixture = Fixture::new()?;
+    let keys = wireguard::Control {
+        keys: fixture.root.join("keys"),
+        dns: wireguard_dns::Cache::new(fixture.root.join("dns.json"))?,
+    };
+    let before = config(json!({"ipv6_enabled":false,"interfaces":[
+        {"name":"eth0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":[]}
+    ],"routes":[{"destination":"198.51.100.0/24","interface":"eth0","table":10001,"metric":0}]}))?;
+    let mut after = before.clone();
+    after.routes.clear();
+    after.interfaces.push(serde_json::from_value(json!({
+        "name":"vlan50","kind":"vlan","role":"lan","up":true,"mtu":1500,
+        "addresses":["192.0.2.1/24"],"vlan":{"parent":"eth0","id":50}
+    }))?);
+    before.validate()?;
+    after.validate()?;
+    let before = Network::parse(&before.operational_value()?)?;
+    let after = Network::parse(&after.operational_value()?)?;
+    session(
+        Arc::new(File::open(&fixture.namespace)?),
+        move |runtime, handle| {
+            runtime.block_on(async {
+                handle
+                    .link()
+                    .add(rtnetlink::LinkVeth::new("eth0", "peer0").build())
+                    .execute()
+                    .await?;
+                let index = networking::links(handle)
+                    .await?
+                    .iter()
+                    .find(|link| networking::name(link) == "eth0")
+                    .unwrap()
+                    .header
+                    .index;
+                handle
+                    .link()
+                    .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+                    .execute()
+                    .await?;
+                handle
+                    .link()
+                    .add(rtnetlink::LinkVlan::new("eth0.50", index, 50).build())
+                    .execute()
+                    .await?;
+                handle
+                    .route()
+                    .add(
+                        rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                            .destination_prefix("198.51.100.0".parse()?, 24)
+                            .output_interface(index)
+                            .table_id(10001)
+                            .protocol(RouteProtocol::Other(crate::model::PROTOCOL))
+                            .scope(RouteScope::Link)
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
+                let routes: Vec<_> = handle
+                    .route()
+                    .get(networking::route_query(IpVersion::V4))
+                    .execute()
+                    .try_collect()
+                    .await?;
+                let links: BTreeMap<_, _> = networking::links(handle)
+                    .await?
+                    .iter()
+                    .map(|link| (networking::name(link), link.header.index))
+                    .collect();
+                let error = networking::reconcile(
+                    handle,
+                    &before,
+                    &after,
+                    &BTreeMap::new(),
+                    &keys,
+                    &BTreeMap::new(),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("conflicts with existing eth0.50")
+                );
+                let current: Vec<_> = handle
+                    .route()
+                    .get(networking::route_query(IpVersion::V4))
+                    .execute()
+                    .try_collect()
+                    .await?;
+                assert_eq!(current, routes);
+                let current: BTreeMap<_, _> = networking::links(handle)
+                    .await?
+                    .iter()
+                    .map(|link| (networking::name(link), link.header.index))
+                    .collect();
+                assert_eq!(current, links);
+                Ok(())
+            })
+        },
+    )
+}
+
+#[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespace/net_admin privileges and nft/WireGuard modules"]
 fn native_wireguard_dns_refresh_failure_restart_rollback_and_disabled_peer() -> Result<()> {
     use std::{
@@ -4412,16 +4520,7 @@ fn native_wireguard_dns_refresh_failure_restart_rollback_and_disabled_peer() -> 
     let empty = Config::empty();
     let mut native = Native::open(options.clone())?;
     native.repair(&empty)?;
-    native.apply(&empty, &desired)?;
-    let endpoint = |native: &Native| -> Result<Option<std::net::SocketAddr>> {
-        session(native.namespace.clone(), |_, _| {
-            let device = Device::get(&"wg0".parse()?, WgBackend::Kernel)?;
-            Ok(device.peers.first().and_then(|peer| peer.config.endpoint))
-        })
-    };
-    assert_eq!(endpoint(&native)?, Some("127.0.0.1:51820".parse()?));
-    native.wireguard_dns.shutdown()?;
-    let phase = Arc::new(AtomicUsize::new(0));
+    let phase = Arc::new(AtomicUsize::new(2));
     let answers = phase.clone();
     native
         .wireguard_dns
@@ -4437,10 +4536,18 @@ fn native_wireguard_dns_refresh_failure_restart_rollback_and_disabled_peer() -> 
             };
             Ok(vec![std::net::SocketAddr::new(address.parse()?, port)])
         }));
+    native.apply(&empty, &desired)?;
+    let endpoint = |native: &Native| -> Result<Option<std::net::SocketAddr>> {
+        session(native.namespace.clone(), |_, _| {
+            let device = Device::get(&"wg0".parse()?, WgBackend::Kernel)?;
+            Ok(device.peers.first().and_then(|peer| peer.config.endpoint))
+        })
+    };
+    assert_eq!(endpoint(&native)?, None);
+    native.wireguard_dns.shutdown()?;
     native
         .wireguard_dns
         .configure_for_test(&desired.operational_value()?, Duration::from_millis(20))?;
-    let ownership = fs::read(native.state.join("ownership.json"))?;
     let wait = |native: &Native, expected: &str, has_error: bool| -> Result<()> {
         let expected = Some(expected.parse()?);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4450,6 +4557,7 @@ fn native_wireguard_dns_refresh_failure_restart_rollback_and_disabled_peer() -> 
             {
                 return Ok(());
             }
+
             ensure!(
                 Instant::now() < deadline,
                 "WireGuard DNS convergence failed: {status}"
@@ -4457,6 +4565,28 @@ fn native_wireguard_dns_refresh_failure_restart_rollback_and_disabled_peer() -> 
             std::thread::sleep(Duration::from_millis(10));
         }
     };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = native.wireguard_dns.snapshot()?;
+        if status["peers"][0]["error"].is_string() {
+            assert!(status["peers"][0]["resolved_endpoint"].is_null());
+            assert!(status["peers"][0]["last_success_unix_ms"].is_null());
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "cold DNS failure was not reported: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(native.observe(&desired)?, desired);
+    native.repair(&desired)?;
+    phase.store(0, Ordering::Release);
+    native
+        .wireguard_dns
+        .configure_for_test(&desired.operational_value()?, Duration::from_millis(20))?;
+    wait(&native, "127.0.0.1:51820", false)?;
+    let ownership = fs::read(native.state.join("ownership.json"))?;
     phase.store(1, Ordering::Release);
     wait(&native, "192.0.2.20:51820", false)?;
     assert_eq!(native.observe(&desired)?, desired);
@@ -4538,7 +4668,9 @@ fn native_wireguard_dns_refresh_failure_restart_rollback_and_disabled_peer() -> 
     let mut unresolved = desired.clone();
     unresolved.interfaces[0].wireguard.as_mut().unwrap().peers[0].endpoint =
         "missing.example.test:51820".into();
-    assert!(native.apply(&desired, &unresolved).is_err());
+    native.apply(&desired, &unresolved)?;
+    assert_eq!(native.observe(&unresolved)?, unresolved);
+    native.apply(&unresolved, &desired)?;
     assert_eq!(native.observe(&desired)?, desired);
     drop(native);
     let mut native = Native::open(options)?;

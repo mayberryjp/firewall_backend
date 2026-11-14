@@ -1992,6 +1992,7 @@ struct Faults {
     path_starts: usize,
     path_cleanup_failure: bool,
     path_shutdowns: usize,
+    experience_shutdown_failure: bool,
     bgp_response: Option<Value>,
     connection_flushes: usize,
     connection_targets: Vec<Option<(u32, crate::ConnectionTarget)>>,
@@ -2109,6 +2110,13 @@ impl Backend for FaultBackend {
             "injected shutdown restoration failure"
         );
         faults.path_active = false;
+        Ok(())
+    }
+    fn shutdown_host_experience(&mut self) -> Result<()> {
+        ensure!(
+            !self.0.lock().unwrap().experience_shutdown_failure,
+            "injected experience shutdown failure"
+        );
         Ok(())
     }
     fn configure_reporting_identity(&mut self, system: &SystemConfig) -> Result<()> {
@@ -4442,20 +4450,99 @@ fn calendar_revisions_roll_days_preserve_history_and_reject_clock_regression() {
     );
     engine.now = Some(tomorrow - Duration::days(1));
     let transaction = submit(&mut engine, config());
-    assert_eq!(transaction.status, 202);
-    let failed = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
-    assert_eq!(failed.status, 503);
-    assert!(failed.body["error"].as_str().unwrap().contains("UTC clock"));
-    let rolled_back = request(
-        &mut engine,
-        "POST",
-        &format!(
-            "/api/v1/transactions/{}/rollback",
-            transaction.body["id"].as_str().unwrap()
-        ),
-        Value::Null,
+    assert_eq!(transaction.status, 503);
+    assert!(
+        transaction.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("UTC clock")
     );
-    assert_eq!(rolled_back.status, 200);
+    assert!(engine.active().is_none());
+    drop(engine);
+    assert_eq!(
+        fixture.engine().committed_revision(),
+        next_day.next(tomorrow.date_naive()).unwrap()
+    );
+}
+
+#[test]
+fn archived_rollback_before_initialization_preserves_observed_timestamps_and_reopens() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202);
+    let id = transaction.body["id"].as_str().unwrap().to_owned();
+    engine.rollback(&id, "operator rollback").unwrap();
+    let mut next = engine.state.clone();
+    let archived = next.transactions.get_mut(&id).unwrap();
+    archived.submitted_at -= Duration::days(120);
+    archived.confirmation_deadline = archived
+        .confirmation_deadline
+        .map(|at| at - Duration::days(120));
+    let observed_submission = archived.submitted_at;
+    let observed_deadline = archived.confirmation_deadline;
+    engine.persist(next).unwrap();
+    drop(engine);
+    let reopened = fixture.engine();
+    assert_eq!(
+        reopened.state.transactions[&id].submitted_at,
+        observed_submission
+    );
+    assert_eq!(
+        reopened.state.transactions[&id].confirmation_deadline,
+        observed_deadline
+    );
+    assert!(reopened.active().is_none());
+}
+
+#[test]
+fn same_day_clock_step_preserves_commit_history_and_monotonic_confirmation_limit() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let noon = engine
+        .state
+        .initialized_at
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc();
+    engine.now = Some(noon);
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202);
+    engine.now = Some(noon - Duration::hours(1));
+    let committed = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
+    assert_eq!(committed.status, 200, "{}", committed.body);
+    drop(engine);
+    let mut engine = fixture.engine();
+    engine.now = Some(noon);
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202);
+    engine.now = Some(noon - Duration::hours(1));
+    engine.confirmation_timer = Some(Instant::now() - std::time::Duration::from_secs(1));
+    let expired = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
+    assert_eq!(expired.status, 409);
+    assert_eq!(expired.body["transaction"]["status"], "rolled_back");
+    assert!(engine.active().is_none());
+}
+
+#[test]
+fn reopening_pending_confirmation_caps_backward_clock_extension_and_tick_rolls_back() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    engine.now = Some(Utc::now() + Duration::days(1));
+    let transaction = submit(&mut engine, config());
+    assert_eq!(transaction.status, 202);
+    drop(engine);
+    let mut reopened = fixture.engine();
+    let timer = reopened.confirmation_timer.unwrap();
+    assert!(timer.saturating_duration_since(Instant::now()) <= std::time::Duration::from_secs(30));
+    reopened.confirmation_timer = Some(Instant::now() - std::time::Duration::from_secs(1));
+    reopened.tick().unwrap();
+    assert!(reopened.active().is_none());
+    assert_eq!(
+        reopened.state.transactions[transaction.body["id"].as_str().unwrap()].status,
+        "rolled_back"
+    );
 }
 
 #[test]
@@ -5887,6 +5974,32 @@ fn shutdown_is_idempotent_and_stops_requests() {
     e.shutdown().unwrap();
     assert_eq!(
         request(&mut e, "GET", "/api/v1/state", Value::Null).status,
+        503
+    );
+}
+
+#[test]
+fn experience_shutdown_failure_still_saves_state_and_closes_engine() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults {
+        experience_shutdown_failure: true,
+        ..Faults::default()
+    }));
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults))).unwrap();
+    engine.state.revision = test_revision(100);
+    let revision = serde_json::to_value(engine.state.revision).unwrap();
+    assert!(
+        engine
+            .shutdown()
+            .unwrap_err()
+            .to_string()
+            .contains("experience shutdown")
+    );
+    let saved: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+    assert_eq!(saved["state"]["revision"], revision);
+    engine.shutdown().unwrap();
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/state", Value::Null).status,
         503
     );
 }

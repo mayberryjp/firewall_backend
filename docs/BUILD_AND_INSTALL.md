@@ -1681,7 +1681,9 @@ forwarded headers stay in message text, not structured journal fields.
 The scripts atomically publish these root-owned mode `0644` managed files:
 
 - `/etc/systemd/journald.conf.d/90-netcontrol-syslog.conf`:
-  `[Journal]`, `ForwardToSyslog=yes`, `MaxLevelSyslog=debug`, `ReadKMsg=yes`.
+  `[Journal]`, `ForwardToSyslog=yes`, `MaxLevelSyslog=debug`, `ReadKMsg=yes`,
+  `Storage=persistent`, `SystemMaxUse=128M`, `SystemKeepFree=256M`,
+  `RuntimeMaxUse=32M`, `MaxRetentionSec=7day`.
 - `/etc/systemd/system/netcontrol-syslog.socket`: a mode `0600` Unix datagram
   receiver at `/run/systemd/journal/syslog`, `Service=netcontrold.service`,
   `FileDescriptorName=netcontrol-syslog`, `RemoveOnStop=yes`,
@@ -1698,6 +1700,11 @@ The scripts reload units, stop/persistently mask installed `rsyslog.service`,
 `syslog-ng.service`, `syslog.service`, `syslogd.service`, `busybox-syslogd.service`
 and the competing vendor `syslog.socket`. They **start/preserve**
 `systemd-journald-dev-log.socket` and restart journald to apply forwarding.
+They then run `journalctl --flush`; failure explicitly aborts deployment.
+Persistent storage creates the journal hierarchy when needed and retains
+boot evidence independently of the daemon. The use/reserve/age settings are
+journald retention targets, not guaranteed evidence capture or a hard disk cap.
+They preserve existing logs; no vacuum, reset or journal deletion is performed.
 No journald input is masked and no arbitrary process/socket is killed/unlinked.
 Custom receivers must release the forwarding path explicitly. Systemd retains
 its normal socket creation/error handling; the Rust worker never steals paths.
@@ -1712,6 +1719,19 @@ before binary replacement. Setup/restart failure aborts deployment and uses
 existing binary recovery. Managed configuration and masks persist on failure.
 Build-only changes none of this. Later operator drop-ins may override the managed
 journald settings; verify the effective configuration and end-to-end capture.
+HTTPS binary self-upgrades do not update these host files; deploy the revised
+full source installer/upgrade to establish persistence on existing appliances.
+Verify both effective policy and retained boot IDs:
+
+```sh
+systemd-analyze cat-config systemd/journald.conf; journalctl --disk-usage; journalctl --list-boots --no-pager
+```
+
+Keep incident evidence private. An absent previous boot does not establish
+kernel panic, OOM, watchdog failure or a daemon/forwarding outage. Inspect
+current-boot kernel messages, supported firmware pstore, and separately
+retained native daemon/socket histories; missing old volatile logs cannot be
+recovered by enabling persistence afterward.
 
 Native syslog requires a systemd launch passing exactly one descriptor named
 `netcontrol-syslog`, bound to the forwarding path, with matching `LISTEN_PID`.

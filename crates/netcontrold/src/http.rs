@@ -102,6 +102,7 @@ pub struct App {
     processes: std::collections::BTreeMap<String, Arc<crate::processes::Control>>,
     daemon_restart: Option<tokio::sync::watch::Sender<bool>>,
     dns_slots: tokio::sync::Semaphore,
+    host_experience_slots: tokio::sync::Semaphore,
 }
 impl App {
     pub fn new(engine: Arc<Mutex<Engine>>, auth: Authentication, tls: bool) -> Arc<Self> {
@@ -121,6 +122,7 @@ impl App {
             processes: Default::default(),
             daemon_restart: None,
             dns_slots: tokio::sync::Semaphore::new(2),
+            host_experience_slots: tokio::sync::Semaphore::new(4),
         })
     }
     pub fn attach_processes(
@@ -738,6 +740,49 @@ fn api(
             }
         };
     }
+    if path == "/api/v1/services/discord/test" {
+        if !credential.permissions.iter().any(|p| p == "discord.write") {
+            return fail(403, "insufficient Discord permission", true);
+        }
+        if method != "POST" {
+            return fail(405, "Discord test requires POST", true);
+        }
+        if !query.is_empty() || !body.is_empty() {
+            return fail(400, "Discord test accepts no query or body", true);
+        }
+        let Some(manager) = &app.discord else {
+            return fail(503, "Discord manager unavailable", true);
+        };
+        if let Err(error) = app.refresh_upgrade_gate() {
+            tracing::error!(%error, "Discord test could not refresh upgrade state");
+            return fail(503, "upgrade state unavailable", true);
+        }
+        let test = {
+            let Ok(engine) = app.engine.lock() else {
+                return fail(503, "engine unavailable", true);
+            };
+            if engine.configuration_busy() {
+                return fail(409, "configuration transaction or upgrade is active", true);
+            }
+            if engine.saved_configuration().discord.webhook_ref.is_empty() {
+                return fail(409, "save a Discord webhook reference before testing", true);
+            }
+            match manager.prepare_test(&engine) {
+                Ok(test) => test,
+                Err(error) => {
+                    tracing::warn!(%error, "Discord test unavailable");
+                    return fail(503, "Discord test requires native Linux host mode", true);
+                }
+            }
+        };
+        return match tokio::runtime::Handle::current().block_on(manager.send_test(test)) {
+            Ok(result) => response(200, result),
+            Err(error) => {
+                tracing::warn!(%error, "Discord test failed");
+                fail(503, &error.to_string(), true)
+            }
+        };
+    }
     if matches!(
         path,
         "/api/v1/processes/restart" | "/api/v1/diagnostics/dns-lookup"
@@ -1184,6 +1229,103 @@ fn api(
                     "could not start software upgrade; inspect the service journal",
                     true,
                 )
+            }
+        };
+    }
+    if matches!(
+        path,
+        "/api/v1/statistics/host-experience/latest" | "/api/v1/statistics/host-experience/history"
+    ) {
+        if !credential
+            .permissions
+            .iter()
+            .any(|permission| permission == "state.read")
+        {
+            return fail(
+                403,
+                "insufficient protected-host experience permission",
+                true,
+            );
+        }
+        if method != "GET" {
+            return fail(405, "host experience supports GET only", true);
+        }
+        if !body.is_empty() {
+            return fail(400, "host experience GET accepts no body", true);
+        }
+        let validation = if path.ends_with("/latest") {
+            netcontrol_core::experience::LatestQuery::parse(query).map(|_| ())
+        } else {
+            netcontrol_core::experience::HistoryQuery::parse(query).map(|_| ())
+        };
+        if let Err(error) = validation {
+            return fail(400, &error.to_string(), true);
+        }
+        let Ok(_slot) = app.host_experience_slots.try_acquire() else {
+            return fail(
+                429,
+                "four protected-host experience reads are already active; retry later",
+                true,
+            );
+        };
+        let config = engine.saved_configuration().sando.clone();
+        let read = match engine.prepare_host_experience(path, query) {
+            Ok(read) => read,
+            Err(error) => return fail(503, &error.to_string(), true),
+        };
+        drop(engine);
+        let metadata = match &app.sando {
+            Some(sando) => match sando.host_experience_metadata(&config) {
+                Ok(metadata) => metadata,
+                Err(error) => return fail(503, &error.to_string(), true),
+            },
+            None => std::collections::BTreeMap::new(),
+        };
+        return match read() {
+            Ok(mut value) => {
+                let enrich = |row: &mut Value| {
+                    if let Some(ip) = row["ip_address"]
+                        .as_str()
+                        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+                    {
+                        if let Some(metadata) = metadata.get(&ip) {
+                            row["metadata"] = metadata.clone();
+                        }
+                    }
+                };
+                if let Some(hosts) = value["hosts"].as_array_mut() {
+                    for host in hosts {
+                        enrich(host);
+                    }
+                }
+                if let Some(host) = value.get_mut("host") {
+                    enrich(host);
+                }
+                match serde_json::to_vec(&value) {
+                    Ok(bytes) if bytes.len() <= 4 << 20 => (),
+                    Ok(_) => {
+                        return fail(
+                            503,
+                            "protected-host response exceeds 4 MiB; reduce latest page size or inspect collector diagnostics",
+                            true,
+                        );
+                    }
+                    Err(error) => {
+                        return fail(
+                            503,
+                            &format!("serialize protected-host response: {error}"),
+                            true,
+                        );
+                    }
+                }
+                response(200, value)
+            }
+            Err(error) => {
+                let status = error
+                    .downcast_ref::<netcontrol_core::HostExperienceError>()
+                    .map_or(503, |error| error.status);
+                tracing::warn!(%error,status,"protected-host experience request failed");
+                fail(status, &error.to_string(), true)
             }
         };
     }

@@ -4,6 +4,16 @@
 
 ### Changed
 
+- Make WireGuard DNS transport readiness asynchronous: validation/network
+  restoration do not query DNS; cold failures retain an unresolved peer and
+  retry with explicit runtime errors. Selected endpoint and attempt/success
+  timestamps are nullable until available. Full Ubuntu install/source upgrade
+  establishes bounded persistent journald retention and verifies boot flushing;
+  binary-only updates do not establish that policy.
+  Release impact: breaking runtime nullability and deployment policy, plus
+  startup durability fixes; next automatic calendar version.
+  [Frontend handoff 2026-11-14-02](docs/frontend-handoffs/2026-11-14.md#2026-11-14-02-startup-durability-and-dns-readiness).
+
 - Reduce continuous monitoring overhead: kernel-filter direct non-TCP,
   IPv4-fragment and outgoing diagnostic packet copies while retaining forwarded
   TCP/IPv6-extension coverage; replace NetFlow full-table expiry/high-water
@@ -27,6 +37,31 @@
   [handoff 2026-11-12-02](docs/frontend-handoffs/2026-11-12.md#2026-11-12-02-installer-disables-sysstat-collection).
 
 ### Added
+
+- Implement [protected-host network experience](docs/PROTECTED_HOST_EXPERIENCE_SPEC.md):
+  configured LAN IPs, ten-second packet/byte/drop/connection measurements,
+  passive TCP/window/ACK and UDP/TCP DNS analysis, last seen, explainable scores,
+  and one-hour private typed SQLite history. Add authenticated `state.read`
+  latest/history APIs, coherent paging, cached Sando metadata and explicit
+  missing/stale/capacity/error states. Collection/writing are independent of
+  polling, with bounded admission, queues and joined pause/shutdown.
+  Finalized storage budget: 2 GiB main plus 32 MiB WAL, not the original
+  unimplemented 512 MiB proposal. Native nftables/NFLOG capabilities and private
+  storage are deployment prerequisites; appliance performance remains to be
+  accepted. Release impact: additive API, new persisted telemetry and native
+  deployment requirements; next automatic calendar version.
+  Required frontend work:
+  [item 2026-11-14-04](docs/frontend-handoffs/2026-11-14.md#2026-11-14-04-protected-host-experience-implementation).
+
+- `POST /api/v1/services/discord/test` (`discord.write`, no query/body) sends
+  the firewall name, backend software version and committed configuration
+  revision through the saved webhook, even with automatic alerts disabled.
+  Successful Discord acceptance clears delivery failures/warnings without
+  changing alert counters, deduplication or settings; failed tests retain counts.
+  Serialize test/alert delivery to preserve subsequent failures. Native host
+  mode and an available worker are required. Release impact: additive API and
+  explicit counter-reset contract; next automatic calendar version.
+  [Frontend handoff 2026-11-14-01](docs/frontend-handoffs/2026-11-14.md#2026-11-14-01-discord-version-test).
 
 - Read-only RSS default-context table/hash/transform details and physical-device
   IRQ effective CPU affinities/exact cumulative per-CPU counts in interface
@@ -384,6 +419,16 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Preserve factual wall-clock timestamps without rejecting otherwise valid
+  archived rollback/commit history on restart. Validate journal updates before
+  saving, reject regressed UTC revision dates before native application, and
+  bound confirmation with monotonic time as well as the saved UTC deadline.
+  Detect conflicting VLAN parent/tag names before networking removes managed
+  routes/rules, with specific creation errors and no implicit foreign-link
+  adoption/deletion. These are not a proven diagnosis/fix for reported overnight
+  hangs or voice interruptions. Release impact: durability fixes; next automatic
+  calendar version.
 
 - Fix relayed DHCPNAK correlation/broadcast delivery, isolate transactions by
   relay address plus transaction ID/MAC across VLANs, and keep healthy

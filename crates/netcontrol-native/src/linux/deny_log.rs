@@ -210,6 +210,16 @@ fn attribute(kind: u16, bytes: &[u8]) -> Vec<u8> {
 }
 
 fn socket() -> Result<OwnedFd> {
+    socket_for(GROUP, 128, 1 << 20, 1, 1)
+}
+
+pub(super) fn socket_for(
+    group: u16,
+    range: u32,
+    capacity: libc::c_int,
+    flags: u16,
+    threshold: u32,
+) -> Result<OwnedFd> {
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -232,7 +242,6 @@ fn socket() -> Result<OwnedFd> {
         "bind NFLOG socket: {}",
         io::Error::last_os_error()
     );
-    let capacity: libc::c_int = 1 << 20;
     ensure!(
         unsafe {
             libc::setsockopt(
@@ -246,25 +255,26 @@ fn socket() -> Result<OwnedFd> {
         "set NFLOG buffer: {}",
         io::Error::last_os_error()
     );
-    configure(&fd, 1, attribute(1, &[1]))?;
-    let mut mode = 128u32.to_be_bytes().to_vec();
+    configure(&fd, group, 1, attribute(1, &[1]))?;
+    let mut mode = range.to_be_bytes().to_vec();
     mode.extend([2, 0]);
     configure(
         &fd,
+        group,
         2,
         [
             attribute(2, &mode),
             attribute(3, &65536u32.to_be_bytes()),
-            attribute(4, &1u32.to_be_bytes()),
+            attribute(4, &threshold.to_be_bytes()),
             attribute(5, &1u32.to_be_bytes()),
-            attribute(6, &1u16.to_be_bytes()),
+            attribute(6, &flags.to_be_bytes()),
         ]
         .concat(),
     )?;
     Ok(fd)
 }
 
-fn configure(fd: &OwnedFd, sequence: u32, attrs: Vec<u8>) -> Result<()> {
+fn configure(fd: &OwnedFd, group: u16, sequence: u32, attrs: Vec<u8>) -> Result<()> {
     let mut message = Vec::new();
     message.extend((20u32 + attrs.len() as u32).to_ne_bytes());
     message.extend(0x0401u16.to_ne_bytes());
@@ -272,7 +282,7 @@ fn configure(fd: &OwnedFd, sequence: u32, attrs: Vec<u8>) -> Result<()> {
     message.extend(sequence.to_ne_bytes());
     message.extend(0u32.to_ne_bytes());
     message.extend([libc::AF_UNSPEC as u8, 0]);
-    message.extend(GROUP.to_be_bytes());
+    message.extend(group.to_be_bytes());
     message.extend(attrs);
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as u16;
@@ -322,7 +332,7 @@ fn configure(fd: &OwnedFd, sequence: u32, attrs: Vec<u8>) -> Result<()> {
     }
 }
 
-fn poll(fd: &OwnedFd, timeout: i32) -> Result<bool> {
+pub(super) fn poll(fd: &OwnedFd, timeout: i32) -> Result<bool> {
     let mut poll = libc::pollfd {
         fd: fd.as_raw_fd(),
         events: libc::POLLIN,
@@ -340,7 +350,7 @@ fn poll(fd: &OwnedFd, timeout: i32) -> Result<bool> {
     Ok(result > 0)
 }
 
-fn receive(fd: &OwnedFd, bytes: &mut [u8]) -> Result<usize> {
+pub(super) fn receive(fd: &OwnedFd, bytes: &mut [u8]) -> Result<usize> {
     let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     let mut length = std::mem::size_of_val(&sender) as u32;
     let count = unsafe {
@@ -367,7 +377,10 @@ fn receive(fd: &OwnedFd, bytes: &mut [u8]) -> Result<usize> {
     Ok(count as usize)
 }
 
-fn frames(mut bytes: &[u8], mut visit: impl FnMut(u16, u32, &[u8]) -> Result<()>) -> Result<()> {
+pub(super) fn frames(
+    mut bytes: &[u8],
+    mut visit: impl FnMut(u16, u32, &[u8]) -> Result<()>,
+) -> Result<()> {
     while !bytes.is_empty() {
         ensure!(bytes.len() >= 16, "short NFLOG frame");
         let length = u32::from_ne_bytes(bytes[..4].try_into()?) as usize;

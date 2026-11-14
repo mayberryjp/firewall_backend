@@ -25,10 +25,23 @@ const INTERVAL: Duration = Duration::from_secs(60);
 struct Entry {
     endpoint: String,
     ipv6_enabled: bool,
-    resolved_endpoint: SocketAddr,
-    last_attempt_unix_ms: u64,
-    last_success_unix_ms: u64,
+    resolved_endpoint: Option<SocketAddr>,
+    last_attempt_unix_ms: Option<u64>,
+    last_success_unix_ms: Option<u64>,
     error: Option<String>,
+}
+
+impl Entry {
+    fn pending(endpoint: &str, ipv6: bool) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            ipv6_enabled: ipv6,
+            resolved_endpoint: None,
+            last_attempt_unix_ms: None,
+            last_success_unix_ms: None,
+            error: None,
+        }
+    }
 }
 
 fn key(endpoint: &str, ipv6_enabled: bool) -> String {
@@ -84,12 +97,16 @@ impl Cache {
                 else {
                     anyhow::bail!("invalid cached WireGuard DNS name");
                 };
-                select(
-                    vec![entry.resolved_endpoint],
-                    None,
-                    port,
-                    entry.ipv6_enabled,
-                )?;
+                if let Some(address) = entry.resolved_endpoint {
+                    select(vec![address], None, port, entry.ipv6_enabled)?;
+                }
+                ensure!(
+                    entry.resolved_endpoint.is_some() == entry.last_success_unix_ms.is_some()
+                        && entry
+                            .last_success_unix_ms
+                            .is_none_or(|_| entry.last_attempt_unix_ms.is_some()),
+                    "inconsistent cached WireGuard DNS resolution"
+                );
                 ensure!(
                     entries
                         .insert(key(&entry.endpoint, entry.ipv6_enabled), entry)
@@ -109,46 +126,20 @@ impl Cache {
         write_json(&self.path, &entries.values().collect::<Vec<_>>())
     }
 
-    pub fn resolve(&self, endpoint: &str, ipv6: bool) -> Result<SocketAddr> {
-        let cache_key = key(endpoint, ipv6);
-        if let Some(entry) = self
+    pub fn cached(&self, endpoint: &str, ipv6: bool) -> Result<Option<SocketAddr>> {
+        ensure!(
+            matches!(
+                WireGuardEndpoint::parse(endpoint)?,
+                Some(WireGuardEndpoint::Dns { .. })
+            ),
+            "expected a WireGuard DNS endpoint"
+        );
+        Ok(self
             .entries
             .lock()
             .map_err(|_| anyhow!("WireGuard DNS cache poisoned"))?
-            .get(&cache_key)
-        {
-            return Ok(entry.resolved_endpoint);
-        }
-        let Some(WireGuardEndpoint::Dns { host, port }) = WireGuardEndpoint::parse(endpoint)?
-        else {
-            anyhow::bail!("expected a WireGuard DNS endpoint");
-        };
-        let address = select((self.resolver)(&host, port, ipv6)?, None, port, ipv6)
-            .with_context(|| format!("resolve WireGuard endpoint {endpoint}"))?;
-        let timestamp = now()?;
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| anyhow!("WireGuard DNS cache poisoned"))?;
-        if let Some(entry) = entries.get(&cache_key) {
-            return Ok(entry.resolved_endpoint);
-        }
-        entries.insert(
-            cache_key.clone(),
-            Entry {
-                endpoint: endpoint.into(),
-                ipv6_enabled: ipv6,
-                resolved_endpoint: address,
-                last_attempt_unix_ms: timestamp,
-                last_success_unix_ms: timestamp,
-                error: None,
-            },
-        );
-        if let Err(error) = self.save(&entries) {
-            entries.remove(&cache_key);
-            return Err(error.context("persist initial WireGuard DNS resolution"));
-        }
-        Ok(address)
+            .get(&key(endpoint, ipv6))
+            .and_then(|entry| entry.resolved_endpoint))
     }
 
     fn refresh(
@@ -157,6 +148,9 @@ impl Cache {
         stop: &AtomicBool,
         update: impl FnOnce(SocketAddr) -> Result<()>,
     ) -> Result<()> {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let Some(WireGuardEndpoint::Dns { host, port }) =
             WireGuardEndpoint::parse(&target.endpoint)?
         else {
@@ -168,30 +162,37 @@ impl Cache {
             .lock()
             .map_err(|_| anyhow!("WireGuard DNS cache poisoned"))?
             .get(&cache_key)
-            .context("WireGuard DNS cache entry missing")?
-            .clone();
+            .cloned()
+            .unwrap_or_else(|| Entry::pending(&target.endpoint, target.ipv6));
         let timestamp = now()?;
-        let result = (self.resolver)(&host, port, target.ipv6).and_then(|addresses| {
-            select(addresses, Some(old.resolved_endpoint), port, target.ipv6)
-        });
+        let result = (self.resolver)(&host, port, target.ipv6)
+            .and_then(|addresses| select(addresses, old.resolved_endpoint, port, target.ipv6));
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut entry = old;
-        entry.last_attempt_unix_ms = timestamp;
+        let mut entry = old.clone();
+        entry.last_attempt_unix_ms = Some(timestamp);
         let result = result.and_then(|address| {
             update(address)?;
-            entry.resolved_endpoint = address;
-            entry.last_success_unix_ms = timestamp;
+            entry.resolved_endpoint = Some(address);
+            entry.last_success_unix_ms = Some(timestamp);
             Ok(())
         });
         entry.error = result.err().map(|error| format!("{error:#}"));
+        if entry.error != old.error {
+            if let Some(error) = &entry.error {
+                tracing::warn!(endpoint = target.endpoint, retained_endpoint = ?entry.resolved_endpoint, "WireGuard DNS refresh failed; retrying: {error}");
+            }
+        }
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| anyhow!("WireGuard DNS cache poisoned"))?;
-        entries.insert(cache_key, entry);
-        self.save(&entries).context("persist WireGuard DNS refresh")
+        let mut next = entries.clone();
+        next.insert(cache_key, entry);
+        self.save(&next).context("persist WireGuard DNS refresh")?;
+        *entries = next;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -250,7 +251,6 @@ impl Manager {
                         WireGuardEndpoint::parse(endpoint)?,
                         Some(WireGuardEndpoint::Dns { .. })
                     ) {
-                        self.control.dns.resolve(endpoint, network.ipv6_enabled)?;
                         targets
                             .entry(key(endpoint, network.ipv6_enabled))
                             .or_insert_with(|| Target {
@@ -360,9 +360,10 @@ impl Manager {
         for target in &self.targets {
             let entry = entries
                 .get(&key(&target.endpoint, target.ipv6))
-                .context("WireGuard DNS cache entry missing")?;
+                .cloned()
+                .unwrap_or_else(|| Entry::pending(&target.endpoint, target.ipv6));
             for (name, public_key, _) in &target.peers {
-                let mut row = serde_json::to_value(entry)?;
+                let mut row = serde_json::to_value(&entry)?;
                 row["interface"] = json!(name);
                 row["public_key"] = json!(public_key);
                 peers.push(row);
@@ -474,16 +475,17 @@ mod tests {
         cache.set_resolver(Arc::new(|_, port, _| {
             Ok(vec![SocketAddr::new("192.0.2.1".parse().unwrap(), port)])
         }));
-        assert_eq!(
-            cache.resolve("vpn.example.test:51820", false).unwrap(),
-            "192.0.2.1:51820".parse().unwrap()
-        );
         let target = Target {
             endpoint: "vpn.example.test:51820".into(),
             ipv6: false,
             peers: vec![],
         };
         let stop = AtomicBool::new(false);
+        cache.refresh(&target, &stop, |_| Ok(())).unwrap();
+        assert_eq!(
+            cache.cached("vpn.example.test:51820", false).unwrap(),
+            Some("192.0.2.1:51820".parse().unwrap())
+        );
         cache.set_resolver(Arc::new(|_, port, _| {
             Ok(vec![SocketAddr::new("192.0.2.2".parse().unwrap(), port)])
         }));
@@ -510,14 +512,11 @@ mod tests {
                 .unwrap()
                 .contains("synthetic DNS failure")
         );
-        assert_eq!(entry.resolved_endpoint, updated.unwrap());
+        assert_eq!(entry.resolved_endpoint, updated);
         drop(entries);
         let mut reopened = Cache::new(path).unwrap();
         reopened.set_resolver(Arc::new(|_, _, _| Err(anyhow!("offline"))));
-        assert_eq!(
-            reopened.resolve(&target.endpoint, false).unwrap(),
-            updated.unwrap()
-        );
+        assert_eq!(reopened.cached(&target.endpoint, false).unwrap(), updated);
         cache.set_resolver(Arc::new(|_, port, _| {
             Ok(vec![SocketAddr::new("192.0.2.3".parse().unwrap(), port)])
         }));
@@ -527,18 +526,12 @@ mod tests {
                 panic!("shutdown must prevent late mutation")
             })
             .unwrap();
-        assert_eq!(
-            cache.resolve(&target.endpoint, false).unwrap(),
-            updated.unwrap()
-        );
+        assert_eq!(cache.cached(&target.endpoint, false).unwrap(), updated);
         stop.store(false, Ordering::Release);
         cache
             .refresh(&target, &stop, |_| Err(anyhow!("synthetic kernel failure")))
             .unwrap();
-        assert_eq!(
-            cache.resolve(&target.endpoint, false).unwrap(),
-            updated.unwrap()
-        );
+        assert_eq!(cache.cached(&target.endpoint, false).unwrap(), updated);
         assert!(
             cache
                 .entries
@@ -552,5 +545,92 @@ mod tests {
                 .unwrap()
                 .contains("kernel failure")
         );
+    }
+
+    #[test]
+    fn cold_dns_failure_is_visible_durable_and_recovers_without_a_previous_address() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("dns.json");
+        let mut cache = Cache::new(path.clone()).unwrap();
+        cache.set_resolver(Arc::new(|_, _, _| {
+            Err(anyhow!("synthetic offline resolver"))
+        }));
+        let target = Target {
+            endpoint: "vpn.example.test:51820".into(),
+            ipv6: false,
+            peers: vec![],
+        };
+        assert_eq!(cache.cached(&target.endpoint, false).unwrap(), None);
+        cache
+            .refresh(&target, &AtomicBool::new(false), |_| {
+                panic!("failed DNS must not install an endpoint");
+            })
+            .unwrap();
+        let mut reopened = Cache::new(path).unwrap();
+        let entry = reopened
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(entry.resolved_endpoint.is_none());
+        assert!(entry.last_success_unix_ms.is_none());
+        assert!(entry.last_attempt_unix_ms.is_some());
+        assert!(entry.error.unwrap().contains("synthetic offline resolver"));
+        reopened.set_resolver(Arc::new(|_, port, _| {
+            Ok(vec![SocketAddr::new("192.0.2.7".parse().unwrap(), port)])
+        }));
+        let mut updated = None;
+        reopened
+            .refresh(&target, &AtomicBool::new(false), |address| {
+                updated = Some(address);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(updated, Some("192.0.2.7:51820".parse().unwrap()));
+        assert_eq!(reopened.cached(&target.endpoint, false).unwrap(), updated);
+        assert!(
+            reopened
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .error
+                .is_none()
+        );
+
+        let mut fresh = Cache::new(fixture.0.join("stopped.json")).unwrap();
+        fresh.set_resolver(Arc::new(|_, _, _| {
+            panic!("shutdown must prevent new lookups")
+        }));
+        fresh
+            .refresh(&target, &AtomicBool::new(true), |_| {
+                panic!("shutdown must not install an endpoint");
+            })
+            .unwrap();
+        assert!(fresh.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cold_dns_cache_persistence_failure_is_not_reported_as_a_success() {
+        let fixture = Fixture::new();
+        let mut cache = Cache::new(fixture.0.join("dns.json")).unwrap();
+        cache.set_resolver(Arc::new(|_, _, _| Err(anyhow!("offline"))));
+        std::fs::create_dir(&cache.path).unwrap();
+        let target = Target {
+            endpoint: "vpn.example.test:51820".into(),
+            ipv6: false,
+            peers: vec![],
+        };
+        assert!(
+            cache
+                .refresh(&target, &AtomicBool::new(false), |_| Ok(()))
+                .is_err()
+        );
+        assert!(cache.entries.lock().unwrap().is_empty());
     }
 }

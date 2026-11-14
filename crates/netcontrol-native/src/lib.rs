@@ -37,6 +37,13 @@ mod conntrack;
     any(not(target_os = "linux"), not(feature = "nftables")),
     allow(dead_code)
 )]
+mod experience_analysis;
+#[cfg(all(target_os = "linux", feature = "nftables"))]
+mod experience_store;
+#[cfg_attr(
+    any(not(target_os = "linux"), not(feature = "nftables")),
+    allow(dead_code)
+)]
 mod firewall_counters;
 #[cfg_attr(
     any(not(target_os = "linux"), not(feature = "nftables")),
