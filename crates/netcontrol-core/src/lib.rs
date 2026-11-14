@@ -20,6 +20,7 @@ mod dynamic_dns;
 pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;
 pub mod experience;
+pub mod experience_summary;
 mod interface_capabilities;
 pub use interface_capabilities::*;
 mod mdns;

@@ -1,7 +1,7 @@
 use super::{deny_log, experience_capture::Egress, experience_kernel as kernel};
 use crate::{
     experience_analysis::Analyzer,
-    experience_store::{Collection, Diagnostics, Filter, Source, Store},
+    experience_store::{Collection, Diagnostics, Filter, Source, Store, SummaryWindow},
     model::Network,
     netlink_decode::{attributes, c_string},
 };
@@ -145,9 +145,16 @@ struct Cursor {
     after: IpAddr,
     issued_ms: i64,
 }
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SummaryCursor {
+    page: Cursor,
+    window: SummaryWindow,
+}
 enum Query {
     Latest(experience::LatestQuery),
     History(experience::HistoryQuery),
+    Summary(experience::LatestQuery),
 }
 fn error(status: u16, message: impl Into<String>) -> anyhow::Error {
     HostExperienceError {
@@ -311,6 +318,11 @@ impl Manager {
             Query::Latest(
                 experience::LatestQuery::parse(query).map_err(|e| error(400, e.to_string()))?,
             )
+        } else if path.ends_with("/summary") {
+            Query::Summary(
+                experience::LatestQuery::parse_summary(query)
+                    .map_err(|e| error(400, e.to_string()))?,
+            )
         } else {
             Query::History(
                 experience::HistoryQuery::parse(query).map_err(|e| error(400, e.to_string()))?,
@@ -452,6 +464,110 @@ impl Manager {
                 result["hosts"] = json!(rows);
                 result["next_cursor"] = json!(cursor);
                 result["clock_discontinuity"] = json!(store.clock_discontinuity(now)?);
+                Ok(result)
+            }
+            Query::Summary(query) => {
+                check_interface(&view, &query)?;
+                let filter = Filter {
+                    address: query.address.map(|ip| ip.to_string()),
+                    interface: query.interface.clone(),
+                };
+                let identities = filtered_hosts(&view, &query);
+                let total = identities.len();
+                let view_hash = hex::encode(Sha256::digest(serde_json::to_vec(&identities)?));
+                let (window, after, issued_ms) = if let Some(token) = query.cursor.as_deref() {
+                    let cursor: SummaryCursor = serde_json::from_slice(
+                        &hex::decode(token).map_err(|_| error(400, "invalid summary cursor"))?,
+                    )
+                    .map_err(|_| error(400, "invalid summary cursor"))?;
+                    ensure_cursor(&cursor.page, &filter, query.limit, &view_hash, now)?;
+                    if cursor.page.collection != cursor.window.last_collection
+                        || !identities
+                            .iter()
+                            .any(|host| host.ip_address == cursor.page.after)
+                    {
+                        return Err(error(400, "invalid summary cursor position or collection"));
+                    }
+                    (
+                        cursor.window,
+                        Some(cursor.page.after),
+                        cursor.page.issued_ms,
+                    )
+                } else {
+                    (store.summary_window(now)?, None, now)
+                };
+                let remaining: Vec<_> = identities
+                    .into_iter()
+                    .filter(|host| after.is_none_or(|ip| host.ip_address > ip))
+                    .collect();
+                let more = remaining.len() > query.limit;
+                let hosts: Vec<_> = remaining.into_iter().take(query.limit).collect();
+                let addresses: Vec<_> = hosts.iter().map(|host| host.ip_address).collect();
+                let summaries = store
+                    .summaries(&addresses, &window, now)
+                    .map_err(|failure| {
+                        match failure.downcast_ref::<crate::experience_store::CursorError>() {
+                            Some(crate::experience_store::CursorError::Expired) => {
+                                error(409, "summary window expired; restart summary paging")
+                            }
+                            Some(_) => error(400, failure.to_string()),
+                            None => failure,
+                        }
+                    })?;
+                let collection = match &window.last_collection {
+                    Some(id) => Some(store.collection_for_addresses(id, &[], now)?.ok_or_else(
+                        || error(409, "summary collection expired; restart summary paging"),
+                    )?),
+                    None => None,
+                };
+                let next_cursor = if more {
+                    let token = hex::encode(serde_json::to_vec(&SummaryCursor {
+                        page: Cursor {
+                            collection: window.last_collection.clone(),
+                            view: view_hash,
+                            filter,
+                            limit: query.limit,
+                            after: hosts
+                                .last()
+                                .context("summary page missing last address")?
+                                .ip_address,
+                            issued_ms,
+                        },
+                        window: window.clone(),
+                    })?);
+                    ensure!(token.len() <= 2048, "summary cursor exceeds bounded size");
+                    Some(token)
+                } else {
+                    None
+                };
+                let mut rows = Vec::with_capacity(hosts.len());
+                for (host, summary) in hosts.into_iter().zip(summaries) {
+                    let mut row = serde_json::to_value(host)?;
+                    row["summary"] = summary;
+                    rows.push(row);
+                }
+                let complete = !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row["summary"]["coverage_complete"] == true);
+                let mut result = envelope("summary", &view, &status, collection.as_ref(), now)?;
+                result["window"] =
+                    json!({"start_at":iso(window.end_ms-3_600_000)?,"end_at":iso(window.end_ms)?});
+                result["snapshot_at"] = json!(iso(issued_ms)?);
+                result["coverage_complete"] = json!(complete);
+                result["collector_scope"] = json!("latest_collection");
+                result["eligible_hosts"] = json!(total);
+                result["hosts"] = json!(rows);
+                result["next_cursor"] = json!(next_cursor);
+                if result["status"] != "stale" {
+                    result["status"] = json!(if window.last_collection.is_none() {
+                        "starting"
+                    } else if complete {
+                        "available"
+                    } else {
+                        "partial"
+                    });
+                }
                 Ok(result)
             }
             Query::History(query) => {
@@ -602,7 +718,7 @@ fn ensure_cursor(
     if cursor.view != view || cursor.issued_ms > now || now - cursor.issued_ms >= 3_600_000 {
         return Err(error(
             409,
-            "experience collection or host attachment changed; restart latest paging",
+            "experience collection or host attachment changed; restart experience paging",
         ));
     }
     Ok(())
@@ -1860,6 +1976,7 @@ mod tests {
                     );
                     sample.configured_name = host.configured_name.clone();
                     sample.interface = host.interface.clone();
+                    sample.measured_duration_ms = 10_000;
                     sample.traffic = Traffic::measured(1, 2, 100, 200, 10_000);
                     sample.activity = Activity::Active;
                     Ok(sample)
@@ -1960,6 +2077,50 @@ mod tests {
             .unwrap()
             .configured_name = "Renamed".into();
         assert_eq!(status(fixture.read("latest", &query).unwrap_err()), 409);
+        Ok(())
+    }
+    #[test]
+    fn summary_pages_pin_hour_and_reject_filters_kind_and_attachment_changes() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.insert("first", fixture.end)?;
+        let first = fixture.read("summary", "limit=1")?;
+        assert_eq!(first["kind"], "summary");
+        assert_eq!(first["hosts"][0]["summary"]["observed_slots"], 1);
+        let cursor = first["next_cursor"].as_str().unwrap();
+        fixture.insert("second", fixture.end + 10_000)?;
+        let query = format!("limit=1&cursor={cursor}");
+        let second = fixture.read("summary", &query)?;
+        assert_eq!(first["window"], second["window"]);
+        assert_eq!(first["snapshot_at"], second["snapshot_at"]);
+        assert_eq!(second["collection_id"], "first");
+        assert_eq!(second["hosts"][0]["ip_address"], "192.0.2.10");
+        assert_eq!(second["hosts"][0]["summary"]["observed_slots"], 1);
+        assert!(second["next_cursor"].is_null());
+        assert_eq!(
+            status(
+                fixture
+                    .read("summary", &format!("limit=2&cursor={cursor}"))
+                    .unwrap_err()
+            ),
+            400
+        );
+        assert_eq!(status(fixture.read("latest", &query).unwrap_err()), 400);
+        assert_eq!(
+            status(fixture.read("summary", "interface=wan0").unwrap_err()),
+            422
+        );
+        fixture
+            .manager
+            .shared
+            .control
+            .lock()
+            .unwrap()
+            .view
+            .hosts
+            .get_mut(&"192.0.2.9".parse()?)
+            .unwrap()
+            .configured_name = "Renamed".into();
+        assert_eq!(status(fixture.read("summary", &query).unwrap_err()), 409);
         Ok(())
     }
     #[test]

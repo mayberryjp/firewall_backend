@@ -46,6 +46,15 @@
 
 ### Added
 
+- `GET /api/v1/statistics/host-experience/summary` adds bounded, paginated
+  rolling-hour observed summaries with exact traffic/TCP/DNS totals, source
+  coverage, pooled ratios, RTT extrema/weighted variation and historical
+  experience-state durations/last rating. Missing evidence remains null;
+  unavailable hourly distributions are explicit, not averaged percentiles.
+  Existing live scoring/history and storage schema are unchanged.
+  Release impact: additive API; next automatic calendar version.
+  Required frontend review: [handoff 2026-11-14-07](docs/frontend-handoffs/2026-11-14.md#2026-11-14-07-one-hour-experience-summaries).
+
 - `GET /api/v1/routes/table` (`state.read`, no query/body) exposes live IPv4/IPv6
   kernel routes across all tables in the managed namespace, with multipath,
   source/gateway/interface metadata, numeric Linux identifiers, metrics/cache

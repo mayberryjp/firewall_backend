@@ -85,6 +85,14 @@ pub struct Usage {
     pub complete: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryWindow {
+    pub end_ms: i64,
+    pub first_collection: Option<String>,
+    pub last_collection: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
@@ -852,6 +860,130 @@ impl Store {
         }))
     }
 
+    pub fn summary_window(&self, now_ms: i64) -> Result<SummaryWindow> {
+        let deadline = ReadDeadline::new(&self.reader);
+        let logical = self.clock(now_ms)?;
+        ensure!(
+            !self.has_discontinuity(logical),
+            "hourly summary unavailable across clock discontinuity"
+        );
+        let end_ms = now_ms - now_ms.rem_euclid(INTERVAL_MS);
+        let mut statement = self.reader.prepare(
+            "SELECT collection_id FROM buckets WHERE seq>?1 AND retention_ms>?2 AND end_ms>?3 AND end_ms<=?4 ORDER BY seq",
+        )?;
+        let collections = statement
+            .query_map(
+                params![
+                    self.quarantine.get(),
+                    logical.saturating_sub(RETENTION_MS),
+                    end_ms.saturating_sub(RETENTION_MS),
+                    end_ms
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            collections.len() <= MAX_SLOTS,
+            "summary collection bound violated"
+        );
+        deadline.check()?;
+        Ok(SummaryWindow {
+            end_ms,
+            first_collection: collections.first().cloned(),
+            last_collection: collections.last().cloned(),
+        })
+    }
+
+    pub fn summaries(
+        &self,
+        addresses: &[IpAddr],
+        window: &SummaryWindow,
+        now_ms: i64,
+    ) -> Result<Vec<Value>> {
+        ensure!(addresses.len() <= 64, "summary page exceeds 64 addresses");
+        let keys = addresses
+            .iter()
+            .map(|ip| address_key(&ip.to_string()))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            keys.iter().collect::<BTreeSet<_>>().len() == keys.len(),
+            "duplicate summary address"
+        );
+        ensure!(
+            window.end_ms >= RETENTION_MS
+                && window.end_ms.rem_euclid(INTERVAL_MS) == 0
+                && window.end_ms <= now_ms
+                && now_ms.saturating_sub(window.end_ms) < RETENTION_MS,
+            CursorError::Expired
+        );
+        let deadline = ReadDeadline::new(&self.reader);
+        let logical = self.clock(now_ms)?;
+        ensure!(
+            !self.has_discontinuity(logical),
+            "hourly summary unavailable across clock discontinuity"
+        );
+        let tx = self.reader.unchecked_transaction()?;
+        let high = match (&window.first_collection, &window.last_collection) {
+            (None, None) => 0,
+            (Some(first), Some(last)) => {
+                bounded_text(first, 128)?;
+                bounded_text(last, 128)?;
+                let high: i64 = tx.query_row(
+                    "SELECT seq FROM buckets WHERE collection_id=?1 AND seq>?2 AND retention_ms>?3 AND end_ms>?4 AND end_ms<=?5",
+                    params![last,self.quarantine.get(),logical.saturating_sub(RETENTION_MS),
+                        window.end_ms-RETENTION_MS,window.end_ms], |row|row.get(0))
+                    .optional()?.context(CursorError::Expired)?;
+                let earliest: Option<String> = tx.query_row(
+                    "SELECT collection_id FROM buckets WHERE seq>?1 AND seq<=?2 AND retention_ms>?3 AND end_ms>?4 AND end_ms<=?5 ORDER BY seq LIMIT 1",
+                    params![self.quarantine.get(),high,logical.saturating_sub(RETENTION_MS),
+                        window.end_ms-RETENTION_MS,window.end_ms], |row|row.get(0)).optional()?;
+                ensure!(earliest.as_ref() == Some(first), CursorError::Expired);
+                high
+            }
+            _ => bail!(CursorError::Invalid),
+        };
+        let sql = format!(
+            "{} WHERE s.address=?1 AND b.seq>?2 AND b.seq<=?3 AND b.retention_ms>?4
+            AND b.end_ms>?5 AND b.end_ms<=?6 ORDER BY b.seq LIMIT 361",
+            select_sql()
+        );
+        let mut result = Vec::with_capacity(keys.len());
+        {
+            let mut statement = tx.prepare(&sql)?;
+            let summary_columns = SummaryColumns::new()?;
+            let mut coverage_reasons = tx.prepare_cached(
+                "SELECT reason FROM coverage_reasons WHERE sample_id=?1 ORDER BY position LIMIT 33",
+            )?;
+            for key in keys {
+                let mut accumulator = netcontrol_core::experience_summary::Accumulator::new(
+                    window.end_ms - RETENTION_MS,
+                    window.end_ms,
+                )?;
+                let mut rows = statement.query(params![
+                    key,
+                    self.quarantine.get(),
+                    high,
+                    logical.saturating_sub(RETENTION_MS),
+                    window.end_ms - RETENTION_MS,
+                    window.end_ms
+                ])?;
+                while let Some(row) = rows.next()? {
+                    deadline.check()?;
+                    accumulator.push(&read_summary_sample(
+                        row,
+                        &summary_columns,
+                        &mut coverage_reasons,
+                    )?)?;
+                }
+                result.push(accumulator.finish()?);
+                deadline.check()?;
+            }
+        }
+        tx.commit()?;
+        deadline.check()?;
+        Ok(result)
+    }
+
     pub fn history(&self, address: IpAddr, now_ms: i64) -> Result<History> {
         let samples = self.address_samples(address, now_ms)?;
         let mut discontinuity = self.has_discontinuity(self.clock(now_ms)?);
@@ -1201,75 +1333,461 @@ fn read_samples<P: rusqlite::Params>(
     let mut samples = Vec::new();
     while let Some(row) = rows.next()? {
         deadline.check()?;
-        let id: i64 = row.get(0)?;
-        let address: Vec<u8> = row.get(1)?;
-        let index: i64 = row.get(6)?;
-        let vlan: i64 = row.get(8)?;
-        let mut value = Value::Object(Map::new());
-        put(
-            &mut value,
-            "ip_address",
-            Value::String(address_literal(&address)?),
-        );
-        for (path, index) in [
-            ("observation_epoch", 2),
-            ("configured_host_id", 3),
-            ("configuration_revision", 4),
-        ] {
-            put(&mut value, path, Value::String(row.get(index)?));
-        }
-        if index == 0 {
-            put(&mut value, "interface", Value::Null);
-        } else {
-            put(&mut value, "interface.name", Value::String(row.get(5)?));
-            put(&mut value, "interface.index", Value::from(index));
-            put(&mut value, "interface.kind", Value::String(row.get(7)?));
-            put(
-                &mut value,
-                "interface.vlan_id",
-                if vlan == 0 {
-                    Value::Null
-                } else {
-                    Value::from(vlan)
-                },
-            );
-        }
-        put(
-            &mut value,
-            "start_at",
-            Value::String(timestamp_literal(row.get(9)?)?),
-        );
-        put(
-            &mut value,
-            "end_at",
-            Value::String(timestamp_literal(row.get(10)?)?),
-        );
-        put(&mut value, "configured_name", Value::String(row.get(11)?));
-        for (index, column) in COLUMNS.iter().enumerate() {
-            let metric: rusqlite::types::Value = row.get(index + 12)?;
-            let decoded = decode_metric(metric, column)?;
-            put(&mut value, column.path, decoded);
-        }
-        let mut reasons =
-            tx.prepare("SELECT reason FROM coverage_reasons WHERE sample_id=?1 ORDER BY position")?;
-        let reasons = reasons
-            .query_map([id], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        put(
-            &mut value,
-            "coverage.reasons",
-            Value::Array(reasons.into_iter().map(Value::String).collect()),
-        );
-        let sample: Sample =
-            serde_json::from_value(value).context("invalid persisted experience sample")?;
-        EncodedSample::new(
-            &sample,
-            sample.start_at.timestamp_millis(),
-            sample.end_at.timestamp_millis(),
-        )?;
-        samples.push(sample);
+        samples.push(read_sample(tx, row)?);
     }
     Ok(samples)
+}
+
+fn read_sample(tx: &Transaction<'_>, row: &rusqlite::Row<'_>) -> Result<Sample> {
+    let id: i64 = row.get(0)?;
+    let address: Vec<u8> = row.get(1)?;
+    let index: i64 = row.get(6)?;
+    let vlan: i64 = row.get(8)?;
+    let mut value = Value::Object(Map::new());
+    put(
+        &mut value,
+        "ip_address",
+        Value::String(address_literal(&address)?),
+    );
+    for (path, index) in [
+        ("observation_epoch", 2),
+        ("configured_host_id", 3),
+        ("configuration_revision", 4),
+    ] {
+        put(&mut value, path, Value::String(row.get(index)?));
+    }
+    if index == 0 {
+        put(&mut value, "interface", Value::Null);
+    } else {
+        put(&mut value, "interface.name", Value::String(row.get(5)?));
+        put(&mut value, "interface.index", Value::from(index));
+        put(&mut value, "interface.kind", Value::String(row.get(7)?));
+        put(
+            &mut value,
+            "interface.vlan_id",
+            if vlan == 0 {
+                Value::Null
+            } else {
+                Value::from(vlan)
+            },
+        );
+    }
+    put(
+        &mut value,
+        "start_at",
+        Value::String(timestamp_literal(row.get(9)?)?),
+    );
+    put(
+        &mut value,
+        "end_at",
+        Value::String(timestamp_literal(row.get(10)?)?),
+    );
+    put(&mut value, "configured_name", Value::String(row.get(11)?));
+    for (index, column) in COLUMNS.iter().enumerate() {
+        let metric: rusqlite::types::Value = row.get(index + 12)?;
+        let decoded = decode_metric(metric, column)?;
+        put(&mut value, column.path, decoded);
+    }
+    let mut reasons = tx.prepare_cached(
+        "SELECT reason FROM coverage_reasons WHERE sample_id=?1 ORDER BY position LIMIT 33",
+    )?;
+    let reasons = reasons
+        .query_map([id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    put(
+        &mut value,
+        "coverage.reasons",
+        Value::Array(reasons.into_iter().map(Value::String).collect()),
+    );
+    let sample: Sample =
+        serde_json::from_value(value).context("invalid persisted experience sample")?;
+    // Scalar decoding has already validated the stored projection.
+    validate_sample(&sample)?;
+    Ok(sample)
+}
+
+macro_rules! summary_columns {
+    ($($field:ident => $path:literal),* $(,)?) => {
+        struct SummaryColumns { $($field: usize),* }
+        impl SummaryColumns {
+            fn new() -> Result<Self> {
+                Ok(Self {
+                    $($field: COLUMNS.iter().position(|column| column.path == $path)
+                        .context(concat!("missing summary metric: ", $path))?),*
+                })
+            }
+        }
+    };
+}
+
+summary_columns! {
+    last_seen_at => "last_seen_at",
+    activity => "activity",
+    measured_duration_ms => "measured_duration_ms",
+    traffic_status => "traffic.status",
+    traffic_error => "traffic.error",
+    traffic_sent_packets => "traffic.sent_packets",
+    traffic_received_packets => "traffic.received_packets",
+    traffic_sent_bytes => "traffic.sent_bytes",
+    traffic_received_bytes => "traffic.received_bytes",
+    traffic_sent_bps => "traffic.sent_bps",
+    traffic_received_bps => "traffic.received_bps",
+    traffic_packet_unit => "traffic.packet_unit",
+    traffic_byte_unit => "traffic.byte_unit",
+    firewall_status => "firewall.status",
+    firewall_error => "firewall.error",
+    firewall_dropped_sent_packets => "firewall.dropped_sent_packets",
+    firewall_dropped_received_packets => "firewall.dropped_received_packets",
+    firewall_drop_coverage => "firewall.drop_coverage",
+    connections_status => "connections.status",
+    connections_error => "connections.error",
+    connections_observed_at => "connections.observed_at",
+    connections_measurement_duration_ms => "connections.measurement_duration_ms",
+    connections_total => "connections.total",
+    connections_tcp_established => "connections.tcp_established",
+    connections_unreplied => "connections.unreplied",
+    tcp_status => "tcp.status",
+    tcp_error => "tcp.error",
+    tcp_data_packets_sent => "tcp.data_packets_sent",
+    tcp_data_packets_received => "tcp.data_packets_received",
+    tcp_retransmission_observations_sent => "tcp.retransmission_observations_sent",
+    tcp_retransmission_observations_received => "tcp.retransmission_observations_received",
+    tcp_retransmission_percent_sent => "tcp.retransmission_percent_sent",
+    tcp_retransmission_percent_received => "tcp.retransmission_percent_received",
+    tcp_window_decreases_host => "tcp.window_decreases_host",
+    tcp_window_decreases_peer => "tcp.window_decreases_peer",
+    tcp_zero_window_observations_host => "tcp.zero_window_observations_host",
+    tcp_zero_window_observations_peer => "tcp.zero_window_observations_peer",
+    tcp_zero_window_transitions_host => "tcp.zero_window_transitions_host",
+    tcp_zero_window_transitions_peer => "tcp.zero_window_transitions_peer",
+    tcp_advertised_window_min_bytes_host => "tcp.advertised_window_min_bytes_host",
+    tcp_advertised_window_min_bytes_peer => "tcp.advertised_window_min_bytes_peer",
+    tcp_rtt_remote_samples => "tcp.rtt_remote.samples",
+    tcp_rtt_remote_variation_pairs => "tcp.rtt_remote.variation_pairs",
+    tcp_rtt_remote_p50_ms => "tcp.rtt_remote.p50_ms",
+    tcp_rtt_remote_p95_ms => "tcp.rtt_remote.p95_ms",
+    tcp_rtt_remote_min_ms => "tcp.rtt_remote.min_ms",
+    tcp_rtt_remote_max_ms => "tcp.rtt_remote.max_ms",
+    tcp_rtt_remote_variation_mean_ms => "tcp.rtt_remote.variation_mean_ms",
+    tcp_rtt_host_samples => "tcp.rtt_host.samples",
+    tcp_rtt_host_variation_pairs => "tcp.rtt_host.variation_pairs",
+    tcp_rtt_host_p50_ms => "tcp.rtt_host.p50_ms",
+    tcp_rtt_host_p95_ms => "tcp.rtt_host.p95_ms",
+    tcp_rtt_host_min_ms => "tcp.rtt_host.min_ms",
+    tcp_rtt_host_max_ms => "tcp.rtt_host.max_ms",
+    tcp_rtt_host_variation_mean_ms => "tcp.rtt_host.variation_mean_ms",
+    dns_status => "dns.status",
+    dns_error => "dns.error",
+    dns_requests => "dns.requests",
+    dns_responses => "dns.responses",
+    dns_unanswered => "dns.unanswered",
+    dns_pending_at_close => "dns.pending_at_close",
+    dns_servfail_responses => "dns.servfail_responses",
+    dns_refused_responses => "dns.refused_responses",
+    dns_excluded_observations => "dns.excluded_observations",
+    dns_response_time_p50_ms => "dns.response_time_p50_ms",
+    dns_response_time_p95_ms => "dns.response_time_p95_ms",
+    dns_response_time_variation_mean_ms => "dns.response_time_variation_mean_ms",
+    dns_unanswered_percent => "dns.unanswered_percent",
+    experience_algorithm => "experience.algorithm",
+    experience_score => "experience.score",
+    experience_level => "experience.level",
+    experience_status => "experience.status",
+    experience_confidence => "experience.confidence",
+    experience_basis_seconds => "experience.basis_seconds",
+    experience_components => "experience.components",
+    experience_reasons => "experience.reasons",
+    coverage_complete => "coverage.complete",
+    coverage_traffic => "coverage.traffic",
+    coverage_firewall => "coverage.firewall",
+    coverage_tcp => "coverage.tcp",
+    coverage_dns => "coverage.dns",
+    coverage_connections => "coverage.connections",
+}
+
+struct SummaryScalars<'a, 'row> {
+    row: &'a rusqlite::Row<'row>,
+}
+impl SummaryScalars<'_, '_> {
+    fn scalar(&self, index: usize) -> Result<rusqlite::types::ValueRef<'_>> {
+        use rusqlite::types::ValueRef as Sql;
+        let column = &COLUMNS[index];
+        let value = self.row.get_ref(index + 12)?;
+        match (column.kind, value) {
+            (_, Sql::Null) => {}
+            (Kind::Text, Sql::Text(bytes)) => {
+                let text = std::str::from_utf8(bytes)?;
+                bounded_text(
+                    text,
+                    if column.path.ends_with(".error") {
+                        1024
+                    } else {
+                        255
+                    },
+                )?;
+                if matches!(column.path, "last_seen_at" | "connections.observed_at") {
+                    timestamp_ms(text)?;
+                }
+            }
+            (Kind::Counter, Sql::Text(bytes)) => {
+                decimal_counter(Some(std::str::from_utf8(bytes)?))?;
+            }
+            (Kind::Integer, Sql::Integer(value)) => ensure!(value >= 0, "negative integer metric"),
+            (Kind::Real, Sql::Real(value)) => {
+                ensure!(value.is_finite() && value >= 0.0, "invalid finite metric");
+            }
+            (Kind::Bool, Sql::Integer(0 | 1)) => {}
+            // Retain the existing array, size and canonical serialized-size checks.
+            (Kind::ScoreJson, Sql::Text(_)) => {}
+            _ => bail!("invalid persisted experience metric type: {}", column.path),
+        }
+        Ok(value)
+    }
+
+    fn text<T: serde::de::DeserializeOwned>(&self, index: usize) -> Result<T> {
+        let value = self.optional_text(index)?;
+        value.context("missing required persisted text metric")
+    }
+    fn optional_text<T: serde::de::DeserializeOwned>(&self, index: usize) -> Result<Option<T>> {
+        use rusqlite::types::ValueRef as Sql;
+        match self.scalar(index)? {
+            Sql::Null => Ok(None),
+            Sql::Text(bytes) => {
+                let text = std::str::from_utf8(bytes)?;
+                let deserializer =
+                    serde::de::value::StrDeserializer::<serde::de::value::Error>::new(text);
+                Ok(Some(T::deserialize(deserializer)?))
+            }
+            _ => bail!("invalid persisted text metric"),
+        }
+    }
+    fn count(&self, index: usize) -> Result<Option<netcontrol_core::experience::Count>> {
+        use rusqlite::types::ValueRef as Sql;
+        // Parse once: Count's canonical representation is also the scalar validation.
+        ensure!(
+            matches!(COLUMNS[index].kind, Kind::Counter),
+            "invalid summary counter column"
+        );
+        match self.row.get_ref(index + 12)? {
+            Sql::Null => Ok(None),
+            Sql::Text(bytes) => Ok(decimal_counter(Some(std::str::from_utf8(bytes)?))?
+                .map(netcontrol_core::experience::Count)),
+            _ => bail!("invalid persisted counter metric"),
+        }
+    }
+    fn required_count(&self, index: usize) -> Result<netcontrol_core::experience::Count> {
+        self.count(index)?
+            .context("missing required persisted timing count")
+    }
+    fn optional_integer<T: TryFrom<u64>>(&self, index: usize) -> Result<Option<T>> {
+        use rusqlite::types::ValueRef as Sql;
+        match self.scalar(index)? {
+            Sql::Null => Ok(None),
+            Sql::Integer(value) => {
+                let value = u64::try_from(value).context("negative persisted integer")?;
+                Ok(Some(T::try_from(value).map_err(|_| {
+                    anyhow::anyhow!("persisted integer out of range")
+                })?))
+            }
+            _ => bail!("invalid persisted integer metric"),
+        }
+    }
+    fn integer<T: TryFrom<u64>>(&self, index: usize) -> Result<T> {
+        self.optional_integer(index)?
+            .context("missing required persisted integer")
+    }
+    fn real(&self, index: usize) -> Result<Option<f64>> {
+        use rusqlite::types::ValueRef as Sql;
+        match self.scalar(index)? {
+            Sql::Null => Ok(None),
+            Sql::Real(value) => Ok(Some(value)),
+            _ => bail!("invalid persisted real metric"),
+        }
+    }
+    fn boolean(&self, index: usize) -> Result<bool> {
+        use rusqlite::types::ValueRef as Sql;
+        match self.scalar(index)? {
+            Sql::Integer(value) => Ok(value == 1),
+            _ => bail!("invalid persisted boolean metric"),
+        }
+    }
+    fn explanation<T: serde::de::DeserializeOwned>(&self, index: usize) -> Result<T> {
+        ensure!(
+            matches!(COLUMNS[index].kind, Kind::ScoreJson),
+            "invalid summary explanation column"
+        );
+        let value = decode_metric(self.row.get(index + 12)?, &COLUMNS[index])?;
+        serde_json::from_value(value).context("invalid persisted score explanation")
+    }
+}
+
+fn summary_timestamp<T: serde::de::DeserializeOwned>(milliseconds: i64) -> Result<T> {
+    let text = timestamp_literal(milliseconds)?;
+    let deserializer = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&text);
+    T::deserialize(deserializer).context("invalid persisted sample timestamp")
+}
+
+fn read_summary_sample(
+    row: &rusqlite::Row<'_>,
+    columns: &SummaryColumns,
+    coverage_reasons: &mut rusqlite::CachedStatement<'_>,
+) -> Result<Sample> {
+    use netcontrol_core::experience::{
+        Connections, Coverage, Dns, Experience, Firewall, InterfaceIdentity, Tcp, Timing, Traffic,
+    };
+    let scalar = SummaryScalars { row };
+    let id: i64 = row.get(0)?;
+    let address = row.get_ref(1)?.as_blob()?;
+    let ip_address = match address {
+        [4, a, b, c, d] => IpAddr::V4(std::net::Ipv4Addr::new(*a, *b, *c, *d)),
+        bytes if bytes.len() == 17 && bytes[0] == 6 => {
+            let octets: [u8; 16] = bytes[1..].try_into()?;
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+        _ => bail!("corrupt experience address"),
+    };
+    let interface_index: i64 = row.get(6)?;
+    let vlan: i64 = row.get(8)?;
+    ensure!(vlan == 0 || (1..=4094).contains(&vlan), "invalid VLAN ID");
+    let interface = if interface_index == 0 {
+        None
+    } else {
+        Some(InterfaceIdentity {
+            name: row.get(5)?,
+            index: u32::try_from(interface_index).context("invalid interface index")?,
+            kind: row.get(7)?,
+            vlan_id: if vlan == 0 {
+                None
+            } else {
+                Some(u16::try_from(vlan)?)
+            },
+        })
+    };
+    let reasons = coverage_reasons
+        .query_map([id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let sample = Sample {
+        ip_address,
+        configured_host_id: row.get(3)?,
+        configured_name: row.get(11)?,
+        configuration_revision: row.get(4)?,
+        observation_epoch: row.get(2)?,
+        start_at: summary_timestamp(row.get(9)?)?,
+        end_at: summary_timestamp(row.get(10)?)?,
+        measured_duration_ms: scalar.integer(columns.measured_duration_ms)?,
+        interface,
+        last_seen_at: scalar.optional_text(columns.last_seen_at)?,
+        activity: scalar.text(columns.activity)?,
+        traffic: Traffic {
+            status: scalar.text(columns.traffic_status)?,
+            error: scalar.optional_text(columns.traffic_error)?,
+            sent_packets: scalar.count(columns.traffic_sent_packets)?,
+            received_packets: scalar.count(columns.traffic_received_packets)?,
+            sent_bytes: scalar.count(columns.traffic_sent_bytes)?,
+            received_bytes: scalar.count(columns.traffic_received_bytes)?,
+            sent_bps: scalar.real(columns.traffic_sent_bps)?,
+            received_bps: scalar.real(columns.traffic_received_bps)?,
+            packet_unit: scalar.text(columns.traffic_packet_unit)?,
+            byte_unit: scalar.text(columns.traffic_byte_unit)?,
+        },
+        firewall: Firewall {
+            status: scalar.text(columns.firewall_status)?,
+            error: scalar.optional_text(columns.firewall_error)?,
+            dropped_sent_packets: scalar.count(columns.firewall_dropped_sent_packets)?,
+            dropped_received_packets: scalar.count(columns.firewall_dropped_received_packets)?,
+            drop_coverage: scalar.text(columns.firewall_drop_coverage)?,
+        },
+        connections: Connections {
+            status: scalar.text(columns.connections_status)?,
+            error: scalar.optional_text(columns.connections_error)?,
+            observed_at: scalar.optional_text(columns.connections_observed_at)?,
+            measurement_duration_ms: scalar
+                .optional_integer(columns.connections_measurement_duration_ms)?,
+            total: scalar.count(columns.connections_total)?,
+            tcp_established: scalar.count(columns.connections_tcp_established)?,
+            unreplied: scalar.count(columns.connections_unreplied)?,
+        },
+        tcp: Tcp {
+            status: scalar.text(columns.tcp_status)?,
+            error: scalar.optional_text(columns.tcp_error)?,
+            data_packets_sent: scalar.count(columns.tcp_data_packets_sent)?,
+            data_packets_received: scalar.count(columns.tcp_data_packets_received)?,
+            retransmission_observations_sent: scalar
+                .count(columns.tcp_retransmission_observations_sent)?,
+            retransmission_observations_received: scalar
+                .count(columns.tcp_retransmission_observations_received)?,
+            retransmission_percent_sent: scalar.real(columns.tcp_retransmission_percent_sent)?,
+            retransmission_percent_received: scalar
+                .real(columns.tcp_retransmission_percent_received)?,
+            window_decreases_host: scalar.count(columns.tcp_window_decreases_host)?,
+            window_decreases_peer: scalar.count(columns.tcp_window_decreases_peer)?,
+            zero_window_observations_host: scalar
+                .count(columns.tcp_zero_window_observations_host)?,
+            zero_window_observations_peer: scalar
+                .count(columns.tcp_zero_window_observations_peer)?,
+            zero_window_transitions_host: scalar.count(columns.tcp_zero_window_transitions_host)?,
+            zero_window_transitions_peer: scalar.count(columns.tcp_zero_window_transitions_peer)?,
+            advertised_window_min_bytes_host: scalar
+                .optional_integer(columns.tcp_advertised_window_min_bytes_host)?,
+            advertised_window_min_bytes_peer: scalar
+                .optional_integer(columns.tcp_advertised_window_min_bytes_peer)?,
+            rtt_remote: Timing {
+                samples: scalar.required_count(columns.tcp_rtt_remote_samples)?,
+                variation_pairs: scalar.required_count(columns.tcp_rtt_remote_variation_pairs)?,
+                p50_ms: scalar.real(columns.tcp_rtt_remote_p50_ms)?,
+                p95_ms: scalar.real(columns.tcp_rtt_remote_p95_ms)?,
+                min_ms: scalar.real(columns.tcp_rtt_remote_min_ms)?,
+                max_ms: scalar.real(columns.tcp_rtt_remote_max_ms)?,
+                variation_mean_ms: scalar.real(columns.tcp_rtt_remote_variation_mean_ms)?,
+            },
+            rtt_host: Timing {
+                samples: scalar.required_count(columns.tcp_rtt_host_samples)?,
+                variation_pairs: scalar.required_count(columns.tcp_rtt_host_variation_pairs)?,
+                p50_ms: scalar.real(columns.tcp_rtt_host_p50_ms)?,
+                p95_ms: scalar.real(columns.tcp_rtt_host_p95_ms)?,
+                min_ms: scalar.real(columns.tcp_rtt_host_min_ms)?,
+                max_ms: scalar.real(columns.tcp_rtt_host_max_ms)?,
+                variation_mean_ms: scalar.real(columns.tcp_rtt_host_variation_mean_ms)?,
+            },
+        },
+        dns: Dns {
+            status: scalar.text(columns.dns_status)?,
+            error: scalar.optional_text(columns.dns_error)?,
+            requests: scalar.count(columns.dns_requests)?,
+            responses: scalar.count(columns.dns_responses)?,
+            unanswered: scalar.count(columns.dns_unanswered)?,
+            pending_at_close: scalar.count(columns.dns_pending_at_close)?,
+            servfail_responses: scalar.count(columns.dns_servfail_responses)?,
+            refused_responses: scalar.count(columns.dns_refused_responses)?,
+            excluded_observations: scalar.count(columns.dns_excluded_observations)?,
+            response_time_p50_ms: scalar.real(columns.dns_response_time_p50_ms)?,
+            response_time_p95_ms: scalar.real(columns.dns_response_time_p95_ms)?,
+            response_time_variation_mean_ms: scalar
+                .real(columns.dns_response_time_variation_mean_ms)?,
+            unanswered_percent: scalar.real(columns.dns_unanswered_percent)?,
+        },
+        experience: Experience {
+            algorithm: scalar.text(columns.experience_algorithm)?,
+            score: scalar.optional_integer(columns.experience_score)?,
+            level: scalar.text(columns.experience_level)?,
+            status: scalar.text(columns.experience_status)?,
+            confidence: scalar.text(columns.experience_confidence)?,
+            basis_seconds: scalar.integer(columns.experience_basis_seconds)?,
+            components: scalar.explanation(columns.experience_components)?,
+            reasons: scalar.explanation(columns.experience_reasons)?,
+        },
+        coverage: Coverage {
+            complete: scalar.boolean(columns.coverage_complete)?,
+            reasons,
+            traffic: scalar.text(columns.coverage_traffic)?,
+            firewall: scalar.text(columns.coverage_firewall)?,
+            tcp: scalar.text(columns.coverage_tcp)?,
+            dns: scalar.text(columns.coverage_dns)?,
+            connections: scalar.text(columns.coverage_connections)?,
+        },
+    };
+    validate_sample(&sample)?;
+    Ok(sample)
 }
 
 fn decode_metric(value: rusqlite::types::Value, column: &Column) -> Result<Value> {
@@ -1586,69 +2104,100 @@ struct EncodedSample {
     coverage_reasons: Vec<String>,
 }
 
+fn validate_sample(sample: &Sample) -> Result<()> {
+    ensure!(
+        [
+            sample.traffic.sent_bps,
+            sample.traffic.received_bps,
+            sample.tcp.retransmission_percent_sent,
+            sample.tcp.retransmission_percent_received,
+            sample.tcp.rtt_remote.p50_ms,
+            sample.tcp.rtt_remote.p95_ms,
+            sample.tcp.rtt_remote.min_ms,
+            sample.tcp.rtt_remote.max_ms,
+            sample.tcp.rtt_remote.variation_mean_ms,
+            sample.tcp.rtt_host.p50_ms,
+            sample.tcp.rtt_host.p95_ms,
+            sample.tcp.rtt_host.min_ms,
+            sample.tcp.rtt_host.max_ms,
+            sample.tcp.rtt_host.variation_mean_ms,
+            sample.dns.response_time_p50_ms,
+            sample.dns.response_time_p95_ms,
+            sample.dns.response_time_variation_mean_ms,
+            sample.dns.unanswered_percent,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|v| v.is_finite() && v >= 0.0),
+        "nonfinite or negative experience metric"
+    );
+    ensure!(
+        sample
+            .experience
+            .components
+            .iter()
+            .all(|c| c.value.is_finite() && c.value >= 0.0 && c.score <= 100),
+        "invalid score contributor"
+    );
+    ensure!(
+        sample.experience.components.len() <= 16 && sample.experience.reasons.len() <= 32,
+        "oversized experience explanation"
+    );
+    for component in &sample.experience.components {
+        bounded_text(&component.code, 64)?;
+        bounded_text(&component.unit, 32)?;
+    }
+    for reason in &sample.experience.reasons {
+        bounded_text(reason, 128)?;
+    }
+    ensure!(
+        sample.experience.score.is_none_or(|score| score <= 100)
+            && sample.experience.basis_seconds <= 60,
+        "invalid experience score or basis"
+    );
+    ensure!(
+        !sample.coverage.complete || sample.measured_duration_ms > 0,
+        "complete coverage requires a positive measured duration"
+    );
+    ensure!(
+        sample.start_at.timestamp_subsec_nanos() % 1_000_000 == 0
+            && sample.end_at.timestamp_subsec_nanos() % 1_000_000 == 0,
+        "collection labels must use exact millisecond precision"
+    );
+    bounded_text(&sample.observation_epoch, 128)?;
+    bounded_text(&sample.configured_host_id, 255)?;
+    bounded_text(&sample.configured_name, 255)?;
+    bounded_text(&sample.configuration_revision, 64)?;
+    if let Some(interface) = &sample.interface {
+        bounded_text(&interface.name, 15)?;
+        bounded_text(&interface.kind, 32)?;
+        ensure!(interface.index > 0, "invalid interface index");
+        ensure!(
+            interface.vlan_id.is_none_or(|id| (1..=4094).contains(&id)),
+            "invalid VLAN ID"
+        );
+    }
+    ensure!(
+        sample.measured_duration_ms <= (2 * INTERVAL_MS) as u64,
+        "invalid measured duration"
+    );
+    ensure!(
+        sample.coverage.reasons.len() <= 32,
+        "too many coverage reasons"
+    );
+    let mut reasons = BTreeSet::new();
+    for reason in &sample.coverage.reasons {
+        bounded_text(reason, 128)?;
+        ensure!(reasons.insert(reason), "duplicate coverage reason");
+    }
+    Ok(())
+}
+
 impl EncodedSample {
     fn new(sample: &Sample, start_ms: i64, end_ms: i64) -> Result<Self> {
-        ensure!(
-            [
-                sample.traffic.sent_bps,
-                sample.traffic.received_bps,
-                sample.tcp.retransmission_percent_sent,
-                sample.tcp.retransmission_percent_received,
-                sample.tcp.rtt_remote.p50_ms,
-                sample.tcp.rtt_remote.p95_ms,
-                sample.tcp.rtt_remote.min_ms,
-                sample.tcp.rtt_remote.max_ms,
-                sample.tcp.rtt_remote.variation_mean_ms,
-                sample.tcp.rtt_host.p50_ms,
-                sample.tcp.rtt_host.p95_ms,
-                sample.tcp.rtt_host.min_ms,
-                sample.tcp.rtt_host.max_ms,
-                sample.tcp.rtt_host.variation_mean_ms,
-                sample.dns.response_time_p50_ms,
-                sample.dns.response_time_p95_ms,
-                sample.dns.response_time_variation_mean_ms,
-                sample.dns.unanswered_percent,
-            ]
-            .into_iter()
-            .flatten()
-            .all(|v| v.is_finite() && v >= 0.0),
-            "nonfinite or negative experience metric"
-        );
-        ensure!(
-            sample
-                .experience
-                .components
-                .iter()
-                .all(|c| c.value.is_finite() && c.value >= 0.0 && c.score <= 100),
-            "invalid score contributor"
-        );
-        ensure!(
-            sample.experience.components.len() <= 16 && sample.experience.reasons.len() <= 32,
-            "oversized experience explanation"
-        );
-        for component in &sample.experience.components {
-            bounded_text(&component.code, 64)?;
-            bounded_text(&component.unit, 32)?;
-        }
-        for reason in &sample.experience.reasons {
-            bounded_text(reason, 128)?;
-        }
-        ensure!(
-            sample.experience.score.is_none_or(|score| score <= 100)
-                && sample.experience.basis_seconds <= 60,
-            "invalid experience score or basis"
-        );
-        ensure!(
-            !sample.coverage.complete || sample.measured_duration_ms > 0,
-            "complete coverage requires a positive measured duration"
-        );
+        validate_sample(sample)?;
         let value = serde_json::to_value(sample)?;
         validate_projection(&value, "")?;
-        ensure!(
-            sample.start_at.timestamp_subsec_nanos() % 1_000_000 == 0
-                && sample.end_at.timestamp_subsec_nanos() % 1_000_000 == 0,
-            "collection labels must use exact millisecond precision"
-        );
         let text = |path: &str, max| -> Result<String> {
             let result = get(&value, path)
                 .and_then(Value::as_str)
@@ -2080,6 +2629,213 @@ mod tests {
             .reader
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn hourly_summaries_pin_rows_and_expire_when_the_first_bucket_leaves_retention() {
+        let directory = TestDirectory::new();
+        let mut store = directory.open(BASE);
+        let address = "192.0.2.1".parse().unwrap();
+        for index in 1..=2 {
+            let end = BASE + index * INTERVAL_MS;
+            insert(
+                &mut store,
+                &format!("bucket-{index}"),
+                end,
+                &[sample("192.0.2.1", end)],
+            );
+        }
+        let now = BASE + 3 * INTERVAL_MS;
+        let window = store.summary_window(now).unwrap();
+        insert(&mut store, "later", now, &[sample("192.0.2.1", now)]);
+        let page = store.summaries(&[address], &window, now).unwrap();
+        assert_eq!(page[0]["observed_slots"], 2);
+        assert_eq!(page[0]["traffic"]["sent_bytes"]["total"], "6");
+        assert_eq!(page[0]["experience"]["missing"]["slots"], 358);
+        assert!(!page[0]["coverage_complete"].as_bool().unwrap());
+        let expired = store
+            .summaries(&[address], &window, BASE + INTERVAL_MS + RETENTION_MS)
+            .unwrap_err();
+        assert!(matches!(
+            expired.downcast_ref::<CursorError>(),
+            Some(CursorError::Expired)
+        ));
+    }
+
+    #[test]
+    fn empty_summary_snapshot_does_not_acquire_new_rows_or_fabricate_zero_counts() {
+        let directory = TestDirectory::new();
+        let mut store = directory.open(BASE);
+        let window = store.summary_window(BASE).unwrap();
+        let end = BASE + INTERVAL_MS;
+        insert(&mut store, "new", end, &[sample("192.0.2.1", end)]);
+        let address = "192.0.2.1".parse().unwrap();
+        let page = store.summaries(&[address], &window, end).unwrap();
+        assert_eq!(page[0]["observed_slots"], 0);
+        assert!(page[0]["traffic"]["sent_bytes"]["total"].is_null());
+        assert!(store.summaries(&[address, address], &window, end).is_err());
+    }
+
+    #[test]
+    fn dense_hourly_page_obeys_read_and_response_bounds() {
+        let directory = TestDirectory::new();
+        let mut store = directory.open(BASE);
+        let addresses: Vec<IpAddr> = (1..=64)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, i)))
+            .collect();
+        for slot in 1..=360 {
+            let end = BASE + slot * INTERVAL_MS;
+            let samples = addresses
+                .iter()
+                .map(|ip| sample(&ip.to_string(), end))
+                .collect::<Vec<_>>();
+            insert(&mut store, &format!("dense-{slot}"), end, &samples);
+        }
+        let now = BASE + RETENTION_MS;
+        let window = store.summary_window(now).unwrap();
+        let page = store.summaries(&addresses, &window, now).unwrap();
+        assert_eq!(page.len(), 64);
+        for summary in &page {
+            assert_eq!(summary["observed_slots"], 360);
+            assert_eq!(summary["traffic"]["sent_bytes"]["total"], "1080");
+            assert_eq!(summary["traffic"]["received_bytes"]["total"], "1440");
+            assert!(summary["coverage_complete"].as_bool().unwrap());
+            assert!(summary["tcp"]["rtt_remote"]["p95_ms"].is_null());
+        }
+        assert!(serde_json::to_vec(&page).unwrap().len() < 4 * 1024 * 1024);
+        let excess: Vec<_> = (1..=65)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, i)))
+            .collect();
+        assert!(store.summaries(&excess, &window, now).is_err());
+    }
+
+    #[test]
+    fn summary_decoder_roundtrips_complete_projection_and_rejects_corrupt_scalars() {
+        use netcontrol_core::experience::{
+            Activity, Component, Confidence, Connections, Dns, Experience, ExperienceLevel,
+            ExperienceStatus, Firewall, SourceStatus, Tcp, Timing,
+        };
+        let directory = TestDirectory::new();
+        let mut store = directory.open(BASE);
+        let end = BASE + INTERVAL_MS;
+        let mut item = sample("2001:db8::20", end);
+        item.activity = Activity::Active;
+        item.last_seen_at = Some(timestamp_literal(end - 125).unwrap().parse().unwrap());
+        item.traffic = Traffic::measured(u64::MAX, 0, u64::MAX, 0, INTERVAL_MS as u64);
+        item.firewall = Firewall {
+            status: SourceStatus::Partial,
+            error: Some("synthetic firewall counter subset".into()),
+            dropped_sent_packets: Some(Count(0)),
+            dropped_received_packets: Some(Count(2)),
+            drop_coverage: "managed_nftables_only".into(),
+        };
+        item.connections = Connections {
+            status: SourceStatus::Partial,
+            error: Some("synthetic conntrack snapshot subset".into()),
+            observed_at: Some(timestamp_literal(end - 250).unwrap().parse().unwrap()),
+            measurement_duration_ms: Some(500),
+            total: Some(Count(u64::MAX)),
+            tcp_established: Some(Count(0)),
+            unreplied: None,
+        };
+        item.tcp = Tcp {
+            status: SourceStatus::Available,
+            error: None,
+            data_packets_sent: Some(Count(100)),
+            data_packets_received: Some(Count(200)),
+            retransmission_observations_sent: Some(Count(3)),
+            retransmission_observations_received: Some(Count(0)),
+            retransmission_percent_sent: Some(3.0),
+            retransmission_percent_received: Some(0.0),
+            window_decreases_host: Some(Count(1)),
+            window_decreases_peer: Some(Count(2)),
+            zero_window_observations_host: Some(Count(0)),
+            zero_window_observations_peer: Some(Count(4)),
+            zero_window_transitions_host: Some(Count(0)),
+            zero_window_transitions_peer: Some(Count(1)),
+            advertised_window_min_bytes_host: Some(0),
+            advertised_window_min_bytes_peer: None,
+            rtt_remote: Timing {
+                samples: Count(4),
+                variation_pairs: Count(3),
+                p50_ms: Some(20.0),
+                p95_ms: Some(40.0),
+                min_ms: Some(10.0),
+                max_ms: Some(40.0),
+                variation_mean_ms: Some(10.0),
+            },
+            rtt_host: Timing {
+                samples: Count(2),
+                variation_pairs: Count(0),
+                p50_ms: Some(0.0),
+                p95_ms: Some(5.0),
+                min_ms: Some(0.0),
+                max_ms: Some(5.0),
+                variation_mean_ms: None,
+            },
+        };
+        item.dns = Dns {
+            status: SourceStatus::Available,
+            error: None,
+            requests: Some(Count(10)),
+            responses: Some(Count(7)),
+            unanswered: Some(Count(2)),
+            pending_at_close: Some(Count(1)),
+            servfail_responses: Some(Count(1)),
+            refused_responses: Some(Count(0)),
+            excluded_observations: Some(Count(3)),
+            response_time_p50_ms: Some(12.0),
+            response_time_p95_ms: Some(25.0),
+            response_time_variation_mean_ms: Some(7.0),
+            unanswered_percent: Some(200.0 / 9.0),
+        };
+        item.experience = Experience {
+            algorithm: netcontrol_core::experience::ALGORITHM.into(),
+            score: Some(60),
+            level: ExperienceLevel::Fair,
+            status: ExperienceStatus::Rated,
+            confidence: Confidence::Limited,
+            basis_seconds: 60,
+            components: vec![Component {
+                code: "tcp_repeats_sent".into(),
+                score: 60,
+                value: 3.0,
+                unit: "percent".into(),
+                samples: Count(100),
+            }],
+            reasons: vec!["tcp_repeats_sent".into()],
+        };
+        item.coverage.reasons = vec!["conntrack_partial".into()];
+        item.coverage.firewall = "partial".into();
+        item.coverage.tcp = "complete".into();
+        item.coverage.dns = "complete".into();
+        item.coverage.connections = "partial".into();
+        insert(&mut store, "summary-projection", end, &[item.clone()]);
+        let columns = SummaryColumns::new().unwrap();
+        let decode = || -> Result<Sample> {
+            let tx = store.reader.unchecked_transaction()?;
+            let mut statement = tx.prepare(&select_sql())?;
+            let mut reasons = tx.prepare_cached(
+                "SELECT reason FROM coverage_reasons WHERE sample_id=?1 ORDER BY position LIMIT 33",
+            )?;
+            let mut rows = statement.query([])?;
+            let row = rows.next()?.context("missing summary projection fixture")?;
+            read_summary_sample(row, &columns, &mut reasons)
+        };
+        let decoded = decode().unwrap();
+        assert_eq!(decoded, item);
+        let mut accumulator =
+            netcontrol_core::experience_summary::Accumulator::new(end - RETENTION_MS, end).unwrap();
+        accumulator.push(&decoded).unwrap();
+        store
+            .writer
+            .execute("UPDATE host_samples SET tcp_rtt_host_max_ms=-1.0", [])
+            .unwrap();
+        let error = decode().unwrap_err();
+        assert!(
+            error.to_string().contains("invalid finite metric"),
+            "{error:#}"
+        );
     }
 
     #[test]

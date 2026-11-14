@@ -1234,7 +1234,9 @@ fn api(
     }
     if matches!(
         path,
-        "/api/v1/statistics/host-experience/latest" | "/api/v1/statistics/host-experience/history"
+        "/api/v1/statistics/host-experience/latest"
+            | "/api/v1/statistics/host-experience/history"
+            | "/api/v1/statistics/host-experience/summary"
     ) {
         if !credential
             .permissions
@@ -1255,6 +1257,8 @@ fn api(
         }
         let validation = if path.ends_with("/latest") {
             netcontrol_core::experience::LatestQuery::parse(query).map(|_| ())
+        } else if path.ends_with("/summary") {
+            netcontrol_core::experience::LatestQuery::parse_summary(query).map(|_| ())
         } else {
             netcontrol_core::experience::HistoryQuery::parse(query).map(|_| ())
         };
@@ -1306,7 +1310,7 @@ fn api(
                     Ok(_) => {
                         return fail(
                             503,
-                            "protected-host response exceeds 4 MiB; reduce latest page size or inspect collector diagnostics",
+                            "protected-host response exceeds 4 MiB; reduce page size or inspect collector diagnostics",
                             true,
                         );
                     }

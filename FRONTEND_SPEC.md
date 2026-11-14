@@ -356,6 +356,7 @@ Both routes require authenticated `state.read`, no body, and return no-store
 | --- | --- | --- |
 | `GET /api/v1/statistics/host-experience/latest` | Optional canonical `address`, existing managed-LAN `interface`, canonical `limit` 1..256 (default 100), opaque `cursor` <=1024 bytes | Current eligible host rows; one pinned completed collection, numeric IP ordering, `next_cursor:string|null` |
 | `GET /api/v1/statistics/host-experience/history` | Required canonical `address` only | Exactly 360 chronological ten-second observed/missing slots; at most one hour, no pagination |
+| `GET /api/v1/statistics/host-experience/summary` | Optional canonical `address`, managed-LAN `interface`, canonical `limit` 1..64 (default 25), opaque `cursor` <=2048 bytes | One pinned rolling-hour summary per currently eligible IP; numeric IP ordering and `next_cursor:string|null` |
 
 Common fields: `kind`, `interval_seconds:10`, `retention_seconds:3600`,
 `collection_id:string|null`, `collected_at:string|null`, `age_ms:number|null`,
@@ -419,6 +420,50 @@ History returns `host`, aligned `window:{start_at,end_at}`, `expected_slots:360`
 `{start_at,end_at,status:observed|missing,sample}`. Missing is null, not zero.
 Removed-IP history retains its configured name and `currently_protected:false`
 until expiry. Never relabel an old sample to a new owner/interface.
+
+Summary uses the same authenticated `state.read`, no-body GET, four-read admission
+and 4 MiB response ceiling. It does not change `/latest`, scoring, collection
+cadence or persisted samples. Its common envelope has `kind:"summary"`,
+`window:{start_at,end_at}` (exactly 3600 seconds; endpoints aligned to ten
+seconds), `snapshot_at`, page-local `coverage_complete`, `eligible_hosts`,
+`collector_scope:"latest_collection"`, current host identity/metadata rows with
+`summary` instead of `sample`, and `next_cursor`. Collector diagnostics remain
+those of the pinned latest collection, not hourly totals.
+
+Each summary has slot/source coverage, observation/identity discontinuities,
+last-seen/sample timestamps, exact observed traffic/drop/TCP/DNS totals,
+duration-weighted traffic rates, pooled TCP-repeat/DNS-unanswered percentages,
+RTT counts/extrema/pair-weighted variation and freshness. Counters are objects
+with nullable decimal-string `total`, numeric observed/complete slot counts and
+measured duration, and nullable `last_observed_at`. Totals may exceed `u64`;
+retain strings or use arbitrary-precision integers. Ratios expose their exact
+decimal-string numerator/denominator; zero denominator yields null percentage.
+Source diagnostics distinguish available, partial, not-observed and unavailable
+slots. Missing periods are neither zero traffic nor good experience.
+
+`experience` provides durations/slots for rated, idle, insufficient-data,
+incomplete, unavailable and missing periods, rated-level durations, worst rated
+level, bounded reason frequencies, and nullable
+`last_rated:{sample_at,experience,is_last_observed_slot}`. Label it historical:
+it is not a current or averaged hourly score. Show coverage and identity-change
+warnings; IP totals may span different configured owners/attachments.
+Hourly RTT p50/p95 and DNS timing percentiles/variation are null with explicit
+unavailability reasons because distributions/weights are not retained. Never
+average bucket percentiles. Connection gauges are not summed; use `/latest` for
+current connections and `/history` for individual measurements.
+
+Follow summary cursors sequentially with unchanged filters/limit; their rolling
+window, upper collection, oldest retained collection and eligible identities
+are pinned. Newly published buckets do not enter later pages. When pruning
+expires any part of the pinned window, return `409`; restart the whole summary
+listing rather than mixing pages. Summary reads reject clock discontinuities
+with `503`; raw history remains the diagnostic view. Before storage is ready,
+summary is `503`; an initialized store with no completed collection returns
+`200` starting and unobserved summaries. No matching eligible IPs is an empty
+list. Use this endpoint for an explicitly labeled **1-hour observed experience**
+table, not one history request per host per live refresh.
+See the [full summary contract](docs/PROTECTED_HOST_EXPERIENCE_SPEC.md#821-one-hour-per-ip-summaries)
+and [required frontend handoff](docs/frontend-handoffs/2026-11-14.md#2026-11-14-07-one-hour-experience-summaries).
 
 Errors: `401`/`403` authentication/scope, `405` method, `400` body or invalid/
 duplicate/noncanonical/unknown query/cursor, `404` unknown interface or absent

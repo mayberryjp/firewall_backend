@@ -801,6 +801,17 @@ pub fn canonical_address(value: &str) -> Result<IpAddr> {
 }
 impl LatestQuery {
     pub fn parse(query: &str) -> Result<Self> {
+        Self::parse_limits(query, 100, 256, 1024)
+    }
+    pub fn parse_summary(query: &str) -> Result<Self> {
+        Self::parse_limits(query, 25, 64, 2048)
+    }
+    fn parse_limits(
+        query: &str,
+        default_limit: usize,
+        maximum: usize,
+        cursor_limit: usize,
+    ) -> Result<Self> {
         ensure!(query.len() <= 4096, "experience query exceeds 4096 bytes");
         let parameters: LatestParameters = serde_urlencoded::from_str(query)?;
         let address = parameters
@@ -811,12 +822,12 @@ impl LatestQuery {
         let limit = if let Some(value) = parameters.limit {
             let limit: usize = value.parse()?;
             ensure!(
-                (1..=256).contains(&limit) && limit.to_string() == value,
-                "limit must be canonical integer 1..256"
+                (1..=maximum).contains(&limit) && limit.to_string() == value,
+                "limit must be canonical integer 1..{maximum}"
             );
             limit
         } else {
-            100
+            default_limit
         };
         if let Some(interface) = &parameters.interface {
             ensure!(
@@ -831,7 +842,7 @@ impl LatestQuery {
         if let Some(cursor) = &parameters.cursor {
             ensure!(
                 !cursor.is_empty()
-                    && cursor.len() <= 1024
+                    && cursor.len() <= cursor_limit
                     && cursor.bytes().all(|b| b.is_ascii_graphic()),
                 "invalid cursor"
             );
@@ -901,6 +912,16 @@ mod tests {
             assert!(LatestQuery::parse(query).is_err(), "{query}");
         }
         assert!(HistoryQuery::parse("address=192.0.2.1&limit=1").is_err());
+        assert_eq!(LatestQuery::parse_summary("").unwrap().limit, 25);
+        assert_eq!(LatestQuery::parse_summary("limit=64").unwrap().limit, 64);
+        for query in [
+            "limit=65",
+            "limit=00",
+            "period=1h",
+            "address=192.0.2.1&address=192.0.2.2",
+        ] {
+            assert!(LatestQuery::parse_summary(query).is_err(), "{query}");
+        }
     }
     #[test]
     fn idle_gap_and_absence_are_not_excellent() {

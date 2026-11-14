@@ -228,8 +228,8 @@ client-visible DNS after DNAT, including port 53 rewritten to another port.
 Intentionally blocked attempts remain visible in traffic/drop counters but do
 not become transport retransmission/unanswered penalties.
 
-- Bind observation to relevant logical LAN links; admit only eligible host
-  traffic and the required TCP/ordinary-DNS forms in the kernel filter.
+- Bind observation to relevant logical LAN links; kernel-filter the required
+  TCP/ordinary-DNS forms and validate exact eligible host identity before analysis.
 - Observe host ingress and host egress for exchange correlation. The existing
   diagnostics collector's outgoing exclusion stays unchanged for its own scope.
   Share parsing/socket lifecycle primitives where appropriate; do not globally
@@ -716,6 +716,130 @@ historical metrics.
 
 Use `/latest` for the table every ten seconds and `/history` only for a selected
 row/graph; do not fetch all hosts' hour histories on every table refresh.
+
+### 8.2.1 One-hour per-IP summaries
+
+`GET /api/v1/statistics/host-experience/summary`
+
+Additive read-only API: authenticated `state.read`, no body. Optional canonical
+`address`, existing managed-LAN `interface`, canonical `limit` 1..64 (default
+25), opaque `cursor` <=2048 bytes. Strict unknown/duplicate/canonical validation
+matches latest. Four shared concurrent reads, the existing storage read deadline
+and 4 MiB response ceiling apply. SQL is streamed per address in one page
+transaction; no all-host history array, probes, rescore or persisted-schema
+change. A timeout/storage failure returns an explicit error, not partial success.
+
+Common envelope plus:
+
+- `kind:"summary"`, `window:{start_at,end_at}`: exactly one trailing hour with
+  ten-second UTC-aligned endpoints, not a civil-clock-hour report.
+- `snapshot_at`: first page's snapshot time; `collection_id`/`collected_at`
+  identify the pinned latest completed collection.
+- `coverage_complete`: whether this page's nonempty host list has full nominal
+  hour coverage. `eligible_hosts` is the number matching current filters, not
+  the number on this page.
+- `collector_scope:"latest_collection"`: common collector diagnostics are
+  interval diagnostics from that collection, not aggregated hourly counts.
+- `hosts[]`: current eligible identity/metadata wrapper, with `summary` rather
+  than `sample`/`retained_usage`; `next_cursor:string|null`.
+
+Pin filters, limit, eligible identity/attachment fingerprint, upper collection
+and oldest retained collection across pages. Rows committed after the first
+page never enter its window, even if their labels fall inside it. An expired
+oldest/upper collection, changed eligible identity or expired cursor is `409`;
+restart the whole listing. Invalid/filter-mismatched/cross-endpoint tokens are
+`400`. Do not silently change windows or retain an expired hour for paging.
+Summary rejects a retained clock discontinuity with `503`; use raw history for
+those explicit anchors. Initializing storage is `503`; initialized empty storage
+returns `200` starting with genuinely unobserved summaries. An unmatched eligible
+filter returns `hosts:[]`. Other authorization/method/body/interface/capacity
+errors retain the common contract.
+
+#### Summary fields and aggregation
+
+All UTC timestamps below are nullable unless stated otherwise. Counts are exact
+canonical decimal strings, including sums above `u64`; slot counts/durations are
+bounded JSON numbers. Null is unobserved, not zero. The fixed window is not a
+guarantee that all sources or the host existed for the full hour.
+
+Reusable structures:
+
+| Structure | Fields |
+| --- | --- |
+| Counter | `total:string|null`, `observed_slots`, `complete_slots`, `measured_duration_ms`, `last_observed_at` |
+| Ratio | `numerator:string|null`, `denominator:string|null`, `percent:number|null`, `observed_slots`, `complete_slots`, `last_observed_at` |
+| Duration | `slots`, `seconds` |
+| Source | `available_slots`, `partial_slots`, `not_observed_slots`, `unavailable_slots`, `observed_slots`, `complete_slots`, `observed_seconds`, `complete_seconds`, `observed_duration_ms`, `complete_duration_ms`, `last_observed_at` |
+| RTT | `samples:string|null`, `variation_pairs:string|null`, `variation_mean_ms:number|null`, `min_ms:number|null`, `max_ms:number|null`, `p50_ms:null`, `p95_ms:null`, `percentile_unavailable_reason`, `observed_slots`, `complete_slots`, `last_observed_at` |
+
+Counter `complete_slots` counts source-available observations independently of
+overall capture coverage; always render it alongside `sources` and the summary
+coverage flag. TCP ratio denominators require valid paired counters; DNS ratio
+denominators additionally require available DNS source status.
+
+Per-host `summary`:
+
+- Nonnull `start_at`/`end_at`, `expected_slots:360`, `observed_slots`,
+  `complete_slots`, `observed_seconds`, `coverage_complete`.
+  Slot durations use nominal ten-second intervals; measured durations remain
+  separate and support actual snapshot skew. No overlapping/duplicate slots.
+- `first_sample_at` (first interval start), `last_sample_at` (last interval end),
+  `last_seen_at`; `observation_epochs`, `epoch_discontinuities`,
+  `identity_changed`, `identity_changes:{host_id,interface,configured_identity}`.
+  Full coverage requires contiguous complete slots and stable identity/epoch.
+  Aggregated IP observations across identities are not one physical device's
+  lifetime history; the current wrapper does not relabel the original evidence.
+- `sources:{traffic,firewall,tcp,dns,connections}`: Source objects. Availability
+  and source-qualified completeness stay distinct from observed counts.
+- `traffic:{sent_packets,received_packets,sent_bytes,received_bytes}`: Counters;
+  `sent_bps`/`received_bps` are bytes divided by their measured durations, not
+  averages of rates or zeros for missing intervals. `packet_unit`/`byte_unit`
+  retain host-perspective kernel-L3/IP-layer units.
+- `firewall:{dropped_sent_packets,dropped_received_packets}`: Counters;
+  `drop_coverage:"managed_nftables_only"`. Never apply an hourly score penalty.
+- `tcp:{data_packets_sent,data_packets_received,
+  retransmission_observations_sent,retransmission_observations_received}`:
+  Counters. `retransmission_sent`/`retransmission_received` are Ratios over rows
+  with valid paired repeat/data counters; missing repeat evidence must not be
+  diluted by unrelated data counts. `rtt_remote`/`rtt_host` are RTT objects.
+- `dns:{requests,responses,unanswered,servfail_responses,refused_responses,
+  excluded_observations}`: Counters. `unanswered_ratio` pools valid available
+  response/unanswered pairs; requests still pending are not finalized failures.
+  `pending_at_close`, `pending_at_close_at` and
+  `pending_at_close_is_last_observed_slot` retain the last observed gauge,
+  not its sum. `response_time_p50_ms`, `response_time_p95_ms` and
+  `response_time_variation_mean_ms` are null with `timing_unavailable_reason`.
+- `experience:{rated,idle,insufficient_data,incomplete,unavailable,missing}`:
+  Duration objects; `rated_levels:{excellent,good,fair,poor}` likewise.
+  `worst_rated_level` is nullable. `last_rated` is null or
+  `{sample_at,experience,is_last_observed_slot}` holding the original stored
+  Experience, including its algorithm/components/reasons. It is historical,
+  not a new hourly/current score. `reason_frequencies` maps reason codes to
+  observed-bucket counts, deduplicating each bucket's experience/coverage reasons
+  (for example `{"capture_gap":2}`). It is bounded to 32 distinct codes;
+  `reason_frequencies_truncated` explicitly reports omitted codes.
+
+RTT counts/extrema pool usable retained timings. Variation is weighted by each
+stored `variation_pairs`, not bucket count; existing same-flow pairs can bridge
+bucket boundaries. Histograms are not persisted: hourly p50/p95 cannot be
+reconstructed. DNS also lacks persisted timing sample/extrema/pair weights.
+Never average bucket percentiles or report a fabricated hourly DNS variation.
+Connection gauges and per-sample window minima are not summed; use latest/raw
+history for those individual observations.
+
+Synthetic counter excerpt (not a full response or deployed measurement):
+
+```json
+{
+  "sent_bytes": {
+    "total": "18446744073709551616",
+    "observed_slots": 2,
+    "complete_slots": 2,
+    "measured_duration_ms": 20000,
+    "last_observed_at": "2026-11-14T01:00:00Z"
+  }
+}
+```
 
 ### 8.3 Sample shape and units
 

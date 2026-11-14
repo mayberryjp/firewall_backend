@@ -106,8 +106,23 @@ async fn host_experience_authentication_contract_and_unsupported_mode() {
     let f = Fixture::new();
     let latest = "/api/v1/statistics/host-experience/latest";
     let history = "/api/v1/statistics/host-experience/history";
+    let summary = "/api/v1/statistics/host-experience/summary";
     assert_eq!(f.get(latest, "").await.0, 401);
     assert_eq!(f.get(latest, "synthetic-operator").await.0, 403);
+    assert_eq!(f.get(summary, "").await.0, 401);
+    assert_eq!(f.get(summary, "synthetic-operator").await.0, 403);
+    assert_eq!(
+        f.request("POST", summary, json!({}), "synthetic-reader")
+            .await
+            .0,
+        405
+    );
+    assert_eq!(
+        f.request("GET", summary, Value::Null, "synthetic-reader")
+            .await
+            .0,
+        400
+    );
     assert_eq!(
         f.request("POST", latest, json!({}), "synthetic-reader")
             .await
@@ -127,11 +142,18 @@ async fn host_experience_authentication_contract_and_unsupported_mode() {
         format!("{latest}?limit=1&limit=1"),
         history.into(),
         format!("{history}?address=192.0.2.20&interface=lan0"),
+        format!("{summary}?limit=65"),
+        format!("{summary}?period=1h"),
+        format!("{summary}?limit=1&limit=1"),
     ] {
         let reply = f.get(&path, "synthetic-reader").await;
         assert_eq!(reply.0, 400, "{path}: {}", reply.1);
     }
-    for path in [latest.into(), format!("{history}?address=192.0.2.20")] {
+    for path in [
+        latest.into(),
+        format!("{history}?address=192.0.2.20"),
+        summary.into(),
+    ] {
         let reply = f.get(&path, "synthetic-reader").await;
         assert_eq!(reply.0, 503, "{path}: {}", reply.1);
         assert!(reply.1["error"].as_str().unwrap().contains("native"));
