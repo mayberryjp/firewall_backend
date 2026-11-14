@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Security
+
+- Restore terminal packet drops after protected-host drop accounting. The shared
+  accounting chain must drop both attributed and unattributed packets rather
+  than return into later rules or an accepting input policy. Real Linux ICMP/
+  ICMPv6 regression reproduced the bypass before this fix. No HTTP, configuration
+  or frontend schema change; next automatic calendar version.
+
 ### Changed
 
 - Make WireGuard DNS transport readiness asynchronous: validation/network

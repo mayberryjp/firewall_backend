@@ -131,7 +131,6 @@ fn matching(
         rule.with_expr(Immediate::new_verdict(VerdictKind::Jump {
             chain: super::experience_kernel::DROP_CHAIN.to_owned(),
         }))
-        .drop()
     } else if plan.action == "return" {
         rule.with_expr(Immediate::new_verdict(VerdictKind::Return))
     } else {

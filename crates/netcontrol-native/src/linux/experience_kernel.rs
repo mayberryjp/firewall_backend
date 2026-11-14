@@ -450,26 +450,31 @@ pub(super) fn drop_layout(
             ));
         }
     }
+    // Returning from a jump resumes at the next caller rule, not its next expression.
+    let drop = expr(
+        "immediate",
+        [n(1, 0), a(0x8002, &a(0x8002, &n(1, 0)))].concat(),
+    );
     for ipv6 in [false, true] {
         for sent in [true, false] {
-            let ret = expr(
-                "immediate",
-                [n(1, 0), a(0x8002, &a(0x8002, &n(1, (-5i32) as u32)))].concat(),
-            );
             rules.push(rule(
                 "netcontrol",
                 DROP_CHAIN,
-                [load_drop(ipv6, sent), ret].concat(),
+                [load_drop(ipv6, sent), drop.clone()].concat(),
             ));
         }
     }
     rules.push(rule(
         "netcontrol",
         DROP_CHAIN,
-        expr(
-            "counter",
-            [a(1, &0u64.to_be_bytes()), a(2, &0u64.to_be_bytes())].concat(),
-        ),
+        [
+            expr(
+                "counter",
+                [a(1, &0u64.to_be_bytes()), a(2, &0u64.to_be_bytes())].concat(),
+            ),
+            drop,
+        ]
+        .concat(),
     ));
     Ok((sets, rules))
 }
