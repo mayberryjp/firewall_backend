@@ -1,7 +1,7 @@
 //! One-hour summaries of retained samples, without reconstructing distributions or scores.
 use crate::experience::{
-    self, Count, Experience, ExperienceLevel, ExperienceStatus, InterfaceIdentity, Sample,
-    SourceStatus, Timing,
+    self, Connections, Count, Experience, ExperienceLevel, ExperienceStatus, InterfaceIdentity,
+    Sample, SourceStatus, Timing,
 };
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
@@ -14,6 +14,88 @@ const SLOT_MS: i64 = 10_000;
 const SLOTS: u32 = 360;
 const REASON_LIMIT: usize = 32;
 const PERCENTILE_REASON: &str = "per_bucket_distributions_not_retained";
+
+fn connection_values(snapshot: &Connections) -> Result<[Count; 3]> {
+    let values = [snapshot.total, snapshot.tcp_established, snapshot.unreplied];
+    let [Some(total), Some(established), Some(unreplied)] = values else {
+        anyhow::bail!("available connection snapshot lacks counts");
+    };
+    ensure!(
+        established.0 <= total.0 && unreplied.0 <= total.0,
+        "connection subtype count exceeds total"
+    );
+    ensure!(
+        snapshot.observed_at.is_some(),
+        "available connection snapshot lacks timestamp"
+    );
+    Ok([total, established, unreplied])
+}
+
+pub fn connection_snapshot(sample: Option<&Sample>, now_ms: i64) -> Result<Value> {
+    let Some(sample) = sample else {
+        let mut result = serde_json::to_value(Connections {
+            error: Some("no matching connection snapshot in pinned latest collection".into()),
+            ..Connections::default()
+        })?;
+        result["age_ms"] = Value::Null;
+        return Ok(result);
+    };
+    let snapshot = &sample.connections;
+    if snapshot.status == SourceStatus::Available {
+        connection_values(snapshot)?;
+    }
+    let age = snapshot
+        .observed_at
+        .map(|at| {
+            now_ms
+                .checked_sub(at.timestamp_millis())
+                .filter(|age| *age >= 0)
+                .ok_or_else(|| anyhow::anyhow!("connection snapshot timestamp is in the future"))
+        })
+        .transpose()?;
+    let mut result = serde_json::to_value(snapshot)?;
+    result["age_ms"] = json!(age);
+    if snapshot.status == SourceStatus::Available && age.is_some_and(|age| age > 30_000) {
+        result["status"] = json!("stale");
+    }
+    Ok(result)
+}
+
+#[derive(Default)]
+struct ConnectionAverage {
+    sums: [u128; 3],
+    observed_slots: u32,
+    first_observed_at: Option<DateTime<Utc>>,
+    last_observed_at: Option<DateTime<Utc>>,
+}
+impl ConnectionAverage {
+    fn push(&mut self, sample: &Sample, values: Option<[Count; 3]>) {
+        if let Some(values) = values {
+            for (sum, value) in self.sums.iter_mut().zip(values) {
+                *sum += u128::from(value.0);
+            }
+            self.observed_slots += 1;
+            if let Some(at) = sample.connections.observed_at {
+                self.first_observed_at.get_or_insert(at);
+                self.last_observed_at = Some(at);
+            }
+        }
+    }
+    fn json(&self) -> Value {
+        let mean = |sum: u128| {
+            (self.observed_slots > 0).then(|| sum as f64 / f64::from(self.observed_slots))
+        };
+        json!({
+            "total": mean(self.sums[0]),
+            "tcp_established": mean(self.sums[1]),
+            "unreplied": mean(self.sums[2]),
+            "observed_slots": self.observed_slots,
+            "coverage_seconds": self.observed_slots * 10,
+            "first_observed_at": self.first_observed_at,
+            "last_observed_at": self.last_observed_at,
+        })
+    }
+}
 
 #[derive(Default)]
 struct Total {
@@ -211,6 +293,7 @@ pub struct Accumulator {
     rtt: [TimingTotal; 2],
     dns: [Total; 6],
     dns_unanswered: Ratio,
+    connections: ConnectionAverage,
     pending_at_close: Option<Count>,
     pending_at_close_at: Option<DateTime<Utc>>,
     statuses: [StatusDuration; 5],
@@ -258,6 +341,7 @@ impl Accumulator {
             rtt: std::array::from_fn(|_| TimingTotal::default()),
             dns: std::array::from_fn(|_| Total::default()),
             dns_unanswered: Ratio::default(),
+            connections: ConnectionAverage::default(),
             pending_at_close: None,
             pending_at_close_at: None,
             statuses: std::array::from_fn(|_| StatusDuration::default()),
@@ -292,6 +376,11 @@ impl Accumulator {
             "mixed summary IP addresses"
         );
         validate(sample)?;
+        let connections = if sample.connections.status == SourceStatus::Available {
+            Some(connection_values(&sample.connections)?)
+        } else {
+            None
+        };
 
         self.address = Some(sample.ip_address);
         self.observed_slots += 1;
@@ -299,6 +388,7 @@ impl Accumulator {
         self.first_sample_at.get_or_insert(sample.start_at);
         self.last_sample_at = Some(sample.end_at);
         self.previous_end_ms = Some(end);
+        self.connections.push(sample, connections);
         if let Some(seen) = sample.last_seen_at {
             self.last_seen_at = Some(self.last_seen_at.map_or(seen, |old| old.max(seen)));
         }
@@ -471,6 +561,10 @@ impl Accumulator {
                 "traffic": self.sources[0].json(), "firewall": self.sources[1].json(),
                 "tcp": self.sources[2].json(), "dns": self.sources[3].json(),
                 "connections": self.sources[4].json(),
+            },
+            "connections": {
+                "current": null,
+                "average": self.connections.json(),
             },
             "traffic": {
                 "sent_packets": self.traffic[0].json(), "received_packets": self.traffic[1].json(),
@@ -911,6 +1005,75 @@ mod tests {
             excluded_observations: Some(0.into()),
             ..Dns::default()
         }
+    }
+
+    #[test]
+    fn connection_averages_exclude_missing_and_partial_snapshots() {
+        let mut accumulator = Accumulator::new(0, HOUR_MS).unwrap();
+        for (slot, (total, status, age)) in [
+            (10, SourceStatus::Available, 1000),
+            (30, SourceStatus::Available, 1000),
+            (1000, SourceStatus::Partial, 1000),
+            (1000, SourceStatus::Unavailable, 3000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = sample(u32::try_from(slot).unwrap());
+            row.connections = Connections {
+                status,
+                observed_at: Some(row.end_at - chrono::Duration::milliseconds(age)),
+                total: Some(Count(total)),
+                tcp_established: Some(Count(total / 2)),
+                unreplied: Some(Count(0)),
+                ..Connections::default()
+            };
+            accumulator.push(&row).unwrap();
+        }
+        accumulator.push(&sample(4)).unwrap();
+        let result = accumulator.finish().unwrap();
+        let average = &result["connections"]["average"];
+        assert_eq!(average["total"], 20.0);
+        assert_eq!(average["tcp_established"], 10.0);
+        assert_eq!(average["unreplied"], 0.0);
+        assert_eq!(average["observed_slots"], 2);
+        assert_eq!(average["coverage_seconds"], 20);
+
+        let mut empty = Accumulator::new(0, HOUR_MS).unwrap();
+        empty.push(&sample(0)).unwrap();
+        assert!(empty.finish().unwrap()["connections"]["average"]["total"].is_null());
+    }
+
+    #[test]
+    fn current_connections_preserve_zero_and_mark_old_snapshots_stale() {
+        let mut row = sample(0);
+        row.connections = Connections {
+            status: SourceStatus::Available,
+            observed_at: Some(row.end_at),
+            measurement_duration_ms: Some(50),
+            total: Some(Count(0)),
+            tcp_established: Some(Count(0)),
+            unreplied: Some(Count(0)),
+            ..Connections::default()
+        };
+        let current = connection_snapshot(Some(&row), 10_000).unwrap();
+        assert_eq!(current["total"], "0");
+        assert_eq!(current["status"], "available");
+        assert_eq!(current["age_ms"], 0);
+        assert_eq!(
+            connection_snapshot(Some(&row), 40_001).unwrap()["status"],
+            "stale"
+        );
+        assert!(connection_snapshot(None, 10_000).unwrap()["total"].is_null());
+        assert!(connection_snapshot(Some(&row), 9999).is_err());
+        let mut average = Accumulator::new(0, HOUR_MS).unwrap();
+        average.push(&row).unwrap();
+        assert_eq!(
+            average.finish().unwrap()["connections"]["average"]["total"],
+            0.0
+        );
+        row.connections.total = None;
+        assert!(connection_snapshot(Some(&row), 10_000).is_err());
     }
 
     #[test]

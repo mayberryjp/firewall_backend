@@ -449,8 +449,19 @@ it is not a current or averaged hourly score. Show coverage and identity-change
 warnings; IP totals may span different configured owners/attachments.
 Hourly RTT p50/p95 and DNS timing percentiles/variation are null with explicit
 unavailability reasons because distributions/weights are not retained. Never
-average bucket percentiles. Connection gauges are not summed; use `/latest` for
-current connections and `/history` for individual measurements.
+average bucket percentiles. `summary.connections.current` is the matching snapshot from the pinned latest
+collection, not an active query. Counts `total`, `tcp_established` and `unreplied`
+remain nullable decimal strings; `observed_at`, `measurement_duration_ms`,
+`age_ms`, `status` and `error` expose actual freshness. Available snapshots older
+than 30 seconds are marked stale; missing/changed-attachment snapshots are
+unavailable with null counts, never replaced by an older valid row.
+`summary.connections.average` provides nullable numeric means of those three
+gauges across available historical snapshots, with `observed_slots`,
+`coverage_seconds`, `first_observed_at` and `last_observed_at`. Each valid
+ten-second snapshot has equal weight; acquisition duration is not a weight.
+Partial/unavailable snapshots are excluded, missing is not zero, and no valid
+snapshots means null averages. Zero valid counts produce zero averages.
+Use `/latest` for live-only polling and `/history` for individual measurements.
 
 Follow summary cursors sequentially with unchanged filters/limit; their rolling
 window, upper collection, oldest retained collection and eligible identities

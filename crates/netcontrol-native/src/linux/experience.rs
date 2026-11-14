@@ -515,9 +515,13 @@ impl Manager {
                         }
                     })?;
                 let collection = match &window.last_collection {
-                    Some(id) => Some(store.collection_for_addresses(id, &[], now)?.ok_or_else(
-                        || error(409, "summary collection expired; restart summary paging"),
-                    )?),
+                    Some(id) => Some(
+                        store
+                            .collection_for_addresses(id, &addresses, now)?
+                            .ok_or_else(|| {
+                                error(409, "summary collection expired; restart summary paging")
+                            })?,
+                    ),
                     None => None,
                 };
                 let next_cursor = if more {
@@ -540,8 +544,18 @@ impl Manager {
                 } else {
                     None
                 };
+                let read_at = wall_ms()?;
                 let mut rows = Vec::with_capacity(hosts.len());
-                for (host, summary) in hosts.into_iter().zip(summaries) {
+                for (host, mut summary) in hosts.into_iter().zip(summaries) {
+                    let sample = collection.as_ref().and_then(|collection| {
+                        collection.samples.iter().find(|sample| {
+                            sample.ip_address == host.ip_address
+                                && sample.configured_host_id == host.configured_host_id
+                                && sample.interface == host.interface
+                        })
+                    });
+                    summary["connections"]["current"] =
+                        netcontrol_core::experience_summary::connection_snapshot(sample, read_at)?;
                     let mut row = serde_json::to_value(host)?;
                     row["summary"] = summary;
                     rows.push(row);
@@ -1960,6 +1974,9 @@ mod tests {
             })
         }
         fn insert(&self, id: &str, end: i64) -> Result<()> {
+            self.insert_connections(id, end, None)
+        }
+        fn insert_connections(&self, id: &str, end: i64, total: Option<u64>) -> Result<()> {
             let control = self.manager.shared.control.lock().unwrap();
             let samples = control
                 .view
@@ -1979,6 +1996,18 @@ mod tests {
                     sample.measured_duration_ms = 10_000;
                     sample.traffic = Traffic::measured(1, 2, 100, 200, 10_000);
                     sample.activity = Activity::Active;
+                    if let Some(total) = total {
+                        sample.connections = Connections {
+                            status: SourceStatus::Available,
+                            observed_at: Some(iso(end - 1000)?.parse()?),
+                            measurement_duration_ms: Some(50),
+                            total: Some(total.into()),
+                            tcp_established: Some((total / 2).into()),
+                            unreplied: Some(0.into()),
+                            ..Connections::default()
+                        };
+                        sample.coverage.connections = "complete".into();
+                    }
                     Ok(sample)
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -2121,6 +2150,48 @@ mod tests {
             .unwrap()
             .configured_name = "Renamed".into();
         assert_eq!(status(fixture.read("summary", &query).unwrap_err()), 409);
+        Ok(())
+    }
+    #[test]
+    fn summary_connections_pin_current_snapshot_and_average_only_valid_history() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.insert_connections("first", fixture.end, Some(10))?;
+        let first = fixture.read("summary", "limit=1")?;
+        let cursor = first["next_cursor"].as_str().context("missing cursor")?;
+        fixture.insert_connections("second", fixture.end + 10_000, Some(30))?;
+        let pinned = fixture.read("summary", &format!("limit=1&cursor={cursor}"))?;
+        let connections = &pinned["hosts"][0]["summary"]["connections"];
+        assert_eq!(connections["current"]["total"], "10");
+        assert_eq!(connections["average"]["total"], 10.0);
+        let fresh = fixture.read("summary", "address=192.0.2.9")?;
+        let connections = &fresh["hosts"][0]["summary"]["connections"];
+        assert_eq!(connections["current"]["total"], "30");
+        assert_eq!(connections["current"]["status"], "available");
+        assert!(
+            connections["current"]["age_ms"]
+                .as_i64()
+                .is_some_and(|age| age >= 0)
+        );
+        assert_eq!(connections["average"]["total"], 20.0);
+        assert_eq!(connections["average"]["observed_slots"], 2);
+        assert_eq!(connections["average"]["coverage_seconds"], 20);
+        fixture
+            .manager
+            .shared
+            .control
+            .lock()
+            .unwrap()
+            .view
+            .hosts
+            .get_mut(&"192.0.2.9".parse()?)
+            .context("missing host")?
+            .configured_host_id = "replacement".into();
+        let replaced = fixture.read("summary", "address=192.0.2.9")?;
+        assert_eq!(
+            replaced["hosts"][0]["summary"]["connections"]["current"]["status"],
+            "unavailable"
+        );
+        assert!(replaced["hosts"][0]["summary"]["connections"]["current"]["total"].is_null());
         Ok(())
     }
     #[test]

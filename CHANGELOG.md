@@ -46,6 +46,13 @@
 
 ### Added
 
+- Hourly host-experience summaries expose `connections.current` with exact
+  counts, acquisition timestamp and stale/unavailable status, plus
+  `connections.average` over valid ten-second snapshots with observation
+  coverage. Missing counts are not zero; no active probe or persistence change.
+  Release impact: additive API; next automatic calendar version.
+  [Required frontend handoff 2026-11-15-02](docs/frontend-handoffs/2026-11-15.md#2026-11-15-02-current-and-hour-average-connection-counts).
+
 - `GET /api/v1/statistics/host-experience/summary` adds bounded, paginated
   rolling-hour observed summaries with exact traffic/TCP/DNS totals, source
   coverage, pooled ratios, RTT extrema/weighted variation and historical

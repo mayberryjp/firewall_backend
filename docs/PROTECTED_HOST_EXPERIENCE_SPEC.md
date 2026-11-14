@@ -791,6 +791,23 @@ Per-host `summary`:
   lifetime history; the current wrapper does not relabel the original evidence.
 - `sources:{traffic,firewall,tcp,dns,connections}`: Source objects. Availability
   and source-qualified completeness stay distinct from observed counts.
+- `connections.current`: the matching host ID/interface snapshot from the pinned
+  latest collection. Includes original connection `status`, `error`,
+  `observed_at`, `measurement_duration_ms`, nullable decimal-string `total`,
+  `tcp_established`, `unreplied`, plus nullable numeric `age_ms`.
+  Source-available snapshots older than 30000 ms are `status:"stale"` and retain
+  their measurements with freshness. Missing/changed-attachment snapshots are
+  unavailable with null counts and explicit error; no historical fallback.
+  This is the latest collected gauge, not an active conntrack query.
+- `connections.average`: nullable numeric `total`, `tcp_established`, `unreplied`;
+  numeric `observed_slots` 0..360, `coverage_seconds` 0..3600, nullable UTC
+  `first_observed_at`/`last_observed_at`. Compute arithmetic means across valid
+  source-available ten-second snapshots using exact unsigned sums internally.
+  Each snapshot has equal nominal weight; the dump's measurement duration is
+  not how long the gauge was held. Partial/unavailable/not-observed snapshots
+  are excluded. Collection already rejects unready, old and previous-generation
+  inventory. Missing snapshots are not zero; no eligible evidence yields null
+  means and zero coverage. Numeric means may be fractional.
 - `traffic:{sent_packets,received_packets,sent_bytes,received_bytes}`: Counters;
   `sent_bps`/`received_bps` are bytes divided by their measured durations, not
   averages of rates or zeros for missing intervals. `packet_unit`/`byte_unit`
@@ -824,8 +841,8 @@ stored `variation_pairs`, not bucket count; existing same-flow pairs can bridge
 bucket boundaries. Histograms are not persisted: hourly p50/p95 cannot be
 reconstructed. DNS also lacks persisted timing sample/extrema/pair weights.
 Never average bucket percentiles or report a fabricated hourly DNS variation.
-Connection gauges and per-sample window minima are not summed; use latest/raw
-history for those individual observations.
+Connection gauges are averaged, not presented as event totals; per-sample window
+minima still require raw history.
 
 Synthetic counter excerpt (not a full response or deployed measurement):
 
