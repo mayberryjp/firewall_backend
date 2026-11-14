@@ -388,6 +388,23 @@ unready, failed, old (>2500 ms) or previous-generation snapshots produce null
 gauges, never fabricated zero. Timing p50/p95 values are bounded-histogram
 estimates; ACK variation is not RTP/one-way jitter.
 
+Connection collection is requested before each ten-second boundary, not just
+at initialization. Accepted sent packets use NFLOG input/forward timestamps;
+received packets use kernel-timestamped AF_PACKET/TPACKET_V2 frames on the
+derived logical LAN egress, including router-local DNS responses after reverse
+NAT. Postrouting NFLOG does not provide timestamps and is not used for timing.
+A bounded 50 ms merge holdback orders directions and closes transport evidence
+at the nominal bucket boundary. Real capture loss, excessive delay, malformed
+observations and queue pressure still mark incomplete coverage rather than
+inventing timings. Deployment now requires packet-ring support and the daemon's
+existing raw-packet privileges. Paths, permissions and nullable field types
+are unchanged; old stored samples are not recomputed.
+
+`dns.excluded_observations` counts only DNS-affecting exclusions, not TCP-only
+analysis exclusions. Collection `analysis_exclusions` aggregates all analysis
+exclusions. Neither is a packet-loss/timeout count or an independent score
+penalty; retained historical samples are not recomputed after a counter fix.
+
 Experience is `excellent|good|fair|poor|unknown`, nullable score 0..100,
 `status:rated|idle|insufficient_data|incomplete|unavailable`,
 `confidence:high|limited|none`, versioned algorithm, contributors and reasons.
@@ -5704,6 +5721,74 @@ requires operator attention; changing a parent's MTU/up externally is not itself
 owned-configuration drift.
 
 ### 6.4 Routes
+
+#### Live kernel route table
+
+`GET /api/v1/routes/table` requires API-key `state.read`, no query and an empty
+body. It returns a fresh read-only dump of **all** IPv4/IPv6 tables in the native
+backend's managed network namespace (host networking in host mode, only the lab
+namespace in namespace mode). Include main/local/custom tables, connected,
+unmanaged, DHCP/BGP and deviceless routes; do not filter to managed ownership.
+Disabled/uninstalled desired routes are not invented. `/api/v1/routes` and BGP
+learned/advertised APIs retain their existing separate meanings.
+
+Envelope: `source:"kernel"`, `scope:string` (opaque namespace identity),
+`collected_at_unix_ms:number` (Unix milliseconds at collection completion),
+`byte_order:"little"|"big"` (native byte order of raw numeric netlink payloads),
+`routes:RouteTableRow[]`. Empty routes is valid only after a successful empty
+dump. This is sequential link/IPv4/IPv6 observation, not an atomic kernel
+snapshot, lookup decision, BGP neighbor inventory or policy-rule dump.
+
+Each row always includes:
+
+| Field | Type / meaning |
+| --- | --- |
+| `family` | `"ipv4"` or `"ipv6"` |
+| `destination`, `source_prefix` | IP/prefix strings; omitted netlink addresses mean family zero with the header prefix length, including `0.0.0.0/0` or `::/0` |
+| `table`, `header_table` | Numeric effective uint32 table (RTA_TABLE overrides header), original uint8 header table |
+| `protocol`, `scope`, `type`, `tos` | Linux uint8 identifiers, not application enums; common types: 1 unicast, 2 local, 3 broadcast, 6 blackhole, 7 unreachable, 8 prohibit |
+| `flags` | Linux uint32 route bitmask; preserve unknown bits |
+| `gateway`, `preferred_source` | Nullable numeric IP strings; gateway also decodes cross-family RTA_VIA |
+| `interface_index`, `input_interface_index` | Nullable uint32 kernel indices |
+| `interface`, `input_interface` | Nullable observed link names; null may mean no device or an index not present in the link dump, not an error/default interface |
+| `metric`, `mark`, `uid`, `nexthop_id` | Nullable uint32 attributes; metric absence is null, explicit zero remains zero |
+| `preference` | Nullable uint8 IPv6 preference (0 medium, 1 high, 3 low) |
+| `expires` | Nullable decimal string, raw RTA_EXPIRES integer; not Unix time or converted seconds |
+| `metrics` | Array of raw nested RTAX attributes (same shape as `attributes`); numeric IDs and raw payloads (MTU kind 2, RTT kind 4, RTT variance kind 5, advertised MSS kind 8); kernel units/encoding, no inferred millisecond values |
+| `cache_info` | Null or numeric uint32 fields `clntref,last_use,expires,error,used,id,ts,ts_age`; raw Linux cache metadata, no inferred wall-clock/seconds conversion |
+| `next_hops` | Array of multipath entries with uint32 `interface_index`, nullable `interface`/IP `gateway`, integer `weight` 1..256, uint8 `flags`, and `attributes` |
+| `attributes` | Ordered array of `{kind:number,value_hex:string,nested:boolean,network_byte_order:boolean}` for **every** top-level attribute, including known/unknown, metrics, encapsulation, realms and nexthop references; lowercase hex value bytes excluding NLA header/padding; same shape for each multipath hop |
+
+Preserve duplicate attributes and numeric identifiers. `nexthop_id` references a
+kernel nexthop object; this endpoint reports the reference, not a separate
+nexthop-object inventory. Raw attributes retain advanced fields that do not have
+a convenience projection. Interpret IP payloads as network bytes and numeric
+payloads according to the Linux attribute ABI/envelope byte order, or network
+byte order when the attribute flag is set. Preserve nested/byte-order flags.
+
+Synthetic envelope excerpt (row fields omitted here only for readability):
+
+```json
+{"source":"kernel","scope":"linux:synthetic","collected_at_unix_ms":1794643200000,"byte_order":"little","routes":[{"family":"ipv4","destination":"0.0.0.0/0","table":254,"type":1,"protocol":242,"scope":0,"gateway":"192.0.2.1","interface_index":2,"interface":"wan0","metric":10,"next_hops":[]}]}
+```
+
+Use the standard `{error,transaction:null}` envelope: `401` unauthenticated,
+`403` missing `state.read`, `405` non-GET, `400` any query/body, `503` simulator/
+unsupported backend, namespace/netlink/decode errors, five-second timeout,
+more than 65,536 routes or over 8 MiB netlink route payload. Never return a
+truncated/partial success. Reads do not perform managed drift verification,
+repair, ownership acquisition, persistence or revision changes.
+
+Add the endpoint to the API explorer and a separate **Live route table** view
+with family/table/type/protocol/interface/text filters and expandable advanced
+metadata/multipath/raw attributes. Label numeric unknowns explicitly, handle
+null fields without fabricated defaults, and do not offer inline editing of
+live rows. Refresh on demand or slow visible-only polling; each read performs
+netlink dumps. Surface errors without clearing the desired route editor/draft.
+Deploy the accepting native backend before enabling this view; no new daemon
+flag, permission, saved configuration or migration.
+
+#### Configured routes
 
 Table/editor: enabled toggle, destination network, optional gateway, managed
 interface, table, metric. Family badge derives from destination. Include

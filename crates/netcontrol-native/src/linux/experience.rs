@@ -1,4 +1,4 @@
-use super::{deny_log, experience_kernel as kernel};
+use super::{deny_log, experience_capture::Egress, experience_kernel as kernel};
 use crate::{
     experience_analysis::Analyzer,
     experience_store::{Collection, Diagnostics, Filter, Source, Store},
@@ -282,8 +282,7 @@ impl Manager {
         status["unmapped_addresses"] = json!(control.view.unmapped.len());
         status["excluded_addresses"] = json!(control.view.excluded);
         status["unmapped"] = json!(control.view.unmapped);
-        status["analysis_memory_bound_bytes"] =
-            json!(crate::experience_analysis::working_memory_bound());
+        status["analysis_memory_bound_bytes"] = json!(Observations::working_memory_bound());
         self.checked_status(status)
     }
     fn checked_status(&self, mut status: Value) -> Result<Value> {
@@ -962,10 +961,82 @@ fn deltas(before: &Counters, after: &Counters, duration: u64) -> Option<Traffic>
         duration,
     ))
 }
+const CAPTURE_HOLDBACK: Duration = Duration::from_millis(50);
+const CAPTURE_QUEUE_LIMIT: usize = 1024;
+struct Observation {
+    address: IpAddr,
+    sent: bool,
+    packet: Box<[u8]>,
+    at: Instant,
+    original: Option<(IpAddr, u16)>,
+}
+#[derive(Default)]
+struct Observations {
+    pending: Vec<Observation>,
+}
+impl Observations {
+    fn push(&mut self, observation: Observation) -> Result<()> {
+        ensure!(
+            observation.packet.len() <= 4608,
+            "experience packet exceeds capture bound"
+        );
+        ensure!(
+            self.pending.len() < CAPTURE_QUEUE_LIMIT,
+            "experience capture merge queue full"
+        );
+        self.pending.push(observation);
+        Ok(())
+    }
+    fn working_memory_bound() -> usize {
+        crate::experience_analysis::working_memory_bound()
+            + CAPTURE_QUEUE_LIMIT * (2 * std::mem::size_of::<Observation>() + 4608 + 32)
+    }
+    fn flush(&mut self, analyzer: &mut Analyzer, through: Instant) -> Result<()> {
+        self.pending.sort_by_key(|observation| observation.at);
+        let count = self
+            .pending
+            .partition_point(|observation| observation.at <= through);
+        for observation in self.pending.drain(..count) {
+            analyzer.observe_translated(
+                observation.address,
+                observation.sent,
+                &observation.packet,
+                observation.at,
+                observation.original,
+            )?;
+        }
+        Ok(())
+    }
+}
+fn capture_time(anchor: (i64, Instant), seconds: u64, nanos: u32) -> Result<Option<Instant>> {
+    ensure!(nanos < 1_000_000_000, "invalid capture timestamp fraction");
+    let timestamp = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(u64::from(nanos)))
+        .context("capture timestamp overflow")?;
+    let anchor_nanos = u64::try_from(anchor.0)?
+        .checked_mul(1_000_000)
+        .context("capture anchor overflow")?;
+    if timestamp < anchor_nanos {
+        return Ok(None);
+    }
+    let at = anchor
+        .1
+        .checked_add(Duration::from_nanos(timestamp - anchor_nanos))
+        .context("capture timestamp outside monotonic range")?;
+    let now = Instant::now();
+    ensure!(
+        at <= now + Duration::from_millis(10)
+            && now.saturating_duration_since(at) <= Duration::from_millis(250),
+        "capture queue delay or clock discontinuity"
+    );
+    Ok(Some(at))
+}
 fn observe(
     payload: &[u8],
     view: &View,
     analyzer: &mut Analyzer,
+    observations: &mut Observations,
     anchor: (i64, Instant),
     previous: &mut Option<u32>,
     lost: &mut Option<u64>,
@@ -992,7 +1063,6 @@ fn observe(
     *previous = Some(sequence);
     let sent = match c_string(get(10).context("capture prefix missing")?)? {
         "exp:sent" => true,
-        "exp:received" => false,
         _ => anyhow::bail!("foreign experience capture prefix"),
     };
     let index = u32::from_be_bytes(
@@ -1025,26 +1095,12 @@ fn observe(
     );
     let stamp = get(3).context("NFLOG kernel timestamp missing")?;
     ensure!(stamp.len() == 16, "invalid NFLOG kernel timestamp");
-    let micros = u64::from_be_bytes(stamp[..8].try_into()?)
-        .checked_mul(1_000_000)
-        .and_then(|seconds| seconds.checked_add(u64::from_be_bytes(stamp[8..].try_into().ok()?)))
-        .context("capture timestamp overflow")?;
-    let anchor_micros = u64::try_from(anchor.0)?
-        .checked_mul(1000)
-        .context("capture anchor overflow")?;
-    if micros < anchor_micros {
+    let seconds = u64::from_be_bytes(stamp[..8].try_into()?);
+    let micros = u64::from_be_bytes(stamp[8..].try_into()?);
+    ensure!(micros < 1_000_000, "invalid NFLOG timestamp fraction");
+    let Some(at) = capture_time(anchor, seconds, u32::try_from(micros * 1000)?)? else {
         return Ok(());
-    }
-    let at = anchor
-        .1
-        .checked_add(Duration::from_micros(micros - anchor_micros))
-        .context("capture timestamp outside monotonic range")?;
-    let now = Instant::now();
-    ensure!(
-        at <= now + Duration::from_millis(10)
-            && now.saturating_duration_since(at) <= Duration::from_millis(250),
-        "capture queue delay or clock discontinuity"
-    );
+    };
     let original = if sent {
         if let Some(ct) = get(18) {
             let ct = [[payload[0], 0, 0, 0].to_vec(), ct.to_vec()].concat();
@@ -1055,7 +1111,13 @@ fn observe(
     } else {
         None
     };
-    analyzer.observe_translated(ip, sent, packet, at, original)
+    observations.push(Observation {
+        address: ip,
+        sent,
+        packet: packet.into(),
+        at,
+        original,
+    })
 }
 
 fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> {
@@ -1137,6 +1199,8 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
     };
     let mut connection_requested = None;
     let mut analyzer = Analyzer::new();
+    let mut egress = None;
+    let mut observations = Observations::default();
     let mut active_generation = None;
     let mut fingerprint = None;
     let mut view = View::default();
@@ -1179,10 +1243,12 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
             let clock_step = (wall
                 - (anchor.0 + i64::try_from(now.duration_since(anchor.1).as_millis())?))
             .abs()
-                > 1000;
+                > 10;
             if paused || config.is_none() {
                 if active_generation.take().is_some() {
                     analyzer.reset();
+                    observations.pending.clear();
+                    egress = None;
                     evidence.clear();
                     baseline = None;
                 }
@@ -1229,6 +1295,14 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
                 fingerprint = Some(super::netfilter::experience_fingerprint()?);
                 analyzer.reset();
                 analyzer.configure(hosts.keys().copied())?;
+                observations.pending.clear();
+                egress = Some(Egress::open(
+                    &view
+                        .hosts
+                        .values()
+                        .filter_map(|host| host.interface.as_ref().map(|interface| interface.index))
+                        .collect(),
+                )?);
                 evidence.clear();
                 epochs = hosts
                     .keys()
@@ -1251,22 +1325,22 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
                     control.status = json!({"status":"starting","error":null,
                         "reasons":[if clock_step{"clock_discontinuity"}else{"configuration_transition"}]});
                 }
-                if Instant::now().saturating_duration_since(
-                    next.checked_sub(Duration::from_secs(2))
-                        .context("invalid connection deadline")?,
-                ) > Duration::ZERO
-                    && connection_requested != Some((generation, next_wall))
-                {
-                    match connections_send.try_send(ConnectionRequest {
-                        generation,
-                        addresses: view.hosts.keys().copied().collect(),
-                    }) {
-                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => (),
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            anyhow::bail!("experience connection worker unavailable")
-                        }
+            }
+            if Instant::now().saturating_duration_since(
+                next.checked_sub(Duration::from_secs(2))
+                    .context("invalid connection deadline")?,
+            ) > Duration::ZERO
+                && connection_requested != Some((generation, next_wall))
+            {
+                match connections_send.try_send(ConnectionRequest {
+                    generation,
+                    addresses: view.hosts.keys().copied().collect(),
+                }) {
+                    Ok(()) => connection_requested = Some((generation, next_wall)),
+                    Err(mpsc::TrySendError::Full(_)) => (),
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        anyhow::bail!("experience connection worker unavailable")
                     }
-                    connection_requested = Some((generation, next_wall));
                 }
             }
             let drain_deadline = Instant::now() + Duration::from_millis(20);
@@ -1280,12 +1354,14 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
                                 payload,
                                 &view,
                                 &mut analyzer,
+                                &mut observations,
                                 anchor,
                                 &mut sequence,
                                 &mut capture_lost,
                             ) {
                                 malformed = malformed.saturating_add(1);
                                 analyzer.capture_gap(0);
+                                observations.pending.clear();
                                 tracing::debug!(%error,"protected-host capture excluded");
                             }
                             Ok(())
@@ -1297,20 +1373,75 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
                             .is_some_and(|e| e.raw_os_error() == Some(libc::ENOBUFS)) =>
                     {
                         analyzer.capture_gap(0);
+                        observations.pending.clear();
                         capture_lost = None;
                     }
                     Err(error) => return Err(error),
                 }
                 wait = 0;
                 if Instant::now() >= drain_deadline {
-                    if deny_log::poll(&capture, 0)? {
-                        analyzer.capture_gap(0);
-                        malformed = malformed.saturating_add(1);
-                    }
                     break;
                 }
             }
-            if Instant::now() < next {
+            let egress = egress
+                .as_mut()
+                .context("experience egress capture missing")?;
+            egress
+                .drain(
+                    Instant::now() + Duration::from_millis(20),
+                    |index, seconds, nanos, packet| {
+                        let ip = match packet.first().map(|byte| byte >> 4) {
+                            Some(4) if packet.len() >= 20 => {
+                                IpAddr::from(<[u8; 4]>::try_from(&packet[16..20])?)
+                            }
+                            Some(6) if packet.len() >= 40 => {
+                                IpAddr::from(<[u8; 16]>::try_from(&packet[24..40])?)
+                            }
+                            _ => anyhow::bail!("invalid egress network header"),
+                        };
+                        let Some(host) = view.hosts.get(&ip) else {
+                            return Ok(());
+                        };
+                        if !host
+                            .interface
+                            .as_ref()
+                            .is_some_and(|interface| interface.index == index)
+                        {
+                            return Ok(());
+                        }
+                        if let Some(at) = capture_time(anchor, seconds, nanos)? {
+                            observations.push(Observation {
+                                address: ip,
+                                sent: false,
+                                packet: packet.into(),
+                                at,
+                                original: None,
+                            })?;
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    malformed = malformed.saturating_add(1);
+                    analyzer.capture_gap(0);
+                    observations.pending.clear();
+                    tracing::debug!(%error, "protected-host egress capture excluded");
+                });
+            let dropped = egress.take_drops()?;
+            if dropped != 0 {
+                analyzer.capture_gap(dropped);
+                observations.pending.clear();
+                capture_lost = capture_lost.and_then(|lost| lost.checked_add(dropped));
+            }
+            if let Err(error) =
+                observations.flush(&mut analyzer, (Instant::now() - CAPTURE_HOLDBACK).min(next))
+            {
+                malformed = malformed.saturating_add(1);
+                analyzer.capture_gap(0);
+                observations.pending.clear();
+                tracing::debug!(%error, "protected-host transport capture excluded");
+            }
+            if Instant::now() < next + CAPTURE_HOLDBACK {
                 continue;
             }
             if Instant::now().saturating_duration_since(next) >= Duration::from_secs(10) {
@@ -1471,7 +1602,7 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
                     }
                     None => sample.connections.error = connections_error.clone(),
                 }
-                let analysis = analyzer.finish(*ip, current.at);
+                let analysis = analyzer.finish(*ip, next);
                 diagnostics.analysis_exclusions = diagnostics
                     .analysis_exclusions
                     .and_then(|n| n.checked_add(analysis.analysis_exclusions));
@@ -1905,6 +2036,258 @@ mod tests {
         assert!(missing.0.is_none() && missing.1.is_some());
     }
     #[test]
+    fn capture_merge_orders_directions_and_defers_next_bucket() -> Result<()> {
+        assert!(Observations::working_memory_bound() <= 80 * 1024 * 1024);
+        fn dns_packet(sent: bool, id: u8) -> Box<[u8]> {
+            let mut question = vec![0, id, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+            if !sent {
+                question[2] = 0x81;
+                question[3] = 0x80;
+            }
+            let mut bytes = vec![0; 28];
+            bytes[0] = 0x45;
+            bytes[2..4].copy_from_slice(&((28 + question.len()) as u16).to_be_bytes());
+            bytes[9] = 17;
+            let (source, destination, source_port, destination_port) = if sent {
+                ([192, 0, 2, 9], [192, 0, 2, 53], 12345u16, 53u16)
+            } else {
+                ([192, 0, 2, 53], [192, 0, 2, 9], 53u16, 12345u16)
+            };
+            bytes[12..16].copy_from_slice(&source);
+            bytes[16..20].copy_from_slice(&destination);
+            bytes[20..22].copy_from_slice(&source_port.to_be_bytes());
+            bytes[22..24].copy_from_slice(&destination_port.to_be_bytes());
+            bytes[24..26].copy_from_slice(&((8 + question.len()) as u16).to_be_bytes());
+            bytes.extend(question);
+            bytes.into_boxed_slice()
+        }
+        let address: IpAddr = "192.0.2.9".parse()?;
+        let mut analyzer = Analyzer::new();
+        analyzer.configure([address])?;
+        let now = Instant::now();
+        let mut observations = Observations::default();
+        for (offset, sent, id) in [(3, true, 2), (2, false, 1), (0, true, 1)] {
+            observations.push(Observation {
+                address,
+                sent,
+                packet: dns_packet(sent, id),
+                at: now + Duration::from_millis(offset),
+                original: None,
+            })?;
+        }
+        observations.flush(&mut analyzer, now + Duration::from_millis(2))?;
+        let first = analyzer.finish(address, now + Duration::from_millis(2));
+        assert_eq!(first.dns.requests, Some(1u64.into()));
+        assert_eq!(first.dns.responses, Some(1u64.into()));
+        assert!(first.dns.response_time_p50_ms.is_some());
+        observations.flush(&mut analyzer, now + Duration::from_millis(4))?;
+        let second = analyzer.finish(address, now + Duration::from_millis(4));
+        assert_eq!(second.dns.requests, Some(1u64.into()));
+        assert_eq!(second.dns.responses, Some(0u64.into()));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN and CAP_NET_ADMIN"]
+    fn kernel_egress_timestamps_restore_bidirectional_tcp_and_dns() -> Result<()> {
+        thread::spawn(|| -> Result<()> {
+            use std::io::{Read, Write};
+            use std::net::{SocketAddr, TcpListener, UdpSocket};
+            ensure!(
+                unsafe { libc::unshare(libc::CLONE_NEWNET) } == 0,
+                "create transport namespace: {}",
+                io::Error::last_os_error()
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let (connection, handle, _) = rtnetlink::new_connection()?;
+                let task = tokio::spawn(connection);
+                handle
+                    .link()
+                    .set(rtnetlink::LinkUnspec::new_with_index(1).up().build())
+                    .execute()
+                    .await?;
+                handle
+                    .address()
+                    .add(1, "::2".parse()?, 128)
+                    .execute()
+                    .await?;
+                task.abort();
+                Ok::<_, anyhow::Error>(())
+            })?;
+            let mut view = View::default();
+            for ip in ["127.0.0.2", "::2"] {
+                let mut identity = host(ip);
+                identity.interface = Some(InterfaceIdentity {
+                    name: "lo".into(),
+                    index: 1,
+                    kind: "loopback".into(),
+                    vlan_id: None,
+                });
+                view.hosts.insert(identity.ip_address, identity);
+            }
+            let capture = deny_log::socket_for(kernel::GROUP, 4608, 4 << 20, 5, 32)?;
+            let mut egress = Egress::open(&BTreeSet::from([1]))?;
+            kernel::install(&view.hosts.keys().map(|ip| (*ip, "lo".to_owned())).collect())?;
+            let anchor = (wall_ms()?, Instant::now());
+            for (client_ip, server_ip) in [("127.0.0.2", "127.0.0.1"), ("::2", "::1")] {
+                let client_ip: IpAddr = client_ip.parse()?;
+                let server_ip: IpAddr = server_ip.parse()?;
+                let server = UdpSocket::bind(SocketAddr::new(server_ip, 53))?;
+                let client = UdpSocket::bind(SocketAddr::new(client_ip, 0))?;
+                let noise = UdpSocket::bind(SocketAddr::new(server_ip, 0))?;
+                noise.send_to(b"not DNS", client.local_addr()?)?;
+                let mut discard = [0; 32];
+                client.recv_from(&mut discard)?;
+                server.set_read_timeout(Some(Duration::from_secs(2)))?;
+                client.set_read_timeout(Some(Duration::from_secs(2)))?;
+                for id in [1, 2] {
+                    let mut query =
+                        vec![0, id, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+                    client.send_to(&query, server.local_addr()?)?;
+                    let mut bytes = [0; 512];
+                    let (_, peer) = server.recv_from(&mut bytes)?;
+                    thread::sleep(Duration::from_millis(2));
+                    query[2] = 0x81;
+                    query[3] = 0x80;
+                    server.send_to(&query, peer)?;
+                    client.recv_from(&mut bytes)?;
+                }
+                let server = TcpListener::bind(SocketAddr::new(server_ip, 0))?;
+                let peer = server.local_addr()?;
+                let serve = thread::spawn(move || -> Result<()> {
+                    let (mut stream, _) = server.accept()?;
+                    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    let mut bytes = [0; 4];
+                    stream.read_exact(&mut bytes)?;
+                    thread::sleep(Duration::from_millis(2));
+                    stream.write_all(b"pong")?;
+                    Ok(())
+                });
+                let mut client = runtime.block_on(async {
+                    let socket = if client_ip.is_ipv4() {
+                        tokio::net::TcpSocket::new_v4()?
+                    } else {
+                        tokio::net::TcpSocket::new_v6()?
+                    };
+                    socket.bind(SocketAddr::new(client_ip, 0))?;
+                    socket.connect(peer).await?.into_std()
+                })?;
+                client.set_nonblocking(false)?;
+                client.set_read_timeout(Some(Duration::from_secs(2)))?;
+                client.write_all(b"ping")?;
+                let mut response = [0; 4];
+                client.read_exact(&mut response)?;
+                serve
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("TCP fixture panicked"))??;
+            }
+            thread::sleep(Duration::from_millis(20));
+            let mut analyzer = Analyzer::new();
+            analyzer.configure(view.hosts.keys().copied())?;
+            let mut observations = Observations::default();
+            let mut sequence = None;
+            let mut lost = Some(0);
+            let mut buffer = vec![0; 65536];
+            while deny_log::poll(&capture, 0)? {
+                let length = deny_log::receive(&capture, &mut buffer)?;
+                deny_log::frames(&buffer[..length], |kind, _, payload| {
+                    ensure!(kind == 0x400, "unexpected transport capture frame");
+                    observe(
+                        payload,
+                        &view,
+                        &mut analyzer,
+                        &mut observations,
+                        anchor,
+                        &mut sequence,
+                        &mut lost,
+                    )
+                })?;
+            }
+            egress.drain(
+                Instant::now() + Duration::from_secs(1),
+                |index, seconds, nanos, packet| {
+                    assert_eq!(index, 1);
+                    let ip = match packet[0] >> 4 {
+                        4 => IpAddr::from(<[u8; 4]>::try_from(&packet[16..20])?),
+                        6 => IpAddr::from(<[u8; 16]>::try_from(&packet[24..40])?),
+                        _ => anyhow::bail!("unexpected captured protocol"),
+                    };
+                    if view.hosts.contains_key(&ip) {
+                        observations.push(Observation {
+                            address: ip,
+                            sent: false,
+                            packet: packet.into(),
+                            at: capture_time(anchor, seconds, nanos)?
+                                .context("missing kernel capture time")?,
+                            original: None,
+                        })?;
+                    }
+                    Ok(())
+                },
+            )?;
+            assert_eq!(egress.take_drops()?, 0);
+            observations.flush(&mut analyzer, Instant::now())?;
+            for ip in view.hosts.keys() {
+                let analysis = analyzer.finish(*ip, Instant::now());
+                assert_eq!(
+                    analysis.dns.requests,
+                    Some(2u64.into()),
+                    "{ip}: {:?}",
+                    analysis
+                );
+                assert_eq!(
+                    analysis.dns.responses,
+                    Some(2u64.into()),
+                    "{ip}: {:?}",
+                    analysis
+                );
+                assert!(
+                    analysis.dns.response_time_p50_ms.is_some(),
+                    "{ip}: {:?}",
+                    analysis
+                );
+                assert!(
+                    analysis
+                        .tcp
+                        .data_packets_sent
+                        .is_some_and(|count| count.0 > 0),
+                    "{ip}: {:?}",
+                    analysis
+                );
+                assert!(
+                    analysis
+                        .tcp
+                        .data_packets_received
+                        .is_some_and(|count| count.0 > 0),
+                    "{ip}: {:?}",
+                    analysis
+                );
+                assert!(
+                    analysis.tcp.rtt_host.samples.0 > 0 && analysis.tcp.rtt_remote.samples.0 > 0,
+                    "{ip}: {:?}",
+                    analysis
+                );
+                assert!(
+                    analysis.evidence.tcp_complete && analysis.evidence.dns_complete,
+                    "{ip}: {:?}",
+                    analysis
+                );
+            }
+            let sender = UdpSocket::bind("127.0.0.1:0")?;
+            let sink = UdpSocket::bind("127.0.0.2:53")?;
+            for _ in 0..2048 {
+                sender.send_to(b"overflow", sink.local_addr()?)?;
+            }
+            ensure!(egress.take_drops()? > 0, "ring overflow was not reported");
+            Ok(())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("transport namespace fixture panicked"))?
+    }
+    #[test]
     fn storage_contention_returns_bounded_error_without_stalling_configuration() -> Result<()> {
         let fixture = Fixture::new()?;
         let read = fixture
@@ -1962,6 +2345,10 @@ mod tests {
             ensure!(sample["traffic"]["sent_packets"]=="0" && sample["traffic"]["received_packets"]=="0","idle kernel counters were not measured");
             ensure!(sample["experience"]["status"]=="idle" && sample["experience"]["score"].is_null(),"idle observation was falsely rated: {sample}");
             ensure!(sample["last_seen_at"].is_null(),"snapshot invented last seen");
+            let connections=&sample["connections"];
+            ensure!(connections["status"]=="available" && connections["error"].is_null(),"recurring conntrack snapshot unavailable: {connections}");
+            ensure!(connections["total"]=="0" && connections["tcp_established"]=="0" && connections["unreplied"]=="0","empty conntrack inventory was not measured: {connections}");
+            ensure!(connections["observed_at"].is_string() && connections["measurement_duration_ms"].is_u64(),"conntrack timing missing: {connections}");
             manager.pause()?;
             manager.shutdown()?;
             Ok(())

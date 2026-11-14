@@ -163,8 +163,8 @@ enum DnsPort {
     Destination,
     OriginalDestination,
 }
-fn transport_capture(ipv6: bool, sent: bool, protocol: u8, port: Option<DnsPort>) -> Vec<u8> {
-    let mut expressions = load(ipv6, sent);
+fn transport_capture(ipv6: bool, protocol: u8, port: Option<DnsPort>) -> Vec<u8> {
+    let mut expressions = load(ipv6, true);
     expressions.extend(expr("meta", [n(1, 3), n(2, 16)].concat()));
     expressions.extend(compare(3, &[protocol]));
     if let Some(port) = port {
@@ -194,7 +194,7 @@ fn transport_capture(ipv6: bool, sent: bool, protocol: u8, port: Option<DnsPort>
         "log",
         [
             a(1, &GROUP.to_be_bytes()),
-            string(2, if sent { "exp:sent" } else { "exp:received" }),
+            string(2, "exp:sent"),
             n(3, if port.is_some() { 4608 } else { 256 }),
             a(4, &32u16.to_be_bytes()),
         ]
@@ -688,31 +688,17 @@ pub(super) fn install(hosts: &BTreeMap<IpAddr, String>) -> Result<()> {
     }
     items.extend(rules);
     for ipv6 in [false, true] {
-        for sent in [true, false] {
-            for (protocol, port) in [
-                (6, Some(DnsPort::Source)),
-                (6, Some(DnsPort::Destination)),
-                (17, Some(DnsPort::Source)),
-                (17, Some(DnsPort::Destination)),
-                (6, Some(DnsPort::OriginalDestination)),
-                (17, Some(DnsPort::OriginalDestination)),
-                (6, None),
-            ] {
-                if sent {
-                    for chain in ["forward_capture", "input_capture"] {
-                        items.push(rule(
-                            TABLE,
-                            chain,
-                            transport_capture(ipv6, sent, protocol, port),
-                        ));
-                    }
-                } else {
-                    items.push(rule(
-                        TABLE,
-                        "egress",
-                        transport_capture(ipv6, sent, protocol, port),
-                    ));
-                }
+        for (protocol, port) in [
+            (6, Some(DnsPort::Source)),
+            (6, Some(DnsPort::Destination)),
+            (17, Some(DnsPort::Source)),
+            (17, Some(DnsPort::Destination)),
+            (6, Some(DnsPort::OriginalDestination)),
+            (17, Some(DnsPort::OriginalDestination)),
+            (6, None),
+        ] {
+            for chain in ["forward_capture", "input_capture"] {
+                items.push(rule(TABLE, chain, transport_capture(ipv6, protocol, port)));
             }
         }
     }

@@ -174,6 +174,9 @@ pub trait Backend: Send {
     fn discover_interfaces(&mut self) -> Result<Value> {
         anyhow::bail!("interface discovery is not supported by this backend")
     }
+    fn route_table(&mut self) -> Result<Value> {
+        anyhow::bail!("live route tables require the native Linux backend")
+    }
     fn discover_interface_capabilities(&mut self) -> Result<InterfaceInventory> {
         anyhow::bail!("interface capability discovery is not supported by this backend")
     }

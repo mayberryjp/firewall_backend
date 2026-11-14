@@ -169,6 +169,18 @@ and [frontend handoff](docs/frontend-handoffs/2026-11-04.md#2026-11-04-06-nic-of
 All traffic shaping remains explicitly deferred; no ALTQ/CAKE/FQ-CoDel/HTB or
 ingress redirection is installed.
 
+## Live route table
+
+`GET /api/v1/routes/table` (`state.read`, no query/body) reads all IPv4/IPv6
+kernel routing tables in the daemon's managed network namespace, including
+unmanaged, connected, local, DHCP, BGP, multipath and deviceless routes.
+It exposes numeric Linux protocol/type/scope/flags, interface names and indices,
+source prefixes, gateways, metrics, cache metadata and raw netlink attributes
+for advanced details. It does not change networking, configuration or ownership.
+Simulator/unavailable/oversized reads fail explicitly; no partial result.
+The existing `/api/v1/routes` remains managed configuration, not this live dump.
+See the [live-table contract](FRONTEND_SPEC.md#live-kernel-route-table).
+
 ## Read-only loopback interfaces
 
 `GET /api/v1/interfaces/discovered` (`state.read`) includes every live link.
@@ -402,7 +414,11 @@ ratings; last seen is traffic observation, not reachability or uptime.
 See the [implemented contract and limits](docs/PROTECTED_HOST_EXPERIENCE_SPEC.md)
 and [frontend handoff](docs/frontend-handoffs/2026-11-14.md#2026-11-14-04-protected-host-experience-implementation).
 Deployment requires owned nftables counter/last-expression sets, NFLOG group 101
-with timestamps/sequence/conntrack metadata, and owner-only writable storage.
+with ingress timestamps/sequence/conntrack metadata, AF_PACKET/TPACKET_V2
+LAN-egress capture, and owner-only writable storage. Linux does not supply NFLOG
+timestamps at postrouting: received transport evidence uses kernel-timestamped
+packet-ring frames instead. Connection inventory refreshes before every
+ten-second bucket; missing/stale sources still return null, never guessed zero.
 The revised main-file budget is 2 GiB plus a bounded 32 MiB WAL; freed pages are
 reused, not continually vacuumed. Simulator/lab-namespace mode is unsupported.
 Appliance throughput, forwarding latency and NIC/offload acceptance remain

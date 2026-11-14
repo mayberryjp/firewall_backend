@@ -58,6 +58,8 @@ mod dhcp_monitors;
 #[cfg(feature = "nftables")]
 mod experience;
 #[cfg(feature = "nftables")]
+mod experience_capture;
+#[cfg(feature = "nftables")]
 mod experience_kernel;
 #[cfg(all(test, feature = "nftables"))]
 mod host_integration;
@@ -73,6 +75,7 @@ mod nft_wire;
 mod offloads;
 mod panic_reboot;
 mod path_test;
+mod routes;
 mod rpf;
 mod rps;
 mod rps_recommendations;
@@ -1956,6 +1959,21 @@ impl Backend for Native {
     fn scope(&self) -> Result<String> {
         self.check_scope()?;
         Ok(self.identity.clone())
+    }
+
+    fn route_table(&mut self) -> Result<Value> {
+        self.check_scope()?;
+        let scope = self.identity.clone();
+        session(self.namespace.clone(), move |rt, handle| {
+            rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    routes::snapshot(handle, &scope),
+                )
+                .await
+                .context("route table collection exceeded five seconds")?
+            })
+        })
     }
 
     fn observe(&mut self, expected: &Config) -> Result<Config> {

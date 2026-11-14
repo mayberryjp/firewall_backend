@@ -215,8 +215,13 @@ never lower experience merely because the firewall successfully enforced policy.
 
 ### 4.3 Passive TCP/DNS observer
 
-Accepted host traffic is copied through NFLOG group 101 at input/forward and
-postrouting hooks, never substituted with router-local TCP_INFO. Generic TCP
+Accepted sent traffic is copied through NFLOG group 101 at input/forward.
+Received traffic uses an AF_PACKET SOCK_DGRAM TPACKET_V2 ring at logical LAN
+egress, after reverse NAT and filtering, including router-local responses.
+Linux omits NFLOG timestamps at postrouting; do not require that absent
+attribute or substitute userspace dequeue time. The ring records per-packet
+kernel timestamps even for locally generated output. Neither direction is
+substituted with router-local TCP_INFO. Generic TCP
 capture is 256 bytes; DNS capture is 4608 bytes to retain a 4096-byte message
 plus headers. Original conntrack destination IP **and port** restore
 client-visible DNS after DNAT, including port 53 rewritten to another port.
@@ -229,6 +234,18 @@ not become transport retransmission/unanswered penalties.
   diagnostics collector's outgoing exclusion stays unchanged for its own scope.
   Share parsing/socket lifecycle primitives where appropriate; do not globally
   widen its filter or double-count parent/child observations.
+- Egress filtering admits only outgoing TCP/ordinary DNS and supported IPv6
+  extension forms on eligible logical LAN interfaces; exact destination IP and
+  attachment checks precede analysis. Physical-parent copies and unrelated
+  UDP are excluded. This filter can admit other IPs on the same logical LAN;
+  they are discarded without allocating host/flow state.
+- Merge both capture sources by kernel timestamp with a 50 ms bounded holdback,
+  at most 1024 queued observations of at most 4608 bytes each. Close transport
+  evidence at the nominal boundary, not the later counter-read time, so deferred
+  next-bucket responses do not prematurely become unanswered DNS requests.
+  A 4 MiB kernel ring, sequence gaps, packet-ring drop statistics, queue bounds
+  and 250 ms maximum capture age make real loss/overload explicit. A nonempty
+  queue at the end of one bounded drain round alone is not evidence of loss.
 - New analysis is continuous. A ten-second periodic packet sample is inadequate
   for sequence/ACK correlation, DNS latency, last seen or short-lived activity.
 - Use monotonic receive timestamps with bounded capture-delay/loss reporting;
@@ -254,6 +271,10 @@ HTTP loop or 2048 separate queries. Derive per-IP `connections_total`,
 `connections_tcp_established` and `connections_unreplied`, counting each kernel
 entry once for that host even when both original and reply tuples match.
 Include zone and full tuple identity internally; kernel IDs alone are reusable.
+Request the bounded worker during every bucket's final two seconds; retry
+admission if its request queue is full. Initialization/configuration transitions
+must not be the only scheduling path. The existing 2500 ms freshness and
+generation checks still reject stale, failed and previous-generation inventories.
 
 NAT/return-direction attribution must preserve the protected private address.
 A connection between two protected hosts counts once for each host. Counts are
@@ -377,6 +398,13 @@ Unanswered percent uses finalized `responses + unanswered`, not currently
 pending requests. DNS variation uses consecutive unambiguous responses for the
 same host/resolver/transport, without bridging gaps. Label it response-time
 variation, not network jitter.
+
+`dns.excluded_observations` counts DNS-affecting exclusions only, including
+ambiguous/unmatched messages and capture/tracking events affecting DNS.
+TCP-only exclusions and invalid TCP timing distributions do not increment it.
+Collection `analysis_exclusions` remains the aggregate across both protocols;
+neither counter is a packet-drop or DNS-timeout count. Previously retained
+samples remain as originally collected; corrected counts apply to new samples.
 
 ## 6. Explainable experience scoring
 
@@ -523,7 +551,8 @@ Finalized implementation bounds and measured sizing revisions:
 - Eligibility: honor existing maximum 2048 configured addresses, not a new lower
   silent UI/collector limit; maximum 737,280 full-retention host sample rows.
 - Analyzer plus all six rolling evidence buckets has a conservative tested
-  allocation bound of 76,877,402 bytes (under 80 MiB on the tested x86-64 layout).
+  allocation bound of 76,913,482 bytes on the tested x86-64 layout. Including
+  the bounded directional merge queue and sort scratch remains under 80 MiB.
   This supersedes the proposed **aggregate** 64 MiB target; it is not an RSS
   measurement or a claim that the rest of the daemon uses no memory.
   TCP flows and pending DNS requests each have an 8192 global / 32 per-host cap.

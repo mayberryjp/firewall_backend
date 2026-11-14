@@ -204,7 +204,8 @@ fn dhcp_relay_diagnostics_api_is_authorized_validated_and_read_only() {
     );
     assert_eq!(fs::read(fixture.path()).unwrap(), saved);
 
-    let mut simulator = Fixture::new().engine();
+    let simulator_fixture = Fixture::new();
+    let mut simulator = simulator_fixture.engine();
     let statistics = "/api/v1/statistics/dhcp-relay";
     let reply = simulator.request("GET", statistics, "", "reader", &["state.read".into()], &[]);
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -1977,6 +1978,8 @@ fn confirmation_at_deadline_is_rejected_and_reverted() {
 }
 #[derive(Default)]
 struct Faults {
+    route_table_response: Option<Value>,
+    route_table_calls: usize,
     log_response: Option<Value>,
     log_sources: Vec<String>,
     dhcp_relay_log_response: Option<Value>,
@@ -2022,6 +2025,14 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn route_table(&mut self) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.route_table_calls += 1;
+        faults
+            .route_table_response
+            .clone()
+            .context("injected route table failure")
+    }
     fn logs(&mut self, source: crate::LogSource, query: &crate::LogQuery) -> Result<Value> {
         let mut faults = self.0.lock().unwrap();
         faults.log_sources.push(source.as_str().to_owned());
@@ -4307,6 +4318,80 @@ fn gateway_monitors_without_public_rules_commit_restart_and_rollback() {
     );
     assert_eq!(rollback.status, 200, "{}", rollback.body);
     assert_eq!(e.saved_configuration(), &config.normalized());
+}
+
+#[test]
+fn live_route_table_authorizes_validates_and_preserves_configuration() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let expected = json!({"source":"kernel","scope":"linux:test","byte_order":"little","collected_at_unix_ms":1,"routes":[{"table":255,"type":2}]});
+    faults.lock().unwrap().route_table_response = Some(expected.clone());
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let saved = fs::read(fixture.path()).unwrap();
+    for (actor, permission, method, query, body, status) in [
+        ("", "state.read", "GET", "", "", 401),
+        ("reader", "routes.write", "GET", "", "", 403),
+        ("reader", "state.read", "POST", "", "", 405),
+        ("reader", "state.read", "DELETE", "", "", 405),
+        ("reader", "state.read", "GET", "table=254", "", 400),
+        ("reader", "state.read", "GET", "", "{}", 400),
+    ] {
+        let reply = engine.request(
+            method,
+            "/api/v1/routes/table",
+            query,
+            actor,
+            &[permission.into()],
+            body.as_bytes(),
+        );
+        assert_eq!(reply.status, status, "{}", reply.body);
+    }
+    assert_eq!(faults.lock().unwrap().route_table_calls, 0);
+    let reply = engine.request(
+        "GET",
+        "/api/v1/routes/table",
+        "",
+        "reader",
+        &["state.read".into()],
+        &[],
+    );
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body, expected);
+    assert_eq!(fs::read(fixture.path()).unwrap(), saved);
+    faults.lock().unwrap().route_table_response = None;
+    let reply = engine.request(
+        "GET",
+        "/api/v1/routes/table",
+        "",
+        "reader",
+        &["state.read".into()],
+        &[],
+    );
+    assert_eq!(reply.status, 503);
+    assert!(
+        reply.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("injected route table failure")
+    );
+    let mut simulator = Fixture::new().engine();
+    assert_eq!(
+        simulator
+            .request(
+                "GET",
+                "/api/v1/routes/table",
+                "",
+                "reader",
+                &["state.read".into()],
+                &[]
+            )
+            .status,
+        503
+    );
+    assert_eq!(
+        request(&mut simulator, "GET", "/api/v1/routes", Value::Null).status,
+        200
+    );
 }
 
 #[test]

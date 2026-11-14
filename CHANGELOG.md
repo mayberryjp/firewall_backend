@@ -46,6 +46,14 @@
 
 ### Added
 
+- `GET /api/v1/routes/table` (`state.read`, no query/body) exposes live IPv4/IPv6
+  kernel routes across all tables in the managed namespace, with multipath,
+  source/gateway/interface metadata, numeric Linux identifiers, metrics/cache
+  data and raw netlink attributes. Bounded, read-only collection fails explicitly
+  rather than returning partial/simulator data; existing configured/BGP APIs
+  are unchanged. Release impact: additive API; next automatic calendar version.
+  Required frontend review: [handoff 2026-11-14-05](docs/frontend-handoffs/2026-11-14.md#2026-11-14-05-live-kernel-route-table).
+
 - Implement [protected-host network experience](docs/PROTECTED_HOST_EXPERIENCE_SPEC.md):
   configured LAN IPs, ten-second packet/byte/drop/connection measurements,
   passive TCP/window/ACK and UDP/TCP DNS analysis, last seen, explainable scores,
@@ -427,6 +435,22 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Repair protected-host experience collection: schedule conntrack before every
+  ten-second bucket, and replace untimestamped postrouting NFLOG observations
+  with kernel-timestamped logical-LAN egress packet-ring capture. Bound and order
+  the two capture sources without treating a busy drain round as packet loss;
+  keep next-bucket DNS evidence out of the closing bucket. Legitimate missing
+  evidence remains null. Fix with AF_PACKET/TPACKET_V2 deployment prerequisite;
+  HTTP schemas/permissions are unchanged. Next automatic calendar version.
+  Optional frontend/operator notes:
+  [handoff 2026-11-14-06](docs/frontend-handoffs/2026-11-14.md#2026-11-14-06-protected-host-collector-repair).
+
+- Keep protected-host `dns.excluded_observations` DNS-specific instead of
+  including TCP-only analysis exclusions. Preserve aggregate diagnostics,
+  capture/completeness and scoring behavior; apply corrected counts to new
+  samples without rewriting retained history. No frontend or schema change.
+  Release impact: counter-reporting fix; next automatic calendar version.
 
 - Preserve factual wall-clock timestamps without rejecting otherwise valid
   archived rollback/commit history on restart. Validate journal updates before

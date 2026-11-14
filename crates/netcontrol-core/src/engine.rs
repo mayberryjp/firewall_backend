@@ -1159,6 +1159,23 @@ impl Engine {
                 json!({"interface": name, "status": "retrying"}),
             ));
         }
+        if path == "/api/v1/routes/table" {
+            require(permissions, "state.read")?;
+            if method != "GET" {
+                return Err(ApiError::new(405, "route table is read-only"));
+            }
+            if !query.is_empty() || !body.is_empty() {
+                return Err(ApiError::new(
+                    400,
+                    "route table accepts no query or request body",
+                ));
+            }
+            return self
+                .backend
+                .route_table()
+                .map(|v| Reply::value(200, v))
+                .map_err(service_error);
+        }
         if method == "GET" {
             require(permissions, "state.read")?;
             if matches!(

@@ -131,6 +131,7 @@ struct Counters {
     servfail: u64,
     refused: u64,
     excluded: u64,
+    dns_excluded: u64,
     capacity: u64,
     capture_dropped: u64,
     tcp_seen: bool,
@@ -140,8 +141,14 @@ struct Counters {
     reasons: Vec<String>,
 }
 impl Counters {
+    fn exclude_observations(&mut self, count: u64, dns: bool) {
+        self.excluded = self.excluded.saturating_add(count);
+        if dns {
+            self.dns_excluded = self.dns_excluded.saturating_add(count);
+        }
+    }
     fn exclude(&mut self, tcp: bool, dns: bool, reason: &str) {
-        self.excluded = self.excluded.saturating_add(1);
+        self.exclude_observations(1, dns);
         self.tcp_partial |= tcp;
         self.dns_partial |= dns;
         if self.reasons.len() < MAX_NATIVE_REASONS {
@@ -589,7 +596,7 @@ impl Analyzer {
             for (dns_key, attempt) in &mut host.dns {
                 if dns_key.flow == key && dns_key.tcp && dns_key.stream == stream_id {
                     attempt.ambiguous = true;
-                    host.counters.excluded = host.counters.excluded.saturating_add(1);
+                    host.counters.exclude_observations(1, true);
                 }
             }
             host.previous_dns.remove(&(key.peer, true, stream_id));
@@ -743,9 +750,9 @@ impl Analyzer {
             .filter(|request| !request.ambiguous)
             .count();
         let mut counters = std::mem::take(&mut host.counters);
-        let invalid_timings = counters.rtt.iter().filter(|r| r.overflowed).count()
-            + usize::from(counters.dns_time.overflowed);
-        counters.excluded = counters.excluded.saturating_add(invalid_timings as u64);
+        let invalid_tcp_timings = counters.rtt.iter().filter(|r| r.overflowed).count();
+        counters.exclude_observations(invalid_tcp_timings as u64, false);
+        counters.exclude_observations(u64::from(counters.dns_time.overflowed), true);
         let tcp_complete = !counters.tcp_partial && !counters.rtt.iter().any(|r| r.overflowed);
         let dns_complete = !counters.dns_partial && !counters.dns_time.overflowed;
         let mut reasons = counters.reasons.clone();
@@ -812,7 +819,7 @@ impl Analyzer {
                 pending_at_close: Some((pending as u64).into()),
                 servfail_responses: Some(counters.servfail.into()),
                 refused_responses: Some(counters.refused.into()),
-                excluded_observations: Some(counters.excluded.into()),
+                excluded_observations: Some(counters.dns_excluded.into()),
                 response_time_p50_ms: summary.p50_ms,
                 response_time_p95_ms: summary.p95_ms,
                 response_time_variation_mean_ms: summary.variation_mean_ms,
@@ -1193,7 +1200,7 @@ fn invalidate_dns(host: &mut Host, flow: &FlowKey, tcp: bool, stream: Option<u64
         }
         !matched
     });
-    host.counters.excluded = host.counters.excluded.saturating_add(removed);
+    host.counters.exclude_observations(removed, true);
     host.previous_dns.retain(|(key, transport, id), _| {
         *key != flow.peer || *transport != tcp || !stream.is_none_or(|stream| stream == *id)
     });
@@ -1326,14 +1333,14 @@ fn dns_message(
     };
     let variation = (flow.peer, tcp, stream);
     if tombstone_matches(host, &key, at) {
-        host.counters.excluded = host.counters.excluded.saturating_add(1);
+        host.counters.exclude_observations(1, true);
         host.previous_dns.remove(&variation);
         return;
     }
     if !parsed.response {
         if let Some(attempt) = host.dns.get_mut(&key) {
             attempt.ambiguous = true;
-            host.counters.excluded = host.counters.excluded.saturating_add(1);
+            host.counters.exclude_observations(1, true);
             host.previous_dns.remove(&variation);
             return;
         }
@@ -1362,19 +1369,19 @@ fn dns_message(
         return;
     }
     let Some(attempt) = host.dns.remove(&key) else {
-        host.counters.excluded = host.counters.excluded.saturating_add(1);
+        host.counters.exclude_observations(1, true);
         host.previous_dns.remove(&variation);
         return;
     };
     if attempt.ambiguous || at < attempt.started {
-        host.counters.excluded = host.counters.excluded.saturating_add(1);
+        host.counters.exclude_observations(1, true);
         host.previous_dns.remove(&variation);
         remember_dns(host, &key, at, at, tombstone_budget);
         return;
     }
     if at.duration_since(attempt.started) >= DNS_DEADLINE {
         host.counters.unanswered = host.counters.unanswered.saturating_add(1);
-        host.counters.excluded = host.counters.excluded.saturating_add(1);
+        host.counters.exclude_observations(1, true);
         host.previous_dns.remove(&variation);
         remember_dns(
             host,
@@ -2203,6 +2210,90 @@ mod tests {
         assert_eq!(result.evidence.dns_time.samples, 1);
         assert_eq!(result.evidence.dns_time.summary().p95_ms, Some(7.0));
         assert_eq!(result.dns.excluded_observations, Some(2u64.into()));
+    }
+    #[test]
+    fn dns_exclusions_do_not_include_tcp_only_sequence_ambiguity() {
+        let now = Instant::now();
+        let mut analyzer = configured();
+        handshake(&mut analyzer, 443, now);
+        for (sent, packet, elapsed) in [
+            (true, udp(true, &question(1, None)), 1),
+            (false, udp(false, &question(1, Some(0))), 2),
+            (true, tcp(true, 443, 100, 200, 16, 100, None, b"a"), 3),
+            (
+                true,
+                tcp(
+                    true,
+                    443,
+                    101u32.wrapping_add(1 << 31),
+                    200,
+                    16,
+                    100,
+                    None,
+                    b"b",
+                ),
+                4,
+            ),
+        ] {
+            analyzer
+                .observe(
+                    host_ip(),
+                    sent,
+                    &packet,
+                    now + Duration::from_millis(elapsed),
+                )
+                .unwrap();
+        }
+        let result = analyzer.finish(host_ip(), now + Duration::from_millis(10));
+        assert_eq!(result.analysis_exclusions, 1);
+        assert_eq!(result.tcp.status, SourceStatus::Partial);
+        assert_eq!(result.dns.status, SourceStatus::Available);
+        assert_eq!(result.dns.excluded_observations, Some(0u64.into()));
+        assert_eq!(result.dns.responses, Some(1u64.into()));
+        assert!(result.evidence.dns_complete);
+
+        analyzer
+            .observe(
+                host_ip(),
+                false,
+                &udp(false, &question(2, Some(0))),
+                now + Duration::from_millis(11),
+            )
+            .unwrap();
+        let next = analyzer.finish(host_ip(), now + Duration::from_millis(20));
+        assert_eq!(next.analysis_exclusions, 1);
+        assert_eq!(next.dns.excluded_observations, Some(1u64.into()));
+        assert_eq!(next.dns.responses, Some(0u64.into()));
+    }
+    #[test]
+    fn dns_exclusions_only_include_dns_timing_overflow() {
+        for dns_overflow in [false, true] {
+            let now = Instant::now();
+            let mut analyzer = configured();
+            analyzer
+                .observe(host_ip(), true, &udp(true, &question(1, None)), now)
+                .unwrap();
+            analyzer
+                .observe(
+                    host_ip(),
+                    false,
+                    &udp(false, &question(1, Some(0))),
+                    now + Duration::from_millis(1),
+                )
+                .unwrap();
+            let counters = &mut analyzer.hosts.get_mut(&host_ip()).unwrap().counters;
+            counters.rtt[0].push(f64::NAN, None);
+            if dns_overflow {
+                counters.dns_time.push(f64::NAN, None);
+            }
+            let result = analyzer.finish(host_ip(), now + Duration::from_millis(10));
+            assert_eq!(result.analysis_exclusions, 1 + u64::from(dns_overflow));
+            assert_eq!(
+                result.dns.excluded_observations,
+                Some(u64::from(dns_overflow).into())
+            );
+            assert_eq!(result.evidence.dns_complete, !dns_overflow);
+        }
     }
     #[test]
     fn truncated_dns_and_missing_tcp_handshake_do_not_invent_latencies() {
