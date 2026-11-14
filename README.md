@@ -405,7 +405,7 @@ external collector programs are used.
 
 `GET /api/v1/statistics/host-experience/summary` provides a separately labeled
 rolling **1-hour observed experience** table, with the same scope/body rules.
-Use `address`, `interface`, `limit` 1..64 (default 25) and its own window-pinned
+Use `address`, `interface`, `limit` 1..256 (default 25) and its own window-pinned
 cursor. It pools exact traffic/TCP/DNS counts, source coverage, usable RTT
 extrema/variation, experience-state durations and timestamped last rated
 experience. Missing evidence remains unknown; no invented hourly score or

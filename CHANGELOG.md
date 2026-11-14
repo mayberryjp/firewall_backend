@@ -52,6 +52,8 @@
   experience-state durations/last rating. Missing evidence remains null;
   unavailable hourly distributions are explicit, not averaged percentiles.
   Existing live scoring/history and storage schema are unchanged.
+  Summary page limits are 1..256 (default 25), increased from the initial 64-host
+  cap; other read/output bounds remain unchanged.
   Release impact: additive API; next automatic calendar version.
   Required frontend review: [handoff 2026-11-14-07](docs/frontend-handoffs/2026-11-14.md#2026-11-14-07-one-hour-experience-summaries).
 

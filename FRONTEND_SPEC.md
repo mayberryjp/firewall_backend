@@ -356,7 +356,7 @@ Both routes require authenticated `state.read`, no body, and return no-store
 | --- | --- | --- |
 | `GET /api/v1/statistics/host-experience/latest` | Optional canonical `address`, existing managed-LAN `interface`, canonical `limit` 1..256 (default 100), opaque `cursor` <=1024 bytes | Current eligible host rows; one pinned completed collection, numeric IP ordering, `next_cursor:string|null` |
 | `GET /api/v1/statistics/host-experience/history` | Required canonical `address` only | Exactly 360 chronological ten-second observed/missing slots; at most one hour, no pagination |
-| `GET /api/v1/statistics/host-experience/summary` | Optional canonical `address`, managed-LAN `interface`, canonical `limit` 1..64 (default 25), opaque `cursor` <=2048 bytes | One pinned rolling-hour summary per currently eligible IP; numeric IP ordering and `next_cursor:string|null` |
+| `GET /api/v1/statistics/host-experience/summary` | Optional canonical `address`, managed-LAN `interface`, canonical `limit` 1..256 (default 25), opaque `cursor` <=2048 bytes | One pinned rolling-hour summary per currently eligible IP; numeric IP ordering and `next_cursor:string|null` |
 
 Common fields: `kind`, `interval_seconds:10`, `retention_seconds:3600`,
 `collection_id:string|null`, `collected_at:string|null`, `age_ms:number|null`,

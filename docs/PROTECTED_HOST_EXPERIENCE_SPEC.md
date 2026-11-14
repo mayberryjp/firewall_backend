@@ -722,7 +722,7 @@ row/graph; do not fetch all hosts' hour histories on every table refresh.
 `GET /api/v1/statistics/host-experience/summary`
 
 Additive read-only API: authenticated `state.read`, no body. Optional canonical
-`address`, existing managed-LAN `interface`, canonical `limit` 1..64 (default
+`address`, existing managed-LAN `interface`, canonical `limit` 1..256 (default
 25), opaque `cursor` <=2048 bytes. Strict unknown/duplicate/canonical validation
 matches latest. Four shared concurrent reads, the existing storage read deadline
 and 4 MiB response ceiling apply. SQL is streamed per address in one page

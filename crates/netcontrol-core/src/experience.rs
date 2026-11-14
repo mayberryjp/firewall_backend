@@ -804,7 +804,7 @@ impl LatestQuery {
         Self::parse_limits(query, 100, 256, 1024)
     }
     pub fn parse_summary(query: &str) -> Result<Self> {
-        Self::parse_limits(query, 25, 64, 2048)
+        Self::parse_limits(query, 25, 256, 2048)
     }
     fn parse_limits(
         query: &str,
@@ -913,9 +913,9 @@ mod tests {
         }
         assert!(HistoryQuery::parse("address=192.0.2.1&limit=1").is_err());
         assert_eq!(LatestQuery::parse_summary("").unwrap().limit, 25);
-        assert_eq!(LatestQuery::parse_summary("limit=64").unwrap().limit, 64);
+        assert_eq!(LatestQuery::parse_summary("limit=256").unwrap().limit, 256);
         for query in [
-            "limit=65",
+            "limit=257",
             "limit=00",
             "period=1h",
             "address=192.0.2.1&address=192.0.2.2",

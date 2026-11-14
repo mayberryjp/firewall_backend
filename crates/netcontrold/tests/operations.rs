@@ -142,7 +142,7 @@ async fn host_experience_authentication_contract_and_unsupported_mode() {
         format!("{latest}?limit=1&limit=1"),
         history.into(),
         format!("{history}?address=192.0.2.20&interface=lan0"),
-        format!("{summary}?limit=65"),
+        format!("{summary}?limit=257"),
         format!("{summary}?period=1h"),
         format!("{summary}?limit=1&limit=1"),
     ] {

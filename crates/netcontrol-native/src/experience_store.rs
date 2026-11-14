@@ -900,7 +900,7 @@ impl Store {
         window: &SummaryWindow,
         now_ms: i64,
     ) -> Result<Vec<Value>> {
-        ensure!(addresses.len() <= 64, "summary page exceeds 64 addresses");
+        ensure!(addresses.len() <= 256, "summary page exceeds 256 addresses");
         let keys = addresses
             .iter()
             .map(|ip| address_key(&ip.to_string()))
@@ -2703,8 +2703,8 @@ mod tests {
             assert!(summary["tcp"]["rtt_remote"]["p95_ms"].is_null());
         }
         assert!(serde_json::to_vec(&page).unwrap().len() < 4 * 1024 * 1024);
-        let excess: Vec<_> = (1..=65)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, i)))
+        let excess: Vec<_> = (1_u128..=257)
+            .map(|i| IpAddr::V6(std::net::Ipv6Addr::from(i)))
             .collect();
         assert!(store.summaries(&excess, &window, now).is_err());
     }
