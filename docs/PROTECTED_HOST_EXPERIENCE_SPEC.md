@@ -310,7 +310,7 @@ age/duration calculations use monotonic time. Never interpolate missing data.
 | `traffic.sent_bps`, `received_bps` | `bytes * 8 / (measured_duration_ms / 1000)`; null without valid counter continuity/coverage |
 | `firewall.dropped_sent_packets`, `dropped_received_packets` | Interval attributable managed drop decisions |
 | `connections.total`, `tcp_established`, `unreplied` | Shared inventory gauges near close, decimal strings; actual timing in `observed_at` and `measurement_duration_ms` |
-| `last_seen_at` | Most recent attributable host boundary traffic; null before observation, unchanged while idle |
+| `last_seen_at` | Most recent attributable host boundary traffic; null before observation, unchanged while idle. Counter acquisition can finish after the nominal bucket end, so the actual observation timestamp can be slightly later than that label; summaries preserve it without clamping. |
 | `activity` | `active` with traffic in the interval; `idle` with complete zero traffic and last seen <=60 seconds old; `not_recently_seen` with older/no observation; `unknown` when traffic observation is unavailable |
 
 Activity is not Wi-Fi association, reachability, operating-system uptime or a

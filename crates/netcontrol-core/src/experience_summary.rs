@@ -733,10 +733,6 @@ fn validate(sample: &Sample) -> Result<()> {
             "invalid summary interface identity"
         );
     }
-    ensure!(
-        sample.last_seen_at.is_none_or(|seen| seen <= sample.end_at),
-        "last_seen_at is after sample"
-    );
     for reasons in [&sample.experience.reasons, &sample.coverage.reasons] {
         ensure!(
             reasons.len() <= REASON_LIMIT
@@ -1005,6 +1001,22 @@ mod tests {
             excluded_observations: Some(0.into()),
             ..Dns::default()
         }
+    }
+
+    #[test]
+    fn last_seen_preserves_actual_observations_after_nominal_bucket_end() {
+        let mut accumulator = Accumulator::new(0, HOUR_MS).unwrap();
+        let mut row = sample(359);
+        let seen = row.end_at + chrono::Duration::milliseconds(125);
+        row.last_seen_at = Some(seen);
+        let mut earlier = sample(358);
+        earlier.last_seen_at = Some(seen - chrono::Duration::seconds(10));
+        accumulator.push(&earlier).unwrap();
+        accumulator.push(&row).unwrap();
+        assert_eq!(
+            accumulator.finish().unwrap()["last_seen_at"],
+            serde_json::to_value(seen).unwrap()
+        );
     }
 
     #[test]

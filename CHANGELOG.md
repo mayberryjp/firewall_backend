@@ -460,6 +460,11 @@
 
 ### Fixed
 
+- Stop rejecting valid hourly experience summaries with `last_seen_at is after
+  sample`: counter acquisition can observe traffic after the nominal bucket
+  boundary. Preserve the actual last-seen timestamp instead of rejecting or
+  clamping it. Release impact: fix; no API/schema or frontend action.
+
 - Reduce dense hourly-summary read overhead after CI exceeded the unchanged
   900 ms deadline: construct typed timestamps directly, validate canonical
   counters without formatting, batch bounded coverage-reason reads per address,
