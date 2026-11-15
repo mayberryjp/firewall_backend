@@ -32,5 +32,11 @@ lto = true
 codegen-units = 1
 strip = true
 
+[profile.test.package.netcontrol-core]
+opt-level = 1
+
+[profile.test.package.netcontrol-native]
+opt-level = 1
+
 [patch.crates-io]
 mozim = { path = "third_party/mozim" }

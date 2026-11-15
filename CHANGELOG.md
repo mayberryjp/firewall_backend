@@ -12,6 +12,12 @@
 
 ### Changed
 
+- Minimally optimize core/native test builds so timing-sensitive bounded-read
+  regressions are not benchmarks of wholly unoptimized debug execution.
+  Preserve debug assertions, the 900 ms deadline and all test coverage.
+  Development/release profiles and runtime/API/storage behavior are unchanged;
+  no contract impact.
+
 - Make WireGuard DNS transport readiness asynchronous: validation/network
   restoration do not query DNS; cold failures retain an unresolved peer and
   retry with explicit runtime errors. Selected endpoint and attempt/success
