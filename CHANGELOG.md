@@ -502,6 +502,11 @@
 
 ### Fixed
 
+- Correct the older traffic-report formatting test to expect an export on a
+  different corrected local date, matching the existing clock-recovery policy.
+  Same-date suppression and reporting-window assertions remain. Test-only CI
+  repair; no runtime/API/frontend contract change or manual version bump.
+
 - Make the isolated IPv6 path-test fixture disable Duplicate Address Detection
   before assigning synthetic addresses, preventing immediate socket binds from
   racing tentative address state. Apply required MQTT metric formatting.

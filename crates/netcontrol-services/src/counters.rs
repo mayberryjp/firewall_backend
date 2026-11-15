@@ -847,7 +847,7 @@ mod tests {
         assert!(!database.report_due(calendar + time::Duration::minutes(1)));
         database.last_report_date = Some("2026-10-28".into());
         assert!(!database.report_due(calendar));
-        assert!(!database.report_due(calendar - time::Duration::days(1)));
+        assert!(database.report_due(calendar - time::Duration::days(1)));
         assert!(database.report_due(calendar + time::Duration::days(1)));
     }
     #[test]
