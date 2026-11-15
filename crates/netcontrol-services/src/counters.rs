@@ -301,7 +301,7 @@ impl Database {
             && self
                 .last_report_date
                 .as_deref()
-                .is_none_or(|date| date < now.date().to_string().as_str())
+                .is_none_or(|date| date != now.date().to_string().as_str())
     }
     #[cfg(target_os = "linux")]
     fn report(
@@ -960,7 +960,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn udp_reporting_persists_date_and_does_not_invent_zero_records() {
+    fn udp_reporting_persists_date_and_totals_after_clock_correction() {
         let directory =
             std::env::temp_dir().join(format!("traffic-report-{}", rand::random::<u64>()));
         std::fs::create_dir(&directory).unwrap();
@@ -1027,10 +1027,55 @@ mod tests {
                 .contains("cannot be represented")
         );
         database.persist(&path).unwrap();
-        let restored = Database::load(&path, "host").unwrap();
+        let mut restored = Database::load(&path, "host").unwrap();
         assert!(!restored.report_due(calendar));
         assert_eq!(restored.sent_datagrams, 2);
         assert!(restored.report_due(calendar + time::Duration::days(1)));
+        let corrected = calendar - time::Duration::days(3);
+        assert!(!restored.report_due(corrected - time::Duration::minutes(1)));
+        assert!(restored.report_due(corrected));
+        let corrected_stamp = corrected
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        for (name, index) in [("lo", 1), ("vlan20", 2)] {
+            restored
+                .observe(
+                    "boot",
+                    "ns",
+                    name,
+                    index,
+                    Counts::default(),
+                    &corrected_stamp,
+                )
+                .unwrap();
+        }
+        let interfaces = serde_json::to_value(&restored.interfaces).unwrap();
+        let history = serde_json::to_value(&restored.history).unwrap();
+        restored
+            .report(
+                &receiver.local_addr().unwrap().to_string(),
+                &identity,
+                corrected,
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let mut buffer = [0; 2048];
+            let length = receiver.recv(&mut buffer).unwrap();
+            assert!(
+                std::str::from_utf8(&buffer[..length])
+                    .unwrap()
+                    .contains(";2026-10-25;")
+            );
+        }
+        assert!(!restored.report_due(corrected));
+        restored.persist(&path).unwrap();
+        let reopened = Database::load(&path, "host").unwrap();
+        assert!(!reopened.report_due(corrected));
+        assert_eq!(
+            serde_json::to_value(&reopened.interfaces).unwrap(),
+            interfaces
+        );
+        assert_eq!(serde_json::to_value(&reopened.history).unwrap(), history);
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]

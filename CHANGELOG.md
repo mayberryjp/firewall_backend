@@ -12,6 +12,25 @@
 
 ### Changed
 
+- Allow configuration submissions, confirmations, restores and restart recovery
+  after a backward UTC correction by advancing the saved revision date's
+  iteration until UTC exceeds its high-water mark. Keep actual commit timestamps,
+  history, authorization, rollback and numeric revision ordering intact.
+  Resume daily traffic export on the corrected local date rather than waiting
+  behind a future-dated report marker. Re-entered dates can repeat exports.
+  Release impact: fix to revision/error and reporting contracts; next automatic
+  calendar version. Software Git-history checks remain strict.
+  [Required frontend handoff 2026-11-15-06](docs/frontend-handoffs/2026-11-15.md#2026-11-15-06-operation-after-backward-clock-correction).
+
+- NTP now immediately steps the whole appliance clock to each selected valid
+  server sample, forward or backward without a correction-size cap, on startup
+  and every fifteen minutes. Replace bounded-slew/residual status and MQTT
+  metrics with `requested_step_ms` and `discipline: "step"`; pre-step offset
+  remains a measurement, not residual error. Packet validation and explicit
+  failure/recovery remain. Breaking runtime/operational contract; next automatic
+  calendar version, no manual bump.
+  [Required frontend handoff 2026-11-15-05](docs/frontend-handoffs/2026-11-15.md#2026-11-15-05-immediate-full-ntp-clock-correction).
+
 - Parallelize GNU release/installation checks and the native, protocol-worker
   and root-CLI CI suites; preserve Cargo's incremental setting under `sudo`
   to avoid rebuilding precompiled tests. Keep all existing tests, manual sizing/
@@ -58,6 +77,13 @@
   [handoff 2026-11-12-02](docs/frontend-handoffs/2026-11-12.md#2026-11-12-02-installer-disables-sysstat-collection).
 
 ### Added
+
+- NTP runtime objects expose optional `server_time` from the selected server's
+  accepted reply-transmission timestamp, separate from firewall-clock sample
+  publication time. Retain it explicitly as stale when sampling is unavailable;
+  clock adjustment, polling and server-selection behavior are unchanged.
+  Release impact: additive runtime field; next automatic calendar version.
+  [Frontend handoff 2026-11-15-04](docs/frontend-handoffs/2026-11-15.md#2026-11-15-04-ntp-server-reported-time).
 
 - Hourly host-experience DNS and both passive RTT p50/p95 now pool retained
   bounded timing histograms, with timing sample/slot coverage and weighted DNS

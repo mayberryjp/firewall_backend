@@ -179,14 +179,17 @@ drift and durable transaction recovery safeguards remain enforced.
   See the [API contract](../../FRONTEND_SPEC.md#dhcp-relay-diagnostics)
   for cursor gaps, filtering, nullability and counter semantics.
 * **NTP:** host UDP poll client, one resolved endpoint per configured server,
-  sixty-four-second polling and three-second response deadlines. Validates
+  immediate startup polling, then fifteen-minute polling and three-second
+  response deadlines. Validates
   server mode, v3/v4, leap, stratum, originate/receive/transmit timestamps,
   round-trip bounds and root distance, including NTP era rollover. Chooses the
-  lowest-delay valid sample and uses only Linux `adjtimex(ADJ_OFFSET_SINGLESHOT)`.
-  Each requested correction is clamped to +/-500 ms (500,000 microseconds);
-  larger valid residual offsets continue polling and slewing rather than
-  causing failure. The kernel applies corrections gradually; no clock step
-  or immediate synchronization is claimed. Requires CAP_SYS_TIME
+  lowest-delay valid sample and immediately sets Linux `CLOCK_REALTIME` with
+  `clock_settime`, applying the full correction forward or backward without
+  an offset-size cap. The target includes estimated network delay and monotonic
+  elapsed time since receipt, including time spent querying other servers.
+  Only finite, representable kernel clock targets can be applied; failures are
+  explicit. Large jumps affect wall-clock timestamps, expiry and schedules;
+  rollback restores configuration, not time. Requires CAP_SYS_TIME
   and explicit operator ownership of clock discipline; no automatic takeover
   of another clock manager. Missing/invalid samples remain visibly unavailable
   with a row-local error while the worker keeps running and polling, even after
@@ -306,7 +309,11 @@ drift and durable transaction recovery safeguards remain enforced.
   stop other reports or collection; setup failures retry on the next sample
   within the reporting minute. The persisted report date suppresses another
   completed daily attempt across normal restart; send-before-persist crashes
-  can duplicate datagrams. Collector deduplication should use hostname/interface/date.
+  can duplicate datagrams. After a backward clock correction, a future-dated
+  marker does not block the different corrected day's 23:59 attempt. Re-entering
+  a prior date after another correction can repeat an export; unchanged-date
+  polling/restart does not. Historical timestamps/totals are not rewritten.
+  Collector deduplication should use hostname/interface/date.
   Missing the whole minute misses that day's export. There is no invented-zero
   fallback on unavailable data; observed zero usage is valid. Removed interfaces
   are not exported. Unsafe report delimiters in interface names skip only their
@@ -449,21 +456,20 @@ Common enabled appliance row:
   "server": "time.example.test",
   "offset_ms": 0.125,
   "delay_ms": 1.5,
-  "requested_slew_ms": 0.125,
-  "uncorrected_offset_ms": 0.0,
-  "discipline": "slew_only",
+  "requested_step_ms": 0.125,
+  "discipline": "step",
   "collected_at": "2026-10-19T05:00:01Z"
 }
 ```
 
 * NTP `sample_status`: `warming_up|available|unavailable`; `server` string;
   `offset_ms` signed number, `delay_ms` nonnegative number; optional `error`
-  string. `requested_slew_ms` is the signed correction requested from Linux,
-  bounded to +/-500; `uncorrected_offset_ms` is the measured sample offset minus
-  that requested correction, **not** the current measured clock error or proof
-  that the asynchronous adjustment completed. `discipline` is `slew_only`.
-  A running worker/available sample does not mean synchronized; large initial
-  offsets may require prolonged slewing. A previous successful sample remains labeled with its original
+  string. `requested_step_ms` is the full signed measured correction in
+  milliseconds, published only after Linux accepts the immediate clock step.
+  `discipline` is `step`; `requested_slew_ms` and `uncorrected_offset_ms` are removed.
+  `offset_ms` is the pre-step measurement, not residual error after correction.
+  A running worker/available sample does not prove ongoing synchronization or
+  the configured server's accuracy. A previous successful sample remains labeled with its original
   `collected_at` when a later polling round fails; `sample_status: unavailable`
   and `error` indicate staleness, not a current successful correction.
 * Syslog adds `source: "journald"` and

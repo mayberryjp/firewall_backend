@@ -23,14 +23,14 @@ impl Version {
 
     pub fn next(self, date: NaiveDate) -> Result<Self> {
         ensure!(
-            date >= self.date,
-            "UTC clock predates the last configuration version"
+            (1..=9999).contains(&date.year()),
+            "version year must be 0001..9999"
         );
         if date > self.date {
             return Self::first(date);
         }
         Ok(Self {
-            date,
+            date: self.date,
             iteration: self
                 .iteration
                 .checked_add(1)
@@ -159,7 +159,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_dates_and_numeric_ordering() {
+    fn canonical_dates_numeric_ordering_and_clock_correction() {
         assert!(RELEASE_VERSION.parse::<Version>().is_ok());
         for invalid in [
             "1.2.3",
@@ -185,10 +185,13 @@ mod tests {
                 .to_string(),
             "2026.10.30.1"
         );
-        assert!(
+        assert_eq!(
             b.next(NaiveDate::from_ymd_opt(2026, 10, 28).unwrap())
-                .is_err()
+                .unwrap()
+                .to_string(),
+            "2026.10.29.11"
         );
+        assert!(b.next(NaiveDate::from_ymd_opt(0, 1, 1).unwrap()).is_err());
         let maximum: Version = "2026.10.29.4294967295".parse().unwrap();
         assert!(
             maximum

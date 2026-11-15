@@ -1,10 +1,13 @@
 use anyhow::{Result, ensure};
 const EPOCH: f64 = 2_208_988_800.;
-fn timestamp(bytes: &[u8], around: f64) -> f64 {
+fn timestamp_seconds(bytes: &[u8], around: f64) -> i64 {
     let seconds = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as f64;
-    let fraction = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as f64 / 4_294_967_296.;
     let era = ((around + EPOCH - seconds) / 4_294_967_296.).round();
-    seconds + fraction + era * 4_294_967_296. - EPOCH
+    (seconds + era * 4_294_967_296. - EPOCH) as i64
+}
+fn timestamp(bytes: &[u8], around: f64) -> f64 {
+    let fraction = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as f64 / 4_294_967_296.;
+    timestamp_seconds(bytes, around) as f64 + fraction
 }
 pub(crate) fn stamp(unix: f64) -> [u8; 8] {
     let ntp = unix + EPOCH;
@@ -13,7 +16,12 @@ pub(crate) fn stamp(unix: f64) -> [u8; 8] {
     out[4..].copy_from_slice(&((ntp.fract() * 4_294_967_296.) as u32).to_be_bytes());
     out
 }
-pub(crate) fn sample(packet: &[u8], origin: [u8; 8], t1: f64, t4: f64) -> Result<(f64, f64)> {
+pub(crate) fn sample(
+    packet: &[u8],
+    origin: [u8; 8],
+    t1: f64,
+    t4: f64,
+) -> Result<(f64, f64, String)> {
     ensure!(
         packet.len() == 48,
         "NTP extensions/authentication are not supported"
@@ -48,18 +56,21 @@ pub(crate) fn sample(packet: &[u8], origin: [u8; 8], t1: f64, t4: f64) -> Result
         "NTP invalid timing or excessive root distance"
     );
     ensure!(offset.is_finite(), "invalid nonfinite NTP offset");
-    Ok((offset, delay.max(0.)))
+    let fraction = u64::from(u32::from_be_bytes(packet[44..48].try_into()?));
+    let nanoseconds = (fraction * 1_000_000_000 / 4_294_967_296) as u32;
+    let server_time =
+        time::OffsetDateTime::from_unix_timestamp(timestamp_seconds(&packet[40..48], t1))?
+            .replace_nanosecond(nanoseconds)?
+            .format(&time::format_description::well_known::Rfc3339)?;
+    Ok((offset, delay.max(0.), server_time))
 }
-pub(crate) fn bounded_slew(offset_seconds: f64) -> Result<(i64, f64)> {
-    ensure!(
-        offset_seconds.is_finite(),
-        "NTP slew requires a finite offset"
-    );
-    let requested_us = (offset_seconds.clamp(-0.5, 0.5) * 1_000_000.).round() as i64;
-    Ok((
-        requested_us,
-        offset_seconds - requested_us as f64 / 1_000_000.,
-    ))
+#[cfg(any(target_os = "linux", test))]
+fn corrected_time(unix_seconds: f64, elapsed: std::time::Duration) -> Result<std::time::Duration> {
+    let target = std::time::Duration::try_from_secs_f64(unix_seconds)
+        .map_err(|error| anyhow::anyhow!("invalid NTP clock target: {error}"))?;
+    target
+        .checked_add(elapsed)
+        .ok_or_else(|| anyhow::anyhow!("NTP clock target overflow"))
 }
 #[cfg(target_os = "linux")]
 fn open_server(host: &str, ipv6_enabled: bool) -> Result<std::net::UdpSocket> {
@@ -106,15 +117,16 @@ pub(crate) fn prepare(
             sockets,
             pending,
             move |host| open_server(host, ipv6_enabled),
-            Duration::from_secs(64),
+            Duration::from_secs(15 * 60),
             Duration::from_secs(3),
-            |requested_us| {
-                let mut tx: libc::timex = unsafe { std::mem::zeroed() };
-                tx.modes = 0x8001; // ADJ_OFFSET_SINGLESHOT; never ADJ_SETOFFSET or clock_settime.
-                tx.offset = requested_us as _;
+            |target| {
+                let target = libc::timespec {
+                    tv_sec: target.as_secs().try_into()?,
+                    tv_nsec: target.subsec_nanos().into(),
+                };
                 ensure!(
-                    unsafe { libc::adjtimex(&mut tx) } >= 0,
-                    "bounded NTP slew failed: {}",
+                    unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &target) } == 0,
+                    "NTP clock step failed: {}",
                     std::io::Error::last_os_error()
                 );
                 Ok(())
@@ -130,7 +142,7 @@ fn poll(
     mut open: impl FnMut(&str) -> Result<std::net::UdpSocket>,
     interval: std::time::Duration,
     response_timeout: std::time::Duration,
-    mut slew: impl FnMut(i64) -> Result<()>,
+    mut step: impl FnMut(std::time::Duration) -> Result<()>,
 ) -> Result<()> {
     use serde_json::json;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -169,10 +181,18 @@ fn poll(
             while start.elapsed() < response_timeout && !ctx.stopping() {
                 match socket.recv(&mut discard) {
                     Ok(n) => {
-                        let t4 = t1 + start.elapsed().as_secs_f64();
+                        let received_at = Instant::now();
+                        let t4 = t1 + received_at.duration_since(start).as_secs_f64();
                         match sample(&discard[..n], origin, t1, t4) {
-                            Ok((offset, delay)) => {
-                                samples.push((offset, delay, host));
+                            Ok((offset, delay, server_time)) => {
+                                samples.push((
+                                    offset,
+                                    delay,
+                                    host,
+                                    server_time,
+                                    t4 + offset,
+                                    received_at,
+                                ));
                                 got = true;
                                 break;
                             }
@@ -193,17 +213,17 @@ fn poll(
             break;
         }
         samples.sort_by(|a, b| a.1.total_cmp(&b.1));
-        if let Some((offset, delay, host)) = samples.first() {
-            let (requested_us, uncorrected) = bounded_slew(*offset)?;
-            slew(requested_us)?;
+        if let Some((offset, delay, host, server_time, target, received_at)) = samples.first() {
+            // Advance the selected sample through time spent querying other servers.
+            step(corrected_time(*target, received_at.elapsed())?)?;
             ctx.update(|s| {
                 s["sample_status"] = json!("available");
                 s["server"] = json!(host);
+                s["server_time"] = json!(server_time);
                 s["offset_ms"] = json!(offset * 1000.);
                 s["delay_ms"] = json!(delay * 1000.);
-                s["requested_slew_ms"] = json!(requested_us as f64 / 1000.);
-                s["uncorrected_offset_ms"] = json!(uncorrected * 1000.);
-                s["discipline"] = json!("slew_only");
+                s["requested_step_ms"] = json!(offset * 1000.);
+                s["discipline"] = json!("step");
                 s["collected_at"] = json!(super::worker::now());
                 s.as_object_mut().unwrap().remove("error");
             });
@@ -240,16 +260,23 @@ mod tests {
         }
     }
 
-    fn respond(server: &UdpSocket) {
+    fn respond_with_offset(server: &UdpSocket, offset: f64) -> f64 {
         let mut wire = [0; 48];
         let (n, from) = server.recv_from(&mut wire).unwrap();
         assert_eq!(n, 48);
         let origin = <[u8; 8]>::try_from(&wire[40..48]).unwrap();
+        let target = timestamp(&origin, 1_800_000_000.) + offset;
         wire[0] = 0x24;
         wire[1] = 2;
         wire[24..32].copy_from_slice(&origin);
-        wire[32..40].copy_from_slice(&origin);
+        wire[32..40].copy_from_slice(&stamp(target));
+        wire[40..48].copy_from_slice(&stamp(target));
         server.send_to(&wire, from).unwrap();
+        target
+    }
+
+    fn respond(server: &UdpSocket) {
+        respond_with_offset(server, 0.);
     }
 
     #[test]
@@ -261,10 +288,10 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.connect(server.local_addr().unwrap()).unwrap();
         client.set_nonblocking(true).unwrap();
-        let (slew_tx, slew_rx) = mpsc::channel();
+        let (step_tx, step_rx) = mpsc::channel();
         let mut worker = Worker::start("ntp".into(), None, json!({"name":"ntp"}), move || {
             let client = client.try_clone()?;
-            let slew_tx = slew_tx.clone();
+            let step_tx = step_tx.clone();
             Ok(Box::new(move |ctx| {
                 poll(
                     ctx,
@@ -274,7 +301,7 @@ mod tests {
                     Duration::from_millis(5),
                     Duration::from_millis(100),
                     |requested| {
-                        slew_tx.send(requested)?;
+                        step_tx.send(requested)?;
                         Ok(())
                     },
                 )
@@ -282,8 +309,12 @@ mod tests {
         })
         .unwrap();
         respond(&server);
-        assert!(slew_rx.recv_timeout(Duration::from_secs(2)).unwrap().abs() <= 500000);
+        step_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let available = wait_for(&worker, |s| s["sample_status"] == "available");
+        assert!(available["server_time"].as_str().is_some_and(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                .is_ok()
+        }));
         for _ in 0..4 {
             let mut request = [0; 48];
             server.recv_from(&mut request).unwrap();
@@ -298,16 +329,16 @@ mod tests {
         );
         for key in [
             "server",
+            "server_time",
             "collected_at",
             "offset_ms",
             "delay_ms",
-            "requested_slew_ms",
-            "uncorrected_offset_ms",
+            "requested_step_ms",
         ] {
             assert_eq!(unavailable[key], available[key], "{key}");
         }
         respond(&server);
-        assert!(slew_rx.recv_timeout(Duration::from_secs(2)).unwrap().abs() <= 500000);
+        step_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let recovered = wait_for(&worker, |s| s["sample_status"] == "available");
         assert_eq!(recovered["state"], "running");
         assert!(recovered.get("error").is_none());
@@ -373,7 +404,7 @@ mod tests {
                     vec![],
                     vec![],
                     |_| anyhow::bail!("unused"),
-                    Duration::from_secs(64),
+                    Duration::from_secs(15 * 60),
                     Duration::from_secs(3),
                     |_| panic!("no samples must not adjust the clock"),
                 )
@@ -431,9 +462,9 @@ mod tests {
         (p, t, origin)
     }
     #[test]
-    fn validates_ntp_and_slew_bounds() {
+    fn validates_ntp_samples() {
         let (mut p, t, origin) = reply();
-        let (offset, delay) = sample(&p, origin, t, t + 0.04).unwrap();
+        let (offset, delay, _) = sample(&p, origin, t, t + 0.04).unwrap();
         assert!((offset - 0.005).abs() < 0.00001);
         assert!((delay - 0.03).abs() < 0.00001);
         p[1] = 0;
@@ -447,30 +478,82 @@ mod tests {
         let (mut p, t, o) = reply();
         p[32..40].copy_from_slice(&stamp(t + 3.));
         p[40..48].copy_from_slice(&stamp(t + 3.01));
-        let (offset, _) = sample(&p, o, t, t + 0.04).unwrap();
+        let (offset, _, _) = sample(&p, o, t, t + 0.04).unwrap();
         assert!((offset - 2.985).abs() < 0.00001);
     }
     #[test]
-    fn bounded_slew_requests_and_residual_are_exact() {
-        for (offset, expected_us, residual) in [
-            (2., 500000, 1.5),
-            (-3., -500000, -2.5),
-            (0.5, 500000, 0.),
-            (-0.5, -500000, 0.),
-            (0.125, 125000, 0.),
-            (-0.125, -125000, 0.),
-            (0., 0, 0.),
-        ] {
-            let (requested, left) = bounded_slew(offset).unwrap();
-            assert_eq!(requested, expected_us);
-            assert_eq!(left, residual);
-            assert!(requested.abs() <= 500000);
+    fn server_time_uses_transmit_timestamp_despite_a_three_day_clock_error() {
+        let (mut packet, local, origin) = reply();
+        let server = local - 3. * 86400.;
+        packet[32..40].copy_from_slice(&stamp(server + 0.125));
+        packet[40..48].copy_from_slice(&stamp(server + 0.25));
+        let (offset, _, server_time) = sample(&packet, origin, local, local + 0.25).unwrap();
+        let reported = time::OffsetDateTime::parse(
+            &server_time,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_eq!(reported.unix_timestamp(), server as i64);
+        assert_eq!(reported.nanosecond(), 250_000_000);
+        assert!(offset < -259199.);
+    }
+    #[test]
+    fn clock_targets_preserve_full_corrections_and_elapsed_time() {
+        let local = 1_800_000_000.;
+        for offset in [-259200., -25828.041862, 0., 259200.] {
+            let target = corrected_time(local + offset, Duration::from_millis(125)).unwrap();
+            assert!((target.as_secs_f64() - (local + offset + 0.125)).abs() < 0.000001);
         }
-        assert!(bounded_slew(f64::NAN).is_err());
-        assert!(bounded_slew(f64::INFINITY).is_err());
-        let (requested, residual) = bounded_slew(0.00000125).unwrap();
-        assert_eq!(requested, 1);
-        assert!((residual - 0.00000025).abs() < 1e-15);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.] {
+            assert!(corrected_time(invalid, Duration::ZERO).is_err());
+        }
+        assert!(corrected_time(local, Duration::MAX).is_err());
+    }
+    #[test]
+    fn polling_steps_large_offsets_in_both_directions_without_changing_host_clock() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(server.local_addr().unwrap()).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let (step_tx, step_rx) = mpsc::channel();
+        let mut worker = Worker::start("ntp".into(), None, json!({}), move || {
+            let client = client.try_clone()?;
+            let step_tx = step_tx.clone();
+            Ok(Box::new(move |ctx| {
+                poll(
+                    ctx,
+                    vec![("fixture".into(), client)],
+                    vec![],
+                    |_| anyhow::bail!("unused"),
+                    Duration::from_millis(5),
+                    Duration::from_secs(1),
+                    |target| {
+                        step_tx.send(target)?;
+                        Ok(())
+                    },
+                )
+            }))
+        })
+        .unwrap();
+        for offset in [-259200., 259200.] {
+            let server_time = respond_with_offset(&server, offset);
+            let target = step_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!((target.as_secs_f64() - server_time).abs() < 1.);
+            let available = wait_for(&worker, |s| {
+                s["sample_status"] == "available"
+                    && s["offset_ms"]
+                        .as_f64()
+                        .is_some_and(|value| (value - offset * 1000.).abs() < 1000.)
+            });
+            assert_eq!(available["discipline"], "step");
+            assert_eq!(available["requested_step_ms"], available["offset_ms"]);
+            assert!(available.get("requested_slew_ms").is_none());
+            assert!(available.get("uncorrected_offset_ms").is_none());
+        }
+        worker.shutdown().unwrap();
     }
     #[test]
     fn era_rollover() {

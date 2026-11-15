@@ -824,9 +824,13 @@ Configuration revision IDs independently use the same UTC date format. Initial
 configuration and each new UTC day's first confirmation allocate iteration 1;
 same-day confirmations increment it. Copy server-issued strings for conflict
 checks and history cursors; use `committed_revision` on confirmed transactions
-rather than adding one. Backward UTC clock movement blocks confirmation explicitly
-but leaves rollback available. Keep the host UTC clock accurate; the configured
-display/host timezone does not affect allocation.
+rather than adding one. Backward UTC correction retains the saved revision date
+and advances its iteration, allowing submission/confirmation/restore and restart
+without rewriting history. A newer UTC date beyond that high-water mark starts
+iteration 1. Actual commit timestamps still use corrected UTC; iteration exhaustion
+fails explicitly and rollback remains available. Keep the host UTC clock accurate;
+the configured display/host timezone does not affect allocation. This does not
+relax the separate software-build rejection of regressed Git commit dates.
 
 Current network journals use `netcontrol-rust-state-v2`. Numeric-revision v1
 journals are incompatible, rejected unchanged, and are not converted by the

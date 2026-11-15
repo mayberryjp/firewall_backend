@@ -591,6 +591,10 @@ including timesyncd, chrony, ntpd and one-shot NTP services/timers. They verify
 stopped/persistently masked units and reject remaining known NTP processes.
 Netcontrol's saved NTP settings are preserved: with NTP disabled there is no
 managed network clock synchronization; enabling it polls only configured servers.
+NTP runtime status includes optional `server_time`, the selected server's sampled
+reply-transmission UTC, separately from firewall-clock `collected_at` and signed
+`offset_ms`. Sampling failure retains the old server time with unavailable sample
+status; it is not a live clock or proof that local clock correction completed.
 Existing appliances need the revised full source upgrade to establish these masks;
 binary-only self-upgrades retain but do not create them. See
 [NTP ownership](docs/BUILD_AND_INSTALL.md#ntp-ownership).
@@ -1216,8 +1220,20 @@ of events. Archived rollback records may predate journal initialization, and a
 same-day clock correction may put confirmation before submission. Neither
 invalidates an otherwise intact journal. Configuration validation, checksums,
 ownership, revision chains and rollback invariants remain strict; history is
-not re-dated, deleted or reset. A UTC date older than the committed configuration
-revision rejects new submissions with `503` before native application.
+not re-dated, deleted or reset. Correcting UTC backward does not block editing:
+new configuration revisions increment the saved date's iteration until real UTC
+passes that date, then start iteration 1 on the newer day. Commit timestamps use
+actual corrected UTC; revision dates are a monotonic high-water mark, not proof
+of the commit's wall-clock date. Iteration exhaustion still fails explicitly.
+Software build versions retain their separate strict Git-history clock checks.
+
+Daily traffic exports also resume at the corrected local 23:59 despite a
+future-dated last-report marker, without resetting accounting/history. Re-entering
+a date after another clock change can repeat an export; unchanged-date restart
+does not. Host-experience timing still quarantines ambiguous pre-correction
+samples and temporarily rejects hourly summaries across a clock discontinuity.
+It recovers after its rolling-hour discontinuity window, not after waiting for
+the formerly incorrect calendar date.
 
 Confirmation is bounded by both the saved UTC deadline and a process-monotonic
 timer. Restart reconstructs the remaining budget, capped at the original
@@ -1342,8 +1358,11 @@ complete schema, host keys, authentication, recovery and limitations.
 ## Current limits and distribution review
 
 The native protocol implementations have explicit boundaries: flow filters are
-limited to empty/ip/ip6/tcp/udp/icmp/icmp6 and exclude fragments; NTP is a bounded
-slew-only client without NTS or server consensus; syslog has no durable
+limited to empty/ip/ip6/tcp/udp/icmp/icmp6 and exclude fragments; NTP immediately
+steps the whole host clock to the lowest-delay valid configured server sample
+on startup and every fifteen minutes, without a correction-size cap.
+Forward/backward jumps affect timestamps and time-based expiry; there is no
+NTS or server consensus. Syslog has no durable
 forwarding queue or automatic reconnect; traffic history is per-sample, not
 calendar aggregation. See the [native service contract](crates/netcontrol-services/README.md).
 No DHCP/DNS server or DHCPv6 relay is provided.

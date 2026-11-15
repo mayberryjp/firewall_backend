@@ -186,8 +186,7 @@ pub fn services(runtime: Option<&Value>) -> Result<HostSensors> {
                         for field in [
                             "offset_ms",
                             "delay_ms",
-                            "requested_slew_ms",
-                            "uncorrected_offset_ms",
+                            "requested_step_ms",
                         ] {
                             metric(
                                 &mut out,
@@ -839,7 +838,7 @@ pub(crate) mod tests {
         json!({
             "appliance_services":[
                 {"name":"ntp","state":"running","sample_status":"available","offset_ms":-2.5,
-                    "delay_ms":1.0,"requested_slew_ms":-2.0,"uncorrected_offset_ms":-0.5},
+                    "delay_ms":1.0,"requested_step_ms":-2.5,"discipline":"step"},
                 {"name":"syslog","state":"running","forwarding_enabled":false,"received_records":"18446744073709551615",
                     "captured_records":"18446744073709551615","forwarded_deliveries":"85",
                     "forwarded_records":"42","failed_deliveries":"3","destination_errors":["omit-private-error"]},
@@ -928,6 +927,8 @@ pub(crate) mod tests {
         let out = services(Some(&runtime)).unwrap();
         for (kind, name, field, expected) in [
             ("service", "ntp", "offset_ms", json!(-2.5)),
+            ("service", "ntp", "requested_step_ms", json!(-2.5)),
+            ("service", "ntp", "discipline", json!("step")),
             (
                 "service",
                 "syslog",

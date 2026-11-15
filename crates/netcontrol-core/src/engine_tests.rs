@@ -4502,22 +4502,32 @@ fn read_routes_runtime_statistics_and_reconcile_contract() {
     );
 }
 #[test]
-fn calendar_revisions_roll_days_preserve_history_and_reject_clock_regression() {
+fn calendar_revisions_preserve_history_and_recover_after_clock_correction() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
     let initial = engine.committed_revision();
-    let tomorrow = Utc::now() + Duration::days(1);
-    engine.now = Some(tomorrow);
+    let corrected = Utc::now();
+    let future = corrected + Duration::days(3);
+    engine.now = Some(future);
     let transaction = submit(&mut engine, config());
     assert_eq!(transaction.status, 202, "{}", transaction.body);
     let committed = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
     assert_eq!(committed.status, 200, "{}", committed.body);
-    let next_day = Version::first(tomorrow.date_naive()).unwrap();
+    let next_day = Version::first(future.date_naive()).unwrap();
     assert_eq!(engine.committed_revision(), next_day);
     assert_eq!(committed.body["committed_revision"], json!(next_day));
+    let first_id = transaction.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        engine.state.transactions[&first_id].committed_at,
+        Some(future)
+    );
     drop(engine);
     let mut engine = fixture.engine();
-    engine.now = Some(tomorrow + Duration::seconds(1));
+    engine.now = Some(corrected);
+    assert_eq!(
+        engine.state.transactions[&first_id].committed_at,
+        Some(future)
+    );
     let restored = request(
         &mut engine,
         "POST",
@@ -4531,23 +4541,50 @@ fn calendar_revisions_roll_days_preserve_history_and_reject_clock_regression() {
     );
     assert_eq!(
         engine.committed_revision(),
-        next_day.next(tomorrow.date_naive()).unwrap()
+        next_day.next(corrected.date_naive()).unwrap()
     );
-    engine.now = Some(tomorrow - Duration::days(1));
+    let restored_id = restored.body["id"].as_str().unwrap();
+    assert_eq!(
+        engine.state.transactions[restored_id].committed_at,
+        Some(corrected)
+    );
     let transaction = submit(&mut engine, config());
-    assert_eq!(transaction.status, 503);
-    assert!(
-        transaction.body["error"]
-            .as_str()
-            .unwrap()
-            .contains("UTC clock")
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
     );
+    let high_water = next_day
+        .next(corrected.date_naive())
+        .unwrap()
+        .next(corrected.date_naive())
+        .unwrap();
+    assert_eq!(engine.committed_revision(), high_water);
+    let pending = submit(&mut engine, config());
+    assert_eq!(pending.status, 202);
+    engine
+        .rollback(pending.body["id"].as_str().unwrap(), "operator rollback")
+        .unwrap();
+    assert_eq!(engine.committed_revision(), high_water);
     assert!(engine.active().is_none());
     drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(engine.committed_revision(), high_water);
     assert_eq!(
-        fixture.engine().committed_revision(),
-        next_day.next(tomorrow.date_naive()).unwrap()
+        engine.state.transactions[&first_id].committed_at,
+        Some(future)
     );
+    engine.now = Some(future + Duration::days(1));
+    let pending = submit(&mut engine, config());
+    assert_eq!(pending.status, 202);
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let next_date = Version::first((future + Duration::days(1)).date_naive()).unwrap();
+    assert_eq!(engine.committed_revision(), next_date);
+    drop(engine);
+    assert_eq!(fixture.engine().committed_revision(), next_date);
 }
 
 #[test]
@@ -4581,7 +4618,7 @@ fn archived_rollback_before_initialization_preserves_observed_timestamps_and_reo
 }
 
 #[test]
-fn same_day_clock_step_preserves_commit_history_and_monotonic_confirmation_limit() {
+fn clock_step_preserves_commit_history_and_monotonic_confirmation_limit() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
     let noon = engine
@@ -4594,7 +4631,7 @@ fn same_day_clock_step_preserves_commit_history_and_monotonic_confirmation_limit
     engine.now = Some(noon);
     let transaction = submit(&mut engine, config());
     assert_eq!(transaction.status, 202);
-    engine.now = Some(noon - Duration::hours(1));
+    engine.now = Some(noon - Duration::days(3));
     let committed = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
     assert_eq!(committed.status, 200, "{}", committed.body);
     drop(engine);
@@ -4602,7 +4639,7 @@ fn same_day_clock_step_preserves_commit_history_and_monotonic_confirmation_limit
     engine.now = Some(noon);
     let transaction = submit(&mut engine, config());
     assert_eq!(transaction.status, 202);
-    engine.now = Some(noon - Duration::hours(1));
+    engine.now = Some(noon - Duration::days(3));
     engine.confirmation_timer = Some(Instant::now() - std::time::Duration::from_secs(1));
     let expired = confirm(&mut engine, transaction.body["id"].as_str().unwrap());
     assert_eq!(expired.status, 409);

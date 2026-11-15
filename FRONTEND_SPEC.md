@@ -162,9 +162,13 @@ Submission/commit timestamps retain observed UTC values. An archived rollback
 before initialization or same-day commit before submission is not corruption;
 do not infer revision ordering from wall-clock timestamps. Checksums, normalized
 configuration, canonical revision chains, active pointers and recovery remain
-strict. New transaction submission/revision restore returns `503` if the current
-UTC date predates the saved revision, before native application; preserve drafts
-and show the clock error rather than automatically resubmitting.
+strict. A corrected UTC date earlier than the saved revision no longer blocks
+submission, restore or confirmation. Revision dates retain their saved high-water
+mark and increment its iteration until UTC passes that date; commit timestamps
+retain the actual corrected UTC. Never infer commit time or clock health from a
+revision date, re-date saved history, or replace the server-issued base revision.
+Iteration exhaustion still returns an explicit `503`; normal conflict,
+authorization, validation and recovery errors remain unchanged.
 
 Identity and scoped-auth files require their own `schema: 1` JSON roots; these
 are not the network-state envelope. A scoped file is
@@ -2924,9 +2928,13 @@ servers and preserving the actual complete network configuration.
 
 - NTP editor: enabled toggle and 0..8 unique server host/IP strings; enabling
   requires at least one. This disciplines the **whole appliance clock**, not an
-  isolated clock, with host networking. Client only, slew-only, no NTP serving
-  or NTS. Each correction is bounded to +/-500 ms, with continued polling for
-  larger residual offsets. Running is not synchronized. Rollback restores
+  isolated clock, with host networking. Client only, immediate clock stepping,
+  no NTP serving or NTS. Polls immediately on startup, then every fifteen minutes.
+  Applies the full lowest-delay valid sample correction forward or backward
+  without an offset-size cap; only representable kernel times are supported.
+  Warn that clock jumps affect timestamps, expiry and schedules, and a wrong
+  configured server can immediately set the wrong time. Running is not
+  synchronized. Rollback restores
   settings, not time. No server-consensus/falseticker algorithm is provided.
   Ubuntu fresh installation and full source upgrades now stop/disable and
   persistently mask standard OS NTP clients and one-shot services/timers,
@@ -2937,7 +2945,7 @@ servers and preserving the actual complete network configuration.
   no implicit public pool. Disabling does not restore OS clients. Arbitrarily
   named custom clients/cron launchers require operator removal. Existing hosts
   need the revised full source upgrade; HTTP/automatic binary self-upgrades
-  retain existing masks but do not establish them. No API/client-type changes;
+  retain existing masks but do not establish them. Ownership settings are unchanged;
   update NTP/operator help for the clock-drift/TLS implications and
   [deployment scope](docs/BUILD_AND_INSTALL.md#ntp-ownership).
   [Handoff 2026-11-09-06](docs/frontend-handoffs/2026-11-09.md#2026-11-09-06-exclusive-os-ntp-ownership)
@@ -2992,12 +3000,26 @@ validation, opt-ins, missing syslog activation, genuine networking drift,
 authorization, persistence and transaction recovery errors remain enforced.
 Running proves local worker/namespace/readiness only, **not** synchronized
 clock, complete capture, or remote delivery. NTP exposes optional sample
-`offset_ms`, `delay_ms`, `requested_slew_ms`, `uncorrected_offset_ms`, `server`,
-`collected_at`, `discipline: "slew_only"`, and
+`offset_ms`, `delay_ms`, `requested_step_ms`, `server`,
+`server_time`, `collected_at`, `discipline: "step"`, and
 `sample_status: "warming_up"|"available"|"unavailable"`. Offsets are signed
-milliseconds; delay is nonnegative. Requested slew is bounded to +/-500 ms.
-Uncorrected offset is sample offset minus the requested correction, not proof
-that the asynchronous adjustment completed. Preserve sample timestamps on stale
+milliseconds; delay is nonnegative. `requested_step_ms` is the full measured
+offset, published only after Linux accepts the immediate clock step.
+`offset_ms` remains the pre-step measurement, not residual clock error.
+The target advances through monotonic time since receipt, including other server
+queries. `requested_slew_ms` and `uncorrected_offset_ms` are removed.
+`server_time` is an optional RFC3339 UTC string decoded from the selected
+server's transmit timestamp in the accepted NTP response, including its fractional
+seconds to nanosecond precision (sub-nanosecond fraction truncated). It is a
+sampled server time, not a live ticking clock, an extrapolated local time or proof
+of server trust/synchronization. NTP era decoding uses the local date as its era
+reference; a three-day local error does not prevent reporting the server's time.
+`collected_at` remains the firewall's UTC sample-publication time and may be
+wrong when its clock is wrong. Display both with their source labels and
+offset/sample status; do not interpret their direct difference as the NTP offset.
+Before the first accepted sample `server_time` is absent; sampling failure retains
+it with the other stale sample fields and marks `sample_status:"unavailable"`.
+Preserve sample timestamps on stale
 samples; no synchronization or remote-delivery acknowledgment is provided.
 Missing or invalid NTP samples do not stop the worker, including after three
 failed polling rounds. While `state: "running"` and `sample_status: "unavailable"`,
@@ -3174,7 +3196,12 @@ not delivery. `last_report_error` is a non-blocking reporting warning; collectio
 continues. Socket/setup failures retry within that minute; per-interface send
 failures are counted without blocking other reports. Persisted date suppresses
 repeat daily attempts across normal restart; a crash between send and persistence
-can duplicate a report. Collector deduplication should use reported name/interface/date;
+can duplicate a report. A future-dated report marker does not postpone exports
+after a backward correction: the next observed local 23:59 may report the
+different corrected date. Re-entering an already reported date after another
+clock change can produce another attempt; unchanged-date polling/restart does not.
+Stored accounting/history is not re-dated or reset. Collector deduplication
+should use reported name/interface/date;
 adding/changing a domain changes that identity and may create a new collector
 device. Preserve existing collector history; no backend migration or duplicate
 short-name report is provided.
@@ -3655,8 +3682,9 @@ Publisher and deployment contract:
     `udp-broadcast-relay:<instance_id>`): process state, retry/restart metadata,
     start/sample timestamps, sample status where supported and `error_present`
     (presence of a reported current/last error, not an assurance of health).
-    NTP exposes discipline and available offset/delay/requested-slew/uncorrected
-    offset in ms. Syslog exposes cumulative captured/forwarded/failed-delivery
+    NTP exposes `discipline: "step"` and available `offset_ms`, `delay_ms`,
+    `requested_step_ms` gauges in ms; requested-slew/uncorrected-offset entities
+    are removed. Syslog exposes cumulative captured/forwarded/failed-delivery
     counts and a destination-error count, not messages or destination details.
     mDNS/UDP relay expose their supported receive/transmit packet/byte, policy/
     loop/duplicate/hop-limit/queue/oversize/unsupported-record/malformed/
@@ -7732,10 +7760,16 @@ canonical `yyyy.mm.dd.iteration` strings on the wire. Use ordinary JSON string
 serialization; remove uint64/lossless-number revision encoders. Validate a real
 UTC date (year 0001..9999) and iteration 1..4294967295 without leading zeroes.
 Compare numeric components, not lexicographic strings (`.10` is newer than `.9`).
-Initialization allocates iteration 1; further same-day confirmations increment it,
-and the first confirmation on a later UTC day starts at 1. Clock regression or
-iteration exhaustion returns an explicit `503`, without committing or losing the
-pending rollback path. Copy the exact current revision for `base_revision`;
+Initialization allocates iteration 1; confirmations on the same or an earlier
+UTC date increment the existing date's iteration. The first confirmation whose
+UTC date exceeds that high-water date starts at 1 on the newer date. For example,
+after correcting November 18 back to November 15, `2026.11.18.3` advances to
+`2026.11.18.4`, while `committed_at` records November 15. November 19 can start
+`2026.11.19.1`. This keeps IDs unique and numerically increasing without
+rewriting history or blocking editing. Iteration exhaustion returns an explicit
+`503`, without committing or losing the pending rollback path. Compiled software
+versions still require nonregressing full Git commit history. Copy the exact
+current revision for `base_revision`;
 numeric inputs, missing base revisions and malformed strings return `400`.
 Configuration and software iterations are independent. Rollbacks do not advance
 configuration versions; confirmed restores create a new revision. History is
@@ -7829,11 +7863,11 @@ interface ApplianceServiceStatus {
   error?: string;
   sample_status?: "warming_up" | "available" | "unavailable";
   server?: string;
+  server_time?: Timestamp; // selected server's sampled reply-transmission UTC
   offset_ms?: number;
   delay_ms?: number;
-  requested_slew_ms?: number;
-  uncorrected_offset_ms?: number;
-  discipline?: "slew_only";
+  requested_step_ms?: number;
+  discipline?: "step";
   collected_at?: Timestamp;
 }
 

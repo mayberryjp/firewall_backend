@@ -210,7 +210,7 @@ fn native_ntp_udp_fixture_validates_origin_without_changing_clock() {
         response[40..48].copy_from_slice(&ntp::stamp(t + 0.02));
         server.send_to(&response, from)?;
         let n = client.recv(&mut wire)?;
-        let (offset, delay) = ntp::sample(&wire[..n], origin, t, t + 0.03)?;
+        let (offset, delay, _) = ntp::sample(&wire[..n], origin, t, t + 0.03)?;
         ensure!(
             offset.abs() < 0.001 && delay < 0.021,
             "invalid native NTP sample"
