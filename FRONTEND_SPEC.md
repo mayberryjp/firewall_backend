@@ -423,7 +423,7 @@ until expiry. Never relabel an old sample to a new owner/interface.
 
 Summary uses the same authenticated `state.read`, no-body GET, four-read admission
 and 4 MiB response ceiling. It does not change `/latest`, scoring, collection
-cadence or persisted samples. Its common envelope has `kind:"summary"`,
+cadence or existing public sample fields. Its common envelope has `kind:"summary"`,
 `window:{start_at,end_at}` (exactly 3600 seconds; endpoints aligned to ten
 seconds), `snapshot_at`, page-local `coverage_complete`, `eligible_hosts`,
 `collector_scope:"latest_collection"`, current host identity/metadata rows with
@@ -447,9 +447,28 @@ level, bounded reason frequencies, and nullable
 `last_rated:{sample_at,experience,is_last_observed_slot}`. Label it historical:
 it is not a current or averaged hourly score. Show coverage and identity-change
 warnings; IP totals may span different configured owners/attachments.
-Hourly RTT p50/p95 and DNS timing percentiles/variation are null with explicit
-unavailability reasons because distributions/weights are not retained. Never
-average bucket percentiles. `summary.connections.current` is the matching snapshot from the pinned latest
+Hourly `tcp.rtt_remote`/`tcp.rtt_host` p50/p95 and DNS
+`response_time_p50_ms`/`response_time_p95_ms` are nullable numbers in milliseconds,
+pooled from retained 32-bin observation histograms, not averages of bucket
+percentiles. These are histogram estimates, not exact raw-observation quantiles.
+Each RTT object and `dns` includes numeric `timing_observed_slots` and
+`timing_missing_slots`, decimal-string `timing_samples`, and boolean
+`timing_coverage_complete`. Coverage counts only available/partial source slots:
+it does not assert a complete hour or complete packet capture. Old rows without
+histograms remain retained and count as missing timing slots; percentiles use
+only the evidenced subset. RTT `samples`/extrema/variation still include usable
+older summaries, so `timing_samples` may differ from `samples`.
+DNS additionally provides nullable numeric `min_ms`, `max_ms`,
+`response_time_variation_mean_ms` and decimal-string `variation_pairs`, all
+from the retained timing subset; variation is weighted by actual pair counts.
+`percentile_unavailable_reason` (RTT) / `timing_unavailable_reason` (DNS) is null
+when timing samples exist, `per_bucket_distributions_not_retained` when there
+are no eligible retained distributions, or `no_timing_observations` when retained
+distributions contain zero timings. Null is not zero.
+Deploying the backend atomically adds a bounded timing table to recognized
+telemetry schema v1, preserving existing history without backfill. New timing
+coverage accumulates over the following hour. Latest/history JSON is unchanged.
+`summary.connections.current` is the matching snapshot from the pinned latest
 collection, not an active query. Counts `total`, `tcp_established` and `unreplied`
 remain nullable decimal strings; `observed_at`, `measurement_duration_ms`,
 `age_ms`, `status` and `error` expose actual freshness. Available snapshots older

@@ -52,6 +52,15 @@
 
 ### Added
 
+- Hourly host-experience DNS and both passive RTT p50/p95 now pool retained
+  bounded timing histograms, with timing sample/slot coverage and weighted DNS
+  variation. Percentiles are estimates, not averaged bucket percentiles.
+  An explicitly authorized atomic telemetry schema v1-to-v2 addition preserves
+  old history without inventing/backfilling missing distributions.
+  Release impact: additive summary fields/populated nullable timings and storage
+  change; next automatic calendar version.
+  [Required frontend handoff 2026-11-15-03](docs/frontend-handoffs/2026-11-15.md#2026-11-15-03-pooled-dns-and-passive-rtt-percentiles).
+
 - Hourly host-experience summaries expose `connections.current` with exact
   counts, acquisition timestamp and stale/unavailable status, plus
   `connections.average` over valid ten-second snapshots with observation

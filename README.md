@@ -409,7 +409,12 @@ Use `address`, `interface`, `limit` 1..256 (default 25) and its own window-pinne
 cursor. It pools exact traffic/TCP/DNS counts, source coverage, usable RTT
 extrema/variation, experience-state durations and timestamped last rated
 experience. Missing evidence remains unknown; no invented hourly score or
-averaged p95. Connection gauges include both the pinned latest snapshot with
+averaged p95. DNS and both passive RTT p50/p95 pool retained 32-bin timing
+histograms, with explicit sample/slot coverage; these are histogram estimates.
+Older history without distributions stays retained but cannot supply timing
+percentiles. The backend atomically extends recognized telemetry schema v1 with
+the bounded timing table; new coverage fills over the next hour, without backfill.
+Connection gauges include both the pinned latest snapshot with
 freshness and the one-hour mean over available snapshots, with coverage.
 Restart paging on `409` window expiry. See the
 [summary contract](docs/PROTECTED_HOST_EXPERIENCE_SPEC.md#821-one-hour-per-ip-summaries).

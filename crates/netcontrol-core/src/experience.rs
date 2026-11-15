@@ -297,6 +297,8 @@ pub struct Sample {
     pub dns: Dns,
     pub experience: Experience,
     pub coverage: Coverage,
+    #[serde(skip)]
+    pub timing_distributions: Option<Box<[Option<Distribution>; 3]>>,
 }
 impl Sample {
     pub fn new(
@@ -326,18 +328,19 @@ impl Sample {
             dns: Dns::default(),
             experience: Experience::default(),
             coverage: Coverage::default(),
+            timing_distributions: None,
         }
     }
 }
 
-/// Transient evidence only: do not persist flow identities, DNS fingerprints or distributions.
+/// Bounded timing evidence. Flow identities and DNS fingerprints are never persisted.
 ///
 /// p50/p95 are histogram estimates: the lower edge of the bin containing the
 /// nearest-rank observation, clipped to the exact observed minimum. The final
 /// bin is [5000 ms, infinity). Exact minima,
 /// maxima, observation counts and flow-local variation sums are retained.
 /// Volume does not exhaust this fixed-size representation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Distribution {
     pub counts: [u64; HISTOGRAM_BINS],
     pub samples: u64,
@@ -444,7 +447,7 @@ impl Distribution {
                 .then(|| self.variation_sum_ms / self.variation_pairs as f64),
         }
     }
-    fn valid(&self) -> bool {
+    pub fn valid(&self) -> bool {
         !self.overflowed
             && self
                 .counts

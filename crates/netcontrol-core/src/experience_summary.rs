@@ -1,4 +1,4 @@
-//! One-hour summaries of retained samples, without reconstructing distributions or scores.
+//! One-hour summaries pooling retained timing distributions without rescoring.
 use crate::experience::{
     self, Connections, Count, Experience, ExperienceLevel, ExperienceStatus, InterfaceIdentity,
     Sample, SourceStatus, Timing,
@@ -14,6 +14,63 @@ const SLOT_MS: i64 = 10_000;
 const SLOTS: u32 = 360;
 const REASON_LIMIT: usize = 32;
 const PERCENTILE_REASON: &str = "per_bucket_distributions_not_retained";
+
+#[derive(Default)]
+struct PooledTiming {
+    distribution: experience::Distribution,
+    observed_slots: u32,
+    missing_slots: u32,
+}
+impl PooledTiming {
+    fn push(&mut self, distribution: Option<&experience::Distribution>) -> Result<()> {
+        if let Some(distribution) = distribution {
+            ensure!(distribution.valid(), "invalid retained timing distribution");
+            self.distribution.merge(distribution);
+            ensure!(
+                self.distribution.valid(),
+                "pooled timing distribution overflow"
+            );
+            self.observed_slots += 1;
+        } else {
+            self.missing_slots += 1;
+        }
+        Ok(())
+    }
+
+    fn fields(&self, value: &mut Value, dns: bool) {
+        let summary = self.distribution.summary();
+        let reason = if self.observed_slots == 0 {
+            Some(PERCENTILE_REASON)
+        } else if summary.samples.0 == 0 {
+            Some("no_timing_observations")
+        } else {
+            None
+        };
+        let (p50, p95, reason_field) = if dns {
+            (
+                "response_time_p50_ms",
+                "response_time_p95_ms",
+                "timing_unavailable_reason",
+            )
+        } else {
+            ("p50_ms", "p95_ms", "percentile_unavailable_reason")
+        };
+        value[p50] = json!(summary.p50_ms);
+        value[p95] = json!(summary.p95_ms);
+        value[reason_field] = json!(reason);
+        value["timing_observed_slots"] = json!(self.observed_slots);
+        value["timing_missing_slots"] = json!(self.missing_slots);
+        value["timing_samples"] = json!(summary.samples);
+        value["timing_coverage_complete"] =
+            json!(self.missing_slots == 0 && self.observed_slots > 0);
+        if dns {
+            value["response_time_variation_mean_ms"] = json!(summary.variation_mean_ms);
+            value["variation_pairs"] = json!(summary.variation_pairs);
+            value["min_ms"] = json!(summary.min_ms);
+            value["max_ms"] = json!(summary.max_ms);
+        }
+    }
+}
 
 fn connection_values(snapshot: &Connections) -> Result<[Count; 3]> {
     let values = [snapshot.total, snapshot.tcp_established, snapshot.unreplied];
@@ -294,6 +351,7 @@ pub struct Accumulator {
     dns: [Total; 6],
     dns_unanswered: Ratio,
     connections: ConnectionAverage,
+    pooled_timing: [PooledTiming; 3],
     pending_at_close: Option<Count>,
     pending_at_close_at: Option<DateTime<Utc>>,
     statuses: [StatusDuration; 5],
@@ -342,6 +400,7 @@ impl Accumulator {
             dns: std::array::from_fn(|_| Total::default()),
             dns_unanswered: Ratio::default(),
             connections: ConnectionAverage::default(),
+            pooled_timing: std::array::from_fn(|_| PooledTiming::default()),
             pending_at_close: None,
             pending_at_close_at: None,
             statuses: std::array::from_fn(|_| StatusDuration::default()),
@@ -381,6 +440,21 @@ impl Accumulator {
         } else {
             None
         };
+        for (index, pooled) in self.pooled_timing.iter_mut().enumerate() {
+            let status = if index == 2 {
+                sample.dns.status
+            } else {
+                sample.tcp.status
+            };
+            if matches!(status, SourceStatus::Available | SourceStatus::Partial) {
+                pooled.push(
+                    sample
+                        .timing_distributions
+                        .as_ref()
+                        .and_then(|streams| streams[index].as_ref()),
+                )?;
+            }
+        }
 
         self.address = Some(sample.ip_address);
         self.observed_slots += 1;
@@ -543,7 +617,7 @@ impl Accumulator {
                 "is_last_observed_slot": self.last_sample_at == Some(at),
             })
         });
-        Ok(json!({
+        let mut result = json!({
             "start_at": start, "end_at": end,
             "expected_slots": SLOTS, "observed_slots": self.observed_slots,
             "complete_slots": self.complete_slots, "observed_seconds": self.observed_slots * 10,
@@ -609,7 +683,11 @@ impl Accumulator {
                 "worst_rated_level": self.worst_level, "last_rated": last_rated,
                 "reason_frequencies": self.reasons, "reason_frequencies_truncated": self.reasons_truncated,
             },
-        }))
+        });
+        self.pooled_timing[0].fields(&mut result["tcp"]["rtt_remote"], false);
+        self.pooled_timing[1].fields(&mut result["tcp"]["rtt_host"], false);
+        self.pooled_timing[2].fields(&mut result["dns"], true);
+        Ok(result)
     }
 }
 
@@ -1016,6 +1094,63 @@ mod tests {
         assert_eq!(
             accumulator.finish().unwrap()["last_seen_at"],
             serde_json::to_value(seen).unwrap()
+        );
+    }
+
+    #[test]
+    fn hourly_percentiles_pool_observations_and_report_missing_distributions() {
+        let mut accumulator = Accumulator::new(0, HOUR_MS).unwrap();
+        for (slot, count, latency) in [(0, 1000, 12.0), (1, 1, 1000.0)] {
+            let mut row = sample(slot);
+            let mut distribution = experience::Distribution::default();
+            for _ in 0..count {
+                distribution.push(latency, Some(latency));
+            }
+            row.tcp = tcp(count, 0);
+            row.tcp.rtt_remote = distribution.summary();
+            row.tcp.rtt_host = distribution.summary();
+            row.dns = dns(count, 0, 0);
+            row.dns.response_time_p50_ms = distribution.quantile(50);
+            row.dns.response_time_p95_ms = distribution.quantile(95);
+            row.dns.response_time_variation_mean_ms = Some(0.0);
+            row.timing_distributions = Some(Box::new([
+                Some(distribution.clone()),
+                Some(distribution.clone()),
+                Some(distribution),
+            ]));
+            accumulator.push(&row).unwrap();
+        }
+        let mut old = sample(2);
+        old.tcp = tcp(1, 0);
+        old.dns = dns(1, 0, 0);
+        accumulator.push(&old).unwrap();
+        let summary = accumulator.finish().unwrap();
+        assert_eq!(summary["dns"]["response_time_p95_ms"], 12.0);
+        assert_eq!(summary["dns"]["response_time_p50_ms"], 12.0);
+        assert_eq!(summary["dns"]["response_time_variation_mean_ms"], 0.0);
+        assert_eq!(summary["dns"]["timing_samples"], "1001");
+        assert_eq!(summary["dns"]["timing_observed_slots"], 2);
+        assert_eq!(summary["dns"]["timing_missing_slots"], 1);
+        assert_eq!(summary["dns"]["timing_coverage_complete"], false);
+        assert!(summary["dns"]["timing_unavailable_reason"].is_null());
+        for side in ["rtt_remote", "rtt_host"] {
+            assert_eq!(summary["tcp"][side]["p95_ms"], 12.0);
+            assert_eq!(summary["tcp"][side]["timing_samples"], "1001");
+        }
+        let mut empty = sample(0);
+        empty.tcp = tcp(0, 0);
+        empty.timing_distributions = Some(Box::new([
+            Some(experience::Distribution::default()),
+            None,
+            None,
+        ]));
+        let mut accumulator = Accumulator::new(0, HOUR_MS).unwrap();
+        accumulator.push(&empty).unwrap();
+        let result = accumulator.finish().unwrap();
+        assert!(result["tcp"]["rtt_remote"]["p95_ms"].is_null());
+        assert_eq!(
+            result["tcp"]["rtt_remote"]["percentile_unavailable_reason"],
+            "no_timing_observations"
         );
     }
 

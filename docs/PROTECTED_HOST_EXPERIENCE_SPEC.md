@@ -492,6 +492,16 @@ Use a versioned typed schema, not arbitrary packet/JSON blobs:
 - Host samples: IP, bucket ID, epoch reference, last seen, activity, nullable
   metric scalars, score/status/confidence/algorithm and bounded reason/component
   records. Unique `(ip_address,bucket_id)`, indexed for IP/time and expiry.
+- Sample timings: schema v2 adds `sample_timings`, one optional bounded binary
+  record per sample, foreign-key cascading on sample expiry. At most 1024 bytes
+  encode three sparse 32-bin distributions (remote RTT, host RTT, DNS), exact
+  extrema, variation sums and pair counts. No raw timings, DNS names/payloads or
+  remote flow identities. Bytes count toward existing transaction/storage caps.
+  At writer startup, recognized schema v1 is validated including integrity and
+  references, then atomically extended without deleting/reconstructing old rows.
+  This narrow additive schema update was explicitly authorized; unknown/corrupt
+  schemas still fail explicitly. Old rows lack timing evidence; no backfill or
+  compatibility guarantee for older binaries.
 
 Store canonical IP bytes with family where useful; expose canonical literals.
 Counts must round-trip unsigned 64-bit values exactly despite SQLite's signed
@@ -773,7 +783,7 @@ Reusable structures:
 | Ratio | `numerator:string|null`, `denominator:string|null`, `percent:number|null`, `observed_slots`, `complete_slots`, `last_observed_at` |
 | Duration | `slots`, `seconds` |
 | Source | `available_slots`, `partial_slots`, `not_observed_slots`, `unavailable_slots`, `observed_slots`, `complete_slots`, `observed_seconds`, `complete_seconds`, `observed_duration_ms`, `complete_duration_ms`, `last_observed_at` |
-| RTT | `samples:string|null`, `variation_pairs:string|null`, `variation_mean_ms:number|null`, `min_ms:number|null`, `max_ms:number|null`, `p50_ms:null`, `p95_ms:null`, `percentile_unavailable_reason`, `observed_slots`, `complete_slots`, `last_observed_at` |
+| RTT | `samples:string|null`, `variation_pairs:string|null`, `variation_mean_ms:number|null`, `min_ms:number|null`, `max_ms:number|null`, `p50_ms:number|null`, `p95_ms:number|null`, `percentile_unavailable_reason:string|null`, `observed_slots`, `complete_slots`, `last_observed_at`, timing coverage fields below |
 
 Counter `complete_slots` counts source-available observations independently of
 overall capture coverage; always render it alongside `sources` and the summary
@@ -827,8 +837,10 @@ Per-host `summary`:
   response/unanswered pairs; requests still pending are not finalized failures.
   `pending_at_close`, `pending_at_close_at` and
   `pending_at_close_is_last_observed_slot` retain the last observed gauge,
-  not its sum. `response_time_p50_ms`, `response_time_p95_ms` and
-  `response_time_variation_mean_ms` are null with `timing_unavailable_reason`.
+  not its sum. Nullable numeric `response_time_p50_ms`, `response_time_p95_ms`,
+  `response_time_variation_mean_ms`, `min_ms` and `max_ms` are milliseconds from
+  retained timing evidence; `variation_pairs` is its decimal-string pair count.
+  `timing_unavailable_reason` is a nullable string; timing coverage is below.
 - `experience:{rated,idle,insufficient_data,incomplete,unavailable,missing}`:
   Duration objects; `rated_levels:{excellent,good,fair,poor}` likewise.
   `worst_rated_level` is nullable. `last_rated` is null or
@@ -839,11 +851,35 @@ Per-host `summary`:
   (for example `{"capture_gap":2}`). It is bounded to 32 distinct codes;
   `reason_frequencies_truncated` explicitly reports omitted codes.
 
-RTT counts/extrema pool usable retained timings. Variation is weighted by each
-stored `variation_pairs`, not bucket count; existing same-flow pairs can bridge
-bucket boundaries. Histograms are not persisted: hourly p50/p95 cannot be
-reconstructed. DNS also lacks persisted timing sample/extrema/pair weights.
-Never average bucket percentiles or report a fabricated hourly DNS variation.
+RTT counts/extrema/variation pool all usable stored summaries, including old rows.
+Variation is weighted by stored `variation_pairs`, not bucket count; existing
+same-flow pairs can bridge bucket boundaries. DNS variation uses retained
+distribution sums/pairs. Pooling creates no new pairs across buckets or flows.
+
+Hourly p50/p95 pool observation counts from the retained 32-bin distributions
+defined in section 6; they are histogram estimates, never averaged bucket
+percentiles or exact raw-timing quantiles. Each RTT object and `dns` exposes:
+
+- `timing_observed_slots` (number 0..360): available/partial source slots with a
+  valid retained distribution, including an empty one.
+- `timing_missing_slots` (number 0..360): available/partial source slots without
+  a valid retained distribution, including historical schema-v1 rows.
+- `timing_samples` (decimal string): usable observations represented by the
+  pooled histogram; zero is `"0"`. It may be smaller than RTT `samples`, whose
+  counts/extrema/variation also cover older scalar-only summaries.
+- `timing_coverage_complete` (boolean): at least one retained eligible
+  distribution and no eligible missing distributions. Not-observed/unavailable
+  source slots do not enter these counts. This flag does not imply 360 slots,
+  complete source/capture coverage, or enough observations for scoring.
+
+RTT `percentile_unavailable_reason` / DNS `timing_unavailable_reason` is null
+with usable histogram samples; `per_bucket_distributions_not_retained` if no
+eligible slot has a distribution (also when the source has never been observed);
+`no_timing_observations` if retained eligible distributions are all empty.
+Percentiles remain null in both no-data cases. With partial retained evidence,
+calculate the subset percentile and show its coverage; never fabricate the
+missing history. Deployment retains old rows; new evidence fills the rolling
+hour naturally. Internal distributions do not change latest/history JSON.
 Connection gauges are averaged, not presented as event totals; per-sample window
 minima still require raw history.
 

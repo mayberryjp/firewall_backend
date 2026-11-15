@@ -2,7 +2,7 @@
 //! not part of this database.
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
-use netcontrol_core::experience::Sample;
+use netcontrol_core::experience::{Distribution, HISTOGRAM_BINS, Sample};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -25,9 +25,113 @@ pub const MAX_SLOTS: usize = 360;
 const MAX_HOSTS: usize = 2048;
 const MAIN_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 const WAL_LIMIT: u64 = 32 * 1024 * 1024;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x4e435845;
 const JSON_LIMIT: usize = 2048;
+
+type RetainedTimings = [Option<Distribution>; 3];
+
+fn encode_timings(streams: &RetainedTimings) -> Result<Vec<u8>> {
+    let mut bytes = vec![0];
+    for (index, distribution) in streams.iter().enumerate() {
+        let Some(distribution) = distribution else {
+            continue;
+        };
+        ensure!(distribution.valid(), "invalid retained timing distribution");
+        bytes[0] |= 1 << index;
+        bytes.push(
+            distribution
+                .counts
+                .iter()
+                .filter(|count| **count > 0)
+                .count() as u8,
+        );
+        for (bin, count) in distribution.counts.iter().enumerate() {
+            if *count > 0 {
+                bytes.push(bin as u8);
+                bytes.extend_from_slice(&count.to_le_bytes());
+            }
+        }
+        for value in [
+            distribution.min_ms.unwrap_or(0.0),
+            distribution.max_ms.unwrap_or(0.0),
+            distribution.variation_sum_ms,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&distribution.variation_pairs.to_le_bytes());
+    }
+    ensure!(
+        bytes.len() <= 1024,
+        "oversized retained timing distribution"
+    );
+    Ok(bytes)
+}
+
+fn timing_bytes<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N]> {
+    let (value, rest) = bytes
+        .split_at_checked(N)
+        .context("truncated timing distribution")?;
+    *bytes = rest;
+    Ok(value.try_into()?)
+}
+
+fn decode_timings(value: rusqlite::types::ValueRef<'_>) -> Result<Option<Box<RetainedTimings>>> {
+    use rusqlite::types::ValueRef;
+    let mut bytes = match value {
+        ValueRef::Null => return Ok(None),
+        ValueRef::Blob(bytes) => bytes,
+        _ => bail!("invalid timing distribution storage type"),
+    };
+    ensure!(
+        bytes.len() <= 1024,
+        "oversized retained timing distribution"
+    );
+    let [mask] = timing_bytes(&mut bytes)?;
+    ensure!(mask & !7 == 0, "invalid timing distribution mask");
+    let mut streams = Box::new(std::array::from_fn(|_| None));
+    for (index, stream) in streams.iter_mut().enumerate() {
+        if mask & (1 << index) == 0 {
+            continue;
+        }
+        let [bins] = timing_bytes(&mut bytes)?;
+        ensure!(usize::from(bins) <= HISTOGRAM_BINS, "too many timing bins");
+        let mut distribution = Distribution::default();
+        let mut previous = None;
+        for _ in 0..bins {
+            let [bin] = timing_bytes(&mut bytes)?;
+            let bin = usize::from(bin);
+            let count = u64::from_le_bytes(timing_bytes(&mut bytes)?);
+            ensure!(
+                bin < HISTOGRAM_BINS && previous.is_none_or(|old| bin > old) && count > 0,
+                "invalid timing bin"
+            );
+            previous = Some(bin);
+            distribution.counts[bin] = count;
+            distribution.samples = distribution
+                .samples
+                .checked_add(count)
+                .context("timing sample count overflow")?;
+        }
+        let min = f64::from_le_bytes(timing_bytes(&mut bytes)?);
+        let max = f64::from_le_bytes(timing_bytes(&mut bytes)?);
+        distribution.min_ms = (distribution.samples > 0).then_some(min);
+        distribution.max_ms = (distribution.samples > 0).then_some(max);
+        distribution.variation_sum_ms = f64::from_le_bytes(timing_bytes(&mut bytes)?);
+        distribution.variation_pairs = u64::from_le_bytes(timing_bytes(&mut bytes)?);
+        ensure!(
+            distribution.valid(),
+            "invalid persisted timing distribution"
+        );
+        ensure!(
+            distribution.samples > 0 || (min == 0.0 && max == 0.0),
+            "invalid empty timing extrema"
+        );
+        *stream = Some(distribution);
+    }
+    ensure!(bytes.is_empty(), "trailing timing distribution bytes");
+    Ok(Some(streams))
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,7 +374,7 @@ impl Store {
             lock.sync_all()?;
         }
         validate_files(path)?;
-        let writer = Connection::open_with_flags(
+        let mut writer = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -282,10 +386,10 @@ impl Store {
         let app: i64 = writer.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         if existed {
             ensure!(
-                version == SCHEMA_VERSION && app == APPLICATION_ID,
+                (version == 1 || version == SCHEMA_VERSION) && app == APPLICATION_ID,
                 "unsupported experience database schema; existing data preserved"
             );
-            validate_schema(&writer)?;
+            validate_schema_version(&writer, version == SCHEMA_VERSION)?;
         } else {
             ensure!(
                 version == 0 && app == 0,
@@ -305,6 +409,12 @@ impl Store {
             foreign_errors == 0,
             "corrupt experience database references"
         );
+        if existed && version == 1 {
+            let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute_batch(TIMING_SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+        }
         writer.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
              PRAGMA wal_autocheckpoint=1024; PRAGMA journal_size_limit=0;
@@ -574,6 +684,12 @@ impl Store {
                 values.extend(row.metrics);
                 insert.execute(rusqlite::params_from_iter(values))?;
                 let sample_id = tx.last_insert_rowid();
+                if let Some(timings) = row.timings {
+                    tx.execute(
+                        "INSERT INTO sample_timings(sample_id,distributions) VALUES (?1,?2)",
+                        params![sample_id, timings],
+                    )?;
+                }
                 for (position, reason) in row.coverage_reasons.into_iter().enumerate() {
                     tx.execute(
                         "INSERT INTO coverage_reasons(sample_id,position,reason) VALUES (?1,?2,?3)",
@@ -1270,8 +1386,9 @@ fn select_sql() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("SELECT s.id,s.address,e.epoch,e.host_id,e.revision,e.interface_name,e.interface_index,
-        e.interface_kind,e.vlan_id,b.start_ms,b.end_ms,e.configured_name,{metrics}
-        FROM host_samples s JOIN buckets b ON b.seq=s.bucket_id JOIN host_epochs e ON e.id=s.identity_id")
+        e.interface_kind,e.vlan_id,b.start_ms,b.end_ms,e.configured_name,{metrics},t.distributions
+        FROM host_samples s JOIN buckets b ON b.seq=s.bucket_id JOIN host_epochs e ON e.id=s.identity_id
+        LEFT JOIN sample_timings t ON t.sample_id=s.id")
 }
 
 fn read_diagnostics(tx: &Transaction<'_>, bucket: i64) -> Result<Diagnostics> {
@@ -1417,8 +1534,9 @@ fn read_sample(tx: &Transaction<'_>, row: &rusqlite::Row<'_>) -> Result<Sample> 
         "coverage.reasons",
         Value::Array(reasons.into_iter().map(Value::String).collect()),
     );
-    let sample: Sample =
+    let mut sample: Sample =
         serde_json::from_value(value).context("invalid persisted experience sample")?;
+    sample.timing_distributions = decode_timings(row.get_ref(COLUMNS.len() + 12)?)?;
     // Scalar decoding has already validated the stored projection.
     validate_sample(&sample)?;
     Ok(sample)
@@ -1801,6 +1919,7 @@ fn read_summary_sample(
             dns: scalar.text(columns.coverage_dns)?,
             connections: scalar.text(columns.coverage_connections)?,
         },
+        timing_distributions: decode_timings(row.get_ref(COLUMNS.len() + 12)?)?,
     };
     validate_sample(&sample)?;
     Ok(sample)
@@ -1968,7 +2087,15 @@ fn column_name(path: &str) -> String {
     path.replace('.', "_")
 }
 
+const TIMING_SCHEMA: &str =
+    "CREATE TABLE sample_timings(sample_id INTEGER PRIMARY KEY REFERENCES host_samples(id) ON DELETE CASCADE,
+     distributions BLOB NOT NULL CHECK(length(distributions)<=1024)) STRICT;";
+
 fn schema_sql() -> String {
+    schema_sql_version(true)
+}
+
+fn schema_sql_version(timings: bool) -> String {
     let metrics = COLUMNS
         .iter()
         .map(|c| {
@@ -1981,6 +2108,8 @@ fn schema_sql() -> String {
             format!(",{name} {kind}")
         })
         .collect::<String>();
+    let timing_schema = if timings { TIMING_SCHEMA } else { "" };
+    let version = if timings { SCHEMA_VERSION } else { 1 };
     format!(
         "PRAGMA page_size=4096; BEGIN IMMEDIATE;
          CREATE TABLE store_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),wall_ms INTEGER NOT NULL,
@@ -2008,15 +2137,16 @@ fn schema_sql() -> String {
          CREATE INDEX sample_identity ON host_samples(identity_id);
          CREATE TABLE coverage_reasons(sample_id INTEGER NOT NULL REFERENCES host_samples(id) ON DELETE CASCADE,
              position INTEGER NOT NULL,reason TEXT NOT NULL,PRIMARY KEY(sample_id,position),UNIQUE(sample_id,reason)) STRICT;
-         PRAGMA application_id={APPLICATION_ID}; PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
+         {timing_schema}
+         PRAGMA application_id={APPLICATION_ID}; PRAGMA user_version={version}; COMMIT;"
     )
 }
 
-fn validate_schema(connection: &Connection) -> Result<()> {
+fn validate_schema_version(connection: &Connection, timings: bool) -> Result<()> {
     // Compare every table/index definition, not merely user_version: a damaged
     // same-version schema is an error, never an invitation to recreate tables.
     let expected = Connection::open_in_memory()?;
-    expected.execute_batch(&schema_sql())?;
+    expected.execute_batch(&schema_sql_version(timings))?;
     let definitions = |db: &Connection| -> Result<Vec<(String, String, Option<String>)>> {
         let mut statement = db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")?;
         Ok(statement
@@ -2118,9 +2248,37 @@ struct EncodedSample {
     vlan_id: i64,
     metrics: Vec<rusqlite::types::Value>,
     coverage_reasons: Vec<String>,
+    timings: Option<Vec<u8>>,
 }
 
 fn validate_sample(sample: &Sample) -> Result<()> {
+    if let Some(streams) = &sample.timing_distributions {
+        for (index, distribution) in streams.iter().enumerate() {
+            if let Some(distribution) = distribution {
+                ensure!(distribution.valid(), "invalid retained timing distribution");
+                let timing = distribution.summary();
+                if index < 2 {
+                    let stored = if index == 0 {
+                        &sample.tcp.rtt_remote
+                    } else {
+                        &sample.tcp.rtt_host
+                    };
+                    ensure!(
+                        timing == *stored,
+                        "retained RTT distribution differs from sample"
+                    );
+                } else {
+                    ensure!(
+                        timing.p50_ms == sample.dns.response_time_p50_ms
+                            && timing.p95_ms == sample.dns.response_time_p95_ms
+                            && timing.variation_mean_ms
+                                == sample.dns.response_time_variation_mean_ms,
+                        "retained DNS distribution differs from sample"
+                    );
+                }
+            }
+        }
+    }
     ensure!(
         [
             sample.traffic.sent_bps,
@@ -2295,6 +2453,11 @@ impl EncodedSample {
             vlan_id,
             metrics,
             coverage_reasons,
+            timings: sample
+                .timing_distributions
+                .as_deref()
+                .map(encode_timings)
+                .transpose()?,
         })
     }
 
@@ -2308,6 +2471,7 @@ impl EncodedSample {
             })
             .sum::<usize>()
             + self.coverage_reasons.iter().map(String::len).sum::<usize>()
+            + self.timings.as_ref().map_or(0, Vec::len)
             + self.address.len()
             + self.epoch.len()
             + self.host_id.len()
@@ -2644,6 +2808,85 @@ mod tests {
             .reader
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn retained_timings_survive_restart_and_schema_update_preserves_history() {
+        let directory = TestDirectory::new();
+        let mut store = directory.open(BASE);
+        let end = BASE + INTERVAL_MS;
+        insert(&mut store, "old", end, &[sample("192.0.2.1", end)]);
+        drop(store);
+        let connection = Connection::open(directory.database()).unwrap();
+        connection
+            .execute_batch("DROP TABLE sample_timings; PRAGMA user_version=1;")
+            .unwrap();
+        drop(connection);
+        store = directory.open(end + 1);
+        assert_eq!(count(&store, "host_samples"), 1);
+        assert!(
+            store.samples("old", end + 1).unwrap()[0]
+                .timing_distributions
+                .is_none()
+        );
+        let mut distribution = Distribution::default();
+        distribution.push(12.0, None);
+        distribution.push(20.0, Some(12.0));
+        let mut item = sample("192.0.2.1", end + INTERVAL_MS);
+        item.observation_epoch = "new-epoch".into();
+        item.tcp.status = netcontrol_core::experience::SourceStatus::Available;
+        item.tcp.data_packets_sent = Some(Count(0));
+        item.tcp.data_packets_received = Some(Count(0));
+        item.tcp.retransmission_observations_sent = Some(Count(0));
+        item.tcp.retransmission_observations_received = Some(Count(0));
+        item.tcp.rtt_remote = distribution.summary();
+        item.tcp.rtt_host = distribution.summary();
+        item.dns.status = netcontrol_core::experience::SourceStatus::Partial;
+        item.dns.responses = Some(Count(2));
+        item.dns.response_time_p50_ms = distribution.quantile(50);
+        item.dns.response_time_p95_ms = distribution.quantile(95);
+        item.dns.response_time_variation_mean_ms = distribution.summary().variation_mean_ms;
+        item.timing_distributions = Some(Box::new([
+            Some(distribution.clone()),
+            Some(distribution.clone()),
+            Some(distribution),
+        ]));
+        insert(&mut store, "new", end + INTERVAL_MS, &[item.clone()]);
+        let encoded = encode_timings(item.timing_distributions.as_deref().unwrap()).unwrap();
+        assert!(encoded.len() < 1024);
+        assert_eq!(
+            decode_timings(rusqlite::types::ValueRef::Blob(&encoded)).unwrap(),
+            item.timing_distributions
+        );
+        assert!(
+            decode_timings(rusqlite::types::ValueRef::Blob(
+                &encoded[..encoded.len() - 1]
+            ))
+            .is_err()
+        );
+        drop(store);
+        store = directory.open(end + INTERVAL_MS + 1);
+        assert_eq!(
+            store.samples("new", end + INTERVAL_MS + 1).unwrap(),
+            vec![item]
+        );
+        let now = end + INTERVAL_MS + 1;
+        let window = store.summary_window(now).unwrap();
+        let summary = store
+            .summaries(&["192.0.2.1".parse().unwrap()], &window, now)
+            .unwrap();
+        assert_eq!(summary[0]["tcp"]["rtt_remote"]["p95_ms"], 20.0);
+        assert_eq!(summary[0]["dns"]["response_time_p95_ms"], 20.0);
+        assert_eq!(summary[0]["traffic"]["sent_bytes"]["total"], "6");
+        store
+            .writer
+            .execute("UPDATE sample_timings SET distributions=x'ff'", [])
+            .unwrap();
+        assert!(
+            store
+                .summaries(&["192.0.2.1".parse().unwrap()], &window, now)
+                .is_err()
+        );
     }
 
     #[test]

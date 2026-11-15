@@ -1741,6 +1741,23 @@ fn run(shared: &Arc<Shared>, namespace: Arc<File>, root: PathBuf) -> Result<()> 
                     .and_then(|n| n.checked_add(analysis.tracking_evictions));
                 sample.tcp = analysis.tcp;
                 sample.dns = analysis.dns;
+                sample.timing_distributions = Some(Box::new([
+                    analysis
+                        .evidence
+                        .remote_rtt
+                        .valid()
+                        .then(|| analysis.evidence.remote_rtt.clone()),
+                    analysis
+                        .evidence
+                        .host_rtt
+                        .valid()
+                        .then(|| analysis.evidence.host_rtt.clone()),
+                    analysis
+                        .evidence
+                        .dns_time
+                        .valid()
+                        .then(|| analysis.evidence.dns_time.clone()),
+                ]));
                 sample.coverage = Coverage {
                     complete: full_bucket
                         && !late
