@@ -502,6 +502,12 @@
 
 ### Fixed
 
+- Align offline numeric-state conversion tests and operator documentation with
+  the existing revision date high-water rule. Preserve backdated commit
+  timestamps, configuration, restore/rollback history and increasing revision
+  IDs; continue rejecting invalid timestamps and incomplete/active histories.
+  Test/documentation-only CI correction; no new runtime or frontend contract.
+
 - Correct the older traffic-report formatting test to expect an export on a
   different corrected local date, matching the existing clock-recovery policy.
   Same-date suppression and reporting-window assertions remain. Test-only CI

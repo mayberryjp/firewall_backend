@@ -962,17 +962,20 @@ mod tests {
     }
 
     #[test]
-    fn numeric_history_restore_and_rollback_map_dates_without_losing_configuration() {
+    fn numeric_history_clock_correction_restore_and_rollback_preserve_configuration() {
         let mut fixture = Fixture::new(true);
         fixture.numeric();
         let mut payload = fixture.payload();
-        let original = payload["transactions"]
+        let mut original = payload["transactions"]
             .as_object()
             .unwrap()
             .values()
             .next()
             .unwrap()
             .clone();
+        let original_id = original["id"].as_str().unwrap().to_owned();
+        original["committed_at"] = json!("2026-10-25T23:59:02Z");
+        payload["transactions"][&original_id] = original.clone();
         let first = original["candidate"].clone();
         let initial = original["previous"].clone();
         let mut restored = original.clone();
@@ -1013,6 +1016,10 @@ mod tests {
         drop(plan);
         let saved = fixture.payload();
         assert_eq!(saved["desired"], first);
+        assert_eq!(
+            saved["transactions"][&original_id]["committed_at"],
+            original["committed_at"]
+        );
         assert_eq!(saved["transactions"].as_object().unwrap().len(), 4);
         assert_eq!(
             saved["transactions"]["b".repeat(32)]["restored_from_revision"],
@@ -1036,7 +1043,7 @@ mod tests {
         for case in [
             "gap",
             "overflow",
-            "regression",
+            "invalid_commit_time",
             "mixed",
             "unknown",
             "restore",
@@ -1056,8 +1063,8 @@ mod tests {
             match case {
                 "gap" => payload["revision"] = json!(2),
                 "overflow" => payload["transactions"][&id]["base_revision"] = json!(u64::MAX),
-                "regression" => {
-                    payload["transactions"][&id]["committed_at"] = json!("2026-10-27T23:59:02Z")
+                "invalid_commit_time" => {
+                    payload["transactions"][&id]["committed_at"] = json!("invalid-timestamp")
                 }
                 "mixed" => payload["transactions"][&id]["base_revision"] = json!("0"),
                 "unknown" => payload["unknown"] = json!(true),

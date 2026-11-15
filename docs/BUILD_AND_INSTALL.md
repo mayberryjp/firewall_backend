@@ -394,8 +394,11 @@ The explicitly authorized `netcontrol-state-convert --date-revisions` operation
 converts valid numeric v1 state offline, preserving desired configuration and
 every historical transaction/configuration. It uses initialization/commit UTC
 dates and the current date-version allocator, mapping numeric revision 0 to the
-initial date's iteration 1. Subsequent commits increment on the same UTC day or
-start at iteration 1 on a later day. Transaction IDs, actors, statuses and
+initial date's iteration 1. Subsequent commits increment the saved date's
+iteration when commit UTC is earlier or equal, or start at iteration 1 when UTC
+advances beyond that date high-water mark. Backward clock corrections therefore
+preserve increasing revision IDs without rewriting actual timestamps.
+Transaction IDs, actors, statuses and
 timestamps remain; base/committed/restore revision references become strings.
 The preview and private backup manifest include the exact revision mapping.
 No old numeric aliases, normal-startup compatibility path or automatic reset
@@ -438,7 +441,7 @@ binary. A binary rollback by itself does not roll back this offline conversion.
 The shared converter holds journal/native locks, verifies original checksums,
 validates all history and current native ownership/adoption, backs up every
 affected file before publication and refuses changed sources. It rejects active
-transactions/native intents, incomplete history, backward UTC commit dates,
+transactions/native intents, incomplete history, invalid commit timestamps,
 unknown fields, nonempty retired policy rules and scope/config mismatches.
 Finish/recover pending work with the previous binary first; do not bypass the
 checks or discard history. The same explicit operation can remove **empty**
