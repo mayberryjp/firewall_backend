@@ -12,6 +12,13 @@
 
 ### Changed
 
+- Parallelize GNU release/installation checks and the native, protocol-worker
+  and root-CLI CI suites; preserve Cargo's incremental setting under `sudo`
+  to avoid rebuilding precompiled tests. Keep all existing tests, manual sizing/
+  throughput checks and publication gates. Correct the unsupported-schema test
+  to use a future version instead of the now-supported telemetry schema v2.
+  Release/API/frontend impact: none; CI/test-only change.
+
 - Minimally optimize core/native test builds so timing-sensitive bounded-read
   regressions are not benchmarks of wholly unoptimized debug execution.
   Preserve debug assertions, the 900 ms deadline and all test coverage.

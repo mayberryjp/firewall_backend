@@ -16,6 +16,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   checks:
     name: Rust checks (Ubuntu x86-64)
@@ -41,6 +44,26 @@ jobs:
       - run: cargo +stable fmt --all -- --check
       - run: cargo +stable test --workspace --locked
       - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+
+  gnu:
+    name: GNU release build and installation checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - name: Cache GNU release dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: ubuntu-24.04-gnu-release
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
       - run: cargo +stable build --workspace --release --locked
       - name: Check service units and installer
         run: |
@@ -53,9 +76,19 @@ jobs:
           systemd-analyze verify packaging/native/netcontrold.service 2>unit-check.log || { cat unit-check.log; exit 1; }
 
   native:
-    name: Privileged native Rust integration
+    name: Privileged integration (${{ matrix.suite }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: native
+            arguments: -p netcontrol-native
+          - suite: services
+            arguments: -p netcontrol-services
+          - suite: local-control
+            arguments: -p netcontrold --test local_control
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -66,30 +99,25 @@ jobs:
       - name: Cache native integration dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          key: ubuntu-24.04-native
+          key: ubuntu-24.04-native-${{ matrix.suite }}
           cache-bin: false
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
       - name: Prepare kernel modules
+        if: matrix.suite != 'local-control'
         run: |
           for module in dummy 8021q wireguard nf_tables nf_conntrack nf_nat; do
             sudo modprobe "$module"
           done
-      - run: cargo +stable test -p netcontrol-native -p netcontrol-services --locked --no-run
-      - name: Test native kernel and protocol workers
+      - run: cargo +stable test ${{ matrix.arguments }} --locked --no-run
+      - name: Run precompiled privileged tests
         run: |
           sudo env "PATH=$PATH" NETCONTROL_INTEGRATION=1 \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
-            cargo +stable test -p netcontrol-native -p netcontrol-services --locked -- --ignored --test-threads=1
-      - name: Test root-only live CLI identity administration
-        run: |
-          cargo +stable test -p netcontrold --test local_control --locked --no-run
-          sudo env "PATH=$PATH" \
-            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
-            cargo +stable test -p netcontrold --test local_control --locked -- --ignored --test-threads=1
+            "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" \
+            cargo +stable test ${{ matrix.arguments }} --locked -- --ignored --test-threads=1
 
   package:
     name: Signed native package (Ubuntu x86-64)
@@ -198,7 +226,7 @@ jobs:
   publish:
     name: Publish stable Ubuntu release
     timeout-minutes: 15
-    needs: [checks, native, package]
+    needs: [checks, gnu, native, package]
     if: inputs.publish && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     concurrency:

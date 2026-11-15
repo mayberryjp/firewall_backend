@@ -556,6 +556,14 @@ NETCONTROL_INTEGRATION=1 cargo test \
 Run these only on an appropriately privileged, disposable Linux test machine.
 Run fixtures serially: isolated host-mode fixtures still share the exclusive
 host-tunables lock. CI uses the same single-threaded test setting.
+CI runs native, protocol-worker and root-only CLI suites on separate disposable
+runners, including the ignored sizing/throughput checks; no tests are skipped.
+It preserves `CARGO_INCREMENTAL=0` when invoking Cargo under `sudo` to reuse
+the precompiled tests. GNU release build/installation checks run independently
+of workspace tests/Clippy and the musl package build. Publication requires all
+jobs, including every privileged matrix entry, to pass. Each new job/suite has
+its own dependency cache; the first run may be cold. Repository rules requiring
+individual job names must account for the split GNU/privileged check names.
 Portable Windows tests and Linux cross-compilation do not establish native
 runtime correctness. Consult the [change journal](docs/journal/2026-10-19.md)
 for actual validation results and known limits of the rewrite.

@@ -3539,7 +3539,7 @@ mod tests {
 
     #[test]
     fn unsupported_version_and_unversioned_existing_database_fail_closed() {
-        for version in [0, 2] {
+        for version in [0, SCHEMA_VERSION + 1] {
             let directory = TestDirectory::new();
             {
                 let store = directory.open(BASE);
