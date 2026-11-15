@@ -1934,6 +1934,8 @@ mod native {
 
         fn paired(v6: bool) -> Result<()> {
             let (source, peer) = if v6 {
+                std::fs::write("/proc/sys/net/ipv6/conf/ptlo/accept_dad", "0")
+                    .context("disable DAD for isolated path-test fixture addresses")?;
                 #[repr(C)]
                 struct In6Ifreq {
                     address: libc::in6_addr,

@@ -502,6 +502,11 @@
 
 ### Fixed
 
+- Make the isolated IPv6 path-test fixture disable Duplicate Address Detection
+  before assigning synthetic addresses, preventing immediate socket binds from
+  racing tentative address state. Apply required MQTT metric formatting.
+  CI/test-only repair; no runtime/API/frontend contract change or manual bump.
+
 - Stop rejecting valid hourly experience summaries with `last_seen_at is after
   sample`: counter acquisition can observe traffic after the nominal bucket
   boundary. Preserve the actual last-seen timestamp instead of rejecting or

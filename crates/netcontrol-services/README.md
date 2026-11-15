@@ -610,3 +610,8 @@ without changing the host clock. They do not establish full production
 interoperability, TLS PKI end-to-end behavior, real DHCP client topology,
 privileged clock mutation, or whole-host log ownership safety on a target
 appliance; those require dedicated Linux deployment checks.
+
+The paired IPv6 path-test fixture disables Duplicate Address Detection only on
+its isolated synthetic interface before assigning addresses, so immediate
+socket binds cannot race tentative address state. Production IPv6 settings and
+host interfaces are unchanged.

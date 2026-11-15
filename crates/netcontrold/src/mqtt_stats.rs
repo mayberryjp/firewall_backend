@@ -183,11 +183,7 @@ pub fn services(runtime: Option<&Value>) -> Result<HostSensors> {
                             None,
                             None,
                         );
-                        for field in [
-                            "offset_ms",
-                            "delay_ms",
-                            "requested_step_ms",
-                        ] {
+                        for field in ["offset_ms", "delay_ms", "requested_step_ms"] {
                             metric(
                                 &mut out,
                                 "service",
