@@ -454,6 +454,13 @@
 
 ### Fixed
 
+- Reduce dense hourly-summary read overhead after CI exceeded the unchanged
+  900 ms deadline: construct typed timestamps directly, validate canonical
+  counters without formatting, batch bounded coverage-reason reads per address,
+  and order by the existing address/bucket index. Preserve all summaries,
+  corruption checks, pinned windows and output limits. Release impact: fix;
+  next automatic calendar version, no frontend or persisted-schema change.
+
 - Repair protected-host experience collection: schedule conntrack before every
   ten-second bucket, and replace untimestamped postrouting NFLOG observations
   with kernel-timestamped logical-LAN egress packet-ring capture. Bound and order

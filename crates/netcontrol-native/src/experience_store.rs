@@ -1,13 +1,14 @@
 //! Private, bounded, completed-bucket storage. Display metadata is deliberately
 //! not part of this database.
 use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, Utc};
 use netcontrol_core::experience::Sample;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     cell::Cell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     net::IpAddr,
     os::{
@@ -944,36 +945,52 @@ impl Store {
         };
         let sql = format!(
             "{} WHERE s.address=?1 AND b.seq>?2 AND b.seq<=?3 AND b.retention_ms>?4
-            AND b.end_ms>?5 AND b.end_ms<=?6 ORDER BY b.seq LIMIT 361",
+            AND b.end_ms>?5 AND b.end_ms<=?6 ORDER BY s.bucket_id LIMIT 361",
             select_sql()
         );
         let mut result = Vec::with_capacity(keys.len());
         {
             let mut statement = tx.prepare(&sql)?;
             let summary_columns = SummaryColumns::new()?;
-            let mut coverage_reasons = tx.prepare_cached(
-                "SELECT reason FROM coverage_reasons WHERE sample_id=?1 ORDER BY position LIMIT 33",
+            let mut coverage_statement = tx.prepare(
+                "SELECT r.sample_id,r.reason FROM host_samples s
+                JOIN buckets b ON b.seq=s.bucket_id JOIN coverage_reasons r ON r.sample_id=s.id
+                WHERE s.address=?1 AND b.seq>?2 AND b.seq<=?3 AND b.retention_ms>?4
+                AND b.end_ms>?5 AND b.end_ms<=?6 ORDER BY s.bucket_id,r.position LIMIT 11521",
             )?;
             for key in keys {
-                let mut accumulator = netcontrol_core::experience_summary::Accumulator::new(
-                    window.end_ms - RETENTION_MS,
-                    window.end_ms,
-                )?;
-                let mut rows = statement.query(params![
+                let parameters = params![
                     key,
                     self.quarantine.get(),
                     high,
                     logical.saturating_sub(RETENTION_MS),
                     window.end_ms - RETENTION_MS,
                     window.end_ms
-                ])?;
+                ];
+                let mut coverage_reasons: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+                {
+                    let mut rows = coverage_statement.query(parameters)?;
+                    let mut count = 0;
+                    while let Some(row) = rows.next()? {
+                        deadline.check()?;
+                        count += 1;
+                        ensure!(count <= MAX_SLOTS * 32, "too many summary coverage reasons");
+                        let reasons = coverage_reasons.entry(row.get(0)?).or_default();
+                        ensure!(reasons.len() < 32, "too many coverage reasons");
+                        let reason: String = row.get(1)?;
+                        bounded_text(&reason, 128)?;
+                        reasons.push(reason);
+                    }
+                }
+                let mut accumulator = netcontrol_core::experience_summary::Accumulator::new(
+                    window.end_ms - RETENTION_MS,
+                    window.end_ms,
+                )?;
+                let mut rows = statement.query(parameters)?;
                 while let Some(row) = rows.next()? {
                     deadline.check()?;
-                    accumulator.push(&read_summary_sample(
-                        row,
-                        &summary_columns,
-                        &mut coverage_reasons,
-                    )?)?;
+                    let reasons = coverage_reasons.remove(&row.get(0)?).unwrap_or_default();
+                    accumulator.push(&read_summary_sample(row, &summary_columns, reasons)?)?;
                 }
                 result.push(accumulator.finish()?);
                 deadline.check()?;
@@ -1314,7 +1331,8 @@ fn decimal_counter(text: Option<&str>) -> Result<Option<u64>> {
     text.map(|text| {
         let value: u64 = text.parse().context("invalid persisted unsigned counter")?;
         ensure!(
-            value.to_string() == text,
+            text.bytes().all(|byte| byte.is_ascii_digit())
+                && (text.len() == 1 || !text.starts_with('0')),
             "noncanonical persisted unsigned counter"
         );
         Ok(value)
@@ -1621,22 +1639,23 @@ impl SummaryScalars<'_, '_> {
     }
 }
 
-fn summary_timestamp<T: serde::de::DeserializeOwned>(milliseconds: i64) -> Result<T> {
-    let text = timestamp_literal(milliseconds)?;
-    let deserializer = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&text);
-    T::deserialize(deserializer).context("invalid persisted sample timestamp")
+fn summary_timestamp(milliseconds: i64) -> Result<DateTime<Utc>> {
+    ensure!(
+        (0..=253_402_300_799_999).contains(&milliseconds),
+        "retained timestamp out of range"
+    );
+    DateTime::from_timestamp_millis(milliseconds).context("invalid persisted sample timestamp")
 }
 
 fn read_summary_sample(
     row: &rusqlite::Row<'_>,
     columns: &SummaryColumns,
-    coverage_reasons: &mut rusqlite::CachedStatement<'_>,
+    reasons: Vec<String>,
 ) -> Result<Sample> {
     use netcontrol_core::experience::{
         Connections, Coverage, Dns, Experience, Firewall, InterfaceIdentity, Tcp, Timing, Traffic,
     };
     let scalar = SummaryScalars { row };
-    let id: i64 = row.get(0)?;
     let address = row.get_ref(1)?.as_blob()?;
     let ip_address = match address {
         [4, a, b, c, d] => IpAddr::V4(std::net::Ipv4Addr::new(*a, *b, *c, *d)),
@@ -1663,9 +1682,6 @@ fn read_summary_sample(
             },
         })
     };
-    let reasons = coverage_reasons
-        .query_map([id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
     let sample = Sample {
         ip_address,
         configured_host_id: row.get(3)?,
@@ -2442,8 +2458,7 @@ fn address_literal(bytes: &[u8]) -> Result<String> {
     }
 }
 
-// UTC RFC3339 only, with optional fractional seconds. This avoids adding a
-// second timestamp dependency solely for the private persistence layer.
+// UTC RFC3339 only, with optional fractional seconds.
 fn timestamp_ms(value: &str) -> Result<i64> {
     let bytes = value.as_bytes();
     ensure!(
@@ -2638,21 +2653,43 @@ mod tests {
         let address = "192.0.2.1".parse().unwrap();
         for index in 1..=2 {
             let end = BASE + index * INTERVAL_MS;
-            insert(
-                &mut store,
-                &format!("bucket-{index}"),
-                end,
-                &[sample("192.0.2.1", end)],
-            );
+            let mut item = sample("192.0.2.1", end);
+            item.coverage.complete = false;
+            item.coverage.reasons = vec!["capture_gap".into()];
+            insert(&mut store, &format!("bucket-{index}"), end, &[item]);
         }
         let now = BASE + 3 * INTERVAL_MS;
         let window = store.summary_window(now).unwrap();
-        insert(&mut store, "later", now, &[sample("192.0.2.1", now)]);
+        let mut later = sample("192.0.2.1", now);
+        later.coverage.reasons = vec!["later_only".into()];
+        insert(&mut store, "later", now, &[later]);
         let page = store.summaries(&[address], &window, now).unwrap();
         assert_eq!(page[0]["observed_slots"], 2);
         assert_eq!(page[0]["traffic"]["sent_bytes"]["total"], "6");
         assert_eq!(page[0]["experience"]["missing"]["slots"], 358);
+        assert_eq!(
+            page[0]["experience"]["reason_frequencies"]["capture_gap"],
+            2
+        );
+        assert!(
+            page[0]["experience"]["reason_frequencies"]
+                .get("later_only")
+                .is_none()
+        );
         assert!(!page[0]["coverage_complete"].as_bool().unwrap());
+        for position in 1..=32 {
+            store
+                .writer
+                .execute(
+                    "INSERT INTO coverage_reasons(sample_id,position,reason)
+                    SELECT s.id,?1,?2 FROM host_samples s JOIN buckets b ON b.seq=s.bucket_id
+                    WHERE b.collection_id='bucket-1'",
+                    params![position, format!("excess-{position}")],
+                )
+                .unwrap();
+        }
+        let error = store.summaries(&[address], &window, now).unwrap_err();
+        assert!(error.to_string().contains("too many coverage reasons"));
         let expired = store
             .summaries(&[address], &window, BASE + INTERVAL_MS + RETENTION_MS)
             .unwrap_err();
@@ -2693,7 +2730,9 @@ mod tests {
         }
         let now = BASE + RETENTION_MS;
         let window = store.summary_window(now).unwrap();
+        let started = Instant::now();
         let page = store.summaries(&addresses, &window, now).unwrap();
+        println!("dense hourly summary read: {:?}", started.elapsed());
         assert_eq!(page.len(), 64);
         for summary in &page {
             assert_eq!(summary["observed_slots"], 360);
@@ -2820,7 +2859,10 @@ mod tests {
             )?;
             let mut rows = statement.query([])?;
             let row = rows.next()?.context("missing summary projection fixture")?;
-            read_summary_sample(row, &columns, &mut reasons)
+            let reasons = reasons
+                .query_map([row.get::<_, i64>(0)?], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            read_summary_sample(row, &columns, reasons)
         };
         let decoded = decode().unwrap();
         assert_eq!(decoded, item);
@@ -2836,6 +2878,33 @@ mod tests {
             error.to_string().contains("invalid finite metric"),
             "{error:#}"
         );
+        store
+            .writer
+            .execute("UPDATE host_samples SET tcp_rtt_host_max_ms=5.0", [])
+            .unwrap();
+        for invalid in ["01", "+1", "18446744073709551616"] {
+            store
+                .writer
+                .execute("UPDATE host_samples SET traffic_sent_packets=?1", [invalid])
+                .unwrap();
+            assert!(decode().is_err(), "accepted corrupt counter {invalid}");
+        }
+        store
+            .writer
+            .execute("UPDATE host_samples SET traffic_sent_packets='0'", [])
+            .unwrap();
+        assert_eq!(decode().unwrap().traffic.sent_packets, Some(Count(0)));
+        for milliseconds in [0, BASE + 125, 253_402_300_799_999] {
+            assert_eq!(
+                summary_timestamp(milliseconds).unwrap(),
+                timestamp_literal(milliseconds)
+                    .unwrap()
+                    .parse::<DateTime<Utc>>()
+                    .unwrap()
+            );
+        }
+        assert!(summary_timestamp(-1).is_err());
+        assert!(summary_timestamp(253_402_300_800_000).is_err());
     }
 
     #[test]

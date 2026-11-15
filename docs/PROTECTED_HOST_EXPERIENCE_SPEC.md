@@ -728,6 +728,9 @@ matches latest. Four shared concurrent reads, the existing storage read deadline
 and 4 MiB response ceiling apply. SQL is streamed per address in one page
 transaction; no all-host history array, probes, rescore or persisted-schema
 change. A timeout/storage failure returns an explicit error, not partial success.
+Coverage reasons are loaded in one bounded query per address, not one query per
+sample. Typed timestamp decoding and index-ordered reads avoid unnecessary
+conversion/sorting work without relaxing the read deadline or validation.
 
 Common envelope plus:
 
