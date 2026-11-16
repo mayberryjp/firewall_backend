@@ -57,27 +57,26 @@ Linux to attempt reboot ten seconds after a kernel panic. There is no editable
 configuration, permission opt-in or original-value restoration. Startup
 overwrites zero (disabled), negative (immediate reboot) and other delays, checks
 exact readback and writes root-owned mode-0644
-`/etc/sysctl.d/99-netcontrol-panic.conf`. A Rust worker checks and reclaims the
-live control and its owned boot file every second, without rewriting unchanged
-files. Conflicting foreign sysctl files are not deleted or edited. Their boot
-ordering can override this file until daemon startup reclaims the live value;
+`/etc/sysctl.d/99-netcontrol-panic.conf`. This is a startup operation, not a
+persistent worker. Later live/file changes are not monitored or overwritten.
+Conflicting foreign sysctl files are not deleted or edited. Their boot
+ordering can override this file until daemon startup reapplies the live value;
 kernel command-line panic policy before sysctl/daemon startup is unchanged.
 
 This applies when the native host daemon starts during installation, upgrades
 (including binary-only self-upgrades), restart and boot. It requires writable
 procfs and a trusted root-owned `/etc/sysctl.d`. Missing/unwritable controls,
-unsafe file targets or failed readback abort initial takeover. Later failures
-are logged, retried and exposed through `GET /api/v1/runtime` and platform
-health/alerts; they do not gate unrelated configuration transactions.
-Do not run competing writers: periodic reclamation is not an exclusive kernel
-lock, and an external writer can change the value between checks.
+unsafe file targets or failed readback abort initial takeover. There is no
+runtime `kernel_panic` object or platform health/alert component.
+Do not run competing writers: an external change remains until another daemon
+startup or the applicable boot sysctl configuration changes it.
 
 Only the reboot delay is changed: panic-on-oops, panic-on-warning, lockup/NMI
 panic triggers and hardware watchdog policy remain untouched. Existing external
 panic triggers are not disabled. No panic is deliberately induced for validation;
 some catastrophic failures cannot execute the kernel reboot path.
-Stopping Netcontrol leaves the live setting and boot file in place, but stops
-periodic reclamation. Configuration rollback does not undo this appliance policy.
+Stopping Netcontrol leaves the live setting and boot file in place.
+Configuration rollback does not undo this appliance policy.
 Simulator, build-only and native lab namespace mode (even with host-tunable
 opt-in) do not take control of this setting. Deployment needs console access and
 explicit operator acceptance of automatic reboots after genuine kernel panics.
@@ -1624,8 +1623,9 @@ Without the database `GET /api/v1/system/timezones` is empty and a timezone chan
 rejected with a clear error. Install `tzdata` with the operating system's package
 manager if you want to manage the time zone.
 
-The daemon treats managed values as authoritative and sets them again if they
-drift. If another agent also writes the hostname they will fight; on Ubuntu images
+The daemon applies and verifies managed values at startup and when the confirmed
+value changes. Failed attempts retry after 30 seconds; successful settings are
+not polled or reclaimed after external changes. Avoid competing writers; on Ubuntu images
 that use cloud-init, set `preserve_hostname: true` in a file under
 `/etc/cloud/cloud.cfg.d/` before managing the hostname, and do not combine it with a
 DHCP-provided hostname. The daemon writes `/etc/hostname` and the kernel name only;

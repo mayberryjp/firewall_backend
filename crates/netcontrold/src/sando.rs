@@ -433,8 +433,11 @@ impl Manager {
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = Result<(Vec<Host>, usize)>>,
     {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut changes = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .subscribe_configuration();
         let mut previous = None;
         let mut due = Instant::now();
         let mut request = None;
@@ -442,29 +445,39 @@ impl Manager {
             if *stop.borrow() {
                 break;
             }
+            let source = self.source()?;
+            if previous.as_ref() != Some(&source) {
+                request = None;
+                due = Instant::now();
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
+                state.syncing = false;
+                state.next_sync_at = None;
+                if state.snapshot.source_url != source.0 {
+                    state.snapshot = Snapshot {
+                        source_url: source.0.clone(),
+                        ..Default::default()
+                    };
+                }
+                previous = Some(source.clone());
+            }
+            if source.1 && request.is_none() && Instant::now() >= due {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
+                state.syncing = true;
+                state.next_sync_at = None;
+                request = Some(Box::pin(acquire(source.0)));
+            }
+            let deadline = (source.1 && request.is_none()).then_some(due);
             tokio::select! {
                 biased;
                 _ = stop.changed() => break,
-                _ = tick.tick() => {
-                    let source = self.source()?;
-                    if previous.as_ref() != Some(&source) {
-                        request = None;
-                        due = Instant::now();
-                        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
-                        state.syncing = false;
-                        state.next_sync_at = None;
-                        if state.snapshot.source_url != source.0 {
-                            state.snapshot = Snapshot { source_url: source.0.clone(), ..Default::default() };
-                        }
-                        previous = Some(source.clone());
-                    }
-                    if source.1 && request.is_none() && Instant::now() >= due {
-                        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
-                        state.syncing = true;
-                        state.next_sync_at = None;
-                        request = Some(Box::pin(acquire(source.0)));
-                    }
-                }
+                changed = changes.changed() => { changed.context("configuration notifications closed")?; }
+                _ = crate::wait_until(deadline) => {}
                 result = async { request.as_mut().expect("guarded Sando request").await }, if request.is_some() => {
                     request = None;
                     self.finish(&previous.as_ref().context("Sando source missing")?.0, result)?;
@@ -718,14 +731,12 @@ mod tests {
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let id = stage(&manager, "http://sando.example.test/proxy", true);
-        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         complete(&manager, &id, "rollback");
         configure(&manager, "http://sando.example.test/proxy", true);
         let before = manager.engine.lock().unwrap().saved_configuration().clone();
         let revision = manager.engine.lock().unwrap().committed_revision();
-        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.status().unwrap()["state"], "succeeded");
@@ -833,7 +844,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.status().unwrap()["state"], "syncing");
         configure(&manager, "http://second.example.test", true);
-        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
@@ -841,11 +851,9 @@ mod tests {
             "http://second.example.test"
         );
         configure(&manager, "http://second.example.test", false);
-        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         assert!(!manager.state.lock().unwrap().syncing);
         configure(&manager, "http://second.example.test", true);
-        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         stop.send(true).unwrap();

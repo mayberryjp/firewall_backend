@@ -102,7 +102,6 @@ pub struct Native {
     #[cfg(feature = "nftables")]
     experience: Option<Arc<experience::Manager>>,
     netcontrol_log: netcontrol_core::DiskLog,
-    panic_reboot: Option<panic_reboot::Guard>,
     path_test: path_test::Manager,
     performance: crate::performance::Monitor,
     bgp: bgp::Manager,
@@ -392,7 +391,6 @@ impl Native {
                     &options.services_state.join("logs").join("netcontrol"),
                 )?,
             },
-            panic_reboot: None,
             path_test: path_test::Manager::new(
                 namespace.clone(),
                 state.clone(),
@@ -476,7 +474,7 @@ impl Native {
             session(native.namespace.clone(), move |_, _| rpf::set(mode))?;
         }
         if host_mode {
-            native.panic_reboot = Some(panic_reboot::Guard::new()?);
+            panic_reboot::take_over()?;
         }
         Ok(native)
     }
@@ -2187,6 +2185,27 @@ impl Backend for Native {
             "error":status.get("error").cloned().unwrap_or(json!(""))}))
     }
 
+    fn process_health(&mut self, _config: &Config) -> Result<Value> {
+        let mut value = self.services.process_health();
+        let mut bgp = self.bgp.try_snapshot().unwrap_or_else(|error| {
+            json!({"name":"bgp","state":"unavailable","retrying":true,"error":error.to_string()})
+        });
+        let summary = bgp.as_object_mut().context("BGP status missing")?;
+        summary.remove("routes");
+        summary.remove("advertised_routes");
+        value["appliance_services"]
+            .as_array_mut()
+            .context("service status missing")?
+            .push(bgp);
+        value["dhcp_clients"] = self
+            .dhcp
+            .try_status()
+            .unwrap_or_else(|error| json!({"errors":{"status":error.to_string()}}));
+        self.dhcp_monitors
+            .try_merge(&mut value["gateway_monitors"])?;
+        Ok(value)
+    }
+
     fn runtime(&mut self, config: &Config) -> Result<Value> {
         self.check_scope()?;
         let parents = self.parents.clone();
@@ -2230,10 +2249,6 @@ impl Backend for Native {
         value["ipv6"] = session(self.namespace.clone(), move |_, _| ipv6::status(enabled))?;
         let mode = config.firewall.rpf_mode;
         value["rpf"] = session(self.namespace.clone(), move |_, _| rpf::status(mode))?;
-        value["kernel_panic"] = match &self.panic_reboot {
-            Some(guard) => guard.status()?,
-            None => Value::Null,
-        };
         let desired = Network::parse(&config.operational_value()?)?.kernel;
         let baseline = self.ownership()?.kernel_baseline;
         let mut effective = baseline.clone();

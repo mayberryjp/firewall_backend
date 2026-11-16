@@ -978,9 +978,7 @@ mod tests {
             assert_eq!(status["forwarded_deliveries"], 1);
             assert_eq!(status["failed_deliveries"], 0);
         }
-        context
-            .stop
-            .store(true, std::sync::atomic::Ordering::Release);
+        context.request_stop();
         prepare(config, log, socket, true).unwrap()(context.clone()).unwrap();
         {
             let status = context.status.lock().unwrap();
@@ -1019,10 +1017,7 @@ mod tests {
         );
     }
     fn ctx() -> super::super::worker::ContextState {
-        super::super::worker::ContextState {
-            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            status: Arc::new(std::sync::Mutex::new(serde_json::json!({}))),
-        }
+        super::super::worker::ContextState::new(serde_json::json!({}))
     }
     #[test]
     fn native_udp_and_octet_counted_tcp_forwarding() {

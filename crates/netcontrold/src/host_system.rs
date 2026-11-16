@@ -16,7 +16,6 @@ const ZONEINFO: &str = "usr/share/zoneinfo";
 const NOT_ZONES: [&str; 5] = ["posix", "right", "posixrules", "localtime", "Factory"];
 const MAX_ZONES: usize = 2048;
 const RETRY_AFTER: Duration = Duration::from_secs(30);
-const REAPPLY_AFTER: Duration = Duration::from_secs(10);
 const SIMULATED_ZONES: [&str; 8] = [
     "America/Chicago",
     "America/Los_Angeles",
@@ -226,6 +225,8 @@ fn kernel_set_hostname(_: &str) -> Result<()> {
 struct Backoff {
     configured: String,
     next: Option<Instant>,
+    applied: bool,
+    error: Option<String>,
 }
 
 impl Backoff {
@@ -234,10 +235,10 @@ impl Backoff {
         if self.configured != configured {
             *self = Self {
                 configured: configured.to_owned(),
-                next: None,
+                ..Default::default()
             };
         }
-        self.next.is_none_or(|next| now >= next)
+        !self.applied && self.next.is_none_or(|next| now >= next)
     }
 }
 
@@ -324,33 +325,53 @@ impl Manager {
         }
     }
 
-    pub async fn run(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+    pub async fn run(self: Arc<Self>, mut stop: watch::Receiver<bool>) -> Result<()> {
+        let mut changes = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .subscribe_configuration();
         loop {
-            tokio::select! {
-                _ = stop.changed() => break,
-                _ = tick.tick() => {}
-            }
             if *stop.borrow() {
                 break;
             }
             let manager = self.clone();
-            if tokio::task::spawn_blocking(move || manager.reconcile(Instant::now()))
-                .await
-                .is_err()
-            {
-                tracing::error!("host system reconciliation task failed");
+            let retry = tokio::task::spawn_blocking(move || {
+                manager.reconcile(Instant::now())?;
+                let paused = manager
+                    .engine
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+                    .configuration_busy();
+                let backoff = manager
+                    .backoff
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("host system retry state unavailable"))?;
+                Ok::<_, anyhow::Error>(
+                    (!paused)
+                        .then(|| backoff.iter().filter_map(|setting| setting.next).min())
+                        .flatten(),
+                )
+            })
+            .await
+            .context("host system reconciliation task failed")??;
+            tokio::select! {
+                _ = stop.changed() => break,
+                changed = changes.changed() => { changed.context("configuration notifications closed")?; }
+                _ = crate::wait_until(retry.map(Into::into)) => {}
             }
         }
+        Ok(())
     }
 
     /// Applies confirmed settings only; unmanaged (empty) values leave the host untouched.
-    fn reconcile(&self, now: Instant) {
-        let config = match self.engine.try_lock() {
-            Ok(engine) => {
-                (!engine.configuration_busy()).then(|| engine.saved_configuration().system.clone())
-            }
-            Err(_) => return,
+    fn reconcile(&self, now: Instant) -> Result<()> {
+        let config = {
+            let engine = self
+                .engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+            (!engine.configuration_busy()).then(|| engine.saved_configuration().system.clone())
         };
         let paused = config.is_none();
         let config = config.unwrap_or_else(|| self.configured());
@@ -359,13 +380,16 @@ impl Manager {
             self.reconcile_setting(1, &config, now, paused),
         );
         let applied = [&hostname, &timezone].iter().any(|(_, applied)| *applied);
-        if let Ok(mut status) = self.status.lock() {
-            status["hostname"] = hostname.0;
-            status["timezone"] = timezone.0;
-            if applied {
-                status["last_applied_at_unix"] = json!(now_unix());
-            }
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("system status unavailable"))?;
+        status["hostname"] = hostname.0;
+        status["timezone"] = timezone.0;
+        if applied {
+            status["last_applied_at_unix"] = json!(now_unix());
         }
+        Ok(())
     }
 
     fn configured(&self) -> SystemConfig {
@@ -409,6 +433,18 @@ impl Manager {
             }
         };
         if configured.is_empty() {
+            let Ok(mut backoff) = self.backoff.lock() else {
+                return (
+                    setting(
+                        "",
+                        None,
+                        "error",
+                        Some("host system retry state unavailable"),
+                    ),
+                    false,
+                );
+            };
+            backoff[index] = Backoff::default();
             return (setting("", read(), "unmanaged", None), false);
         }
         match self.mode {
@@ -429,6 +465,31 @@ impl Manager {
         if paused {
             return (setting(configured, read(), "paused", None), false);
         }
+        let Ok(mut backoff) = self.backoff.lock() else {
+            return (
+                setting(configured, read(), "error", Some("state unavailable")),
+                false,
+            );
+        };
+        if !backoff[index].due(configured, now) {
+            return (
+                setting(
+                    configured,
+                    if backoff[index].applied {
+                        Some(configured.into())
+                    } else {
+                        read()
+                    },
+                    if backoff[index].applied {
+                        "current"
+                    } else {
+                        "error"
+                    },
+                    backoff[index].error.as_deref(),
+                ),
+                false,
+            );
+        }
         let current = if index == 0 {
             self.host.hostname_current(configured)
         } else {
@@ -437,46 +498,47 @@ impl Manager {
         let current = match current {
             Ok(current) => current,
             Err(error) => {
+                backoff[index].next = Some(now + RETRY_AFTER);
+                backoff[index].error = Some(format!("{error:#}"));
+                tracing::warn!(setting = kind, %error, "host setting verification failed");
                 return (
                     setting(configured, read(), "error", Some(&format!("{error:#}"))),
                     false,
                 );
             }
         };
-        let Ok(mut backoff) = self.backoff.lock() else {
-            return (
-                setting(configured, read(), "error", Some("state unavailable")),
-                false,
-            );
-        };
         if current {
-            // Keeps any re-apply delay so an external agent that fights back cannot cause a hot loop.
-            backoff[index].due(configured, now);
+            backoff[index].applied = true;
+            backoff[index].next = None;
+            backoff[index].error = None;
             return (setting(configured, read(), "current", None), false);
         }
-        if !backoff[index].due(configured, now) {
-            let state = self.status.lock().ok().and_then(|status| {
-                (status[kind]["state"] == "error").then(|| status[kind].clone())
-            });
-            return match state {
-                Some(row) => (row, false),
-                None => (setting(configured, read(), "applying", None), false),
-            };
-        }
-        let result = if index == 0 {
+        let result = (if index == 0 {
             self.host.apply_hostname(configured)
         } else {
             self.host.apply_timezone(configured)
-        };
+        })
+        .and_then(|()| {
+            let verified = if index == 0 {
+                self.host.hostname_current(configured)?
+            } else {
+                self.host.observed_timezone().as_deref() == Some(configured)
+            };
+            ensure!(verified, "{kind} verification failed after apply");
+            Ok(())
+        });
         match result {
             Ok(()) => {
-                backoff[index].next = Some(now + REAPPLY_AFTER);
+                backoff[index].applied = true;
+                backoff[index].next = None;
+                backoff[index].error = None;
                 tracing::info!(setting = kind, value = configured, "host setting applied");
                 (setting(configured, read(), "current", None), true)
             }
             Err(error) => {
                 backoff[index].next = Some(now + RETRY_AFTER);
                 let message = format!("{error:#}");
+                backoff[index].error = Some(message.clone());
                 tracing::warn!(setting = kind, error = %message, "host setting failed");
                 (setting(configured, read(), "error", Some(&message)), false)
             }
@@ -655,14 +717,14 @@ mod tests {
         fs::write(fixture.directory.path().join("etc/localtime"), b"old-copy").unwrap();
         let manager = fixture.manager(Mode::Native);
         let start = Instant::now();
-        manager.reconcile(start);
+        manager.reconcile(start).unwrap();
         let status = manager.status().unwrap();
         assert_eq!(status["hostname"]["state"], "unmanaged");
         assert_eq!(status["hostname"]["observed"], "old");
         assert_eq!(fixture.read("proc/sys/kernel/hostname"), "old\n");
 
         fixture.configure(system("fw-1", "America/New_York"));
-        manager.reconcile(start);
+        manager.reconcile(start).unwrap();
         let status = manager.status().unwrap();
         assert_eq!(status["hostname"]["state"], "current", "{status}");
         assert_eq!(status["hostname"]["observed"], "fw-1");
@@ -686,16 +748,16 @@ mod tests {
                     .starts_with('.'))
         );
 
-        // External drift is repaired, but not more often than the re-apply delay.
+        // Successful settings are not reclaimed after external changes.
         fs::write(fixture.directory.path().join("etc/hostname"), "other\n").unwrap();
-        manager.reconcile(start + Duration::from_secs(1));
+        manager.reconcile(start + Duration::from_secs(1)).unwrap();
         assert_eq!(fixture.read("etc/hostname"), "other\n");
-        manager.reconcile(start + REAPPLY_AFTER + Duration::from_secs(1));
-        assert_eq!(fixture.read("etc/hostname"), "fw-1\n");
+        manager.reconcile(start + Duration::from_secs(60)).unwrap();
+        assert_eq!(fixture.read("etc/hostname"), "other\n");
 
         // Clearing a value stops management and leaves the host as it is.
         fixture.configure(system("", ""));
-        manager.reconcile(start + Duration::from_secs(60));
+        manager.reconcile(start + Duration::from_secs(61)).unwrap();
         let status = manager.status().unwrap();
         assert_eq!(status["hostname"]["state"], "unmanaged");
         assert_eq!(status["hostname"]["observed"], "fw-1");
@@ -708,7 +770,7 @@ mod tests {
         let fixture = Fixture::new();
         let manager = fixture.manager(Mode::Native);
         fixture.configure(system("", "UTC"));
-        manager.reconcile(Instant::now());
+        manager.reconcile(Instant::now()).unwrap();
         assert_eq!(manager.status().unwrap()["timezone"]["state"], "current");
         assert!(!fixture.directory.path().join("etc/timezone").exists());
     }
@@ -733,7 +795,7 @@ mod tests {
         .unwrap();
         fixture.configure(system("fw-2", ""));
         let start = Instant::now();
-        manager.reconcile(start);
+        manager.reconcile(start).unwrap();
         let status = manager.status().unwrap();
         assert_eq!(status["hostname"]["state"], "error");
         assert!(
@@ -744,10 +806,12 @@ mod tests {
         );
         assert_eq!(status["hostname"]["observed"], "old");
         assert!(!root.join("etc/hostname").exists());
-        manager.reconcile(start + Duration::from_secs(5));
+        manager.reconcile(start + Duration::from_secs(5)).unwrap();
         assert_eq!(*attempts.lock().unwrap(), 1);
         assert_eq!(manager.status().unwrap()["hostname"]["state"], "error");
-        manager.reconcile(start + RETRY_AFTER + Duration::from_secs(1));
+        manager
+            .reconcile(start + RETRY_AFTER + Duration::from_secs(1))
+            .unwrap();
         assert_eq!(*attempts.lock().unwrap(), 2);
     }
 
@@ -765,13 +829,42 @@ mod tests {
         assert_eq!(submit(&mut engine, &config).status, 202);
     }
 
+    #[tokio::test]
+    async fn confirmed_changes_wake_idle_manager() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager(Mode::Native);
+        let (stop, receiver) = watch::channel(false);
+        let task = tokio::spawn(manager.clone().run(receiver));
+        fixture.configure(system("event-fw", ""));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.status().unwrap()["hostname"]["state"] != "current" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fixture.read("etc/hostname"), "event-fw\n");
+        fs::write(fixture.directory.path().join("etc/hostname"), "external\n").unwrap();
+        fixture.configure(system("changed-fw", ""));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.status().unwrap()["hostname"]["observed"] != "changed-fw" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fixture.read("etc/hostname"), "changed-fw\n");
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
     #[test]
     fn simulator_and_unsupported_modes_never_touch_the_host() {
         let fixture = Fixture::new();
         let manager = fixture.manager(Mode::Simulated);
         assert!(manager.timezones().contains(&"UTC".to_owned()));
         fixture.configure(system("sim-1", "Europe/London"));
-        manager.reconcile(Instant::now());
+        manager.reconcile(Instant::now()).unwrap();
         let status = manager.status().unwrap();
         assert_eq!(status["hostname"]["state"], "simulated");
         assert_eq!(status["timezone"]["state"], "simulated");
@@ -780,7 +873,7 @@ mod tests {
 
         let unsupported = fixture.manager(Mode::Unsupported);
         assert!(unsupported.timezones().is_empty());
-        unsupported.reconcile(Instant::now());
+        unsupported.reconcile(Instant::now()).unwrap();
         let status = unsupported.status().unwrap();
         assert_eq!(status["hostname"]["state"], "unavailable");
         assert!(status["hostname"]["error"].as_str().is_some());

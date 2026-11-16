@@ -512,8 +512,7 @@ async fn run(options: Options) -> Result<()> {
                 let system = system.clone();
                 async move {
                     system.reset_retry()?;
-                    system.run(receiver).await;
-                    Ok(())
+                    system.run(receiver).await
                 }
             })
             .await
@@ -551,10 +550,7 @@ async fn run(options: Options) -> Result<()> {
         mqtt_control
             .run(mqtt_receiver, move |receiver| {
                 let mqtt = mqtt.clone();
-                async move {
-                    mqtt.run(receiver).await;
-                    Ok(())
-                }
+                async move { mqtt.run(receiver).await }
             })
             .await
     });
@@ -597,9 +593,37 @@ async fn run(options: Options) -> Result<()> {
         ("release_check", release_task.abort_handle()),
         ("sando_sync", sando_task.abort_handle()),
     ];
+    let health_app = app.clone();
+    let mut health_stop = stop_rx.clone();
+    let health_watchdog_enabled = watchdog.enabled();
+    let health_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = health_stop.changed() => break,
+                _ = interval.tick() => {}
+            }
+            if *health_stop.borrow() {
+                break;
+            }
+            let app = health_app.clone();
+            let tasks: Vec<_> = task_handles
+                .iter()
+                .map(|(name, handle)| (*name, handle.is_finished()))
+                .collect();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                app.refresh_health(health_watchdog_enabled, &tasks);
+            })
+            .await
+            {
+                tracing::error!(%error, "process health collection task failed");
+            }
+        }
+    });
     let ticker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
-        let mut next_health = std::time::Instant::now();
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 changed = stop_rx.changed() => {
@@ -608,18 +632,9 @@ async fn run(options: Options) -> Result<()> {
                 _ = interval.tick() => {
                     let engine = tick_engine.clone();
                     let app = tick_app.clone();
-                    let refresh_health = std::time::Instant::now() >= next_health;
-                    if refresh_health {
-                        next_health = std::time::Instant::now() + Duration::from_secs(2);
-                    }
-                    let watchdog_enabled = tick_watchdog.enabled();
-                    let tasks: Vec<_> = task_handles.iter().map(|(name, handle)| (*name, handle.is_finished())).collect();
                     let result = tokio::task::spawn_blocking(move || {
                         app.refresh_upgrade_gate()?;
                         engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.tick()?;
-                        if refresh_health {
-                            app.refresh_health(watchdog_enabled, &tasks);
-                        }
                         Ok::<(), anyhow::Error>(())
                     }).await
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("deadline worker failed")));
@@ -763,6 +778,9 @@ async fn run(options: Options) -> Result<()> {
         .context("release checker shutdown failed")??;
     sando_task.await.context("Sando sync shutdown failed")??;
     let tick_result = ticker.await.context("deadline ticker task");
+    health_task
+        .await
+        .context("process health task shutdown failed")?;
     let shutdown_result = engine
         .lock()
         .map_err(|_| anyhow::anyhow!("engine lock poisoned"))?

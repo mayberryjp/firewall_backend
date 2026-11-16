@@ -23,6 +23,7 @@ libc.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "now"] }
 base64 = "0.22"
 zeroize = "1"
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

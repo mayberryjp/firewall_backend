@@ -122,6 +122,14 @@ impl Manager {
             .status
             .clone())
     }
+    pub fn try_snapshot(&self) -> Result<Value> {
+        Ok(self
+            .state
+            .try_lock()
+            .map_err(|error| anyhow!("cached BGP status unavailable: {error}"))?
+            .status
+            .clone())
+    }
     pub fn configure(&mut self, value: &Value) -> Result<()> {
         ensure!(
             !self.recovery_pending,
@@ -945,6 +953,19 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_snapshot_reports_contention_and_recovers() -> Result<()> {
+        let manager = Manager::new(Arc::new(File::open(".")?), PathBuf::new())?;
+        let mut state = manager.state.lock().unwrap();
+        state.status["state"] = json!("error");
+        state.status["error"] = json!("synthetic BGP failure");
+        assert!(manager.try_snapshot().is_err());
+        drop(state);
+        assert_eq!(manager.try_snapshot()?["error"], "synthetic BGP failure");
+        Ok(())
+    }
+
     fn neighbor() -> Neighbor {
         Neighbor {
             config: BGPNeighbor {

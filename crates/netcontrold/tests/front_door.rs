@@ -501,6 +501,71 @@ async fn platform_status_is_authenticated_nonblocking_and_included_with_configur
     assert_eq!(response.unwrap().unwrap().status(), StatusCode::OK);
 }
 
+#[test]
+fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
+    use netcontrol_core::{Backend, Config};
+    struct CachedHealth(Simulator);
+    impl Backend for CachedHealth {
+        fn scope(&self) -> anyhow::Result<String> {
+            self.0.scope()
+        }
+        fn observe(&mut self, config: &Config) -> anyhow::Result<Config> {
+            self.0.observe(config)
+        }
+        fn apply(&mut self, before: &Config, after: &Config) -> anyhow::Result<()> {
+            self.0.apply(before, after)
+        }
+        fn repair(&mut self, config: &Config) -> anyhow::Result<Value> {
+            self.0.repair(config)
+        }
+        fn runtime(&mut self, _: &Config) -> anyhow::Result<Value> {
+            panic!("process health must not collect live runtime diagnostics");
+        }
+        fn statistics(
+            &mut self,
+            config: &Config,
+            path: &str,
+            query: &str,
+        ) -> anyhow::Result<Value> {
+            self.0.statistics(config, path, query)
+        }
+        fn process_health(&mut self, _: &Config) -> anyhow::Result<Value> {
+            Ok(
+                json!({"appliance_services":[{"name":"cached-worker","state":"error","retrying":true}]}),
+            )
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(
+            &directory.path().join("state.json"),
+            Box::new(CachedHealth(Simulator::new())),
+        )
+        .unwrap(),
+    ));
+    let app = App::new(engine.clone(), Authentication::Scoped(vec![]), false);
+    app.refresh_health(false, &[]);
+    let health = app.health.snapshot();
+    assert_eq!(health["process_health"]["status"], "degraded");
+    assert!(
+        health["process_health"]["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["resource"] == "cached-worker")
+    );
+    let guard = engine.lock().unwrap();
+    app.refresh_health(false, &[]);
+    assert_eq!(app.health.snapshot()["process_health"]["status"], "unknown");
+    drop(guard);
+    engine.lock().unwrap().tick().unwrap();
+    app.refresh_health(false, &[]);
+    assert_eq!(
+        app.health.snapshot()["process_health"]["status"],
+        "degraded"
+    );
+}
+
 #[tokio::test]
 async fn mdns_http_contract_authentication_permissions_queries_and_repair() {
     use netcontrold::http::Credential;

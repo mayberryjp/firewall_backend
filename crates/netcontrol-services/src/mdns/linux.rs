@@ -1764,10 +1764,7 @@ mod tests {
         counts.filters[0].transmitted_packets = u64::MAX;
         counts.matched(1);
         counts.transmitted(1);
-        let ctx = ContextState {
-            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            status: std::sync::Arc::new(std::sync::Mutex::new(json!({}))),
-        };
+        let ctx = ContextState::new(json!({}));
         counts.snapshot(&ctx);
         let status = ctx.status.lock().unwrap().clone();
         assert_eq!(
@@ -2554,10 +2551,7 @@ mod tests {
                 ..Counts::default()
             };
             counts.add("receive_drops", overflow as u64);
-            let ctx = ContextState {
-                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                status: std::sync::Arc::new(std::sync::Mutex::new(json!({}))),
-            };
+            let ctx = ContextState::new(json!({}));
             counts.snapshot(&ctx);
             let status = ctx.status.lock().unwrap();
             let expected = overflow.to_string();

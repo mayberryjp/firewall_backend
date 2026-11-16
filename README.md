@@ -14,9 +14,10 @@ process or simulator result is not evidence that real networking works.
 
 Native host mode mandatorily owns `kernel.panic=10`: reboot ten seconds after a
 kernel panic. Startup overwrites conflicting values, persists
-`/etc/sysctl.d/99-netcontrol-panic.conf`, and a Rust worker reclaims runtime and
-owned-file drift every second. Errors are explicit in runtime/platform health;
-startup takeover failures abort startup. This does not enable panic-on-oops,
+`/etc/sysctl.d/99-netcontrol-panic.conf`, and verifies readback. There is no
+dedicated worker or panic-policy process-health row; later external changes
+remain until daemon startup or boot reapplies the policy.
+Startup takeover failures abort startup. This does not enable panic-on-oops,
 panic-on-warning or watchdog-triggered panics. Simulator and lab namespace modes
 never claim this host-global setting. See the
 [operator contract](docs/BUILD_AND_INSTALL.md#kernel-panic-reboot-ownership).
@@ -1017,13 +1018,15 @@ after confirmation, like MQTT: the network is not touched and a rolled-back
 transaction never changes the host. Linux host mode sets the kernel hostname and
 `/etc/hostname` and replaces `/etc/localtime` with a link to the zone file (the host
 must have its timezone database, normally the `tzdata` package; nothing is installed).
-Values are enforced, so a change by another agent is set again within seconds, and
-failures are retried. Clearing a value stops managing it and does not revert the
+Values are applied and verified at daemon/manager startup and when the confirmed
+value changes; failed attempts retry after 30 seconds. Successful settings are
+not continuously polled or reclaimed after external changes. Clearing a value
+stops managing it and does not revert the
 host. `/etc/hosts` is not edited, and processes started earlier may keep the old time
 zone until restarted. The simulator and namespace lab perform no host changes.
 
 `GET /api/v1/system/status` and `GET /api/v1/system/timezones` (`state.read`) report
-the confirmed values, what the host reports and the valid zone names. CLI:
+the confirmed values, their last apply-time observations and the valid zone names. CLI:
 `hostname NAME`, `domain NAME`, `timezone ZONE`, `no hostname`, `no domain`, `no timezone`. DNS resolvers are not
 part of this section: use the per-interface `dns` settings. See the
 [exact contract](FRONTEND_SPEC.md#616-host-name-and-time-zone).

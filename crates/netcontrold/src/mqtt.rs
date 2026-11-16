@@ -25,9 +25,9 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 use zeroize::Zeroizing;
 
 pub struct Secrets {
@@ -477,42 +477,60 @@ impl Manager {
         });
     }
 
-    pub async fn run(self: Arc<Self>, mut stop: watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+    pub async fn run(self: Arc<Self>, mut stop: watch::Receiver<bool>) -> Result<()> {
+        let mut changes = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .subscribe_configuration();
         let mut retry = Instant::now();
+        let mut previous = None;
         loop {
             if *stop.borrow() {
                 break;
             }
-            tokio::select! {
-                _ = stop.changed() => { break; }
-                _ = interval.tick() => {
-                    let config = match self.engine.try_lock() {
-                        Ok(engine) => engine.saved_configuration().mqtt.clone(),
-                        Err(_) => continue,
-                    };
-                    if !config.enabled {
-                        self.state(false, "disabled", None);
-                    } else if self.mode == Mode::Simulated {
-                        self.state(true, "simulated", None);
-                    } else if self.mode == Mode::Unsupported {
-                        self.state(true, "unavailable", Some("MQTT publishing requires Linux host mode"));
-                    } else if Instant::now() >= retry {
-                        self.attempting();
-                        let result = self.session(config, stop.clone()).await;
-                        if *stop.borrow() { break; }
-                        if let Err(error) = result {
-                            self.failed(&error);
-                            retry = Instant::now() + Duration::from_secs(5);
-                        }
-                    }
-                }
+            let config = self
+                .engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+                .saved_configuration()
+                .mqtt
+                .clone();
+            if previous.as_ref() != Some(&config) {
+                retry = Instant::now();
+                previous = Some(config.clone());
             }
-            if *stop.borrow() {
-                break;
+            if !config.enabled {
+                self.state(false, "disabled", None);
+            } else if self.mode == Mode::Simulated {
+                self.state(true, "simulated", None);
+            } else if self.mode == Mode::Unsupported {
+                self.state(
+                    true,
+                    "unavailable",
+                    Some("MQTT publishing requires Linux host mode"),
+                );
+            } else if Instant::now() >= retry {
+                self.attempting();
+                let result = self.session(config, stop.clone()).await;
+                if *stop.borrow() {
+                    break;
+                }
+                if let Err(error) = result {
+                    self.failed(&error);
+                    retry = Instant::now() + Duration::from_secs(5);
+                }
+                continue;
+            }
+            let deadline = (config.enabled && self.mode == Mode::Native).then_some(retry);
+            tokio::select! {
+                _ = stop.changed() => break,
+                changed = changes.changed() => { changed.context("configuration notifications closed")?; }
+                _ = crate::wait_until(deadline) => {}
             }
         }
         self.state(false, "stopped", None);
+        Ok(())
     }
 
     fn connection(&self, config: &MQTTConfig) -> Result<(AsyncClient, EventLoop)> {
@@ -737,6 +755,21 @@ impl Manager {
         config: MQTTConfig,
         mut stop: watch::Receiver<bool>,
     ) -> Result<()> {
+        let mut changes = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .subscribe_configuration();
+        if self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .saved_configuration()
+            .mqtt
+            != config
+        {
+            return Ok(());
+        }
         let (client, mut events) = self.connection(&config)?;
         *self
             .cpu_baseline
@@ -756,7 +789,6 @@ impl Manager {
         });
         let base = format!("netcontrol/{}", self.device_id);
         let mut queue = VecDeque::<Publication>::new();
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut connected = false;
         let mut pending = 0usize;
         let mut acknowledgement_deadline = None;
@@ -781,13 +813,21 @@ impl Manager {
                 pending += 1;
                 queue.pop_front();
             }
+            let sample_deadline =
+                (connected && collecting.is_none() && pending == 0 && queue.is_empty())
+                    .then_some(next_sample);
+            let deadline = acknowledgement_deadline
+                .into_iter()
+                .chain(sample_deadline)
+                .min();
             tokio::select! {
                 _ = stop.changed() => { break; }
-                _ = interval.tick() => {
-                    if *stop.borrow() { break; }
-                    if let Ok(engine) = self.engine.try_lock() {
-                        if engine.saved_configuration().mqtt != config { break; }
-                    }
+                changed = changes.changed() => {
+                    changed.context("configuration notifications closed")?;
+                    if self.engine.lock().map_err(|_| anyhow::anyhow!("engine unavailable"))?
+                        .saved_configuration().mqtt != config { break; }
+                }
+                _ = crate::wait_until(deadline) => {
                     ensure!(acknowledgement_deadline.is_none_or(|deadline| Instant::now() < deadline), Failure::new(
                         "publication_ack_timeout", "MQTT broker did not acknowledge publications for 30 seconds; check publish ACLs, packet limits and broker logs"
                     ));
@@ -2124,6 +2164,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), worker)
             .await
             .unwrap()
+            .unwrap()
             .unwrap();
         assert_eq!(manager.status().unwrap()["state"], "stopped");
     }
@@ -2663,7 +2704,7 @@ mod tests {
                 }).await??;
                 broker.await??;
                 stop.send(true)?;
-                tokio::time::timeout(Duration::from_secs(5), worker).await??;
+                tokio::time::timeout(Duration::from_secs(5), worker).await???;
                 native.apply(&physical, &empty)?;
                 Ok(())
             })

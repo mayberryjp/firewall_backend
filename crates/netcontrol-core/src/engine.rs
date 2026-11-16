@@ -383,6 +383,8 @@ pub struct Engine {
     discord_webhooks: Option<BTreeSet<String>>,
     timezone_check: Option<TimezoneCheck>,
     confirmation_timer: Option<Instant>,
+    configuration_changes: tokio::sync::watch::Sender<()>,
+    notified_busy: bool,
     #[cfg(test)]
     now: Option<DateTime<Utc>>,
 }
@@ -495,6 +497,8 @@ impl Engine {
             discord_webhooks: None,
             timezone_check: None,
             confirmation_timer,
+            configuration_changes: tokio::sync::watch::Sender::new(()),
+            notified_busy: false,
             #[cfg(test)]
             now: None,
         };
@@ -571,7 +575,20 @@ impl Engine {
             self.confirmation_timer = None;
         }
         self.state = next;
+        self.notify_configuration_change();
         Ok(())
+    }
+    pub fn subscribe_configuration(&self) -> tokio::sync::watch::Receiver<()> {
+        self.configuration_changes.subscribe()
+    }
+
+    fn notify_configuration_change(&mut self) {
+        self.notified_busy = self.configuration_busy();
+        self.configuration_changes.send_replace(());
+    }
+
+    pub fn process_health(&mut self) -> Result<Value> {
+        self.backend.process_health(&self.state.desired)
     }
     fn confirmation_expired(&self, t: &Transaction) -> bool {
         t.confirmation_deadline.is_some_and(|deadline| {
@@ -636,6 +653,9 @@ impl Engine {
         self.backend
             .configure_host_experience(&self.state.desired, self.state.revision, paused)
             .context("configure protected-host observation")?;
+        if paused != self.notified_busy {
+            self.notify_configuration_change();
+        }
         Ok(())
     }
     /// Leaves pending confirmations durable for deadline-aware restart recovery.
@@ -659,7 +679,10 @@ impl Engine {
                     && !self.backend.path_test_active()),
             "upgrade requires a healthy engine with no active transaction or path test"
         );
-        self.maintenance = enabled;
+        if self.maintenance != enabled {
+            self.maintenance = enabled;
+            self.notify_configuration_change();
+        }
         Ok(())
     }
     pub fn request(
@@ -674,10 +697,14 @@ impl Engine {
         if self.closed {
             return ApiError::new(503, "engine is shut down").reply();
         }
-        match self.route(method, path, query, actor, permissions, body) {
+        let reply = match self.route(method, path, query, actor, permissions, body) {
             Ok(r) => r,
             Err(e) => e.reply(),
+        };
+        if self.configuration_busy() != self.notified_busy {
+            self.notify_configuration_change();
         }
+        reply
     }
     fn route(
         &mut self,
@@ -1441,10 +1468,12 @@ impl Engine {
             "configuration transaction, upgrade or restart is active"
         );
         self.restarting = true;
+        self.notify_configuration_change();
         Ok(())
     }
     pub fn cancel_restart(&mut self) {
         self.restarting = false;
+        self.notify_configuration_change();
     }
     pub fn prepare_dns_lookup(
         &mut self,

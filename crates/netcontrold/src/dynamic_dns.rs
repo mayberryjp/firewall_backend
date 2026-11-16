@@ -24,9 +24,9 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 use zeroize::Zeroizing;
 
 struct Secrets {
@@ -233,14 +233,24 @@ impl Manager {
     }
 
     async fn worker(&self, mut stop: watch::Receiver<bool>) -> Result<()> {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut changes = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .subscribe_configuration();
         let mut previous = Vec::new();
         let mut due = BTreeMap::<String, Instant>::new();
-        loop {
+        let mut wake = Some(Instant::now());
+        'worker: loop {
+            if *stop.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = stop.changed() => break,
-                _ = tick.tick() => {}
+                changed = changes.changed() => { changed.context("configuration notifications closed")?; }
+                _ = crate::wait_until(wake) => {}
             }
+            wake = None;
             if *stop.borrow() {
                 break;
             }
@@ -302,13 +312,15 @@ impl Manager {
                     tokio::select! {
                         _ = stop.changed() => return Ok(()),
                         result = &mut update => break Some(result),
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        changed = changes.changed() => {
+                            changed.context("configuration notifications closed")?;
                             if self.configuration()?.as_ref() != Some(&config) { break None; }
                         }
                     }
                 };
                 let Some(result) = result else {
-                    break;
+                    wake = Some(Instant::now());
+                    continue 'worker;
                 };
                 due.insert(
                     entry.name.clone(),
@@ -331,6 +343,13 @@ impl Manager {
                         }
                     }
                 })?;
+            }
+            if self.mode == Mode::Native {
+                wake = config
+                    .iter()
+                    .filter(|entry| entry.enabled)
+                    .filter_map(|entry| due.get(&entry.name).copied())
+                    .min();
             }
         }
         Ok(())

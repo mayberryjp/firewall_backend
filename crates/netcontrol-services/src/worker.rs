@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -13,20 +17,44 @@ pub(crate) fn now() -> String {
 }
 #[derive(Clone)]
 pub(crate) struct ContextState {
-    pub stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<StopSignal>,
     pub status: Arc<Mutex<Value>>,
 }
+struct StopSignal {
+    requested: AtomicBool,
+    lock: Mutex<()>,
+    changed: Condvar,
+}
 impl ContextState {
+    pub fn new(status: Value) -> Self {
+        Self {
+            stop: Arc::new(StopSignal {
+                requested: AtomicBool::new(false),
+                lock: Mutex::new(()),
+                changed: Condvar::new(),
+            }),
+            status: Arc::new(Mutex::new(status)),
+        }
+    }
     pub fn stopping(&self) -> bool {
-        self.stop.load(std::sync::atomic::Ordering::Acquire)
+        self.stop.requested.load(Ordering::Acquire)
+    }
+    pub fn request_stop(&self) {
+        let _guard = self.stop.lock.lock().expect("worker stop lock poisoned");
+        self.stop.requested.store(true, Ordering::Release);
+        self.stop.changed.notify_all();
     }
     pub fn wait(&self, duration: Duration) -> bool {
-        let end = Instant::now() + duration;
-        while !self.stopping() && Instant::now() < end {
-            thread::sleep(
-                Duration::from_millis(20).min(end.saturating_duration_since(Instant::now())),
-            );
+        if self.stopping() {
+            return true;
         }
+        // Serialize the predicate check and sleep with stop publication to avoid lost wakeups.
+        let guard = self.stop.lock.lock().expect("worker stop lock poisoned");
+        let (_guard, _) = self
+            .stop
+            .changed
+            .wait_timeout_while(guard, duration, |_| !self.stopping())
+            .expect("worker stop wait lock poisoned");
         self.stopping()
     }
     pub fn update(&self, f: impl FnOnce(&mut Value)) {
@@ -70,10 +98,7 @@ impl Worker {
     ) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (done_tx, done) = mpsc::sync_channel(1);
-        let context = ContextState {
-            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            status: Arc::new(Mutex::new(initial.clone())),
-        };
+        let context = ContextState::new(initial.clone());
         let ctx = context.clone();
         let worker_namespace = namespace.clone();
         let worker_prepare = prepare.clone();
@@ -195,10 +220,6 @@ impl Worker {
         match ready_rx.recv_timeout(Duration::from_secs(60)) {
             Ok(Ok(())) => Ok(worker),
             other => {
-                worker
-                    .context
-                    .stop
-                    .store(true, std::sync::atomic::Ordering::Release);
                 worker.shutdown()?;
                 Err(anyhow!("service startup failed: {other:?}"))
             }
@@ -221,13 +242,21 @@ impl Worker {
             .map(|s| s.clone())
             .unwrap_or_else(|_| json!({"state":"error","error":"status lock poisoned"}))
     }
+    pub fn try_snapshot(&self) -> Value {
+        self.context
+            .status
+            .try_lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|error| {
+                json!({"name":self.name,"state":"unavailable","retrying":true,
+                    "error":format!("cached worker status unavailable: {error}")})
+            })
+    }
     pub fn active(&self) -> bool {
         !self.context.stopping() && self.join.as_ref().is_some_and(|join| !join.is_finished())
     }
     pub fn shutdown(&mut self) -> Result<()> {
-        self.context
-            .stop
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.context.request_stop();
         if self.join.is_some() {
             self.done
                 .recv_timeout(Duration::from_secs(10))
@@ -242,9 +271,7 @@ impl Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.context
-            .stop
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.context.request_stop();
         // All workers use bounded nonblocking I/O. Never detach an owned thread.
         if let Some(h) = self.join.take() {
             let _ = h.join();
@@ -254,6 +281,99 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_snapshot_reports_contention_and_recovers() -> Result<()> {
+        let worker = Worker::start(
+            "cached-status-test".into(),
+            None,
+            json!({"name":"cached-status-test"}),
+            || {
+                Ok(Box::new(|context| {
+                    context.wait(Duration::from_secs(60));
+                    Ok(())
+                }))
+            },
+        )?;
+        let mut status = worker.context.status.lock().unwrap();
+        *status = json!({"name":"cached-status-test","state":"error","error":"synthetic failure"});
+        let unavailable = worker.try_snapshot();
+        assert_eq!(unavailable["state"], "unavailable");
+        assert_eq!(unavailable["retrying"], true);
+        assert!(
+            unavailable["error"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable")
+        );
+        drop(status);
+        assert_eq!(worker.try_snapshot()["error"], "synthetic failure");
+        Ok(())
+    }
+
+    #[test]
+    fn stop_interrupts_long_waits_across_all_clones() {
+        let context = ContextState::new(json!({}));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let joins: Vec<_> = (0..3)
+            .map(|_| {
+                let context = context.clone();
+                let started = started_tx.clone();
+                let done = done_tx.clone();
+                thread::spawn(move || {
+                    started.send(()).unwrap();
+                    done.send(context.wait(Duration::from_secs(60))).unwrap();
+                })
+            })
+            .collect();
+        for _ in &joins {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        thread::sleep(Duration::from_millis(20));
+        context.clone().request_stop();
+        for _ in &joins {
+            assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        for join in joins {
+            join.join().unwrap();
+        }
+        assert!(context.wait(Duration::ZERO));
+        assert!(context.wait(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn wait_honors_deadline_despite_non_stop_notifications() {
+        let context = ContextState::new(json!({}));
+        assert!(!context.wait(Duration::ZERO));
+        let duration = Duration::from_millis(80);
+        let start = Instant::now();
+        assert!(!context.wait(duration));
+        assert!(start.elapsed() >= duration);
+
+        let waiter = context.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let start = Instant::now();
+            let stopped = waiter.wait(duration);
+            done_tx.send((stopped, start.elapsed())).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = loop {
+            context.stop.changed.notify_all();
+            match done_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(result) => break Some(result),
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                _ => break None,
+            }
+        };
+        context.request_stop();
+        join.join().unwrap();
+        let (stopped, elapsed) = result.expect("notifications extended the wait deadline");
+        assert!(!stopped, "notification must not be interpreted as shutdown");
+        assert!(elapsed >= duration, "notification ended the wait early");
+    }
+
     #[test]
     fn forced_restart_reuses_factory_and_joins_the_previous_attempt() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -266,19 +386,24 @@ mod tests {
             move || {
                 count.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(|ctx| {
-                    while !ctx.wait(Duration::from_millis(5)) {}
+                    ctx.wait(Duration::from_secs(60));
                     Ok(())
                 }))
             },
         )
         .unwrap();
         let old = worker.context.clone();
+        let start = Instant::now();
         worker.restart().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
         assert!(old.stopping());
+        assert!(!worker.context.stopping());
         assert_eq!(old.status.lock().unwrap()["state"], "stopped");
         assert_eq!(prepared.load(Ordering::SeqCst), 2);
         assert!(worker.active());
+        let start = Instant::now();
         worker.shutdown().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

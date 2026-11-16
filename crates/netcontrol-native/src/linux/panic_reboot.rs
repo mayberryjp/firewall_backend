@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -8,17 +7,13 @@ use std::{
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::Path,
-    sync::{Arc, Mutex, mpsc},
-    thread::{self, JoinHandle},
-    time::Duration,
 };
 
 const SECONDS: i32 = 10;
-const INTERVAL: Duration = Duration::from_secs(1);
 const DIRECTORY: &str = "/etc/sysctl.d";
 const FILE: &str = "99-netcontrol-panic.conf";
 const CONTENT: &[u8] =
-    b"# Owned by netcontrold; reclaimed every second in native host mode.\nkernel.panic = 10\n";
+    b"# Owned by netcontrold; established at startup in native host mode.\nkernel.panic = 10\n";
 
 fn control(write: bool) -> Result<File> {
     let file = OpenOptions::new()
@@ -43,7 +38,7 @@ fn read() -> Result<i32> {
     text.trim().parse().context("invalid kernel.panic value")
 }
 
-fn enforce_control(
+fn take_over_control(
     mut read: impl FnMut() -> Result<i32>,
     mut write: impl FnMut() -> Result<()>,
 ) -> Result<()> {
@@ -101,102 +96,14 @@ fn persist(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn enforce() -> Result<()> {
-    enforce_control(read, || {
+pub(super) fn take_over() -> Result<()> {
+    take_over_control(read, || {
         control(true)?
             .write_all(b"10\n")
             .context("take over kernel.panic")
-    })?;
+    })
+    .context("claim mandatory panic reboot policy")?;
     persist(Path::new(DIRECTORY)).context("persist mandatory panic reboot policy")
-}
-
-pub(super) struct Guard {
-    stop: mpsc::Sender<()>,
-    thread: Option<JoinHandle<()>>,
-    error: Arc<Mutex<Option<String>>>,
-}
-
-impl Guard {
-    pub fn new() -> Result<Self> {
-        Self::start(enforce, INTERVAL)
-    }
-
-    fn start(
-        mut enforce: impl FnMut() -> Result<()> + Send + 'static,
-        interval: Duration,
-    ) -> Result<Self> {
-        enforce().context("claim mandatory panic reboot policy")?;
-        let error = Arc::new(Mutex::new(None));
-        let output = error.clone();
-        let (stop, receiver) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("panic-reboot".into())
-            .spawn(move || {
-                loop {
-                    match receiver.recv_timeout(interval) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    let result = enforce();
-                    let next = result.err().map(|error| format!("{error:#}"));
-                    let mut current = match output.lock() {
-                        Ok(current) => current,
-                        Err(error) => {
-                            tracing::error!("panic reboot enforcement status poisoned: {error}");
-                            break;
-                        }
-                    };
-                    if *current != next {
-                        if let Some(error) = &next {
-                            tracing::error!("panic reboot enforcement failed; retrying: {error}");
-                        } else {
-                            tracing::info!("panic reboot enforcement recovered");
-                        }
-                    }
-                    *current = next;
-                }
-            })?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-            error,
-        })
-    }
-
-    pub fn status(&self) -> Result<Value> {
-        let error = self
-            .error
-            .lock()
-            .map_err(|_| anyhow::anyhow!("panic reboot status poisoned"))?;
-        let observed = read();
-        let live_error = observed.as_ref().err().map(|error| format!("{error:#}"));
-        let error = live_error.or_else(|| error.clone());
-        let observed = observed.ok();
-        let running = self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished());
-        let drift = observed.map(|value| value != SECONDS);
-        Ok(json!({
-            "state": if running && error.is_none() && drift == Some(false) { "running" } else { "error" },
-            "retrying": running, "error": error, "reboot_after_seconds": SECONDS,
-            "observed_seconds": observed, "drift": drift, "enforcement_interval_seconds": 1,
-            "persistence_file": format!("{DIRECTORY}/{FILE}")
-        }))
-    }
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        let _ = self.stop.send(());
-        if self
-            .thread
-            .take()
-            .is_some_and(|thread| thread.join().is_err())
-        {
-            tracing::error!("panic reboot enforcement thread panicked");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -209,7 +116,7 @@ mod tests {
         for original in [0, -1, 1, 30, 10] {
             let value = AtomicI32::new(original);
             let writes = AtomicUsize::new(0);
-            enforce_control(
+            take_over_control(
                 || Ok(value.load(Ordering::SeqCst)),
                 || {
                     writes.fetch_add(1, Ordering::SeqCst);
@@ -220,88 +127,50 @@ mod tests {
             assert_eq!(value.load(Ordering::SeqCst), 10);
             assert_eq!(writes.load(Ordering::SeqCst), usize::from(original != 10));
         }
-        assert!(enforce_control(|| Ok(0), || Ok(())).is_err());
-        assert!(enforce_control(|| anyhow::bail!("read failed"), || Ok(())).is_err());
-        assert!(enforce_control(|| Ok(0), || anyhow::bail!("write failed")).is_err());
+        assert!(take_over_control(|| Ok(0), || Ok(())).is_err());
+        assert!(take_over_control(|| anyhow::bail!("read failed"), || Ok(())).is_err());
+        assert!(take_over_control(|| Ok(0), || anyhow::bail!("write failed")).is_err());
         Ok(())
     }
 
     #[test]
-    fn worker_retries_recovers_and_stops_before_returning() -> Result<()> {
-        let (events, received) = mpsc::channel();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let count = calls.clone();
-        let guard = Guard::start(
-            move || {
-                let call = count.fetch_add(1, Ordering::SeqCst);
-                events.send(call)?;
-                if call == 1 {
-                    anyhow::bail!("synthetic enforcement failure");
-                }
-                Ok(())
-            },
-            Duration::from_millis(5),
-        )?;
-        for expected in 0..4 {
-            assert_eq!(received.recv_timeout(Duration::from_secs(2))?, expected);
-        }
-        drop(guard);
-        let stopped = calls.load(Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(20));
-        assert_eq!(calls.load(Ordering::SeqCst), stopped);
-        assert!(Guard::start(|| anyhow::bail!("startup failure"), INTERVAL).is_err());
-        Ok(())
+    fn startup_rechecks_an_already_correct_value() {
+        let mut observations = [Ok(SECONDS), Ok(0)].into_iter();
+        assert!(
+            take_over_control(
+                || observations.next().unwrap(),
+                || panic!("already correct value must not be written"),
+            )
+            .is_err()
+        );
+        let mut observations = [Ok(SECONDS), Err(anyhow::anyhow!("readback failed"))].into_iter();
+        assert!(
+            take_over_control(
+                || observations.next().unwrap(),
+                || panic!("already correct value must not be written"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn worker_reclaims_external_drift() -> Result<()> {
-        let value = Arc::new(AtomicI32::new(0));
-        let observed = value.clone();
-        let (events, received) = mpsc::channel();
-        let guard = Guard::start(
-            move || {
-                enforce_control(
-                    || Ok(observed.load(Ordering::SeqCst)),
-                    || {
-                        observed.store(SECONDS, Ordering::SeqCst);
-                        Ok(())
-                    },
-                )?;
-                events.send(())?;
-                Ok(())
-            },
-            Duration::from_millis(5),
-        )?;
-        received.recv_timeout(Duration::from_secs(2))?;
-        assert_eq!(value.load(Ordering::SeqCst), 10);
-        value.store(0, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while value.load(Ordering::SeqCst) != 10 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "drift was not reclaimed"
-            );
-            received.recv_timeout(Duration::from_secs(2))?;
-        }
-        drop(guard);
-        assert_eq!(value.load(Ordering::SeqCst), 10);
-        Ok(())
-    }
-
-    #[test]
-    fn boot_file_is_reclaimed_without_touching_other_settings() -> Result<()> {
+    fn startup_persists_boot_file_without_touching_other_settings() -> Result<()> {
         if unsafe { libc::geteuid() } != 0 {
             eprintln!("root-owned sysctl persistence test requires root");
             return Ok(());
         }
-        let directory =
-            std::env::temp_dir().join(format!("netcontrol-panic-{}", std::process::id()));
+        let directory = Path::new(".").join(format!(".netcontrol-panic-{}", std::process::id()));
         fs::create_dir(&directory)?;
         let result = (|| -> Result<()> {
             let unrelated = directory.join("10-unrelated.conf");
             fs::write(&unrelated, b"kernel.panic_on_oops = 0\n")?;
             persist(&directory)?;
             assert_eq!(fs::read(directory.join(FILE))?, CONTENT);
+            let metadata = fs::metadata(directory.join(FILE))?;
+            assert_eq!(metadata.uid(), 0);
+            assert_eq!(metadata.mode() & 0o777, 0o644);
+            persist(&directory)?;
+            assert_eq!(fs::metadata(directory.join(FILE))?.ino(), metadata.ino());
             fs::write(directory.join(FILE), b"kernel.panic = 0\n")?;
             persist(&directory)?;
             persist(&directory)?;

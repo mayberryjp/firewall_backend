@@ -3238,8 +3238,13 @@ Existing genuine errors from state/runtime reads are not converted into fake
 successful configuration reads. Service reconcile responses need not contain
 the daemon-enriched fields; the GET responses above do.
 
-The monitor samples approximately every two seconds after completed engine
-deadline ticks. `process_health.status` is `healthy`, `degraded`, `unhealthy`
+The monitor samples approximately every two seconds independently of engine
+deadline ticks and watchdog progress. It reads nonblocking cached native worker
+snapshots, not the live runtime diagnostic API. A contended worker reports
+temporary unavailability/retrying rather than blocking collection; engine
+contention makes the native sample unavailable. Live diagnostic collectors and
+their sampling intervals are unchanged.
+`process_health.status` is `healthy`, `degraded`, `unhealthy`
 or `unknown`; `healthy` is respectively `true`, `null`, `false` or `null`.
 Use `status` to distinguish a known degraded condition from unknown health.
 Known component states
@@ -3268,7 +3273,8 @@ visible; running services still report unavailable accounting and capture loss.
 after 15 seconds without a completed health collection (monotonic timeout);
 aggregate/daemon health becomes unknown, not stale success, and a
 `monitor_stale` alert appears. Initial unsampled health is unknown. Optional
-`runtime_available` says whether the latest native runtime collection succeeded.
+`runtime_available` says whether the latest cached native worker-status collection
+succeeded, not whether live runtime diagnostics or forwarding succeed.
 Optional `daemon` reports the real PID, local state/health, sampled uptime in
 seconds and whether systemd watchdog configuration was detected. `components`
 contains stable IDs, component/resource identifiers, actual source state,
@@ -3915,7 +3921,7 @@ Deployment/operator requirements:
   edits (`412`), throttling (`429`), expired secrets (`401`), permissions (`403`)
   and other failures surface as per-entry errors, then retry next interval.
 - Only confirmed settings run; pending transaction/maintenance pauses checks and
-  cancels work on the next one-second observation. Shutdown cancels requests and
+  cancels work on configuration notification rather than one-second polling. Shutdown cancels requests and
   joins the worker. An already transmitted Azure PUT can still complete; no
   external DNS rollback, deletion or record restoration is attempted.
 - Preserve `<state>.dynamic-dns` alongside journal backups (default
@@ -3976,10 +3982,12 @@ keys have it automatically.
 **When it takes effect.** Like MQTT and Dynamic DNS, `system` is daemon-owned and is
 **not** part of the networking apply: it never changes the network, never delays
 confirmation, and a rolled-back or unconfirmed transaction never touches the host.
-Within about a second of confirmation the daemon applies the saved values. While
-a transaction is pending, nothing is applied. The values are enforced: if another
-agent changes them, the daemon sets them again (at most every 10 seconds); a failed
-apply is retried every 30 seconds. **Clearing a value (empty string) stops managing
+At daemon/manager startup and after a confirmed value changes, the daemon applies
+and verifies the saved value using configuration notifications, not a periodic
+configuration scan. While a transaction is pending, nothing is applied.
+Successful values are not continuously checked or reclaimed after external
+changes; unrelated configuration changes do not reapply them. A failed
+apply/verification is retried after 30 seconds. **Clearing a value (empty string) stops managing
 it and leaves the host as it is**; it does not restore the previous name or zone.
 
 Host effects:
@@ -4003,15 +4011,15 @@ Read-only endpoints (`state.read`; no query parameters; `405` for other methods,
 
 | Method and path | Result |
 | --- | --- |
-| `GET /api/v1/system/status` | `SystemStatus`, the confirmed settings and what the host reports |
+| `GET /api/v1/system/status` | `SystemStatus`, confirmed settings and cached apply-time observations |
 | `GET /api/v1/system/timezones` | `{"timezones":["America/Chicago","UTC",...]}` sorted valid zone names |
 
 ```ts
 type SystemSettingState =
-  | "unmanaged" | "current" | "applying" | "error" | "paused" | "simulated" | "unavailable";
+  | "unmanaged" | "current" | "error" | "paused" | "simulated" | "unavailable";
 interface SystemSettingStatus {
   configured: string;        // confirmed value, "" when unmanaged
-  observed: string | null;   // what the host reports now; null when unknown
+  observed: string | null;   // last apply/verification observation; null when unknown
   state: SystemSettingState;
   error: string | null;      // set when state is "error" or "unavailable"
 }
@@ -4028,13 +4036,15 @@ interface SystemStatus {
  "last_applied_at_unix":1792890000}
 ```
 
-`current` means the host matches; `applying` is a short wait (for example after an
-external change, before the daemon sets it again); `paused` means a transaction is
+`current` means the last startup/configuration application verified a match, not
+continuous proof that no external writer changed it. The previous `applying`
+state is removed; `paused` means a transaction is
 pending or an upgrade is running; `error` carries a message such as a missing
 privilege or timezone database and is retried; `simulated` and `unavailable`
 (namespace lab or non-Linux) never touch a host. `observed` is the kernel hostname,
-or the zone name from `/etc/localtime` (null when it is not a link into the zone
-database), and is also reported for unmanaged settings. The simulator returns a
+or the zone name from `/etc/localtime` at the last application/verification
+(null when it is not a link into the zone database). Unmanaged observations are
+refreshed on configuration notifications, not continuously. The simulator returns a
 fixed sample zone list; the native list is empty when the host has no timezone
 database.
 
@@ -6147,49 +6157,28 @@ conversion endpoint, browser repair action or permissive startup fallback.
 
 #### Mandatory host panic reboot
 
-Native host mode now mandatorily enforces `kernel.panic=10`: Linux attempts
+Native host mode sets and verifies `kernel.panic=10` at startup: Linux attempts
 reboot ten seconds after a kernel panic. Startup claims the setting and persists
-`/etc/sysctl.d/99-netcontrol-panic.conf`; an in-process worker reclaims runtime
-and owned-file drift every second. Initial failures abort native startup;
-later failures are logged/retried and reported as a `kernel_panic` component
-in existing platform process health/alerts. They do not block unrelated valid
-configuration transactions. This policy is not editable configuration and
+`/etc/sysctl.d/99-netcontrol-panic.conf`. Initial failures abort native startup.
+There is no persistent enforcement worker; later external changes are not
+polled or overwritten. This policy is not editable configuration and
 configuration rollback does not restore an earlier foreign value.
 
-`GET /api/v1/runtime` (`state.read`) adds `kernel_panic` in native mode:
-
-```json
-{
-  "kernel_panic": {
-    "state": "running",
-    "retrying": true,
-    "error": null,
-    "reboot_after_seconds": 10,
-    "observed_seconds": 10,
-    "drift": false,
-    "enforcement_interval_seconds": 1,
-    "persistence_file": "/etc/sysctl.d/99-netcontrol-panic.conf"
-  }
-}
-```
-
-`state` is `running` only while the worker is alive, its latest enforcement
-succeeded and a fresh control read equals 10; otherwise `error`.
-`retrying` indicates that the worker is alive. `observed_seconds` is the live
-signed integer or null on read failure; `drift` is null when unmeasured, otherwise
-whether it differs from 10. `error` is nullable diagnostic text for read or
-enforcement failure; observed drift or an exited worker can have null error.
-Native lab mode returns null, including with host-tunable opt-in; simulator
-omits the field. No request fields, new methods/paths, authentication changes
-or editable kernel catalog entries are added.
+`GET /api/v1/runtime` (`state.read`) no longer returns `kernel_panic`, including
+in native lab mode. Platform process-health/alerts have no `kernel_panic:host`
+component. Remove the panic worker/recovery row and its runtime client type.
+This removes the previous `state`, `retrying`, `error`, `reboot_after_seconds`,
+`observed_seconds`, `drift`, `enforcement_interval_seconds` and `persistence_file`
+runtime fields; it does not indicate a kernel crash or loss of kernel-managed
+reboot behavior. No new methods/paths, request fields, permissions or editable
+kernel catalog entries are added.
 
 Required frontend work is operator-help disclosure of mandatory automatic
-reboot/deployment requirements; optionally render measured policy/drift and the
-existing platform alert. Do not offer a delay/disable control or treat null/
-absent observations as enforced. Panic-on-oops/warnings and watchdog/NMI panic
+reboot/deployment requirements; do not render nonexistent live policy/drift or
+worker recovery status. Do not offer a delay/disable control. Panic-on-oops/warnings and watchdog/NMI panic
 triggers are unchanged. Existing conflicting files are not removed; boot
 ordering and competing writers can override the value until the next daemon
-claim. Stopping the daemon stops reclamation, not the saved/live policy.
+startup. Stopping the daemon does not remove the saved/live policy.
 See [deployment details](docs/BUILD_AND_INSTALL.md#kernel-panic-reboot-ownership)
 and [handoff](docs/frontend-handoffs/2026-11-10.md#2026-11-10-01-mandatory-panic-reboot).
 
@@ -6778,8 +6767,10 @@ clears the error. A failed delivery is not proof that the worker stopped and is
 not replayed. A malformed or unreadable rate-limit response is a delivery
 failure, not a reason to stop the worker. `error` state still indicates a
 stopped worker that requires the separately reported manager recovery.
-The three notification booleans report the manager's current policy; worker
-updates normally occur on its one-second tick. Read saved configuration for
+The three notification booleans report the manager's current policy; configuration
+notifications update them without waiting for a one-second configuration scan.
+Enabled native drop consumption still samples once per second; disabled/paused
+managers wait for configuration notification. Read saved configuration for
 authoritative committed settings and do not overwrite a pending draft from status.
 The `discord` manager participates in daemon health/task supervision and
 `POST /api/v1/processes/restart {"target":"discord"}` (`system.restart`,

@@ -45,6 +45,9 @@ pub(crate) fn gateway_samples(config: &Config) -> Vec<Value> {
     })).collect()
 }
 impl Backend for Simulator {
+    fn process_health(&mut self, config: &Config) -> Result<Value> {
+        self.runtime(config)
+    }
     fn bgp_status(&mut self, config: &Config) -> Result<Value> {
         Ok(
             json!({"name":"bgp","scope":"simulator","state":if config.bgp.enabled{"simulated"}else{"disabled"},

@@ -12,6 +12,17 @@
 
 ### Changed
 
+- Apply/verify panic reboot policy once at native startup instead of supervising
+  it continuously; remove `runtime.kernel_panic` and its process-health row.
+  Apply hostname/timezone at manager startup and confirmed value changes, with
+  timed retries only for failures. Replace integration configuration polling
+  with change notifications and work/retry timers; isolate cached process-health
+  collection from transaction deadlines/watchdog progress. Service waits now
+  block until their deadline or an explicit stop signal. Leave always-on packet
+  diagnostics unchanged. Breaking runtime/host-policy/status-observation contract;
+  next automatic calendar version.
+  [Required frontend handoff 2026-11-17-01](docs/frontend-handoffs/2026-11-17.md#2026-11-17-01-startup-policy-and-event-driven-managers).
+
 - Allow configuration submissions, confirmations, restores and restart recovery
   after a backward UTC correction by advancing the saved revision date's
   iteration until UTC exceeds its high-water mark. Keep actual commit timestamps,
@@ -224,11 +235,11 @@
 
 - Mandatory native-host `kernel.panic=10` ownership: attempt reboot ten seconds
   after a kernel panic, overwrite conflicts at startup, durably persist the boot
-  setting and reclaim live/owned-file drift every second in Rust. Expose measured
-  runtime status and enforcement failures in platform health; leave panic
+  setting and verify readback. Startup-only application supersedes the earlier
+  continuous enforcement/runtime metadata in handoff 2026-11-10-01; leave panic
   triggers, simulator and native lab namespaces unchanged. Initial takeover
   errors abort startup. Release impact: breaking host deployment policy with
-  additive runtime metadata; next automatic calendar version.
+  no runtime worker metadata; next automatic calendar version.
   Required operator-help review:
   [handoff 2026-11-10-01](docs/frontend-handoffs/2026-11-10.md#2026-11-10-01-mandatory-panic-reboot).
 

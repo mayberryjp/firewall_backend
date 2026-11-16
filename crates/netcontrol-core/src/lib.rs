@@ -81,6 +81,10 @@ pub use connections::{ConnectionQuery, ConnectionTarget, ConnectionTuple};
 
 /// Implementations must observe real state and report unsupported operations as errors.
 pub trait Backend: Send {
+    /// Return cached worker health only; do not perform live network or filesystem diagnostics.
+    fn process_health(&mut self, _config: &Config) -> Result<Value> {
+        anyhow::bail!("cached worker health is not supported by this backend")
+    }
     fn configure_host_experience(
         &mut self,
         _config: &Config,

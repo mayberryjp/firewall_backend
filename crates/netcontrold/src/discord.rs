@@ -334,13 +334,22 @@ impl Manager {
 
     async fn worker(&self, mut stop: watch::Receiver<bool>) -> Result<()> {
         let client = Self::discord_client()?;
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut changes = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .subscribe_configuration();
+        let mut next_poll = Some(tokio::time::Instant::now());
         'worker: loop {
+            if *stop.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = stop.changed() => break,
-                _ = tick.tick() => {}
+                changed = changes.changed() => { changed.context("configuration notifications closed")?; }
+                _ = crate::wait_until(next_poll) => {}
             }
+            next_poll = None;
             if *stop.borrow() {
                 break;
             }
@@ -371,6 +380,9 @@ impl Manager {
                     .state = "paused";
                 continue;
             };
+            if config.enabled && self.mode == Mode::Native {
+                next_poll = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+            }
             {
                 let mut status = self
                     .status
@@ -482,9 +494,19 @@ impl Manager {
     }
 
     async fn configuration_changed(&self, original: &DiscordConfig) {
+        let mut changes = match self.engine.lock() {
+            Ok(engine) => engine.subscribe_configuration(),
+            Err(error) => {
+                tracing::error!(%error, "Discord configuration notifications unavailable");
+                return;
+            }
+        };
         loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
             if self.configuration_is_changed(original) {
+                return;
+            }
+            if let Err(error) = changes.changed().await {
+                tracing::error!(%error, "Discord configuration notifications closed");
                 return;
             }
         }

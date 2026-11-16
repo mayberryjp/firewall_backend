@@ -466,6 +466,35 @@ impl Manager {
         Ok(())
     }
 
+    pub fn try_merge(&self, value: &mut Value) -> Result<()> {
+        let output = value.as_array_mut().context("monitor rows missing")?;
+        match self.rows.try_lock() {
+            Ok(rows) => {
+                for row in output {
+                    if let Some(dynamic) = row["name"].as_str().and_then(|name| rows.get(name)) {
+                        for (key, value) in dynamic.as_object().unwrap() {
+                            row[key] = value.clone();
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                for row in output {
+                    if row["mode"] == "dhcp" && row["process_state"] != "disabled" {
+                        row["process_state"] = json!("unavailable");
+                        row["sample_status"] = json!("unavailable");
+                        row["health"] = json!("unknown");
+                        row["retrying"] = json!(true);
+                        row["error"] = json!(format!(
+                            "cached DHCP gateway monitor status unavailable: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         self.stop.store(true, Ordering::Release);
         if let Some(join) = &self.join {
@@ -503,6 +532,58 @@ impl Drop for Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_snapshot_merge_reports_contention_and_recovers() -> Result<()> {
+        let manager = Manager::new(
+            Arc::new(File::open(".")?),
+            Arc::new(Mutex::new(dhcp_client::State::default())),
+        );
+        let baseline = json!([
+            {"name":"first","mode":"dhcp","process_state":"waiting"},
+            {"name":"static","mode":"explicit","process_state":"running","health":"up"},
+            {"name":"disabled","mode":"dhcp","process_state":"disabled"}
+        ]);
+        let mut rows = manager.rows.lock().unwrap();
+        rows.insert(
+            "first".into(),
+            json!({"name":"first","process_state":"error","sample_status":"unavailable",
+                "health":"unknown","reason":"synthetic gateway failure"}),
+        );
+        let _leases = manager.leases.lock().unwrap();
+        let mut unavailable = baseline.clone();
+        manager.try_merge(&mut unavailable)?;
+        assert_eq!(unavailable[0]["process_state"], "unavailable");
+        assert_eq!(unavailable[0]["retrying"], true);
+        assert!(
+            unavailable[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("cached DHCP gateway monitor status unavailable")
+        );
+        assert_eq!(unavailable[1], baseline[1]);
+        assert_eq!(unavailable[2], baseline[2]);
+        drop(rows);
+
+        let mut failed = baseline.clone();
+        manager.try_merge(&mut failed)?;
+        assert_eq!(failed[0]["process_state"], "error");
+        assert_eq!(failed[0]["reason"], "synthetic gateway failure");
+        assert_eq!(failed[1], baseline[1]);
+        assert_eq!(failed[2], baseline[2]);
+
+        manager.rows.lock().unwrap().insert(
+            "first".into(),
+            json!({"name":"first","process_state":"running","sample_status":"current",
+                "health":"up","reason":null}),
+        );
+        let mut recovered = baseline;
+        manager.try_merge(&mut recovered)?;
+        assert_eq!(recovered[0]["process_state"], "running");
+        assert_eq!(recovered[0]["health"], "up");
+        assert!(recovered[0].get("error").is_none());
+        Ok(())
+    }
 
     fn configuration() -> Config {
         let mut config: Config = serde_json::from_value(json!({"interfaces":[

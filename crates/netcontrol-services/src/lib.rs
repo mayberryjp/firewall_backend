@@ -471,9 +471,18 @@ impl Services {
         Ok(())
     }
     fn row(&self, key: &str, enabled: bool, base: Value) -> Value {
+        self.row_with_snapshot(key, enabled, base, Worker::snapshot)
+    }
+    fn row_with_snapshot(
+        &self,
+        key: &str,
+        enabled: bool,
+        base: Value,
+        snapshot: fn(&Worker) -> Value,
+    ) -> Value {
         if enabled {
             if let Some(w) = self.workers.get(key) {
-                let mut row = w.snapshot();
+                let mut row = snapshot(w);
                 for (k, v) in base.as_object().unwrap() {
                     row[k] = v.clone();
                 }
@@ -485,18 +494,31 @@ impl Services {
         row
     }
     pub fn status(&self) -> Value {
+        self.status_with_snapshot(Worker::snapshot)
+    }
+    pub fn process_health(&self) -> Value {
+        self.status_with_snapshot(Worker::try_snapshot)
+    }
+    fn status_with_snapshot(&self, snapshot: fn(&Worker) -> Value) -> Value {
         let c = &self.config;
         let mut appliance = vec![
-            self.row("ntp", c.ntp.enabled, json!({"name":"ntp","scope":"host"})),
-            self.row(
+            self.row_with_snapshot(
+                "ntp",
+                c.ntp.enabled,
+                json!({"name":"ntp","scope":"host"}),
+                snapshot,
+            ),
+            self.row_with_snapshot(
                 "syslog",
                 c.syslog.enabled || self.local_syslog_available(),
                 json!({"name":"syslog","scope":"host","forwarding_enabled":c.syslog.enabled}),
+                snapshot,
             ),
-            self.row(
+            self.row_with_snapshot(
                 "vnstat",
                 c.vnstat.enabled,
                 json!({"name":"vnstat","scope":"host"}),
+                snapshot,
             ),
         ];
         let mut base = c.mdns_status.clone();
@@ -505,7 +527,7 @@ impl Services {
             base = config.mdns.status(&config, "disabled");
         }
         appliance.push(if let Some(worker) = self.workers.get("mdns") {
-            worker.snapshot()
+            snapshot(worker)
         } else {
             base["state"] = json!(if c.mdns.enabled {
                 "stopped"
@@ -518,10 +540,11 @@ impl Services {
             .interfaces
             .iter()
             .map(|i| {
-                self.row(
+                self.row_with_snapshot(
                     "dhcp-relay",
                     i.dhcp_relay.enabled,
                     json!({"interface":i.name}),
+                    snapshot,
                 )
             })
             .collect();
@@ -529,7 +552,7 @@ impl Services {
             appliance.push(
                 self.workers
                     .get(&format!("udp-broadcast-relay:{}", instance.id))
-                    .map(Worker::snapshot)
+                    .map(snapshot)
                     .unwrap_or_else(|| {
                         instance.status(
                             c.udp_broadcast_relay.enabled && instance.enabled,
@@ -546,15 +569,16 @@ impl Services {
             .softflowd
             .iter()
             .map(|f| {
-                self.row(
+                self.row_with_snapshot(
                     &format!("flow:{}", f.name),
                     f.enabled,
                     json!({"name":f.name}),
+                    snapshot,
                 )
             })
             .collect();
         let gateways:Vec<_>=c.gateway_monitors.iter().map(|m|{
-            let row=self.row(&format!("gateway:{}",m.name),m.enabled,json!({"name":m.name}));
+            let row=self.row_with_snapshot(&format!("gateway:{}",m.name),m.enabled,json!({"name":m.name}),snapshot);
             let mut stats=row.get("statistics").cloned().unwrap_or_else(||json!({"name":m.name,"process_state":row["state"],"sample_status":if m.enabled {"warming_up"}else{"disabled"},"health":"unknown","started_at":row["started_at"],"collected_at":null,"health_changed_at":null,"last_success_at":null,"sent":0,"received":0,"lost":0,"pending":0,"variation_pairs":0,"loss_percent":null,"rtt_min_ms":null,"rtt_max_ms":null,"rtt_avg_ms":null,"rtt_stddev_ms":null,"rtt_p50_ms":null,"rtt_p95_ms":null,"rtt_variation_ms":null}));
             stats["process_state"]=row["state"].clone();
             for key in ["retrying", "restart_count", "last_error"] {
@@ -562,7 +586,7 @@ impl Services {
                     stats[key] = value.clone();
                 }
             }
-            if row["state"]=="error" {stats["sample_status"]=json!("unavailable");stats["health"]=json!("unknown");stats["error"]=row["error"].clone();}
+            if row["state"]=="error"||row["state"]=="unavailable" {stats["sample_status"]=json!("unavailable");stats["health"]=json!("unknown");stats["error"]=row["error"].clone();}
             else if row["state"]=="stopped"||row["state"]=="disabled"{stats["sample_status"]=row["state"].clone();stats["health"]=json!("unknown");}
             stats["mode"]=json!(m.mode);
             stats["interface"]=json!(m.interface);
@@ -793,11 +817,36 @@ mod tests {
         assert!(previous.stopping());
         assert!(!untouched.stopping());
         assert!(Arc::ptr_eq(
-            &untouched.stop,
-            &services.workers["mdns"].context.stop
+            &untouched.status,
+            &services.workers["mdns"].context.status
         ));
         assert_eq!(starts[0].load(Ordering::SeqCst), 2);
         assert_eq!(starts[1].load(Ordering::SeqCst), 1);
+        let locked = services.workers["mdns"].context.status.lock().unwrap();
+        let health = services.process_health();
+        let mdns = health["appliance_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "mdns")
+            .unwrap();
+        assert_eq!(mdns["state"], "unavailable");
+        assert!(
+            health["appliance_services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["name"] == "ntp" && row["state"] != "unavailable")
+        );
+        drop(locked);
+        let health = services.process_health();
+        assert!(
+            health["appliance_services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["name"] == "mdns" && row["state"] == "running")
+        );
         assert!(services.restart_worker("unknown").is_err());
         services.shutdown()?;
         drop(services);

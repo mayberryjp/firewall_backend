@@ -408,6 +408,70 @@ fn confirm(e: &mut Engine, id: &str) -> Reply {
     )
 }
 
+#[test]
+fn configuration_notifications_cover_confirm_rollback_and_operational_pauses() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut changes = engine.subscribe_configuration();
+    let saved = engine.saved_configuration().clone();
+    let pending = submit(&mut engine, config());
+    assert_eq!(pending.status, 202, "{}", pending.body);
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    assert!(engine.configuration_busy());
+    assert_eq!(*engine.saved_configuration(), saved);
+    assert_eq!(
+        confirm(&mut engine, pending.body["id"].as_str().unwrap()).status,
+        200
+    );
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    assert!(!engine.configuration_busy());
+
+    let committed = engine.saved_configuration().clone();
+    let mut candidate = committed.clone();
+    candidate.interfaces[0].mtu = 1400;
+    let pending = submit(&mut engine, candidate);
+    assert_eq!(pending.status, 202);
+    changes.borrow_and_update();
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                pending.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    assert_eq!(*engine.saved_configuration(), committed);
+
+    engine.set_upgrade_maintenance(true).unwrap();
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    engine.set_upgrade_maintenance(true).unwrap();
+    assert!(!changes.has_changed().unwrap());
+    engine.set_upgrade_maintenance(false).unwrap();
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    engine.begin_restart().unwrap();
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    engine.cancel_restart();
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/runtime", Value::Null).status,
+        200
+    );
+    assert!(!changes.has_changed().unwrap());
+}
+
 fn firewall_clear_config(host_policies: bool) -> Config {
     let mut candidate = config();
     candidate.interfaces.push(

@@ -187,17 +187,17 @@ impl App {
         Ok(())
     }
     pub fn refresh_health(&self, watchdog: bool, tasks: &[(&str, bool)]) {
-        let runtime = self.engine.try_lock().ok().and_then(|mut engine| {
-            let reply = engine.request(
-                "GET",
-                "/api/v1/runtime",
-                "",
-                "platform-monitor",
-                &["state.read".into()],
-                &[],
-            );
-            (reply.status == 200).then_some(reply.body)
-        });
+        let runtime =
+            self.engine
+                .try_lock()
+                .ok()
+                .and_then(|mut engine| match engine.process_health() {
+                    Ok(status) => Some(status),
+                    Err(error) => {
+                        tracing::warn!(%error, "cached native process health unavailable");
+                        None
+                    }
+                });
         let mut managers = Vec::new();
         for (name, status) in [
             ("mqtt", self.mqtt.as_ref().map(|manager| manager.status())),

@@ -51,6 +51,11 @@ HTTP state/runtime reads include shared observational `process_health` and
 without acquiring the networking engine. Health samples approximately every
 two seconds; retrying component failures yield degraded rather than unhealthy
 aggregate status, and after 15 seconds without collection it is unknown/stale.
+Collection runs separately from transaction deadlines/watchdog progress and
+uses nonblocking cached native worker snapshots, not full live runtime diagnostics.
+Contended worker snapshots report temporary unavailability rather than waiting
+behind network reconciliation. The live runtime API remains unchanged except
+that startup-only panic policy has no `kernel_panic` object.
 Discord delivery failures remain visible as warnings while its worker runs. Alerts
 deduplicate and clear on observed recovery, are not persisted configuration,
 and never create write locks or stop services. MQTT publishes the same objects

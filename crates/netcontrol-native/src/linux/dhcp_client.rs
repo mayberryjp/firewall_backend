@@ -594,6 +594,14 @@ impl Manager {
         Ok(json!({"leases": state.leases, "errors": state.errors}))
     }
 
+    pub fn try_status(&self) -> Result<Value> {
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|error| anyhow::anyhow!("cached DHCP status unavailable: {error}"))?;
+        Ok(json!({"leases": state.leases, "errors": state.errors}))
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         for worker in self.workers.values() {
             worker.stop.store(true, Ordering::Release);
@@ -950,6 +958,22 @@ mod tests {
             PathBuf::new(),
             false,
         )
+    }
+
+    #[test]
+    fn cached_snapshot_reports_contention_and_recovers() -> Result<()> {
+        let manager = manager();
+        let mut state = manager.state.lock().unwrap();
+        state
+            .errors
+            .insert("wan0".into(), "synthetic DHCP failure".into());
+        assert!(manager.try_status().is_err());
+        drop(state);
+        assert_eq!(
+            manager.try_status()?["errors"]["wan0"],
+            "synthetic DHCP failure"
+        );
+        Ok(())
     }
 
     #[test]

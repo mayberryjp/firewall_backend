@@ -18,3 +18,10 @@ pub mod sando;
 pub mod ssh;
 pub mod updates;
 pub mod watchdog;
+
+pub(crate) async fn wait_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
