@@ -1,0 +1,47 @@
+{
+  "base_revision": "2026.10.29.1",
+  "confirm_timeout_seconds": 30,
+  "description": "Synthetic routed BGP speaker with a separate on-link forwarding host; replace addresses, revision and complete firewall configuration before submitting",
+  "config": {
+    "interfaces": [
+      {
+        "name": "lan0",
+        "kind": "ethernet",
+        "role": "lan",
+        "mtu": 1500,
+        "up": true,
+        "addresses": ["192.0.2.2/24"]
+      }
+    ],
+    "routes": [
+      {
+        "enabled": true,
+        "destination": "198.51.100.22/32",
+        "gateway": "192.0.2.1",
+        "interface": "lan0",
+        "table": 254,
+        "metric": 10
+      }
+    ],
+    "bgp": {
+      "enabled": true,
+      "local_asn": 65004,
+      "router_id": "192.0.2.2",
+      "keepalive_seconds": 30,
+      "hold_seconds": 90,
+      "max_prefixes": 4096,
+      "neighbors": [
+        {
+          "name": "remote",
+          "address": "198.51.100.22",
+          "local_address": "192.0.2.2",
+          "interface": "lan0",
+          "remote_asn": 65000,
+          "multihop_ttl": 8,
+          "allowed_next_hops": ["192.0.2.1"],
+          "accept_default": false
+        }
+      ]
+    }
+  }
+}

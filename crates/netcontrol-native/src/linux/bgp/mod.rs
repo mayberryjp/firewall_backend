@@ -339,8 +339,15 @@ struct Neighbor {
     retry: Instant,
     error: Option<String>,
     rejected: u64,
+    last_rejection: Option<Rejection>,
 }
-fn bound_socket(local: Ipv4Addr, interface: &str) -> Result<std::os::fd::OwnedFd> {
+#[derive(Serialize)]
+struct Rejection {
+    prefix: String,
+    next_hop: Ipv4Addr,
+    reason: &'static str,
+}
+fn bound_socket(interface: &str, ttl: u8) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     let fd = unsafe {
         libc::socket(
@@ -365,7 +372,20 @@ fn bound_socket(local: Ipv4Addr, interface: &str) -> Result<std::os::fd::OwnedFd
         "BGP bind interface: {}",
         std::io::Error::last_os_error()
     );
-    let _ = local;
+    let ttl = i32::from(ttl);
+    ensure!(
+        unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_TTL,
+                (&ttl as *const i32).cast(),
+                std::mem::size_of_val(&ttl) as libc::socklen_t,
+            )
+        } == 0,
+        "BGP IP_TTL: {}",
+        std::io::Error::last_os_error()
+    );
     Ok(fd)
 }
 fn sockaddr(ip: Ipv4Addr, port: u16) -> libc::sockaddr_in {
@@ -393,8 +413,8 @@ fn bind(fd: i32, local: Ipv4Addr, port: u16) -> Result<()> {
     );
     Ok(())
 }
-fn listen(local: Ipv4Addr, interface: &str) -> Result<TcpListener> {
-    let fd = bound_socket(local, interface)?;
+fn listen(local: Ipv4Addr, interface: &str, ttl: u8) -> Result<TcpListener> {
+    let fd = bound_socket(interface, ttl)?;
     let yes = 1i32;
     ensure!(
         unsafe {
@@ -418,7 +438,7 @@ fn listen(local: Ipv4Addr, interface: &str) -> Result<TcpListener> {
 }
 fn connect(peer: &BGPNeighbor) -> Result<TcpStream> {
     let local = peer.local_address.parse()?;
-    let fd = bound_socket(local, &peer.interface)?;
+    let fd = bound_socket(&peer.interface, peer.multihop_ttl)?;
     bind(fd.as_raw_fd(), local, 0)?;
     let address = sockaddr(peer.address.parse()?, 179);
     if unsafe {
@@ -487,17 +507,34 @@ fn process(
                     let looped = path.as_path.contains(&bgp.local_asn)
                         || (bgp.local_asn != neighbor.config.remote_asn
                             && path.as_path.first() != Some(&neighbor.config.remote_asn));
+                    let next_hop = path.next_hop.to_string();
+                    let next_hop_allowed = if neighbor.config.allowed_next_hops.is_empty() {
+                        next_hop == neighbor.config.address
+                    } else {
+                        neighbor.config.allowed_next_hops.contains(&next_hop)
+                    };
                     for prefix in update.announced {
-                        // This deliberately small speaker accepts direct-next-hop paths only.
-                        let blocked = looped
-                            || path.next_hop != neighbor.config.address.parse::<Ipv4Addr>()?
-                            || (prefix.length == 0 && !neighbor.config.accept_default)
-                            || prefix.address.is_multicast()
-                            || prefix.address.is_loopback()
-                            || connected.contains(&prefix);
-                        if blocked {
+                        let reason = if looped {
+                            Some("as_path")
+                        } else if !next_hop_allowed {
+                            Some("next_hop_not_allowed")
+                        } else if prefix.length == 0 && !neighbor.config.accept_default {
+                            Some("default_not_allowed")
+                        } else if prefix.address.is_multicast() || prefix.address.is_loopback() {
+                            Some("invalid_prefix")
+                        } else if connected.contains(&prefix) {
+                            Some("connected_route")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
                             connection.routes.remove(&prefix);
                             neighbor.rejected = neighbor.rejected.saturating_add(1);
+                            neighbor.last_rejection = Some(Rejection {
+                                prefix: prefix.to_string(),
+                                next_hop: path.next_hop,
+                                reason,
+                            });
                             continue;
                         }
                         ensure!(
@@ -749,16 +786,22 @@ fn run(
     stop: &AtomicBool,
 ) -> Result<()> {
     let bgp = &config.bgp;
-    let mut listeners = BTreeMap::new();
+    let mut listener_ttls = BTreeMap::<_, u8>::new();
     for peer in &bgp.neighbors {
         let key = (
             peer.interface.clone(),
             peer.local_address.parse::<Ipv4Addr>()?,
         );
-        if !listeners.contains_key(&key) {
-            listeners.insert(key.clone(), listen(key.1, &key.0)?);
-        }
+        listener_ttls
+            .entry(key)
+            .and_modify(|ttl| *ttl = (*ttl).max(peer.multihop_ttl))
+            .or_insert(peer.multihop_ttl);
     }
+    // SYN-ACKs precede peer lookup, so shared listeners use the largest configured TTL.
+    let listeners = listener_ttls
+        .into_iter()
+        .map(|(key, ttl)| listen(key.1, &key.0, ttl).map(|listener| (key, listener)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let mut neighbors = bgp
         .neighbors
         .iter()
@@ -770,6 +813,7 @@ fn run(
             retry: Instant::now(),
             error: None,
             rejected: 0,
+            last_rejection: None,
         })
         .collect::<Vec<_>>();
     let mut connected = BTreeSet::new();
@@ -802,6 +846,7 @@ fn run(
                                     .iter()
                                     .any(|c| c.established || !c.outbound)
                             {
+                                stream.set_ttl(u32::from(peer.config.multihop_ttl))?;
                                 peer.connections.push(Connection::new(stream, false, bgp)?);
                             }
                         }
@@ -875,7 +920,7 @@ fn run(
             let connection=n.connections.iter().find(|c|c.established).or_else(||n.connections.first());
             json!({"name":n.config.name,"address":n.config.address,"interface":n.config.interface,
                 "state":if connection.is_some_and(|c|c.established){"established"}else if connection.is_some_and(|c|c.open.is_some()){"open_confirm"}else if connection.is_some(){"open_sent"}else{"active"},
-                "received_prefixes":n.routes.len(),"rejected_prefixes":n.rejected,
+                "received_prefixes":n.routes.len(),"rejected_prefixes":n.rejected,"last_rejection":n.last_rejection,
                 "advertised_prefixes":connection.map_or(0,|c|c.advertised.len()),
                 "negotiated_hold_seconds":connection.and_then(|c|c.open.as_ref()).map(|o|o.hold.min(bgp.hold_seconds)),
                 "remote_router_id":connection.and_then(|c|c.open.as_ref()).map(|o|o.router_id),"error":n.error})
@@ -904,12 +949,15 @@ mod tests {
                 remote_asn: 65002,
                 wireguard_public_key: String::new(),
                 accept_default: false,
+                multihop_ttl: 1,
+                allowed_next_hops: Vec::new(),
             },
             connections: Vec::new(),
             routes: BTreeMap::new(),
             retry: Instant::now(),
             error: None,
             rejected: 0,
+            last_rejection: None,
         }
     }
     #[test]
@@ -1039,6 +1087,333 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn routed_sessions_authorize_advertised_gateways_per_neighbor_and_withdraw() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let bgp = BGPConfig {
+            local_asn: 65004,
+            router_id: "192.0.2.2".into(),
+            ..Default::default()
+        };
+        let prefix = Prefix::new("203.0.113.0".parse()?, 24)?;
+        let mut peers = Vec::new();
+        let mut remotes = Vec::new();
+        for (name, address, gateway) in [
+            ("first", "198.51.100.22", "192.0.2.1"),
+            ("second", "198.51.100.23", "192.0.2.3"),
+        ] {
+            let stream = TcpStream::connect(listener.local_addr()?)?;
+            remotes.push(listener.accept()?.0);
+            let mut connection = Connection::new(stream, true, &bgp)?;
+            let mut peer = neighbor();
+            peer.config.name = name.into();
+            peer.config.address = address.into();
+            peer.config.local_address = "192.0.2.2".into();
+            peer.config.multihop_ttl = 8;
+            peer.config.allowed_next_hops = vec![gateway.into()];
+            connection
+                .input
+                .extend(wire::open(65002, address.parse()?, 90));
+            connection.input.extend(wire::frame(4, &[]));
+            connection
+                .input
+                .extend(wire::announce(prefix, 65002, gateway.parse()?, true, false));
+            process(&mut connection, &mut peer, &bgp, &BTreeSet::new())?;
+            assert!(connection.established);
+            assert_eq!(
+                connection.routes[&prefix].next_hop,
+                gateway.parse::<Ipv4Addr>()?
+            );
+            peer.routes = connection.routes.clone();
+            peer.connections.push(connection);
+            peers.push(peer);
+        }
+        let config = Config {
+            bgp: bgp.clone(),
+            ..Config::empty()
+        };
+        let (ledger, _) = desired(&config, &peers, &BTreeSet::new());
+        assert_eq!(ledger.routes[0].gateway, Some("192.0.2.1".parse()?));
+
+        let mut connection = peers[0].connections.remove(0);
+        connection.input.extend(wire::announce(
+            prefix,
+            65002,
+            "192.0.2.3".parse()?,
+            true,
+            false,
+        ));
+        process(&mut connection, &mut peers[0], &bgp, &BTreeSet::new())?;
+        assert!(connection.routes.is_empty());
+        assert_eq!(peers[0].rejected, 1);
+        assert_eq!(
+            serde_json::to_value(&peers[0].last_rejection)?,
+            json!({"prefix":"203.0.113.0/24","next_hop":"192.0.2.3","reason":"next_hop_not_allowed"})
+        );
+        peers[0].routes = connection.routes.clone();
+        let (ledger, _) = desired(&config, &peers, &BTreeSet::new());
+        assert_eq!(ledger.routes[0].gateway, Some("192.0.2.3".parse()?));
+
+        let mut connection = peers[1].connections.remove(0);
+        connection.input.extend(wire::withdraw(prefix));
+        process(&mut connection, &mut peers[1], &bgp, &BTreeSet::new())?;
+        peers[1].routes = connection.routes;
+        assert!(
+            desired(&config, &peers, &BTreeSet::new())
+                .0
+                .routes
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/net_admin/mount privileges"]
+    fn native_bgp_routed_peer_installs_advertised_gateway_and_cleans_up() -> Result<()> {
+        use crate::linux::{integration::Fixture, session};
+        use futures_util::TryStreamExt;
+        use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteProtocol};
+        let receiver = Fixture::new()?;
+        let gateway = Fixture::new()?;
+        let speaker = Fixture::new()?;
+        let ns = |fixture: &Fixture| -> Result<Arc<File>> {
+            Ok(Arc::new(File::open(fixture.options().namespace)?))
+        };
+        let receiver_ns = ns(&receiver)?;
+        let gateway_ns = ns(&gateway)?;
+        let speaker_ns = ns(&speaker)?;
+        for (from, to, local, remote) in [
+            (receiver_ns.clone(), gateway_ns.clone(), "peer0", "gw0"),
+            (gateway_ns.clone(), speaker_ns.clone(), "gw1", "speaker0"),
+        ] {
+            session(from, move |rt, h| {
+                rt.block_on(async {
+                    h.link()
+                        .add(rtnetlink::LinkVeth::new(local, remote).build())
+                        .execute()
+                        .await?;
+                    let link = h
+                        .link()
+                        .get()
+                        .match_name(remote.into())
+                        .execute()
+                        .try_next()
+                        .await?
+                        .context("veth missing")?;
+                    h.link()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .setns_by_fd(to.as_raw_fd())
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
+                    Ok(())
+                })
+            })?;
+        }
+        for (namespace, interface, address) in [
+            (receiver_ns.clone(), "peer0", "192.0.2.2"),
+            (gateway_ns.clone(), "gw0", "192.0.2.1"),
+            (gateway_ns.clone(), "gw1", "198.51.100.1"),
+            (speaker_ns.clone(), "speaker0", "198.51.100.22"),
+        ] {
+            session(namespace, move |rt, h| {
+                rt.block_on(async {
+                    let link = h
+                        .link()
+                        .get()
+                        .match_name(interface.into())
+                        .execute()
+                        .try_next()
+                        .await?
+                        .context("veth missing")?;
+                    h.address()
+                        .add(link.header.index, address.parse()?, 24)
+                        .execute()
+                        .await?;
+                    h.link()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .up()
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
+                    Ok(())
+                })
+            })?;
+        }
+        session(gateway_ns, |_, _| {
+            std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+            Ok(())
+        })?;
+        for (namespace, destination, via) in [
+            (receiver_ns.clone(), "198.51.100.22", "192.0.2.1"),
+            (speaker_ns.clone(), "192.0.2.2", "198.51.100.1"),
+        ] {
+            session(namespace, move |rt, h| {
+                rt.block_on(
+                    h.route()
+                        .add(
+                            rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+                                .destination_prefix(destination.parse()?, 32)
+                                .gateway(via.parse()?)
+                                .build(),
+                        )
+                        .execute(),
+                )?;
+                Ok(())
+            })?;
+        }
+        let config: Config = serde_json::from_value(json!({
+            "interfaces":[{"name":"peer0","kind":"ethernet","role":"lan","up":true,"mtu":1500,"addresses":["192.0.2.2/24"]}],
+            "routes":[{"enabled":true,"destination":"198.51.100.22/32","gateway":"192.0.2.1","interface":"peer0","table":254,"metric":10}],
+            "bgp":{"enabled":true,"local_asn":65004,"router_id":"192.0.2.2",
+                "neighbors":[{"name":"remote","interface":"peer0","local_address":"192.0.2.2",
+                    "address":"198.51.100.22","remote_asn":65000,"multihop_ttl":8,"allowed_next_hops":["192.0.2.1"]}]}
+        }))?;
+        config.validate()?;
+        let listener = session(speaker_ns.clone(), |_, _| {
+            listen("198.51.100.22".parse()?, "speaker0", 8)
+        })?;
+        assert_eq!(listener.ttl()?, 8);
+        let root = receiver.options().services_state;
+        std::fs::create_dir_all(&root)?;
+        let mut manager = Manager::new(receiver_ns.clone(), root)?;
+        manager.recover()?;
+        manager.configure(&config.operational_value()?)?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (mut remote, address) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "routed BGP connect timeout: {}",
+                        manager.snapshot()?
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        assert_eq!(address.ip(), "192.0.2.2".parse::<Ipv4Addr>()?);
+        remote.set_nonblocking(false)?;
+        remote.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let prefix = Prefix::new("203.0.113.0".parse()?, 24)?;
+        let mut messages = wire::open(65000, "198.51.100.22".parse()?, 90);
+        messages.extend(wire::frame(4, &[]));
+        messages.extend(wire::announce(
+            prefix,
+            65000,
+            "192.0.2.1".parse()?,
+            true,
+            false,
+        ));
+        remote.write_all(&messages)?;
+        let wait_route = |present: bool| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let status = manager.snapshot()?;
+                let found = status["routes"].as_array().is_some_and(|routes| {
+                    routes.iter().any(|r| {
+                        r["prefix"] == "203.0.113.0/24"
+                            && r["next_hop"] == "192.0.2.1"
+                            && r["installed"] == true
+                    })
+                });
+                if found == present {
+                    return Ok(());
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "BGP route presence {present}: {status}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_route(true)?;
+        let check_kernel = |present: bool| -> Result<()> {
+            session(receiver_ns.clone(), move |rt, h| {
+                let routes = rt.block_on(
+                    h.route()
+                        .get(crate::linux::networking::route_query(
+                            rtnetlink::IpVersion::V4,
+                        ))
+                        .execute()
+                        .try_collect::<Vec<_>>(),
+                )?;
+                let found = routes.iter().any(|r| {
+                    r.header.protocol == RouteProtocol::Other(245)
+                        && r.attributes
+                            .contains(&RouteAttribute::Destination(RouteAddress::Inet(
+                                "203.0.113.0".parse().unwrap(),
+                            )))
+                        && r.attributes
+                            .contains(&RouteAttribute::Gateway(RouteAddress::Inet(
+                                "192.0.2.1".parse().unwrap(),
+                            )))
+                });
+                ensure!(found == present, "kernel advertised gateway mismatch");
+                ensure!(
+                    routes
+                        .iter()
+                        .any(|r| r.header.destination_prefix_length == 32
+                            && r.attributes.contains(&RouteAttribute::Destination(
+                                RouteAddress::Inet("198.51.100.22".parse().unwrap())
+                            ))),
+                    "bootstrap route lost"
+                );
+                Ok(())
+            })
+        };
+        check_kernel(true)?;
+        remote.write_all(&wire::withdraw(prefix))?;
+        wait_route(false)?;
+        check_kernel(false)?;
+        drop(remote);
+        drop(listener);
+        manager.shutdown()?;
+
+        // Reverse initiation exercises the passive listener and its per-peer TTL.
+        manager.configure(&config.operational_value()?)?;
+        let mut remote_peer = neighbor().config;
+        remote_peer.interface = "speaker0".into();
+        remote_peer.local_address = "198.51.100.22".into();
+        remote_peer.address = "192.0.2.2".into();
+        remote_peer.multihop_ttl = 8;
+        let mut remote = session(speaker_ns, move |_, _| connect(&remote_peer))?;
+        remote.set_nonblocking(false)?;
+        remote.set_write_timeout(Some(Duration::from_secs(2)))?;
+        remote.write_all(&messages)?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let status = manager.snapshot()?;
+            if status["routes"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|r| r["installed"] == true))
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "passive routed BGP timeout: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        check_kernel(true)?;
+        manager.shutdown()?;
+        check_kernel(false)?;
+        assert!(
+            manager.snapshot()?["routes"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        Ok(())
+    }
+
     #[test]
     fn best_path_selection_preserves_static_routes_and_wireguard_peer_ownership() -> Result<()> {
         let mut config = Config::empty();

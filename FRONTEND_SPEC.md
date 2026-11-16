@@ -4490,8 +4490,17 @@ different from their local address.
 
 Each neighbor requires `name`, `address`, `local_address`, `interface`,
 `remote_asn`. `local_address` must be a static IPv4 address on a configured up
-peering interface. Non-WireGuard peers must be directly connected on that
-interface. Non-WireGuard `wireguard_public_key` must be empty (default).
+peering interface. `multihop_ttl` is an integer `1..255`, default `1`, controlling
+outgoing IPv4 TCP TTL for active and accepted connections. Previously sockets
+used the OS default TTL; direct sessions now explicitly use `1` unless configured
+otherwise. This is a transmit hop budget, not an inbound TTL-security check.
+Listeners shared by several neighbors use their maximum TTL for SYN-ACKs;
+accepted sockets then use that neighbor's TTL.
+Non-WireGuard peers outside the interface's static IPv4 subnets require
+`multihop_ttl > 1` and a nonempty `allowed_next_hops` list. Provide an independent
+connected/static bootstrap route to the remote speaker through the selected
+interface, a return route and suitable TCP/179 permits; BGP does not create that
+bootstrap route. Non-WireGuard `wireguard_public_key` must be empty (default).
 For WireGuard it must identify an enabled peer on the selected interface;
 one BGP neighbor per WireGuard peer is supported. That peer's **static**
 AllowedIPs must already cover the neighbor address to bootstrap BGP. Operators
@@ -4500,6 +4509,30 @@ working underlay route to its WireGuard endpoint. DNS endpoints also require
 working underlay DNS; endpoint refresh preserves BGP-owned AllowedIPs.
 BGP cannot learn the route
 needed to establish its own initial connection.
+
+`allowed_next_hops` is an array of at most 32 unique unicast IPv4 address strings,
+default `[]`. For non-WireGuard neighbors, empty means only the directly
+connected peering address is accepted. A nonempty list **replaces** that implicit
+authorization: the received NEXT_HOP must match an entry, and the peering address
+is not additionally accepted unless listed. Every entry must be a usable host
+address in a static IPv4 subnet of the selected interface and must not be any
+configured firewall address. Network/broadcast addresses are rejected for
+prefixes shorter than `/31`; `/31` point-to-point hosts are supported.
+Off-link/recursive gateways are not supported. Each neighbor has an independent
+list, so a container's session address and the host's forwarding address may
+differ without authorizing other peers' gateways. WireGuard neighbors require
+an empty list and still accept only the referenced peer's peering address.
+Invalid TTL, list, gateway reachability or interface/address configuration fails
+transaction validation with `422`; malformed field types fail deserialization.
+
+Synthetic non-WireGuard neighbor fragment (local `192.0.2.2/24` on `lan0`,
+static `198.51.100.22/32` via `192.0.2.1` already provided):
+
+```json
+{"name":"remote","address":"198.51.100.22","local_address":"192.0.2.2","interface":"lan0","remote_asn":65000,"multihop_ttl":8,"allowed_next_hops":["192.0.2.1"],"accept_default":false}
+```
+
+See the [complete synthetic transaction](examples/bgp-routed.json).
 
 `accept_default` defaults false per neighbor. True permits receiving `0.0.0.0/0`;
 it does not originate a default route or override ownership protections.
@@ -4522,8 +4555,9 @@ contract; incorrect types and invalid supported fields fail validation.
   Configured static routes and BGP-learned routes are not redistributed.
 - Receive IPv4 unicast UPDATEs. Reject own-AS loops, eBGP paths whose first AS
   differs from the configured remote AS, default routes without opt-in, invalid
-  addresses and paths whose NEXT_HOP is not the neighbor's peering address.
-  For iBGP, the other speaker must use next-hop-self for nonlocal paths.
+  addresses and paths whose NEXT_HOP is not authorized by that neighbor's
+  `allowed_next_hops` policy. With an empty list (including WireGuard), the other
+  speaker must use its peering address as NEXT_HOP, including nonlocal iBGP paths.
   Rejected prefixes are counted, not retained as accepted path rows.
 - Deterministic basic selection: highest iBGP LOCAL_PREF (eBGP uses 100),
   shortest AS sequence, lowest ORIGIN, prefer eBGP over iBGP, then neighbor
@@ -4629,11 +4663,18 @@ Neighbor rows include `name`, IPv4 `address`, `interface`, session `state`
 (`active`, `open_sent`, `open_confirm`, `established`), numeric
 `received_prefixes`, `advertised_prefixes`, cumulative `rejected_prefixes`,
 nullable `negotiated_hold_seconds`, nullable IPv4 `remote_router_id` and
-nullable last `error`. Counts/reset state are ephemeral and reset on worker
+nullable last `error`. `last_rejection` is null before a policy rejection,
+otherwise `{"prefix":"203.0.113.0/24","next_hop":"192.0.2.3","reason":"next_hop_not_allowed"}`.
+Its reason is `as_path` (own-AS loop or wrong first eBGP AS),
+`next_hop_not_allowed`, `default_not_allowed`, `invalid_prefix` or
+`connected_route`. It records the latest rejected NLRI, not an accepted route,
+an active session error or a retained rejected-route table. Successful updates
+and reconnects do not clear it or the cumulative rejection counter.
+Counts/reset state are ephemeral and reset on worker
 restart; previous session errors clear on a new establishment. Inactive/
 starting/error snapshots can omit active-only fields. Simulator reports
 `simulated` or `disabled`, no learned routes, null unmeasured counts, and no
-real session/forwarding claim. Treat `scope` as opaque.
+real session/forwarding claim; simulator `last_rejection` is null. Treat `scope` as opaque.
 
 `runtime.bgp` and an `appliance_services` row named `bgp` expose the same
 summary without full route rows. Shared `process_health` and `active_alerts`

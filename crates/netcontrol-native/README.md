@@ -304,6 +304,13 @@ Disconnect/withdraw/stop removes owned runtime additions. A durable private
 ownership journal is recovered only after native namespace/scope validation;
 learned state is not desired configuration or a revision.
 
+Routed speakers use per-neighbor `multihop_ttl` (default 1). Non-WireGuard
+`allowed_next_hops` explicitly authorizes directly connected forwarding gateways
+independently of the session address; a nonempty list replaces peer-only
+authorization. Off-link speakers require TTL greater than 1, an explicit gateway
+list and independent bootstrap/return routing. WireGuard keeps its peer-only
+next-hop rule. The latest policy rejection is visible in neighbor status.
+
 Runtime status, process health, MQTT summary, restart and BGP-only route APIs
 are described in the [canonical contract](../../FRONTEND_SPEC.md#native-ipv4-bgp).
 Operators provide bootstrap routes/static AllowedIPs, TCP 179 input permits

@@ -1120,6 +1120,38 @@ fn bgp_api_permissions_transactions_restart_and_route_visibility() {
     let response=engine.request("POST","/api/v1/transactions","","operator",&no_bgp,
         &serde_json::to_vec(&json!({"base_revision":test_revision(1),"confirm_timeout_seconds":30,"description":"BGP timers","config":candidate})).unwrap());
     assert_eq!(response.status, 403, "{}", response.body);
+    candidate.bgp.neighbors[0].address = "198.51.100.22".into();
+    candidate.bgp.neighbors[0].multihop_ttl = 8;
+    candidate.bgp.neighbors[0].allowed_next_hops = vec!["192.0.2.2".into()];
+    let transaction = submit(&mut engine, candidate.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let mut engine = fixture.engine();
+    let saved = request(&mut engine, "GET", "/api/v1/services/bgp", Value::Null);
+    assert_eq!(saved.body, serde_json::to_value(&candidate.bgp).unwrap());
+    let mut changed = candidate.clone();
+    changed.bgp.neighbors[0].allowed_next_hops = vec!["192.0.2.3".into()];
+    let transaction = submit(&mut engine, changed);
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    let id = transaction.body["id"].as_str().unwrap();
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/services/bgp", Value::Null).body,
+        serde_json::to_value(&candidate.bgp).unwrap()
+    );
 }
 
 #[test]

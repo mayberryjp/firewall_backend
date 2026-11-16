@@ -46,6 +46,14 @@ pub struct BGPNeighbor {
     pub wireguard_public_key: String,
     #[serde(default)]
     pub accept_default: bool,
+    #[serde(default = "default_multihop_ttl")]
+    pub multihop_ttl: u8,
+    #[serde(default)]
+    pub allowed_next_hops: Vec<String>,
+}
+
+fn default_multihop_ttl() -> u8 {
+    1
 }
 
 impl BGPConfig {
@@ -94,6 +102,11 @@ impl BGPConfig {
             ensure!(valid_asn(peer.remote_asn), "invalid BGP remote_asn");
             let remote: Ipv4Addr = peer.address.parse()?;
             let local: Ipv4Addr = peer.local_address.parse()?;
+            ensure!(peer.multihop_ttl > 0, "BGP multihop_ttl must be 1..255");
+            ensure!(
+                peer.allowed_next_hops.len() <= 32,
+                "BGP supports at most 32 allowed_next_hops per neighbor"
+            );
             ensure!(
                 unicast(remote) && unicast(local) && remote != local && addresses.insert(remote),
                 "BGP neighbor addresses must be unique unicast IPv4 addresses different from local_address"
@@ -113,6 +126,10 @@ impl BGPConfig {
                 "BGP local_address must be statically configured on the peering interface"
             );
             if let Some(wg) = &link.wireguard {
+                ensure!(
+                    peer.allowed_next_hops.is_empty(),
+                    "BGP WireGuard neighbors require empty allowed_next_hops; NEXT_HOP must identify the peering address"
+                );
                 let wg_peer=wg.peers.iter().find(|p|p.enabled && p.public_key==peer.wireguard_public_key)
                     .ok_or_else(||anyhow::anyhow!("BGP WireGuard neighbor requires an enabled peer public key on its interface"))?;
                 ensure!(
@@ -133,19 +150,62 @@ impl BGPConfig {
                     peer.wireguard_public_key.is_empty(),
                     "wireguard_public_key requires a WireGuard interface"
                 );
+                let direct = on_link(&link.addresses, remote);
                 ensure!(
-                    link.addresses.iter().any(|prefix| {
-                        crate::canonical_prefix(prefix, false).is_ok_and(|(ip, len)| match ip {
-                            std::net::IpAddr::V4(ip) => contains(ip, len, remote),
-                            _ => false,
-                        })
-                    }),
-                    "BGP neighbor must be directly connected on the selected interface"
+                    direct || peer.multihop_ttl > 1,
+                    "routed BGP neighbor requires multihop_ttl greater than 1"
                 );
+                ensure!(
+                    direct || !peer.allowed_next_hops.is_empty(),
+                    "routed BGP neighbor requires explicit on-link allowed_next_hops"
+                );
+                let mut next_hops = BTreeSet::new();
+                for address in &peer.allowed_next_hops {
+                    let next_hop: Ipv4Addr = address.parse()?;
+                    ensure!(
+                        unicast(next_hop) && next_hops.insert(next_hop),
+                        "BGP allowed_next_hops must be unique unicast IPv4 addresses"
+                    );
+                    ensure!(
+                        on_link(&link.addresses, next_hop),
+                        "BGP allowed_next_hops must be usable addresses directly connected on the selected interface"
+                    );
+                    ensure!(
+                        !config
+                            .interfaces
+                            .iter()
+                            .flat_map(|i| &i.addresses)
+                            .any(|a| {
+                                crate::canonical_prefix(a, false)
+                                    .is_ok_and(|(ip, _)| ip == std::net::IpAddr::V4(next_hop))
+                            }),
+                        "BGP allowed_next_hops must not be the firewall's own addresses"
+                    );
+                }
             }
         }
         Ok(())
     }
+}
+
+fn on_link(addresses: &[String], candidate: Ipv4Addr) -> bool {
+    addresses.iter().any(|prefix| {
+        crate::canonical_prefix(prefix, false).is_ok_and(|(ip, length)| {
+            let std::net::IpAddr::V4(ip) = ip else {
+                return false;
+            };
+            if !contains(ip, length, candidate) {
+                return false;
+            }
+            if length >= 31 {
+                return true;
+            }
+            let mask = u32::MAX.checked_shl(u32::from(32 - length)).unwrap_or(0);
+            let network = u32::from(ip) & mask;
+            let address = u32::from(candidate);
+            address != network && address != (network | !mask)
+        })
+    })
 }
 
 pub fn valid_asn(asn: u32) -> bool {
@@ -189,5 +249,67 @@ mod tests {
             24,
             "192.0.3.7".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn routed_peering_requires_explicit_ttl_and_usable_authorized_gateways() -> Result<()> {
+        let mut c: Config = serde_json::from_value(serde_json::json!({
+            "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","up":true,"mtu":1500,"addresses":["192.0.2.2/24"]}],
+            "bgp":{"enabled":true,"local_asn":65004,"router_id":"192.0.2.2",
+                "neighbors":[{"name":"remote","interface":"lan0","local_address":"192.0.2.2",
+                    "address":"198.51.100.22","remote_asn":65000,"allowed_next_hops":["192.0.2.1"]}]}
+        }))?;
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("multihop_ttl")
+        );
+        c.bgp.neighbors[0].multihop_ttl = 8;
+        c.validate()?;
+        c.bgp.neighbors[0].allowed_next_hops.clear();
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("allowed_next_hops")
+        );
+        for invalid in [
+            vec!["192.0.2.2"],
+            vec!["192.0.2.0"],
+            vec!["192.0.2.255"],
+            vec!["198.51.100.1"],
+            vec!["127.0.0.1"],
+            vec!["0.0.0.0"],
+            vec!["224.0.0.1"],
+            vec!["::1"],
+            vec!["192.0.2.1", "192.0.2.1"],
+        ] {
+            c.bgp.neighbors[0].allowed_next_hops = invalid.into_iter().map(String::from).collect();
+            assert!(c.validate().is_err(), "{:?}", c.bgp.neighbors[0]);
+        }
+        c.bgp.neighbors[0].allowed_next_hops = vec!["192.0.2.1".into()];
+        c.bgp.neighbors[0].multihop_ttl = 0;
+        assert!(c.validate().is_err());
+        c.bgp.neighbors[0].multihop_ttl = 255;
+        c.bgp.neighbors[0].allowed_next_hops = (1..=33).map(|n| format!("192.0.2.{n}")).collect();
+        assert!(c.validate().is_err());
+        c.bgp.neighbors[0].allowed_next_hops = vec!["192.0.2.1".into()];
+        c.validate()?;
+
+        c.interfaces[0].addresses = vec!["192.0.2.0/31".into()];
+        c.bgp.neighbors[0].local_address = "192.0.2.0".into();
+        c.validate()?;
+        c.interfaces[0].addresses = vec!["192.0.2.2/32".into()];
+        c.bgp.neighbors[0].local_address = "192.0.2.2".into();
+        assert!(c.validate().is_err());
+
+        let example: serde_json::Value =
+            serde_json::from_str(include_str!("../../../examples/bgp.json"))?;
+        let mut wg: Config = serde_json::from_value(example["config"].clone())?;
+        wg.validate()?;
+        wg.bgp.neighbors[0].allowed_next_hops = vec!["10.10.0.2".into()];
+        assert!(wg.validate().unwrap_err().to_string().contains("WireGuard"));
+        Ok(())
     }
 }

@@ -1821,6 +1821,7 @@ fn all_current_example_feature_schemas_validate() {
     for raw in [
         include_str!("../../../examples/appliance-services.json"),
         include_str!("../../../examples/bgp.json"),
+        include_str!("../../../examples/bgp-routed.json"),
         include_str!("../../../examples/dhcp-relay.json"),
         include_str!("../../../examples/destination-rewrite.json"),
         include_str!("../../../examples/gateway-monitoring.json"),

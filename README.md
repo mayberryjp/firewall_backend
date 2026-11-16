@@ -662,6 +662,15 @@ A [synthetic BGP-over-WireGuard transaction](examples/bgp.json) illustrates
 the current schema; provision keys/underlay and adapt the complete configuration
 before applying it.
 
+For a routed speaker with a separate forwarding host, set each neighbor's
+`multihop_ttl` (1..255, default 1) and `allowed_next_hops` (up to 32 on-link
+gateway addresses). A nonempty list replaces the implicit peer-only next-hop
+policy; an off-link non-WireGuard speaker requires TTL greater than 1 and a
+nonempty list. Provide independent bootstrap/return routes and TCP/179 permits.
+See the [synthetic routed BGP transaction](examples/bgp-routed.json).
+Neighbor status exposes `last_rejection` alongside the rejected-prefix counter.
+Recursive gateways and third-party WireGuard next hops remain unsupported.
+
 Optional Ubuntu amd64 self-upgrade uses `POST /api/v1/system/upgrade` with a
 specific `yyyy.mm.dd.iteration` version and `GET` on the same path for durable job status.
 Installation and source upgrades automatically create/validate private update
