@@ -1155,6 +1155,93 @@ fn bgp_api_permissions_transactions_restart_and_route_visibility() {
 }
 
 #[test]
+fn bgp_neighbor_toggle_is_authorized_persisted_and_reversible() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut enabled = config();
+    enabled.bgp = serde_json::from_value(json!({
+        "enabled":true,"local_asn":65001,"router_id":"192.0.2.1",
+        "neighbors":[{"name":"edge","interface":"lan0","local_address":"192.0.2.1",
+            "address":"192.0.2.2","remote_asn":65002}]
+    }))
+    .unwrap();
+    let transaction = submit(&mut engine, enabled.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let mut disabled = enabled.clone();
+    disabled.bgp.neighbors[0].enabled = false;
+    let permissions: Vec<_> = all().into_iter().filter(|p| p != "bgp.write").collect();
+    let response = engine.request(
+        "POST",
+        "/api/v1/transactions",
+        "",
+        "operator",
+        &permissions,
+        &serde_json::to_vec(&json!({"base_revision":engine.committed_revision(),
+            "confirm_timeout_seconds":30,"config":disabled}))
+        .unwrap(),
+    );
+    assert_eq!(response.status, 403, "{}", response.body);
+    let transaction = submit(&mut engine, disabled.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    drop(engine);
+    let mut engine = fixture.engine();
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/services/bgp", Value::Null).body,
+        serde_json::to_value(&disabled.bgp).unwrap()
+    );
+    let status = request(
+        &mut engine,
+        "GET",
+        "/api/v1/services/bgp/status",
+        Value::Null,
+    );
+    assert_eq!(status.body["state"], "simulated");
+    assert_eq!(status.body["neighbors"][0]["enabled"], false);
+    assert_eq!(status.body["neighbors"][0]["state"], "disabled");
+    let transaction = submit(&mut engine, enabled.clone());
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                transaction.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/services/bgp", Value::Null).body,
+        serde_json::to_value(&disabled.bgp).unwrap()
+    );
+    let transaction = submit(&mut engine, enabled);
+    assert_eq!(transaction.status, 202, "{}", transaction.body);
+    assert_eq!(
+        confirm(&mut engine, transaction.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let status = request(
+        &mut engine,
+        "GET",
+        "/api/v1/services/bgp/status",
+        Value::Null,
+    );
+    assert_eq!(status.body["neighbors"][0]["enabled"], true);
+    assert_eq!(status.body["neighbors"][0]["state"], "simulated");
+}
+
+#[test]
 fn destination_rewrite_permissions_persistence_and_rollback() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

@@ -37,6 +37,8 @@ impl Default for BGPConfig {
 pub struct BGPNeighbor {
     #[serde(default, skip_serializing_if = "crate::ObjectMetadata::is_empty")]
     pub metadata: crate::ObjectMetadata,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     pub name: String,
     pub address: String,
     pub interface: String,
@@ -50,6 +52,10 @@ pub struct BGPNeighbor {
     pub multihop_ttl: u8,
     #[serde(default)]
     pub allowed_next_hops: Vec<String>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_multihop_ttl() -> u8 {

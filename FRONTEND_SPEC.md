@@ -4452,6 +4452,7 @@ referenced interface/address and, for WireGuard, peer already configured):
     "neighbors": [
       {
         "name": "remote",
+        "enabled": true,
         "address": "10.10.0.2",
         "local_address": "10.10.0.1",
         "interface": "wg0",
@@ -4487,6 +4488,25 @@ affected session and withdraws its routes, not a partial silently accepted
 table. Maximum 32 neighbors. Neighbor names follow interface-name shape/length
 rules and are unique; IPv4 neighbor addresses must be unique, unicast and
 different from their local address.
+
+Per-neighbor `enabled` is a non-null boolean, default `true`, independent of
+global `bgp.enabled`. Set it to `false` to retain the neighbor's settings but
+close its session, stop active reconnects, reject passive BGP admission and
+remove its received/exported inventory and owned forwarding additions. Static
+routes, WireGuard peers and static AllowedIPs are preserved. Other enabled
+neighbors remain eligible for best-path selection. Disabled entries still count
+toward the 32-neighbor limit and undergo the same complete validation, including
+an up interface, an enabled referenced WireGuard peer and bootstrap coverage.
+All configured neighbors may be disabled while global BGP stays enabled: this
+is a healthy idle worker with no BGP listeners. Shared listeners exist only for
+enabled neighbors; a disabled address cannot establish BGP through one.
+
+Toggle through the normal full-configuration transaction, confirmation and
+rollback flow; there is no per-neighbor mutation endpoint. Configuration apply
+currently restarts the entire BGP worker, so **other enabled peers may briefly
+reconnect**, and counters/diagnostics reset. Re-enable starts a fresh session and
+relearns routes rather than restoring stale learned state. Rollback restores
+the previous configured toggle and uses the same restart/relearn lifecycle.
 
 Each neighbor requires `name`, `address`, `local_address`, `interface`,
 `remote_asn`. `local_address` must be a static IPv4 address on a configured up
@@ -4667,15 +4687,16 @@ with session changes. Bulk advertised rows are excluded from the status API,
 native runtime summaries, aggregate statistics and MQTT publication.
 
 Worker states: `disabled`, `starting`, `running`, `error`, `stopped`, and
-simulator `simulated`. Running worker `health` is `up` only when all sessions
-are established and installation succeeded, otherwise `degraded`. A running
+simulator `simulated`. Running worker `health` is `up` only when all enabled
+neighbors are established and installation succeeded, otherwise `degraded`.
+Administratively disabled neighbors do not degrade health. A running
 process is not proof of established BGP. Active running status includes
 `local_asn`, `router_id`, `connected_prefixes` (canonical string array),
 `installed_prefixes` (number), `kernel_protocol:245`, `route_metric:200`,
 `table:254`, nullable error and `neighbors`.
 
-Neighbor rows include `name`, IPv4 `address`, `interface`, session `state`
-(`active`, `open_sent`, `open_confirm`, `established`), numeric
+Neighbor rows include `name`, IPv4 `address`, `interface`, boolean `enabled`,
+session `state` (`disabled`, `active`, `open_sent`, `open_confirm`, `established`), numeric
 `received_prefixes`, `advertised_prefixes`, cumulative `rejected_prefixes`,
 nullable `negotiated_hold_seconds`, nullable IPv4 `remote_router_id` and
 nullable last `error`. `last_rejection` is null before a policy rejection,
@@ -4690,6 +4711,11 @@ restart; previous session errors clear on a new establishment. Inactive/
 starting/error snapshots can omit active-only fields. Simulator reports
 `simulated` or `disabled`, no learned routes, null unmeasured counts, and no
 real session/forwarding claim; simulator `last_rejection` is null. Treat `scope` as opaque.
+In running native status, disabled neighbors have zero prefix/rejection counts,
+null negotiated hold/router ID/error/rejection, and no route rows. Simulator
+disabled neighbors retain null unmeasured counts. MQTT configured-neighbor counts
+continue to include disabled entries; their per-neighbor state is `disabled`,
+not a failed or unavailable session.
 
 `runtime.bgp` and an `appliance_services` row named `bgp` expose the same
 summary without full route rows. Shared `process_health` and `active_alerts`
@@ -4710,6 +4736,8 @@ CLI: `bgp JSON`, `no bgp` edit the private candidate; `show bgp`,
 Frontend tasks: add a BGP settings form to transactional networking, local/
 remote ASN validation, router ID, interface/local-address and WireGuard peer
 selectors, timer/prefix bounds, and a clearly warned default-route opt-in.
+Add a per-neighbor enabled toggle that preserves the remaining settings, shows
+administrative disable distinctly, and warns about transaction-wide reconnects.
 Add neighbor-state and BGP-specific route tables with AS path, source,
 selected/installed/reason/error distinctions; poll status single-flight while
 visible and fetch route rows separately. Preserve configured AllowedIPs in

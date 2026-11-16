@@ -53,6 +53,7 @@
       "neighbors": [
         {
           "name": "remote",
+          "enabled": true,
           "address": "203.0.113.22",
           "local_address": "10.10.0.1",
           "interface": "wg0",

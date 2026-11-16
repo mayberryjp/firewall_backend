@@ -33,6 +33,7 @@
       "neighbors": [
         {
           "name": "remote",
+          "enabled": true,
           "address": "198.51.100.22",
           "local_address": "192.0.2.2",
           "interface": "lan0",

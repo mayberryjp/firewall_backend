@@ -600,7 +600,7 @@ fn process(
 }
 fn advertised_routes(neighbors: &[Neighbor]) -> Vec<Value> {
     let mut routes = Vec::new();
-    for neighbor in neighbors {
+    for neighbor in neighbors.iter().filter(|n| n.config.enabled) {
         if let Some(connection) = neighbor
             .connections
             .iter()
@@ -622,6 +622,9 @@ fn desired(
 ) -> (Ledger, Vec<Value>) {
     let mut candidates = BTreeMap::<Prefix, Vec<(usize, &Path)>>::new();
     for (index, neighbor) in neighbors.iter().enumerate() {
+        if !neighbor.config.enabled {
+            continue;
+        }
         for (prefix, path) in &neighbor.routes {
             candidates.entry(*prefix).or_default().push((index, path));
         }
@@ -787,7 +790,7 @@ fn run(
 ) -> Result<()> {
     let bgp = &config.bgp;
     let mut listener_ttls = BTreeMap::<_, u8>::new();
-    for peer in &bgp.neighbors {
+    for peer in bgp.neighbors.iter().filter(|p| p.enabled) {
         let key = (
             peer.interface.clone(),
             peer.local_address.parse::<Ipv4Addr>()?,
@@ -836,7 +839,8 @@ fn run(
                 match listener.accept() {
                     Ok((stream, address)) => {
                         if let Some(peer) = neighbors.iter_mut().find(|n| {
-                            n.config.interface == *interface
+                            n.config.enabled
+                                && n.config.interface == *interface
                                 && n.config.local_address == local.to_string()
                                 && n.config.address == address.ip().to_string()
                         }) {
@@ -859,6 +863,9 @@ fn run(
         }
         let mut total_prefixes = 0;
         for peer in &mut neighbors {
+            if !peer.config.enabled {
+                continue;
+            }
             if peer.connections.is_empty() && Instant::now() >= peer.retry {
                 peer.retry = Instant::now() + Duration::from_secs(5);
                 match connect(&peer.config).and_then(|stream| Connection::new(stream, true, bgp)) {
@@ -918,14 +925,14 @@ fn run(
         }
         let peers=neighbors.iter().map(|n|{
             let connection=n.connections.iter().find(|c|c.established).or_else(||n.connections.first());
-            json!({"name":n.config.name,"address":n.config.address,"interface":n.config.interface,
-                "state":if connection.is_some_and(|c|c.established){"established"}else if connection.is_some_and(|c|c.open.is_some()){"open_confirm"}else if connection.is_some(){"open_sent"}else{"active"},
+            json!({"name":n.config.name,"address":n.config.address,"interface":n.config.interface,"enabled":n.config.enabled,
+                "state":if !n.config.enabled{"disabled"}else if connection.is_some_and(|c|c.established){"established"}else if connection.is_some_and(|c|c.open.is_some()){"open_confirm"}else if connection.is_some(){"open_sent"}else{"active"},
                 "received_prefixes":n.routes.len(),"rejected_prefixes":n.rejected,"last_rejection":n.last_rejection,
                 "advertised_prefixes":connection.map_or(0,|c|c.advertised.len()),
                 "negotiated_hold_seconds":connection.and_then(|c|c.open.as_ref()).map(|o|o.hold.min(bgp.hold_seconds)),
                 "remote_router_id":connection.and_then(|c|c.open.as_ref()).map(|o|o.router_id),"error":n.error})
         }).collect::<Vec<_>>();
-        shared.status = json!({"name":"bgp","state":"running","health":if error.is_some(){"degraded"}else if peers.iter().all(|p|p["state"]=="established"){"up"}else{"degraded"},
+        shared.status = json!({"name":"bgp","state":"running","health":if error.is_some(){"degraded"}else if peers.iter().all(|p|p["state"]=="established" || p["state"]=="disabled"){"up"}else{"degraded"},
             "local_asn":bgp.local_asn,"router_id":bgp.router_id,"neighbors":peers,"routes":routes,"advertised_routes":advertised_routes(&neighbors),"error":error,
             "connected_prefixes":connected.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "installed_prefixes":if synced{next.routes.len()}else{0},"kernel_protocol":kernel::PROTOCOL,"route_metric":kernel::METRIC,"table":254});
@@ -942,6 +949,7 @@ mod tests {
         Neighbor {
             config: BGPNeighbor {
                 metadata: Default::default(),
+                enabled: true,
                 name: "edge".into(),
                 address: "192.0.2.2".into(),
                 interface: "test0".into(),
@@ -971,7 +979,12 @@ mod tests {
         let prefix = Prefix::new("203.0.113.0".parse()?, 24)?;
         let mut neighbors = Vec::new();
         let mut remotes = Vec::new();
-        for (name, established) in [("edge", true), ("other", true), ("connecting", false)] {
+        for (name, established) in [
+            ("edge", true),
+            ("other", true),
+            ("connecting", false),
+            ("disabled", true),
+        ] {
             let stream = TcpStream::connect(listener.local_addr()?)?;
             remotes.push(listener.accept()?.0);
             let mut connection = Connection::new(stream, true, &bgp)?;
@@ -979,6 +992,7 @@ mod tests {
             connection.advertised.insert(prefix);
             let mut peer = neighbor();
             peer.config.name = name.into();
+            peer.config.enabled = name != "disabled";
             peer.connections.push(connection);
             neighbors.push(peer);
         }
@@ -1272,7 +1286,9 @@ mod tests {
             "routes":[{"enabled":true,"destination":"198.51.100.22/32","gateway":"192.0.2.1","interface":"peer0","table":254,"metric":10}],
             "bgp":{"enabled":true,"local_asn":65004,"router_id":"192.0.2.2",
                 "neighbors":[{"name":"remote","interface":"peer0","local_address":"192.0.2.2",
-                    "address":"198.51.100.22","remote_asn":65000,"multihop_ttl":8,"allowed_next_hops":["192.0.2.1"]}]}
+                    "address":"198.51.100.22","remote_asn":65000,"multihop_ttl":8,"allowed_next_hops":["192.0.2.1"]},
+                    {"name":"disabled","enabled":false,"interface":"peer0","local_address":"192.0.2.2",
+                    "address":"198.51.100.23","remote_asn":65000,"multihop_ttl":8,"allowed_next_hops":["192.0.2.1"]}]}
         }))?;
         config.validate()?;
         let listener = session(speaker_ns.clone(), |_, _| {
@@ -1335,6 +1351,9 @@ mod tests {
             }
         };
         wait_route(true)?;
+        let status = manager.snapshot()?;
+        assert_eq!(status["neighbors"][1]["state"], "disabled");
+        assert_eq!(status["health"], "up");
         let check_kernel = |present: bool| -> Result<()> {
             session(receiver_ns.clone(), move |rt, h| {
                 let routes = rt.block_on(
@@ -1664,6 +1683,74 @@ mod tests {
             false,
         ))?;
         wait_route(&a.bgp, true)?;
+        let mut disabled = config.clone();
+        disabled.bgp.neighbors[0].enabled = false;
+        a.apply(&config, &disabled)?;
+        check_kernel(false)?;
+        drop(remote);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let status = a.bgp.snapshot()?;
+            if status["state"] == "running" {
+                assert_eq!(status["neighbors"][0]["enabled"], false);
+                assert_eq!(status["neighbors"][0]["state"], "disabled");
+                assert_eq!(status["neighbors"][0]["received_prefixes"], 0);
+                assert_eq!(status["neighbors"][0]["advertised_prefixes"], 0);
+                assert_eq!(status["advertised_routes"], json!([]));
+                assert_eq!(status["health"], "up");
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "disabled BGP worker not running: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        session(b.namespace.clone(), |_, _| {
+            let error =
+                TcpStream::connect_timeout(&"10.10.0.1:179".parse()?, Duration::from_secs(2))
+                    .expect_err("disabled-only BGP must not keep a listener");
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+            Ok(())
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(_) => anyhow::bail!("disabled neighbor attempted an outbound connection"),
+                Err(error) => return Err(error.into()),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(a.observe(&disabled)?, disabled);
+        a.apply(&disabled, &config)?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut remote = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "reenabled BGP connect timeout: {}",
+                        a.bgp.snapshot()?
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        remote.set_nonblocking(false)?;
+        remote.set_write_timeout(Some(Duration::from_secs(2)))?;
+        remote.write_all(&messages)?;
+        remote.write_all(&wire::announce(
+            prefix,
+            65002,
+            "10.10.0.2".parse()?,
+            true,
+            false,
+        ))?;
+        wait_route(&a.bgp, true)?;
+        check_kernel(true)?;
         a.bgp.shutdown()?;
         check_kernel(false)?;
         assert_eq!(a.observe(&config)?, config);
@@ -1698,10 +1785,18 @@ mod tests {
                 med: 0,
             },
         );
-        let (ledger, rows) = desired(&config, &[first, second], &BTreeSet::new());
+        let mut neighbors = vec![first, second];
+        let (ledger, rows) = desired(&config, &neighbors, &BTreeSet::new());
         assert_eq!(ledger.routes.len(), 1);
         assert_eq!(rows.iter().filter(|r| r["selected"] == true).count(), 1);
         assert_eq!(ledger.routes[0].gateway, Some("192.0.2.2".parse()?));
+        neighbors[0].config.enabled = false;
+        let (ledger, rows) = desired(&config, &neighbors, &BTreeSet::new());
+        assert_eq!(ledger.routes[0].gateway, Some("192.0.2.3".parse()?));
+        assert_eq!(rows.len(), 1);
+        neighbors[1].config.enabled = false;
+        let (ledger, rows) = desired(&config, &neighbors, &BTreeSet::new());
+        assert!(ledger.routes.is_empty() && rows.is_empty());
         config.routes.push(netcontrol_core::Route {
             metadata: Default::default(),
             enabled: true,

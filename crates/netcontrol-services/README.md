@@ -611,7 +611,9 @@ interoperability, TLS PKI end-to-end behavior, real DHCP client topology,
 privileged clock mutation, or whole-host log ownership safety on a target
 appliance; those require dedicated Linux deployment checks.
 
-The paired IPv6 path-test fixture disables Duplicate Address Detection only on
-its isolated synthetic interface before assigning addresses, so immediate
-socket binds cannot race tentative address state. Production IPv6 settings and
-host interfaces are unchanged.
+The paired IPv6 path-test fixture assigns synthetic addresses with per-address
+`IFA_F_NODAD`, so immediate socket binds cannot race tentative address state.
+It explicitly enables namespace-wide DAD while disabling interface DAD to cover
+the case where the namespace-wide policy overrides the interface setting.
+All settings are confined to its fresh network namespace; production IPv6
+settings and host interfaces are unchanged.

@@ -652,6 +652,12 @@ transaction with local ASN/router ID, interface-bound neighbors and keepalive/
 hold timers. It advertises connected prefixes from all configured up interfaces,
 installs accepted learned routes, and maintains BGP-owned WireGuard AllowedIPs
 for explicitly referenced peers. Default-route import requires opt-in.
+Each neighbor has `enabled` (default `true`); set `false` in a full transaction
+to stop that session and remove its learned routes without deleting saved
+settings or static WireGuard AllowedIPs. Disabled neighbors show `disabled`
+and do not degrade health; all-disabled BGP is idle with no listeners.
+Applying the change currently restarts BGP, briefly reconnecting other enabled
+peers too. Disabled saved neighbors still require valid interface/peer settings.
 Inspect `GET /api/v1/services/bgp/status` or `GET /api/v1/routes/bgp`;
 `GET /api/v1/routes/bgp/advertised` lists exact per-neighbor session exports.
 CLI inspection uses `show bgp status` or `show routes bgp`; MQTT includes the summary and shared

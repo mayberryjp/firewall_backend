@@ -304,6 +304,13 @@ Disconnect/withdraw/stop removes owned runtime additions. A durable private
 ownership journal is recovered only after native namespace/scope validation;
 learned state is not desired configuration or a revision.
 
+Per-neighbor `enabled` defaults to `true`. Disabled entries remain validated
+and visible as `disabled`, but create no listener, active connection, accepted
+BGP session, advertisements or learned paths. They do not degrade worker health;
+all-disabled BGP is a healthy idle worker. Applying a toggle uses the existing
+whole-worker restart and ownership cleanup: other enabled peers may reconnect,
+and static routes/AllowedIPs remain intact. Re-enable/rollback relearns state.
+
 Routed speakers use per-neighbor `multihop_ttl` (default 1). Non-WireGuard
 `allowed_next_hops` explicitly authorizes directly connected forwarding gateways
 independently of the session address; a nonempty list replaces peer-only

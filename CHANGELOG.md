@@ -78,6 +78,16 @@
 
 ### Added
 
+- Add per-BGP-neighbor `enabled` (default true), persisted through normal
+  configuration transactions and rollback. Disabled peers retain validated
+  settings but stop sessions/listeners and contribute no learned/exported
+  routes; remove only owned runtime forwarding additions. Expose `enabled`
+  and `disabled` neighbor status without degrading health. Applying a toggle
+  retains the existing whole-worker restart, so other enabled peers may
+  briefly reconnect. Additive configuration/status contract; next automatic
+  calendar version.
+  [Required frontend handoff 2026-11-16-03](docs/frontend-handoffs/2026-11-16.md#2026-11-16-03-per-neighbor-bgp-enable-toggle).
+
 - Support routed IPv4 BGP speakers with per-neighbor `multihop_ttl` and explicit
   `allowed_next_hops`, separating session endpoints from forwarding
   gateways. Expose the latest import rejection in neighbor status. Preserve
@@ -513,6 +523,12 @@
   [handoff 2026-11-04-02](docs/frontend-handoffs/2026-11-04.md#2026-11-04-02-get-capability-refresh-and-api-explorer-registration).
 
 ### Fixed
+
+- Assign isolated IPv6 path-test addresses with per-address `IFA_F_NODAD`.
+  Namespace-wide DAD can override the fixture's interface-only setting and
+  cause immediate socket binds to fail in CI. Exercise that policy combination
+  without changing production networking or reducing coverage. Test-only fix;
+  no API/frontend contract impact.
 
 - Align offline numeric-state conversion tests and operator documentation with
   the existing revision date high-water rule. Preserve backdated commit

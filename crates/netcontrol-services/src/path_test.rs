@@ -1934,27 +1934,18 @@ mod native {
 
         fn paired(v6: bool) -> Result<()> {
             let (source, peer) = if v6 {
+                std::fs::write("/proc/sys/net/ipv6/conf/all/accept_dad", "1").context(
+                    "enable namespace-wide DAD to exercise per-address fixture readiness",
+                )?;
                 std::fs::write("/proc/sys/net/ipv6/conf/ptlo/accept_dad", "0")
-                    .context("disable DAD for isolated path-test fixture addresses")?;
-                #[repr(C)]
-                struct In6Ifreq {
-                    address: libc::in6_addr,
-                    prefix: u32,
-                    index: i32,
-                }
-                let fd = linux::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0)?;
+                    .context("set isolated interface DAD policy")?;
+                let index = linux::ifindex("ptlo")?;
                 for address in ["2001:db8::1", "2001:db8::2"] {
                     let address: std::net::Ipv6Addr = address.parse()?;
-                    let req = In6Ifreq {
-                        address: libc::in6_addr {
-                            s6_addr: address.octets(),
-                        },
-                        prefix: 128,
-                        index: linux::ifindex("ptlo")? as i32,
-                    };
-                    linux::check(unsafe {
-                        libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFADDR as _, &req)
-                    })?;
+                    let mut body = vec![libc::AF_INET6 as u8, 128, libc::IFA_F_NODAD as u8, 0];
+                    body.extend_from_slice(&index.to_ne_bytes());
+                    body.extend_from_slice(&attribute(1, &address.octets()));
+                    netlink(libc::RTM_NEWADDR, body, true)?;
                 }
                 ("2001:db8::1", "2001:db8::2")
             } else {
