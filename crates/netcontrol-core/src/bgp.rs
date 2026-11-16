@@ -125,11 +125,26 @@ impl BGPConfig {
                     .any(|a| a.split('/').next() == Some(peer.local_address.as_str())),
                 "BGP local_address must be statically configured on the peering interface"
             );
-            if let Some(wg) = &link.wireguard {
+            let mut next_hops = BTreeSet::new();
+            for address in &peer.allowed_next_hops {
+                let next_hop: Ipv4Addr = address.parse()?;
                 ensure!(
-                    peer.allowed_next_hops.is_empty(),
-                    "BGP WireGuard neighbors require empty allowed_next_hops; NEXT_HOP must identify the peering address"
+                    unicast(next_hop) && next_hops.insert(next_hop),
+                    "BGP allowed_next_hops must be unique unicast IPv4 addresses"
                 );
+                ensure!(
+                    !config
+                        .interfaces
+                        .iter()
+                        .flat_map(|i| &i.addresses)
+                        .any(|a| {
+                            crate::canonical_prefix(a, false)
+                                .is_ok_and(|(ip, _)| ip == std::net::IpAddr::V4(next_hop))
+                        }),
+                    "BGP allowed_next_hops must not be the firewall's own addresses"
+                );
+            }
+            if let Some(wg) = &link.wireguard {
                 let wg_peer=wg.peers.iter().find(|p|p.enabled && p.public_key==peer.wireguard_public_key)
                     .ok_or_else(||anyhow::anyhow!("BGP WireGuard neighbor requires an enabled peer public key on its interface"))?;
                 ensure!(
@@ -137,14 +152,21 @@ impl BGPConfig {
                     "one BGP neighbor per WireGuard peer is supported"
                 );
                 ensure!(
-                    wg_peer.allowed_ips.iter().any(|prefix| {
-                        crate::canonical_prefix(prefix, true).is_ok_and(|(ip, len)| match ip {
-                            std::net::IpAddr::V4(ip) => contains(ip, len, remote),
-                            _ => false,
-                        })
-                    }),
+                    covers(&wg_peer.allowed_ips, remote),
                     "WireGuard static AllowedIPs must cover the BGP neighbor address to bootstrap peering"
                 );
+                for next_hop in next_hops {
+                    ensure!(
+                        covers(&wg_peer.allowed_ips, next_hop),
+                        "BGP WireGuard allowed_next_hops must be covered by the referenced peer's static AllowedIPs"
+                    );
+                    ensure!(
+                        !wg.peers.iter().any(|other| other.enabled
+                            && other.public_key != peer.wireguard_public_key
+                            && covers(&other.allowed_ips, next_hop)),
+                        "BGP WireGuard allowed_next_hops must not overlap another enabled peer's static AllowedIPs"
+                    );
+                }
             } else {
                 ensure!(
                     peer.wireguard_public_key.is_empty(),
@@ -159,33 +181,25 @@ impl BGPConfig {
                     direct || !peer.allowed_next_hops.is_empty(),
                     "routed BGP neighbor requires explicit on-link allowed_next_hops"
                 );
-                let mut next_hops = BTreeSet::new();
-                for address in &peer.allowed_next_hops {
-                    let next_hop: Ipv4Addr = address.parse()?;
-                    ensure!(
-                        unicast(next_hop) && next_hops.insert(next_hop),
-                        "BGP allowed_next_hops must be unique unicast IPv4 addresses"
-                    );
+                for next_hop in next_hops {
                     ensure!(
                         on_link(&link.addresses, next_hop),
                         "BGP allowed_next_hops must be usable addresses directly connected on the selected interface"
-                    );
-                    ensure!(
-                        !config
-                            .interfaces
-                            .iter()
-                            .flat_map(|i| &i.addresses)
-                            .any(|a| {
-                                crate::canonical_prefix(a, false)
-                                    .is_ok_and(|(ip, _)| ip == std::net::IpAddr::V4(next_hop))
-                            }),
-                        "BGP allowed_next_hops must not be the firewall's own addresses"
                     );
                 }
             }
         }
         Ok(())
     }
+}
+
+fn covers(prefixes: &[String], address: Ipv4Addr) -> bool {
+    prefixes.iter().any(|prefix| {
+        crate::canonical_prefix(prefix, true).is_ok_and(|(ip, length)| match ip {
+            std::net::IpAddr::V4(ip) => contains(ip, length, address),
+            _ => false,
+        })
+    })
 }
 
 fn on_link(addresses: &[String], candidate: Ipv4Addr) -> bool {
@@ -304,12 +318,74 @@ mod tests {
         c.bgp.neighbors[0].local_address = "192.0.2.2".into();
         assert!(c.validate().is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn wireguard_separates_speaker_and_next_hop_without_cross_peer_authorization() -> Result<()> {
         let example: serde_json::Value =
             serde_json::from_str(include_str!("../../../examples/bgp.json"))?;
-        let mut wg: Config = serde_json::from_value(example["config"].clone())?;
-        wg.validate()?;
-        wg.bgp.neighbors[0].allowed_next_hops = vec!["10.10.0.2".into()];
-        assert!(wg.validate().unwrap_err().to_string().contains("WireGuard"));
+        let mut c: Config = serde_json::from_value(example["config"].clone())?;
+        c.validate()?;
+        c.bgp.neighbors[0].allowed_next_hops.clear();
+        c.validate()?;
+        c.bgp.neighbors[0].address = "198.51.100.22".into();
+        c.bgp.neighbors[0].multihop_ttl = 8;
+        c.bgp.neighbors[0].allowed_next_hops = vec!["10.10.0.2".into()];
+        let wg = c.interfaces[0].wireguard.as_mut().unwrap();
+        wg.peers[0].allowed_ips.push("198.51.100.22/32".into());
+        c.validate()?;
+        // WireGuard uses peer ownership, not an Ethernet-subnet or ARP gateway.
+        c.bgp.neighbors[0].allowed_next_hops = vec!["203.0.113.1".into()];
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("static AllowedIPs")
+        );
+        c.interfaces[0].wireguard.as_mut().unwrap().peers[0]
+            .allowed_ips
+            .push("203.0.113.1/32".into());
+        c.validate()?;
+        for invalid in [
+            vec!["10.10.0.1"],
+            vec!["127.0.0.1"],
+            vec!["0.0.0.0"],
+            vec!["224.0.0.1"],
+            vec!["255.255.255.255"],
+            vec!["::1"],
+            vec!["10.10.0.2", "10.10.0.2"],
+        ] {
+            c.bgp.neighbors[0].allowed_next_hops = invalid.into_iter().map(String::from).collect();
+            assert!(c.validate().is_err(), "{:?}", c.bgp.neighbors[0]);
+        }
+        c.bgp.neighbors[0].allowed_next_hops = vec!["10.10.0.2".into()];
+        let mut other = c.interfaces[0].wireguard.as_ref().unwrap().peers[0].clone();
+        other.public_key = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=".into();
+        other.allowed_ips = vec!["10.10.0.0/29".into()];
+        c.interfaces[0]
+            .wireguard
+            .as_mut()
+            .unwrap()
+            .peers
+            .push(other);
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("another enabled peer")
+        );
+        c.interfaces[0].wireguard.as_mut().unwrap().peers[1].enabled = false;
+        c.validate()?;
+        c.interfaces[0].wireguard.as_mut().unwrap().peers[0]
+            .allowed_ips
+            .retain(|p| p != "198.51.100.22/32");
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("neighbor address")
+        );
         Ok(())
     }
 }

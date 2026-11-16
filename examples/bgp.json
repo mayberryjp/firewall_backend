@@ -1,7 +1,7 @@
 {
   "base_revision": "2026.10.29.1",
   "confirm_timeout_seconds": 30,
-  "description": "Synthetic IPv4 BGP over WireGuard example; replace the DNS peer name and provision the private key, underlay and DNS first",
+  "description": "Synthetic BGP over WireGuard with separate speaker and forwarding addresses; provision keys, DNS, underlay, return routing and complete firewall policy first",
   "config": {
     "interfaces": [
       {
@@ -18,7 +18,7 @@
             {
               "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
               "endpoint": "vpn.example.test:51820",
-              "allowed_ips": ["10.10.0.2/32"],
+              "allowed_ips": ["10.10.0.2/32", "203.0.113.22/32"],
               "persistent_keepalive_seconds": 25
             }
           ]
@@ -33,6 +33,16 @@
         "addresses": ["198.51.100.1/24"]
       }
     ],
+    "routes": [
+      {
+        "enabled": true,
+        "destination": "203.0.113.22/32",
+        "gateway": "",
+        "interface": "wg0",
+        "table": 254,
+        "metric": 10
+      }
+    ],
     "bgp": {
       "enabled": true,
       "local_asn": 65001,
@@ -43,11 +53,13 @@
       "neighbors": [
         {
           "name": "remote",
-          "address": "10.10.0.2",
+          "address": "203.0.113.22",
           "local_address": "10.10.0.1",
           "interface": "wg0",
           "remote_asn": 65002,
           "wireguard_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+          "multihop_ttl": 8,
+          "allowed_next_hops": ["10.10.0.2"],
           "accept_default": false
         }
       ]

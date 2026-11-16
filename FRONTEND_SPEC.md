@@ -4511,17 +4511,29 @@ BGP cannot learn the route
 needed to establish its own initial connection.
 
 `allowed_next_hops` is an array of at most 32 unique unicast IPv4 address strings,
-default `[]`. For non-WireGuard neighbors, empty means only the directly
-connected peering address is accepted. A nonempty list **replaces** that implicit
+default `[]`. Empty means only the peering address is accepted, for both
+WireGuard and non-WireGuard neighbors. A nonempty list **replaces** that implicit
 authorization: the received NEXT_HOP must match an entry, and the peering address
-is not additionally accepted unless listed. Every entry must be a usable host
-address in a static IPv4 subnet of the selected interface and must not be any
-configured firewall address. Network/broadcast addresses are rejected for
-prefixes shorter than `/31`; `/31` point-to-point hosts are supported.
-Off-link/recursive gateways are not supported. Each neighbor has an independent
-list, so a container's session address and the host's forwarding address may
-differ without authorizing other peers' gateways. WireGuard neighbors require
-an empty list and still accept only the referenced peer's peering address.
+is not additionally accepted unless listed. No entry may be any configured
+firewall address.
+
+- Non-WireGuard entries must be usable host addresses in a static IPv4 subnet
+  of the selected interface. Network/broadcast addresses are rejected for
+  prefixes shorter than `/31`; `/31` point-to-point hosts are supported.
+  Off-link/recursive gateways are not supported.
+- WireGuard entries must be covered by the **referenced peer's static
+  AllowedIPs**, independently of the BGP speaker's bootstrap address coverage,
+  and must not be covered by another enabled peer's static AllowedIPs on that
+  interface. They need not be in the local tunnel address's subnet: WireGuard
+  is point-to-point and does not resolve an Ethernet/ARP gateway. No automatic
+  reassignment to another peer, gateway override or recursive resolution occurs.
+
+Each neighbor has an independent list, so a container's session address and
+the host's forwarding address may differ over Ethernet **or WireGuard**.
+For WireGuard, the referenced public key must identify the forwarding host
+through which the BGP speaker is reachable, not a different forwarding peer.
+Learned prefixes still route through that peer's tunnel/AllowedIPs; the route
+API preserves the actual advertised NEXT_HOP.
 Invalid TTL, list, gateway reachability or interface/address configuration fails
 transaction validation with `422`; malformed field types fail deserialization.
 
@@ -4532,7 +4544,8 @@ static `198.51.100.22/32` via `192.0.2.1` already provided):
 {"name":"remote","address":"198.51.100.22","local_address":"192.0.2.2","interface":"lan0","remote_asn":65000,"multihop_ttl":8,"allowed_next_hops":["192.0.2.1"],"accept_default":false}
 ```
 
-See the [complete synthetic transaction](examples/bgp-routed.json).
+See the [complete Ethernet transaction](examples/bgp-routed.json) and
+[separate-speaker WireGuard transaction](examples/bgp.json).
 
 `accept_default` defaults false per neighbor. True permits receiving `0.0.0.0/0`;
 it does not originate a default route or override ownership protections.
@@ -4568,7 +4581,9 @@ contract; incorrect types and invalid supported fields fail validation.
   malformed protocol inputs close the session with an explicit error.
 - Install selected accepted prefixes in Linux main table `254`, metric `200`,
   owned protocol `245`. Non-WireGuard routes use the received next hop on the
-  selected interface; WireGuard routes use the tunnel interface. Configured
+  selected interface; WireGuard routes use the tunnel interface without an IP
+  gateway attribute, even when the advertised NEXT_HOP differs from the speaker.
+  Destination AllowedIPs select the referenced forwarding peer. Configured
   static/connected routes with the same prefix take precedence in the BGP
   ownership policy. Other protocols' routes are not removed or overwritten;
   an exact kernel key conflict is an explicit install error. `installed` means

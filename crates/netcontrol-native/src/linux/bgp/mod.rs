@@ -1415,6 +1415,262 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires NETCONTROL_INTEGRATION=1, Linux namespaces/net_admin, nftables and WireGuard"]
+    fn native_bgp_wireguard_accepts_separate_speaker_and_forwarding_host() -> Result<()> {
+        use crate::linux::{Native, integration::Fixture, session, wireguard};
+        use futures_util::TryStreamExt;
+        use netcontrol_core::Backend;
+        use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteProtocol};
+        use std::net::UdpSocket;
+        let first = Fixture::new()?;
+        let second = Fixture::new()?;
+        let ns1 = Arc::new(File::open(first.options().namespace)?);
+        let ns2 = Arc::new(File::open(second.options().namespace)?);
+        let target = ns2.clone();
+        session(ns1.clone(), move |rt, h| {
+            rt.block_on(async {
+                h.link()
+                    .add(rtnetlink::LinkVeth::new("under0", "under1").build())
+                    .execute()
+                    .await?;
+                let link = h
+                    .link()
+                    .get()
+                    .match_name("under1".into())
+                    .execute()
+                    .try_next()
+                    .await?
+                    .context("veth missing")?;
+                h.link()
+                    .set(
+                        rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                            .setns_by_fd(target.as_raw_fd())
+                            .build(),
+                    )
+                    .execute()
+                    .await?;
+                Ok(())
+            })
+        })?;
+        for (namespace, interface, address) in
+            [(ns1, "under0", "192.0.2.1"), (ns2, "under1", "192.0.2.2")]
+        {
+            session(namespace, move |rt, h| {
+                rt.block_on(async {
+                    let link = h
+                        .link()
+                        .get()
+                        .match_name(interface.into())
+                        .execute()
+                        .try_next()
+                        .await?
+                        .context("veth missing")?;
+                    h.address()
+                        .add(link.header.index, address.parse()?, 24)
+                        .execute()
+                        .await?;
+                    h.link()
+                        .set(
+                            rtnetlink::LinkUnspec::new_with_index(link.header.index)
+                                .up()
+                                .build(),
+                        )
+                        .execute()
+                        .await?;
+                    Ok(())
+                })
+            })?;
+        }
+        let key1 = wireguard::create_key(&first.options().keys, "bgp")?;
+        let key2 = wireguard::create_key(&second.options().keys, "bgp")?;
+        let config: Config = serde_json::from_value(json!({
+            "interfaces":[
+                {"name":"wg0","kind":"wireguard","role":"wan","up":true,"mtu":1420,"addresses":["10.10.0.1/30"],
+                    "wireguard":{"key_ref":"bgp","listen_port":51820,"peers":[{"public_key":key2,"endpoint":"192.0.2.2:51820","allowed_ips":["10.10.0.2/32","203.0.113.22/32"]}]}},
+                {"name":"lan0","kind":"dummy","role":"lan","up":true,"mtu":1500,"addresses":["198.51.1.1/24"]}
+            ],
+            "routes":[{"enabled":true,"destination":"203.0.113.22/32","interface":"wg0","table":254,"metric":10}],
+            "bgp":{"enabled":true,"local_asn":65001,"router_id":"10.10.0.1",
+                "neighbors":[{"name":"remote","address":"203.0.113.22","remote_asn":65002,"interface":"wg0",
+                    "local_address":"10.10.0.1","wireguard_public_key":key2,"multihop_ttl":8,"allowed_next_hops":["10.10.0.2"]}]}
+        }))?;
+        let remote_config: Config = serde_json::from_value(json!({
+            "interfaces":[
+                {"name":"wg0","kind":"wireguard","role":"wan","up":true,"mtu":1420,"addresses":["10.10.0.2/30","203.0.113.22/32"],
+                    "wireguard":{"key_ref":"bgp","listen_port":51820,"peers":[{"public_key":key1,"endpoint":"192.0.2.1:51820","allowed_ips":["10.10.0.1/32"]}]}},
+                {"name":"lan0","kind":"dummy","role":"lan","up":true,"mtu":1500,"addresses":["198.51.2.1/24"]}
+            ]
+        }))?;
+        config.validate()?;
+        remote_config.validate()?;
+        let mut a = Native::open(first.options())?;
+        let mut b = Native::open(second.options())?;
+        b.apply(&Config::empty(), &remote_config)?;
+        let listener = session(b.namespace.clone(), |_, _| {
+            listen("203.0.113.22".parse()?, "wg0", 8)
+        })?;
+        a.apply(&Config::empty(), &config)?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (mut remote, address) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "WireGuard BGP connect timeout: {}",
+                        a.bgp.snapshot()?
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        assert_eq!(address.ip(), "10.10.0.1".parse::<Ipv4Addr>()?);
+        remote.set_nonblocking(false)?;
+        remote.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let prefix = Prefix::new("198.51.2.0".parse()?, 24)?;
+        let mut messages = wire::open(65002, "203.0.113.22".parse()?, 90);
+        messages.extend(wire::frame(4, &[]));
+        messages.extend(wire::announce(
+            prefix,
+            65002,
+            "10.10.0.99".parse()?,
+            true,
+            false,
+        ));
+        remote.write_all(&messages)?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let status = a.bgp.snapshot()?;
+            if status["neighbors"][0]["last_rejection"]["reason"] == "next_hop_not_allowed" {
+                assert_eq!(status["routes"], json!([]));
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "unauthorized WireGuard next hop was not rejected: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        remote.write_all(&wire::announce(
+            prefix,
+            65002,
+            "10.10.0.2".parse()?,
+            true,
+            false,
+        ))?;
+        let wait_route = |manager: &Manager, present: bool| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let status = manager.snapshot()?;
+                let found = status["routes"].as_array().is_some_and(|routes| {
+                    routes.iter().any(|r| {
+                        r["prefix"] == "198.51.2.0/24"
+                            && r["next_hop"] == "10.10.0.2"
+                            && r["installed"] == true
+                    })
+                });
+                if found == present {
+                    return Ok(());
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "WireGuard route presence {present}: {status}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_route(&a.bgp, true)?;
+        let receiver_namespace = a.namespace.clone();
+        let check_kernel =
+            |present: bool| -> Result<()> {
+                let key = key2.clone();
+                session(receiver_namespace.clone(), move |rt, h| {
+                    let device = wireguard_control::Device::get(
+                        &"wg0".parse()?,
+                        wireguard_control::Backend::Kernel,
+                    )?;
+                    let peer = device
+                        .peers
+                        .iter()
+                        .find(|p| p.config.public_key.to_base64() == key)
+                        .context("referenced peer missing")?;
+                    let ips = peer
+                        .config
+                        .allowed_ips
+                        .iter()
+                        .map(|p| format!("{}/{}", p.address, p.cidr))
+                        .collect::<BTreeSet<_>>();
+                    assert!(ips.contains("10.10.0.2/32"));
+                    assert!(ips.contains("203.0.113.22/32"));
+                    assert_eq!(ips.contains("198.51.2.0/24"), present);
+                    let routes = rt.block_on(
+                        h.route()
+                            .get(crate::linux::networking::route_query(
+                                rtnetlink::IpVersion::V4,
+                            ))
+                            .execute()
+                            .try_collect::<Vec<_>>(),
+                    )?;
+                    let found = routes.iter().find(|r| {
+                        r.header.protocol == RouteProtocol::Other(245)
+                            && r.attributes.contains(&RouteAttribute::Destination(
+                                RouteAddress::Inet("198.51.2.0".parse().unwrap()),
+                            ))
+                    });
+                    assert_eq!(found.is_some(), present);
+                    if let Some(route) = found {
+                        assert!(
+                            !route
+                                .attributes
+                                .iter()
+                                .any(|a| matches!(a, RouteAttribute::Gateway(_)))
+                        );
+                    }
+                    assert!(routes.iter().any(|r| {
+                        r.header.destination_prefix_length == 32
+                            && r.attributes.contains(&RouteAttribute::Destination(
+                                RouteAddress::Inet("203.0.113.22".parse().unwrap()),
+                            ))
+                    }));
+                    Ok(())
+                })
+            };
+        check_kernel(true)?;
+        let sender = session(a.namespace.clone(), |_, _| {
+            Ok(UdpSocket::bind("10.10.0.1:0")?)
+        })?;
+        let receiver = session(b.namespace.clone(), |_, _| {
+            Ok(UdpSocket::bind("198.51.2.1:0")?)
+        })?;
+        sender.set_read_timeout(Some(Duration::from_secs(2)))?;
+        receiver.set_read_timeout(Some(Duration::from_secs(2)))?;
+        sender.send_to(b"forwarded", receiver.local_addr()?)?;
+        let mut bytes = [0; 32];
+        let (length, source) = receiver.recv_from(&mut bytes)?;
+        assert_eq!(&bytes[..length], b"forwarded");
+        receiver.send_to(b"reply", source)?;
+        let length = sender.recv(&mut bytes)?;
+        assert_eq!(&bytes[..length], b"reply");
+        assert_eq!(a.observe(&config)?, config);
+        remote.write_all(&wire::withdraw(prefix))?;
+        wait_route(&a.bgp, false)?;
+        check_kernel(false)?;
+        remote.write_all(&wire::announce(
+            prefix,
+            65002,
+            "10.10.0.2".parse()?,
+            true,
+            false,
+        ))?;
+        wait_route(&a.bgp, true)?;
+        a.bgp.shutdown()?;
+        check_kernel(false)?;
+        assert_eq!(a.observe(&config)?, config);
+        Ok(())
+    }
+
+    #[test]
     fn best_path_selection_preserves_static_routes_and_wireguard_peer_ownership() -> Result<()> {
         let mut config = Config::empty();
         config.bgp.local_asn = 65001;

@@ -79,12 +79,16 @@
 ### Added
 
 - Support routed IPv4 BGP speakers with per-neighbor `multihop_ttl` and explicit
-  on-link `allowed_next_hops`, separating session endpoints from forwarding
+  `allowed_next_hops`, separating session endpoints from forwarding
   gateways. Expose the latest import rejection in neighbor status. Preserve
-  peer-only WireGuard next hops, route ownership and withdrawal/recovery.
+  route ownership and withdrawal/recovery. WireGuard also authorizes distinct
+  speaker/next-hop addresses covered by the referenced peer's static AllowedIPs,
+  without crossing another enabled peer's next-hop ownership.
   Additive configuration/status contract; transmit TTL now explicitly defaults
   to 1 instead of the OS default. Next automatic calendar version; no manual bump.
   [Required frontend handoff 2026-11-16-01](docs/frontend-handoffs/2026-11-16.md#2026-11-16-01-routed-bgp-speakers-and-authorized-next-hops).
+  Correct the initial WireGuard exclusion with
+  [required frontend correction 2026-11-16-02](docs/frontend-handoffs/2026-11-16.md#2026-11-16-02-wireguard-separate-speaker-and-next-hop-correction).
 
 - NTP runtime objects expose optional `server_time` from the selected server's
   accepted reply-transmission timestamp, separate from firewall-clock sample

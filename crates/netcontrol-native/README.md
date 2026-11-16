@@ -308,8 +308,12 @@ Routed speakers use per-neighbor `multihop_ttl` (default 1). Non-WireGuard
 `allowed_next_hops` explicitly authorizes directly connected forwarding gateways
 independently of the session address; a nonempty list replaces peer-only
 authorization. Off-link speakers require TTL greater than 1, an explicit gateway
-list and independent bootstrap/return routing. WireGuard keeps its peer-only
-next-hop rule. The latest policy rejection is visible in neighbor status.
+list and independent bootstrap/return routing. WireGuard also accepts explicit
+next-hop lists: the referenced peer's static AllowedIPs must cover each listed
+next hop and the session address; listed next hops cannot overlap another
+enabled peer's static AllowedIPs. Learned routes remain device-only through
+that peer with destination AllowedIPs, even when the NEXT_HOP and speaker
+addresses differ. The latest policy rejection is visible in neighbor status.
 
 Runtime status, process health, MQTT summary, restart and BGP-only route APIs
 are described in the [canonical contract](../../FRONTEND_SPEC.md#native-ipv4-bgp).
