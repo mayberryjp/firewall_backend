@@ -19,6 +19,7 @@ const NETLINK_LIMIT: usize = 16 * 1024 * 1024;
 const ROW_LIMIT: usize = 8192;
 
 pub struct Monitor {
+    performance_log: netcontrol_core::PerformanceLog,
     state: Arc<Mutex<(Instant, Value)>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -32,10 +33,13 @@ impl Monitor {
                 .join()
                 .map_err(|_| anyhow::anyhow!("link monitor thread panicked"))?;
         }
-        *self = Self::new(namespace)?;
+        *self = Self::new(namespace, self.performance_log.clone())?;
         Ok(())
     }
-    pub fn new(namespace: Arc<File>) -> Result<Self> {
+    pub fn new(
+        namespace: Arc<File>,
+        performance_log: netcontrol_core::PerformanceLog,
+    ) -> Result<Self> {
         let state = Arc::new(Mutex::new((
             Instant::now(),
             json!({
@@ -46,6 +50,7 @@ impl Monitor {
         let stop = Arc::new(AtomicBool::new(false));
         let output = state.clone();
         let stopping = stop.clone();
+        let log = performance_log.clone();
         let thread = thread::Builder::new()
             .name("link-diagnostics".into())
             .spawn(move || {
@@ -62,6 +67,7 @@ impl Monitor {
                     Ok(())
                 })();
                 if let Err(error) = result {
+                    log.record("link_monitor_unavailable", &timestamp(), json!({"error":format!("{error:#}")}));
                     publish_error(&output, &error);
                     return;
                 }
@@ -70,12 +76,15 @@ impl Monitor {
                 let mut baseline = Baseline::default();
                 let mut totals = Totals::default();
                 let mut next = Instant::now();
+                let mut previous_sample = None;
+                let mut previous_error = None;
                 while !stopping.load(Ordering::Relaxed) {
                     if Instant::now() >= next {
                         if packet.is_none() {
                             match packet_socket() {
                                 Ok(socket) => packet = Some(socket),
                                 Err(error) => {
+                                    record_collection_error(&log, &mut previous_error, &error);
                                     publish_error(&output, &error);
                                     next = Instant::now() + Duration::from_secs(1);
                                     thread::sleep(Duration::from_millis(100));
@@ -90,11 +99,20 @@ impl Monitor {
                             &mut totals,
                         ) {
                             Ok(value) => {
+                                record_observation(&log, previous_sample.as_ref(), &value);
+                                if previous_error.take().is_some() {
+                                    log.record("link_monitor_recovered", value["collected_at"].as_str().unwrap(), json!({}));
+                                }
+                                previous_sample = Some(json!({
+                                    "collected_at":value["collected_at"],
+                                    "packet_headers":{"kernel_drops":value["packet_headers"]["kernel_drops"]}
+                                }));
                                 if let Ok(mut state) = output.lock() {
                                     *state = (Instant::now(), value);
                                 }
                             }
                             Err(error) => {
+                                record_collection_error(&log, &mut previous_error, &error);
                                 publish_error(&output, &error);
                                 // Never bridge rate/delta baselines over an unavailable interval.
                                 baseline = Baseline::default();
@@ -104,6 +122,7 @@ impl Monitor {
                     }
                     if let Some(socket) = &packet {
                         if let Err(error) = receive(socket, &mut capture, &stopping) {
+                            record_collection_error(&log, &mut previous_error, &error);
                             publish_error(&output, &error);
                             capture.capture_gaps += 1;
                             packet = None;
@@ -115,6 +134,7 @@ impl Monitor {
                 }
             })?;
         Ok(Self {
+            performance_log,
             state,
             stop,
             thread: Some(thread),
@@ -137,6 +157,86 @@ impl Monitor {
     }
 }
 
+fn record_collection_error(
+    log: &netcontrol_core::PerformanceLog,
+    previous_error: &mut Option<String>,
+    error: &anyhow::Error,
+) {
+    let error = format!("{error:#}");
+    if previous_error.as_ref() != Some(&error) {
+        log.record(
+            "link_monitor_unavailable",
+            &timestamp(),
+            json!({"error":error}),
+        );
+        *previous_error = Some(error);
+    }
+}
+
+fn timestamp() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("current UTC timestamp is representable as RFC3339")
+}
+
+fn record_observation(
+    log: &netcontrol_core::PerformanceLog,
+    previous: Option<&Value>,
+    sample: &Value,
+) {
+    let positive = |value: &Value| {
+        value
+            .as_str()
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|v| v > 0)
+    };
+    let mut evidence = Vec::new();
+    if let Some(rows) = sample["queues"].as_array() {
+        for row in rows {
+            if positive(&row["drops_delta"]) {
+                evidence.push(json!({"event":"qdisc_drops","qdisc":row}));
+            }
+        }
+    }
+    if let Some(rows) = sample["interfaces"].as_array() {
+        for row in rows {
+            if positive(&row["errors_delta"]) || positive(&row["drops_delta"]) {
+                evidence.push(json!({"event":"interface_errors_or_drops","interface":row}));
+            }
+        }
+    }
+    if positive(&sample["local_tcp"]["retransmissions_delta"]) {
+        evidence.push(json!({"event":"local_tcp_retransmissions","local_tcp":sample["local_tcp"]}));
+    }
+    let capture_drops = |sample: &Value| {
+        sample["packet_headers"]["kernel_drops"]
+            .as_str()
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    if let Some(increase) = capture_drops(sample)
+        .and_then(|current| delta(previous.and_then(capture_drops), current))
+        .filter(|increase| *increase > 0)
+    {
+        evidence.push(json!({
+            "event":"diagnostic_capture_drops",
+            "drops_delta":increase.to_string(),
+            "drops":sample["packet_headers"]["kernel_drops"]
+        }));
+    }
+    // Bound each durable write without discarding evidence on hosts with many queues.
+    for batch in evidence.chunks(32) {
+        log.record(
+            "link_observation",
+            sample["collected_at"].as_str().unwrap(),
+            json!({
+                "previous_collected_at":previous.map(|sample| &sample["collected_at"]),
+                "interval_seconds":sample["interval_seconds"],
+                "evidence":batch
+            }),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +245,73 @@ mod tests {
         io::Write,
         net::{TcpListener, TcpStream},
     };
+
+    #[test]
+    fn performance_log_retains_positive_evidence_without_summing_qdiscs() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log = netcontrol_core::PerformanceLog::open(&directory.path().join("performance"))?;
+        let previous =
+            json!({"collected_at":"2026-11-17T01:00:00Z","packet_headers":{"kernel_drops":"7"}});
+        let sample = json!({
+            "collected_at":"2026-11-17T01:00:01Z", "interval_seconds":1.0,
+            "queues":[
+                {"name":"wan0","handle":1,"parent":0,"kind":"mq","drops_delta":"2"},
+                {"name":"wan0","handle":2,"parent":1,"kind":"fq_codel","drops_delta":"2"},
+                {"name":"wan0","handle":3,"parent":1,"kind":"fq_codel","drops_delta":null},
+                {"name":"wan0","handle":4,"parent":1,"kind":"fq_codel","drops_delta":"0"}
+            ],
+            "interfaces":[{"name":"lan0","errors_delta":"1","drops_delta":"0"}],
+            "local_tcp":{"retransmissions_delta":"3"},
+            "packet_headers":{"kernel_drops":"8"}
+        });
+        record_observation(&log, Some(&previous), &sample);
+        let page = log.read(&netcontrol_core::LogQuery::parse("")?)?;
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        let message: Value = serde_json::from_str(page["entries"][0]["message"].as_str().unwrap())?;
+        assert_eq!(message["observed_at"], sample["collected_at"]);
+        assert_eq!(
+            message["details"]["previous_collected_at"],
+            previous["collected_at"]
+        );
+        let evidence = message["details"]["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 5);
+        assert_eq!(evidence[0]["qdisc"]["drops_delta"], "2");
+        assert_eq!(evidence[1]["qdisc"]["drops_delta"], "2");
+        let mut quiet = sample.clone();
+        quiet["queues"] = json!([{"drops_delta":null},{"drops_delta":"0"}]);
+        quiet["interfaces"] = json!([{"errors_delta":null,"drops_delta":null}]);
+        quiet["local_tcp"]["retransmissions_delta"] = Value::Null;
+        quiet["packet_headers"]["kernel_drops"] = json!("0");
+        record_observation(&log, Some(&sample), &quiet);
+        assert_eq!(
+            log.read(&netcontrol_core::LogQuery::parse("")?)?["entries"],
+            page["entries"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn performance_log_bounds_batches_and_records_collection_failure_transitions() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log = netcontrol_core::PerformanceLog::open(&directory.path().join("performance"))?;
+        let rows: Vec<_> = (0..65)
+            .map(|handle| json!({"handle":handle,"drops_delta":"1"}))
+            .collect();
+        let sample = json!({"collected_at":"2026-11-17T01:00:01Z","queues":rows});
+        record_observation(&log, None, &sample);
+        let mut error = None;
+        record_collection_error(&log, &mut error, &anyhow::anyhow!("dump failed"));
+        record_collection_error(&log, &mut error, &anyhow::anyhow!("dump failed"));
+        let page = log.read(&netcontrol_core::LogQuery::parse("")?)?;
+        assert_eq!(page["entries"].as_array().unwrap().len(), 4);
+        let mut count = 0;
+        for entry in page["entries"].as_array().unwrap().iter().take(3) {
+            let message: Value = serde_json::from_str(entry["message"].as_str().unwrap())?;
+            count += message["details"]["evidence"].as_array().unwrap().len();
+        }
+        assert_eq!(count, 65);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires NETCONTROL_INTEGRATION=1 and packet sockets in a disposable container"]
@@ -275,7 +442,11 @@ mod tests {
 
     #[test]
     fn stale_and_failed_samples_cannot_look_healthy_or_refresh_timestamps() -> Result<()> {
+        let log_directory = tempfile::tempdir()?;
         let monitor = Monitor {
+            performance_log: netcontrol_core::PerformanceLog::open(
+                &log_directory.path().join("performance"),
+            )?,
             state: Arc::new(Mutex::new((
                 Instant::now() - Duration::from_secs(6),
                 json!({"status":"available","collected_at":"2026-10-27T00:00:00Z",
@@ -434,7 +605,11 @@ mod tests {
             Ok(listener)
         })?;
         let destination = listener.local_addr()?;
-        let monitor = Monitor::new(router)?;
+        let log_directory = tempfile::tempdir()?;
+        let monitor = Monitor::new(
+            router,
+            netcontrol_core::PerformanceLog::open(&log_directory.path().join("performance"))?,
+        )?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while monitor.snapshot()?["status"] != "available" {
             ensure!(
@@ -569,7 +744,11 @@ mod tests {
             second["queues"].is_array() && second["interfaces"].is_array(),
             "missing kernel sections"
         );
-        let monitor = Monitor::new(Arc::new(File::open("/proc/thread-self/ns/net")?))?;
+        let log_directory = tempfile::tempdir()?;
+        let monitor = Monitor::new(
+            Arc::new(File::open("/proc/thread-self/ns/net")?),
+            netcontrol_core::PerformanceLog::open(&log_directory.path().join("performance"))?,
+        )?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let value = monitor.snapshot()?;

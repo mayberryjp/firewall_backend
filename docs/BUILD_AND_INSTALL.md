@@ -1678,7 +1678,8 @@ Journald keeps `/dev/log`, kernel capture and its local journal even when native
 syslog is disabled. Netcontrol neither binds/unlinks `/dev/log`, reads
 `/dev/kmsg`, nor tails `backend.log`; this avoids duplicate kernel/backend
 forwarding. Private daemon/native history now uses `logs/netcontrol`, and local
-socket history uses `logs/syslog`, below the services state directory. Each stream
+socket history uses `logs/syslog`, below the services state directory.
+Performance evidence uses a separate `logs/performance` stream. Each stream
 retains four 2 MiB segments with private identity/lock files. Old `backend.log`
 and `syslog-host.log` are preserved but no longer written, imported or served.
 Messages from
@@ -1756,12 +1757,13 @@ journald's journal. Previously captured records are never forwarded on enable.
 The socket queue remains bounded/non-durable during worker stop/restart and may
 overflow; daemon stop/restart discards it, not the retained disk history.
 No journal replay, exact coverage or remote acknowledgment is provided.
-`GET /api/v1/logs/syslog` and `GET /api/v1/logs/netcontrol` require `logs.read`
+`GET /api/v1/logs/syslog`, `GET /api/v1/logs/netcontrol` and
+`GET /api/v1/logs/performance` require `logs.read`
 and provide bounded retained-history cursors, not journald cursors.
 Restrict log-reading keys: captured third-party messages may contain sensitive
 text, and this is not a tamper-evident audit service.
 
-Allow at least 16 MiB for both streams, plus small identity/lock metadata and
+Allow at least 24 MiB for all three streams, plus small identity/lock metadata and
 one temporary extra segment per stream during rotation/recovery. Writes use
 `sync_data`; rotation/directory changes are synchronized on Linux. High log
 volume can still exceed capture/socket/disk throughput, and power/device failure
@@ -1771,6 +1773,14 @@ repair without automatic data deletion/reset. Do not edit/rotate these owned
 segment files with an external log-rotation tool. History and cursor identity
 survive normal restart and worker repair; current source availability is
 reported independently from retained records.
+
+Performance storage opens automatically in native mode, independently of the
+host-services opt-in. Existing collectors record positive counter evidence and
+enabled explicit/DHCP gateway probe failures; no extra worker, probes or tuning
+are enabled. Observation times are not exact packet-drop times, and diagnostic
+socket loss is not user traffic loss. Retain the private services state directory
+across daemon updates; unavailable/corrupt storage fails explicitly.
+See the [performance log contract](../FRONTEND_SPEC.md#performance-evidence-log).
 
 Verify `systemctl status netcontrold netcontrol-syslog.socket systemd-journald`
 and effective `systemd-analyze cat-config systemd/journald.conf`, then use a

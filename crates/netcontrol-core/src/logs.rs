@@ -19,6 +19,7 @@ pub const LOG_PAGE_BYTES: usize = 512 * 1024;
 pub enum LogSource {
     Syslog,
     Netcontrol,
+    Performance,
 }
 
 impl LogSource {
@@ -26,6 +27,7 @@ impl LogSource {
         match self {
             Self::Syslog => "syslog",
             Self::Netcontrol => "netcontrol",
+            Self::Performance => "performance",
         }
     }
 }

@@ -183,7 +183,8 @@ No old identity, network-state, or vnStat database importer/reset is provided.
 CLI options use `--long-options`. External executable, child UID/GID,
 runtime-directory, `--backend-log-file`, and `--syslog-ca-file` settings are
 removed. Native daemon/backend history is `<services-state-dir>/logs/netcontrol`,
-and socket history is `<services-state-dir>/logs/syslog`; native syslog
+socket history is `<services-state-dir>/logs/syslog`, and performance evidence
+uses `<services-state-dir>/logs/performance`; native syslog
 receives journald-forwarded messages via systemd socket activation, and syslog TLS
 uses system CA trust. See the [daemon contract](crates/netcontrold/README.md)
 and [installation guide](docs/BUILD_AND_INSTALL.md) for current deployment flags.
@@ -1993,7 +1994,10 @@ or a current local socket peer-zero window. Show queue/interface evidence with
 the relevant rows and keep local TCP evidence explicitly separate. RTT rise
 plus queue growth/drops suggests local congestion; retransmissions alone do not
 locate upstream loss. There is no cross-router correlation, exact upstream-hop
-diagnosis, packet-loss history, per-destination aggregation or automatic repair.
+diagnosis, complete per-packet loss history, per-destination aggregation or
+automatic repair. Positive observations and configured gateway probe failures
+also enter the [durable performance log](#performance-evidence-log); this does
+not make the cached sample a historical API or establish end-to-end voice loss.
 Existing gateway-probe statistics remain separately available for comparison.
 
 MQTT's existing QoS-1 nonretained `netcontrol/<device_id>/state` payload gains
@@ -3306,14 +3310,15 @@ configuration validation, genuine network drift and durable recovery guards stay
 
 ### Persistent log viewing APIs
 
-Provide separate socket/system and Netcontrol diagnostics views:
+Provide separate socket/system, Netcontrol diagnostics and performance views:
 
 | Method | Path | Permission | Source |
 |---|---|---|---|
 | GET | `/api/v1/logs/syslog` | `logs.read` | Locally captured journald forwarding-socket records, wrapped as RFC5424 text |
 | GET | `/api/v1/logs/netcontrol` | `logs.read` | Native daemon tracing diagnostics, native backend events and worker diagnostics, as JSON message text |
+| GET | `/api/v1/logs/performance` | `logs.read` | Native performance evidence from existing link and explicit/DHCP gateway collectors, as JSON message text |
 
-Neither endpoint reads journald's journal or arbitrary filesystem paths.
+None of these endpoints reads journald's journal or arbitrary filesystem paths.
 New journald socket records with source tag `netcontrold` or
 `netcontrold[<numeric PID>]` are excluded before local capture and remote syslog
 forwarding. Match the native journald timestamp/source header, not mentions of
@@ -3340,7 +3345,7 @@ are excluded from syslog even before direct logging initializes, so operators
 must use the host journal for those failures. No new configuration/editor fields
 or clear/delete endpoint. Simulator returns 503 rather than modeled log messages.
 
-Both are bodyless GETs with optional strict `cursor` and `limit` query fields.
+All three are bodyless GETs with optional strict `cursor` and `limit` query fields.
 Default `limit=100`, canonical integer 1..500; query maximum 1024 bytes.
 Unknown/duplicate fields, empty/malformed cursors and noncanonical limits are
 400. Other methods are 405, missing/invalid authentication 401, missing
@@ -3355,7 +3360,7 @@ Synthetic response:
 {"source":"syslog","entries":[{"sequence":"7","timestamp":"2026-11-11T00:00:00+00:00","message":"<14>1 2026-11-11T00:00:00Z appliance journald - - - synthetic event"}],"next_cursor":"0123456789abcdef0123456789abcdef:7","oldest_cursor":"0123456789abcdef0123456789abcdef:6","gap":false,"reset":false,"has_more":false,"retention_bytes":8388608,"max_message_bytes":65000,"capture":{"state":"running","retrying":false,"error":null}}
 ```
 
-`source` is `syslog|netcontrol`. Entry `sequence` is an exact positive decimal
+`source` is `syslog|netcontrol|performance`. Entry `sequence` is an exact positive decimal
 u64 string; `timestamp` is the UTC capture timestamp, not an assertion about
 original event time. `message` is UTF-8 text, at most 65,000 bytes. Netcontrol
 messages contain JSON text, not a new stable schema for individual tracing
@@ -3380,7 +3385,7 @@ browsing rather than treating the default tail as a complete history.
 `reset:true` means a foreign stream identity (including the other endpoint's
 cursor); return the new stream's newest page. Cursors remain valid across daemon/
 worker restarts while the same persisted stream identity exists. A matching
-cursor ahead of history is 400. Keep separate cursor state for both endpoints.
+cursor ahead of history is 400. Keep separate cursor state for each endpoint.
 
 Pages contain at most `limit` entries and 512 KiB of serialized entry data
 (the complete JSON response remains under 1 MiB). Large messages can shorten a
@@ -3390,8 +3395,9 @@ existing non-overlapping 2-5 second cadence; drain available forward pages
 without overlapping requests, pause when hidden and preserve the cursor on errors.
 Bound the frontend's own visible history and show gap/reset/retention notices.
 
-Each stream retains at most four 2 MiB segments below
-`<services-state-dir>/logs/{syslog,netcontrol}`, plus private identity/lock
+Allow at least 24 MiB for the three streams plus private metadata and temporary
+rotation segments. Each stream retains at most four 2 MiB segments below
+`<services-state-dir>/logs/{syslog,netcontrol,performance}`, plus private identity/lock
 metadata. One additional segment can temporarily exist during rotation.
 The byte budget, not elapsed time, determines expiration. Records and stream
 identity persist through normal restart; counters still reset per worker
@@ -3408,6 +3414,106 @@ written/imported/exposed; no compatibility path or migration is added.
 
 Required frontend work and acceptance:
 [handoff 2026-11-11-05](docs/frontend-handoffs/2026-11-11.md#2026-11-11-05-persistent-socket-and-netcontrol-log-apis).
+
+#### Performance evidence log
+
+`GET /api/v1/logs/performance` is an additive native-only stream using exactly
+the authorization, cursor, retention, no-store, limits and error contract above.
+No query/body fields or permissions are added. Simulator returns 503.
+Storage opens at native service initialization even without host-services or
+gateway-monitoring opt-in; gateway events require an already enabled/authorized
+monitor. Storage initialization errors fail startup without resetting history.
+The directory requires the same private daemon-owned storage as the other logs.
+No new configuration setting, polling worker, active probe, schema conversion
+or automatic repair is introduced.
+
+The outer entry's `timestamp` is UTC persistence time. Its `message` is JSON text
+with envelope `schema:"netcontrol-performance/v1"`, `event:string`,
+`observed_at:string` (UTC RFC3339 observation time) and `details:object`.
+Sequence orders concurrent producers and backward wall-clock corrections;
+never sort solely by either timestamp. Event details are diagnostic text;
+clients must preserve unknown fields/events and safely display opaque messages.
+
+Events:
+
+- `link_observation`: `details.previous_collected_at:string|null`,
+  `interval_seconds:number|null` and `evidence:object[]`. Existing successful
+  samples, approximately one second apart plus collection/storage cost, emit
+  only positive counter evidence, batched into at most 32 evidence rows per
+  durable entry without summing/truncating rows:
+  - `event:"qdisc_drops", qdisc:object`: the existing queue row, including numeric
+    interface `index`, nullable `name`, `kind`, numeric `handle`/`parent`,
+    decimal-string `drops_delta` and `queue.drops` cumulative total.
+    First/reset/new identity deltas are not loss; parent and child counters
+    remain separate and may describe the same dropped packets.
+  - `event:"interface_errors_or_drops", interface:object`: existing interface
+    row with `index`, `name`, decimal-string cumulative `errors`/`drops` and
+    nullable decimal-string `errors_delta`/`drops_delta`. These combine RX+TX,
+    not direction-specific or unique packet-loss totals.
+  - `event:"local_tcp_retransmissions", local_tcp:object`: existing local TCP
+    summary, including positive decimal-string `retransmissions_delta`.
+    This covers router-terminated established sockets, **not forwarded TCP
+    or UDP/audio**, and does not locate the loss.
+  - `event:"diagnostic_capture_drops", drops_delta:string, drops:string`:
+    increased diagnostic AF_PACKET socket drops between successful observations.
+    These mean monitoring coverage was lost, **not that user traffic was
+    dropped**. No initial cumulative total is interpreted as interval loss.
+- `gateway_probe_loss`: explicit and DHCP monitors report only newly timed-out
+  unanswered ICMP probes, once per sequence per worker attempt, even during
+  warm-up and before health holds expire. Several timeouts observed together
+  are grouped. `details` contains string `name`, `mode`, `interface`,
+  `source_address`, `gateway`, `target`, numeric `routing_table`, positive
+  integer `newly_lost`, numeric `loss_timeout_ms`, decimal-string
+  `first_sequence`/`last_sequence`, UTC `first_sent_at`/`last_sent_at`, and
+  `window` (the current gateway statistics object). The rolling window's
+  `lost` is **not** a new-loss counter; do not repeatedly count it or assume
+  every sequence between first/last was lost. Late replies do not clear a
+  timed-out probe. Observation uses the existing approximately 100 ms
+  statistics cycle plus scheduling/I/O cost; this is not exact wire loss time.
+- `gateway_health_change`: the same gateway identity, string `previous_health`
+  and `health`, `window`, and numeric `latency_threshold_ms`,
+  `loss_threshold_percent`, `rtt_variation_threshold_ms`. Log actual held
+  transitions, including initial health, degraded/down, unknown and recovery;
+  unchanged rolling-window loss/high latency is not repeatedly logged as a new
+  health change. The existing configured thresholds/holds are unchanged.
+- `gateway_unavailable`: gateway identity plus `error:string` when preparation
+  or a running probe worker fails. Retry attempts can produce more than one
+  record. This is unavailable measurement, not fabricated 100% probe loss.
+- `link_monitor_unavailable`: `details.error:string`; identical consecutive
+  collection/receive failures are suppressed until recovery or a changed error.
+  `link_monitor_recovered`: empty details when a successful collection follows
+  failure. Failed collection resets the existing rate/delta baselines.
+
+Synthetic inner message:
+
+```json
+{"schema":"netcontrol-performance/v1","event":"gateway_probe_loss","observed_at":"2026-11-17T01:00:02Z","details":{"name":"wan","mode":"explicit","interface":"wan0","source_address":"192.0.2.2","gateway":"192.0.2.1","target":"203.0.113.1","routing_table":10000,"newly_lost":1,"loss_timeout_ms":2000,"first_sequence":"17","last_sequence":"17","first_sent_at":"2026-11-17T01:00:00Z","last_sent_at":"2026-11-17T01:00:00Z","window":{"name":"wan","health":"unknown","sample_status":"warming_up","lost":1,"received":0,"pending":0,"loss_percent":100.0}}}
+```
+
+The example's `window` is abbreviated; real records include the existing full
+gateway statistics object. Gateway target nonresponse can be ICMP filtering/
+deprioritization and does not prove forwarding or application loss. Ordinary
+backlog/overlimits, cwnd changes and arbitrary CPU/latency thresholds do not
+become loss alarms. No packet payloads or flow endpoints are logged; configured
+gateway/source/target addresses are included, so restrict `logs.read`.
+
+Healthy sample heartbeats are not written. `capture.state:"running"` means
+the durable sink is readable, **not** that every detector is available or no
+interruptions occurred. Consult current diagnostic/runtime freshness and
+unavailable/recovery records. Disabled/removed/restarting monitors cannot
+observe losses; there is no guaranteed gap-free measurement or record of each
+configuration-driven stop. Appends synchronize through the existing storage
+mutex, without holding configuration/cache locks; slow storage can delay
+observations. Failures are reported through daemon error tracing (once per
+sink instance), monitoring continues, and storage errors make the endpoint
+503 rather than returning an empty healthy history. Normal restart retains
+history, not old counter baselines or probe sequence identity. Four 2 MiB
+segments bound disk use; sustained failures can expire history quickly.
+No infinite archive, fixed retention duration, exact kernel drop timestamps,
+complete voice-loss detection or performance improvement is promised.
+
+Required frontend tasks/acceptance:
+[2026-11-17-02](docs/frontend-handoffs/2026-11-17.md#2026-11-17-02-durable-performance-evidence-log).
 
 ### 6.1.4 Home Assistant MQTT Streaming
 
@@ -7732,6 +7838,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/firewall/deny-log` | Filtered persistent deny history, capture/loss/retention status; `firewall.logs.read` |
 | GET | `/logs/syslog` | Bounded persistent socket-log page; `logs.read`, optional cursor/limit |
 | GET | `/logs/netcontrol` | Bounded persistent daemon/native diagnostic page; `logs.read`, optional cursor/limit |
+| GET | `/logs/performance` | Bounded persistent performance evidence page; `logs.read`, optional cursor/limit |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
 | GET | `/firewall/nat` | Observed `{ "masquerade": [...], "destination_rewrite": [...] }` |

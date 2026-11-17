@@ -9,6 +9,7 @@ pub use logs::{
     LogEntry, LogPage, LogQuery, LogSource,
 };
 mod path_test;
+mod performance_log;
 pub use bgp::{BGPConfig, BGPNeighbor};
 pub use deny_log::{DenyLogQuery, DenyRecord, DenyTrafficTag};
 pub use dhcp_relay::DHCPRelayLogQuery;
@@ -16,6 +17,7 @@ pub use path_test::{
     PATH_TEST_ARM_SECONDS, PATH_TEST_LIFETIME_SECONDS, PATH_TEST_PORT, PATH_TEST_RUN_SECONDS,
     PathTestParent, PathTestRequest,
 };
+pub use performance_log::PerformanceLog;
 mod dynamic_dns;
 pub use diagnostics::{DNSLookup, DNSLookupRequest, DNSRecordType};
 mod engine;

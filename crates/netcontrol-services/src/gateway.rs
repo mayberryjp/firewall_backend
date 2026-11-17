@@ -67,6 +67,8 @@ struct Probe {
     seq: u64,
     sent: Instant,
     rtt: Option<f64>,
+    sent_at: String,
+    loss_reported: bool,
 }
 pub(crate) struct Window {
     config: super::config::Gateway,
@@ -98,6 +100,8 @@ impl Window {
             seq,
             sent: now,
             rtt: None,
+            sent_at: super::worker::now(),
+            loss_reported: false,
         });
     }
     fn received(&mut self, seq: u64, now: Instant) {
@@ -221,6 +225,58 @@ impl Window {
             "rtt_min_ms":values.first(),"rtt_max_ms":values.last(),"rtt_avg_ms":avg,"rtt_stddev_ms":stddev,
             "rtt_p50_ms":percentile(0.5),"rtt_p95_ms":percentile(0.95),"rtt_variation_ms":var})
     }
+
+    fn observe(&mut self, now: Instant, log: &netcontrol_core::PerformanceLog) -> Value {
+        let observed_at = super::worker::now();
+        let mut newly_lost = 0usize;
+        let mut first = None;
+        let mut last = None;
+        for probe in &mut self.probes {
+            if probe.rtt.is_none()
+                && !probe.loss_reported
+                && now.duration_since(probe.sent)
+                    >= Duration::from_millis(self.config.loss_timeout_ms)
+            {
+                probe.loss_reported = true;
+                newly_lost += 1;
+                first.get_or_insert((probe.seq.to_string(), probe.sent_at.clone()));
+                last = Some((probe.seq.to_string(), probe.sent_at.clone()));
+            }
+        }
+        let previous_health = self.health.clone();
+        let mut stats = self.sample(now);
+        stats["collected_at"] = json!(observed_at);
+        if newly_lost > 0 {
+            let mut details = gateway_identity(&self.config);
+            details["newly_lost"] = json!(newly_lost);
+            details["loss_timeout_ms"] = json!(self.config.loss_timeout_ms);
+            details["first_sequence"] = json!(first.as_ref().map(|value| &value.0));
+            details["first_sent_at"] = json!(first.as_ref().map(|value| &value.1));
+            details["last_sequence"] = json!(last.as_ref().map(|value| &value.0));
+            details["last_sent_at"] = json!(last.as_ref().map(|value| &value.1));
+            details["window"] = stats.clone();
+            log.record("gateway_probe_loss", &observed_at, details);
+        }
+        if previous_health != self.health {
+            let mut details = gateway_identity(&self.config);
+            details["previous_health"] = json!(previous_health);
+            details["health"] = json!(self.health);
+            details["window"] = stats.clone();
+            details["latency_threshold_ms"] = json!(self.config.latency_threshold_ms);
+            details["loss_threshold_percent"] = json!(self.config.loss_threshold_percent);
+            details["rtt_variation_threshold_ms"] = json!(self.config.rtt_variation_threshold_ms);
+            log.record("gateway_health_change", &observed_at, details);
+        }
+        stats
+    }
+}
+
+fn gateway_identity(config: &super::config::Gateway) -> Value {
+    json!({
+        "name":config.name, "mode":config.mode, "interface":config.interface,
+        "source_address":config.source_address, "gateway":config.gateway,
+        "target":config.target, "routing_table":config.routing_table
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -356,6 +412,34 @@ fn path(config: &super::config::Gateway, index: u32) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare(
     config: super::config::Gateway,
+    performance_log: netcontrol_core::PerformanceLog,
+) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
+    let identity = gateway_identity(&config);
+    let run_log = performance_log.clone();
+    let report = move |error: &anyhow::Error| {
+        let mut details = identity.clone();
+        details["error"] = json!(format!("{error:#}"));
+        performance_log.record("gateway_unavailable", &super::worker::now(), details);
+    };
+    match prepare_inner(config, run_log) {
+        Ok(run) => Ok(Box::new(move |ctx| {
+            let result = run(ctx);
+            if let Err(error) = &result {
+                report(error);
+            }
+            result
+        })),
+        Err(error) => {
+            report(&error);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_inner(
+    config: super::config::Gateway,
+    performance_log: netcontrol_core::PerformanceLog,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     use crate::linux as l;
     use std::{
@@ -417,7 +501,7 @@ pub(crate) fn prepare(
                 }
             }
             if sampled.elapsed() >= Duration::from_millis(100) {
-                let stats = window.sample(Instant::now());
+                let stats = window.observe(Instant::now(), &performance_log);
                 ctx.update(|s| s["statistics"] = stats);
                 sampled = Instant::now();
             }
@@ -461,6 +545,77 @@ mod tests {
         let a = w.sample(start + Duration::from_millis(2100));
         assert_eq!(a["sample_status"], "unavailable");
         assert_eq!(a["health"], "unknown");
+    }
+    #[test]
+    fn performance_log_records_new_timeouts_once_and_health_recovery() -> Result<(), anyhow::Error>
+    {
+        let directory = tempfile::tempdir()?;
+        let log = netcontrol_core::PerformanceLog::open(&directory.path().join("performance"))?;
+        let start = Instant::now();
+        let mut w = Window::new(config(), start);
+        w.sent(1, start + Duration::from_millis(800));
+        w.observe(start + Duration::from_millis(850), &log);
+        assert!(
+            log.read(&netcontrol_core::LogQuery::parse("")?)?["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        w.observe(start + Duration::from_millis(900), &log);
+        w.observe(start + Duration::from_millis(950), &log);
+        w.received(1, start + Duration::from_millis(1050));
+        w.observe(start + Duration::from_millis(1000), &log);
+        w.observe(start + Duration::from_millis(1100), &log);
+        w.sent(2, start + Duration::from_millis(2000));
+        w.received(2, start + Duration::from_millis(2010));
+        w.observe(start + Duration::from_millis(2010), &log);
+        w.observe(start + Duration::from_millis(2110), &log);
+        let page = log.read(&netcontrol_core::LogQuery::parse("")?)?;
+        let messages: Vec<Value> = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| serde_json::from_str(entry["message"].as_str().unwrap()).unwrap())
+            .collect();
+        let losses: Vec<_> = messages
+            .iter()
+            .filter(|message| message["event"] == "gateway_probe_loss")
+            .collect();
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0]["details"]["newly_lost"], 1);
+        assert_eq!(losses[0]["details"]["first_sequence"], "1");
+        assert_eq!(losses[0]["details"]["target"], "192.0.2.3");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["details"]["health"] == "down")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["details"]["health"] == "up")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn performance_log_does_not_count_an_expiring_window_loss_twice() -> Result<(), anyhow::Error> {
+        let directory = tempfile::tempdir()?;
+        let log = netcontrol_core::PerformanceLog::open(&directory.path().join("performance"))?;
+        let start = Instant::now();
+        let mut w = Window::new(config(), start);
+        w.sent(1, start);
+        w.sent(2, start + Duration::from_millis(10));
+        w.received(2, start + Duration::from_millis(20));
+        w.sent(3, start + Duration::from_millis(30));
+        w.observe(start + Duration::from_millis(2000), &log);
+        w.observe(start + Duration::from_millis(2100), &log);
+        let page = log.read(&netcontrol_core::LogQuery::parse("")?)?;
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        let message: Value = serde_json::from_str(page["entries"][0]["message"].as_str().unwrap())?;
+        assert_eq!(message["details"]["newly_lost"], 2);
+        assert_eq!(message["details"]["last_sequence"], "3");
+        Ok(())
     }
     #[test]
     fn truncated_random_icmp_never_panics() {

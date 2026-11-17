@@ -50,7 +50,7 @@ fn separate_log_apis_require_logs_permission_and_preserve_state() {
     faults.lock().unwrap().log_response = Some(expected.clone());
     let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
     let saved = fs::read(fixture.path()).unwrap();
-    for source in ["syslog", "netcontrol"] {
+    for source in ["syslog", "netcontrol", "performance"] {
         let path = format!("/api/v1/logs/{source}");
         for (actor, permissions, method, query, body, status) in [
             ("", vec!["logs.read".into()], "GET", "", "", 401),
@@ -107,14 +107,21 @@ fn separate_log_apis_require_logs_permission_and_preserve_state() {
     }
     assert_eq!(
         faults.lock().unwrap().log_sources,
-        ["syslog", "syslog", "netcontrol", "netcontrol"]
+        [
+            "syslog",
+            "syslog",
+            "netcontrol",
+            "netcontrol",
+            "performance",
+            "performance"
+        ]
     );
     faults.lock().unwrap().log_response = None;
     assert_eq!(
         engine
             .request(
                 "GET",
-                "/api/v1/logs/netcontrol",
+                "/api/v1/logs/performance",
                 "",
                 "reader",
                 &["logs.read".into()],
@@ -129,7 +136,7 @@ fn separate_log_apis_require_logs_permission_and_preserve_state() {
             .engine()
             .request(
                 "GET",
-                "/api/v1/logs/syslog",
+                "/api/v1/logs/performance",
                 "",
                 "reader",
                 &["logs.read".into()],

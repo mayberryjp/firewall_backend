@@ -89,6 +89,22 @@
 
 ### Added
 
+- Add a separate durable performance log at `GET /api/v1/logs/performance`
+  (`logs.read`): observed qdisc/interface drops/errors, router-local TCP
+  retransmissions, diagnostic capture loss, explicit/DHCP gateway probe
+  timeouts and held health transitions/recovery, plus collector failures.
+  Reuse existing collectors, preserve counter-reset semantics and never sum
+  hierarchical queues. Retain four synchronized 2 MiB segments across restart;
+  observation timestamps are not exact packet-drop times or proof of voice
+  loss. Additive API/operational contract; next automatic calendar version.
+  [Required frontend handoff 2026-11-17-02](docs/frontend-handoffs/2026-11-17.md#2026-11-17-02-durable-performance-evidence-log).
+
+- Add a standalone, read-only Linux `traffic-watch.sh` troubleshooting script
+  with timestamped WAN/LAN counter deltas, explicit drop/error highlights and
+  per-qdisc drop/backlog evidence. Ignore lifetime totals, rebaseline resets/
+  replacements and never sum hierarchical qdisc drops. No daemon/API/frontend
+  changes; additive operator tooling, next automatic calendar version.
+
 - Add per-BGP-neighbor `enabled` (default true), persisted through normal
   configuration transactions and rollback. Disabled peers retain validated
   settings but stop sessions/listeners and contribute no learned/exported

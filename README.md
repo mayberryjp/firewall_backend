@@ -48,7 +48,8 @@ runs inside Netcontrol with automatic reconnect/retry, not an external package.
 
 `GET /api/v1/logs/syslog` reads locally captured journald/socket messages;
 `GET /api/v1/logs/netcontrol` reads daemon diagnostics and native backend events.
-Both require the separate `logs.read` permission and support bounded cursor
+`GET /api/v1/logs/performance` reads a separate performance-evidence history.
+All three require the separate `logs.read` permission and support bounded cursor
 polling. Each stream retains four 2 MiB segments under
 `<services-state-dir>/logs`, survives daemon restart and reports cursor gaps
 when old segments expire. No whole-file download or forwarding replay.
@@ -66,6 +67,27 @@ syslog history and remote forwarding; daemon diagnostics remain in the Netcontro
 view and host journal. Existing history is not rewritten. Routine HTTP completion
 events are not emitted. Named process/worker lifecycle, retry and destination
 recovery events provide troubleshooting context without request/packet logging.
+
+The performance stream is always available in native mode, without the
+host-services opt-in. Existing collectors record newly observed qdisc drops,
+interface RX+TX errors/drops, local-router TCP retransmissions, and diagnostic
+capture drops (not user-packet loss). Configured explicit and DHCP gateway
+monitors record each newly timed-out probe once, plus held health changes
+(including recovery) with measured loss/latency/RTT variation and configured
+thresholds. Collector failures/recovery and gateway worker failures distinguish
+missing measurements from clean measurements. No additional poller, probes,
+thresholds, configuration changes or automatic tuning are added.
+
+Records contain UTC observation times, interval/identity/counter evidence, and
+gateway probe send times/timeouts; they do not recover exact packet-drop times
+or prove the cause of poor audio. Link collection is approximately once a second
+plus collection/storage time; gateway timeout observation uses the existing
+approximately 100 ms statistics cycle. Healthy samples and ordinary backlog/
+overlimits are not logged. Event-only synchronized writes share the existing
+bounded log storage, under `<services-state-dir>/logs/performance`: four 2 MiB
+segments, retained across restart, not an unlimited archive or retention period.
+Busy failure periods can expire history quickly; copy evidence promptly.
+See the [performance log contract](FRONTEND_SPEC.md#performance-evidence-log).
 
 Host-wide traffic accounting uses one Rust worker for every kernel interface,
 including unmanaged, VLAN, tunnel, veth and loopback links. Optional
@@ -115,6 +137,32 @@ DPDK readiness requires future PMD-specific validation. See the
 [frontend contract](FRONTEND_SPEC.md#interface-capability-snapshots).
 
 ## Performance diagnostics and safe RPS tuning
+
+For a readable, read-only Linux terminal view of new interface/qdisc drops,
+run [traffic-watch.sh](traffic-watch.sh) during the incident (replace the WAN/LAN
+names with the actual interfaces):
+
+```sh
+bash traffic-watch.sh enp1s0 enp2s0
+```
+
+It establishes a baseline, then labels WAN/LAN input/output and reports new
+packets, drops, errors, missed receives and carrier errors each second.
+`!!!!` highlights new drops/errors; `WAIT` shows sampled queue backlog, which
+does not itself prove loss. An optional third argument sets the interval in
+whole seconds from 1 to 60. Ctrl-C stops; append `| tee traffic-watch.log` to
+retain the timestamped output locally. The script changes no networking settings
+and needs Bash plus `tc` (iproute2), awk, date and sleep; root is normally not
+required, but network statistics must be readable.
+
+Existing lifetime totals are ignored. Counter decreases, replaced interfaces
+and new/replaced qdisc identities establish fresh baselines rather than inventing
+negative or huge loss counts. Parent/child qdisc drops are shown separately,
+never summed. Missing/unreadable counters or unsupported qdisc output stop with
+an explicit error. No alerts does not prove uninterrupted audio: the script does
+not identify voice packets, measure upstream/receiver loss or catch every
+between-sample queue change. This is a standalone troubleshooting tool, not a
+daemon feature or continuous background service.
 
 `GET /api/v1/statistics/performance` (`state.read`, no body/query) collects
 passive host CPU, network softirq, softnet, IRQ and interface/queue evidence.

@@ -104,7 +104,8 @@ regardless of `syslog.enabled`; only remote forwarding depends on that flag.
 Request bodies, raw URLs, cookies, passwords,
 Authorization headers, and API-key tokens are never logged.
 
-`GET /api/v1/logs/syslog` and `GET /api/v1/logs/netcontrol` require `logs.read`
+`GET /api/v1/logs/syslog`, `GET /api/v1/logs/netcontrol` and
+`GET /api/v1/logs/performance` require `logs.read`
 (not `state.read` or `syslog.write`) and expose separately retained streams,
 each bounded to four 2 MiB segments. Default reads show the latest 100 records;
 strict `cursor`/`limit` queries page/poll chronologically, with limit 1..500
@@ -115,6 +116,14 @@ Simulator returns 503, not invented logs. Legacy `backend.log` and
 `syslog-host.log` files are neither imported nor deleted. Full contract,
 retention/error limitations and frontend requirements:
 [persistent log APIs](../../FRONTEND_SPEC.md#persistent-log-viewing-apis).
+
+The separate performance stream persists observed qdisc/interface drops/errors,
+local-router TCP retransmissions, diagnostic socket loss, explicit/DHCP gateway
+probe timeouts and health changes/recovery, and collection failures. It reuses
+existing collectors, not a new polling worker or probe. Gateway loss means a
+probe timed out, not proven audio loss; capture drops mean missing diagnostic
+coverage. UTC observation timestamps are not exact packet-drop times.
+See the [performance contract](../../FRONTEND_SPEC.md#performance-evidence-log).
 
 ## Configuration SSH
 

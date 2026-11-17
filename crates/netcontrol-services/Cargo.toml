@@ -26,3 +26,6 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

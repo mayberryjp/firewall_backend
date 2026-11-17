@@ -383,7 +383,11 @@ impl Native {
             allow_gateway_monitoring: options.gateway_monitoring,
         })?;
         let dhcp = dhcp_client::Manager::new(namespace.clone(), state.clone(), host_mode);
-        let dhcp_monitors = dhcp_monitors::Manager::new(namespace.clone(), dhcp.state.clone());
+        let dhcp_monitors = dhcp_monitors::Manager::new(
+            namespace.clone(),
+            dhcp.state.clone(),
+            services.performance_log(),
+        );
         let mut native = Self {
             netcontrol_log: match netcontrol_log {
                 Some(log) => log,
@@ -403,7 +407,10 @@ impl Native {
                 state.join("wireguard-dns.json"),
             )?,
             bgp: bgp::Manager::new(namespace.clone(), state.clone())?,
-            link_monitor: link_monitor::Monitor::new(namespace.clone())?,
+            link_monitor: link_monitor::Monitor::new(
+                namespace.clone(),
+                services.performance_log(),
+            )?,
             #[cfg(feature = "nftables")]
             experience: if options.namespace.is_empty() {
                 Some(experience::Manager::open(
@@ -1654,6 +1661,7 @@ impl Backend for Native {
         query: &netcontrol_core::LogQuery,
     ) -> Result<Value> {
         match source {
+            netcontrol_core::LogSource::Performance => self.services.performance_log().read(query),
             netcontrol_core::LogSource::Syslog => self.services.syslog_log(query),
             netcontrol_core::LogSource::Netcontrol => {
                 let mut page = serde_json::to_value(self.netcontrol_log.read(query)?)?;

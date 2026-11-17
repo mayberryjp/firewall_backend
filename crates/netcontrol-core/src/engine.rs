@@ -949,7 +949,10 @@ impl Engine {
             }
             return value(&self.state.interface_capabilities).map(|v| Reply::value(200, v));
         }
-        if path == "/api/v1/logs/syslog" || path == "/api/v1/logs/netcontrol" {
+        if matches!(
+            path,
+            "/api/v1/logs/syslog" | "/api/v1/logs/netcontrol" | "/api/v1/logs/performance"
+        ) {
             require(permissions, "logs.read")?;
             if method != "GET" {
                 return Err(ApiError::new(405, "method not allowed"));
@@ -957,10 +960,10 @@ impl Engine {
             if !body.is_empty() {
                 return Err(ApiError::new(400, "log retrieval accepts no body"));
             }
-            let source = if path.ends_with("/syslog") {
-                crate::LogSource::Syslog
-            } else {
-                crate::LogSource::Netcontrol
+            let source = match path {
+                "/api/v1/logs/syslog" => crate::LogSource::Syslog,
+                "/api/v1/logs/performance" => crate::LogSource::Performance,
+                _ => crate::LogSource::Netcontrol,
             };
             let query = crate::LogQuery::parse(query).map_err(|e| ApiError::new(400, e))?;
             return self

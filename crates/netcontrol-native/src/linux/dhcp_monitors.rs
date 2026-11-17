@@ -280,7 +280,12 @@ impl Entry {
         Ok(())
     }
 
-    fn reconcile(&mut self, wanted: Option<Path>, namespace: Arc<File>) -> Result<()> {
+    fn reconcile(
+        &mut self,
+        wanted: Option<Path>,
+        namespace: Arc<File>,
+        performance_log: netcontrol_core::PerformanceLog,
+    ) -> Result<()> {
         if self.path == wanted
             && (wanted.is_none()
                 || self
@@ -299,7 +304,7 @@ impl Entry {
             config["source_address"] = json!(path.source.to_string());
             config["gateway"] = json!(path.gateway);
             config["routing_table"] = json!(path.table);
-            self.probe = Some(GatewayProbe::start(&config, namespace)?);
+            self.probe = Some(GatewayProbe::start(&config, namespace, performance_log)?);
         }
         Ok(())
     }
@@ -364,6 +369,7 @@ impl Entry {
 }
 
 pub struct Manager {
+    performance_log: netcontrol_core::PerformanceLog,
     namespace: Arc<File>,
     leases: Arc<Mutex<dhcp_client::State>>,
     rows: Arc<Mutex<BTreeMap<String, Value>>>,
@@ -372,8 +378,13 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn new(namespace: Arc<File>, leases: Arc<Mutex<dhcp_client::State>>) -> Self {
+    pub fn new(
+        namespace: Arc<File>,
+        leases: Arc<Mutex<dhcp_client::State>>,
+        performance_log: netcontrol_core::PerformanceLog,
+    ) -> Self {
         Self {
+            performance_log,
             namespace,
             leases,
             rows: Arc::new(Mutex::new(BTreeMap::new())),
@@ -401,6 +412,7 @@ impl Manager {
         let rows = self.rows.clone();
         let leases = self.leases.clone();
         let namespace = self.namespace.clone();
+        let performance_log = self.performance_log.clone();
         self.join = Some(
             std::thread::Builder::new()
                 .name("nc-dhcp-monitors".into())
@@ -422,7 +434,13 @@ impl Manager {
                             .map_err(|_| anyhow::anyhow!("DHCP state poisoned"))?;
                         for entry in &mut entries {
                             let result = resolve(&entry.config, entry.table, &state, &config)
-                                .and_then(|path| entry.reconcile(path, namespace.clone()));
+                                .and_then(|path| {
+                                    entry.reconcile(
+                                        path,
+                                        namespace.clone(),
+                                        performance_log.clone(),
+                                    )
+                                });
                             entry.reason = if let Err(error) = result {
                                 let cleanup = entry.stop(namespace.clone());
                                 Some(format!(
@@ -535,9 +553,11 @@ mod tests {
 
     #[test]
     fn cached_snapshot_merge_reports_contention_and_recovers() -> Result<()> {
+        let log_directory = tempfile::tempdir()?;
         let manager = Manager::new(
             Arc::new(File::open(".")?),
             Arc::new(Mutex::new(dhcp_client::State::default())),
+            netcontrol_core::PerformanceLog::open(&log_directory.path().join("performance"))?,
         );
         let baseline = json!([
             {"name":"first","mode":"dhcp","process_state":"waiting"},
@@ -781,7 +801,10 @@ mod tests {
         })?;
         let config = configuration();
         let leases = Arc::new(Mutex::new(dhcp_client::State::default()));
-        let mut manager = Manager::new(namespace.clone(), leases.clone());
+        let log_directory = tempfile::tempdir()?;
+        let performance_log =
+            netcontrol_core::PerformanceLog::open(&log_directory.path().join("performance"))?;
+        let mut manager = Manager::new(namespace.clone(), leases.clone(), performance_log.clone());
         manager.configure(&config.operational_value()?)?;
         fn wait(manager: &Manager, name: &str, state: &str) -> Value {
             let until = Instant::now() + Duration::from_secs(15);
@@ -815,6 +838,28 @@ mod tests {
         let running = wait(&manager, "first", "running");
         wait(&manager, "third", "running");
         wait(&manager, "fourth", "running");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let page = performance_log.read(&netcontrol_core::LogQuery::parse("")?)?;
+            let found = page["entries"].as_array().unwrap().iter().any(|entry| {
+                let message: Value =
+                    serde_json::from_str(entry["message"].as_str().unwrap()).unwrap();
+                message["event"] == "gateway_probe_loss"
+                    && message["details"]["name"] == "first"
+                    && message["details"]["newly_lost"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+                    && message["details"]["mode"] == "dhcp"
+            });
+            if found {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "live DHCP gateway probe loss was not durably logged"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         leases
             .lock()
             .unwrap()

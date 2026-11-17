@@ -36,7 +36,11 @@ pub struct GatewayProbe {
 
 impl GatewayProbe {
     #[cfg(target_os = "linux")]
-    pub fn start(value: &Value, namespace: std::sync::Arc<std::fs::File>) -> Result<Self> {
+    pub fn start(
+        value: &Value,
+        namespace: std::sync::Arc<std::fs::File>,
+        performance_log: netcontrol_core::PerformanceLog,
+    ) -> Result<Self> {
         let mut config: config::Gateway = serde_json::from_value(value.clone())?;
         config.routing_mark = (config.mode == "dhcp").then_some(config.routing_table);
         let name = config.name.clone();
@@ -44,7 +48,7 @@ impl GatewayProbe {
             format!("dhcp-gateway:{name}"),
             Some(namespace),
             json!({"name":name}),
-            move || gateway::prepare(config.clone()),
+            move || gateway::prepare(config.clone(), performance_log.clone()),
         )?;
         Ok(Self { worker })
     }
@@ -65,6 +69,7 @@ pub struct ServiceOptions {
     pub allow_gateway_monitoring: bool,
 }
 pub struct Services {
+    performance_log: netcontrol_core::PerformanceLog,
     syslog_log: Option<netcontrol_core::DiskLog>,
     dhcp_telemetry: dhcp_telemetry::Telemetry,
     options: ServiceOptions,
@@ -139,6 +144,9 @@ impl Services {
             host_namespace.clone()
         };
         Ok(Self {
+            performance_log: netcontrol_core::PerformanceLog::open(
+                &options.state_directory.join("logs").join("performance"),
+            )?,
             syslog_log: if options.allow_host_services {
                 Some(netcontrol_core::DiskLog::open(
                     &options.state_directory.join("logs").join("syslog"),
@@ -163,6 +171,9 @@ impl Services {
             syslog_socket: syslog::JournalSocket::activated()
                 .context("receive systemd syslog socket")?,
         })
+    }
+    pub fn performance_log(&self) -> netcontrol_core::PerformanceLog {
+        self.performance_log.clone()
     }
     pub fn configure_reporting_identity(
         &mut self,
@@ -424,11 +435,12 @@ impl Services {
                 .filter(|m| m.enabled && m.mode == "explicit")
             {
                 let config = m.clone();
+                let performance_log = self.performance_log.clone();
                 self.insert(
                     &format!("gateway:{}", m.name),
                     managed.clone(),
                     json!({"name":m.name,"scope":"managed"}),
-                    move || gateway::prepare(config.clone()),
+                    move || gateway::prepare(config.clone(), performance_log.clone()),
                 )?;
             }
         }
