@@ -244,6 +244,7 @@ impl Window {
             }
         }
         let previous_health = self.health.clone();
+        let health_established = self.changed.is_some();
         let mut stats = self.sample(now);
         stats["collected_at"] = json!(observed_at);
         if newly_lost > 0 {
@@ -257,7 +258,7 @@ impl Window {
             details["window"] = stats.clone();
             log.record("gateway_probe_loss", &observed_at, details);
         }
-        if previous_health != self.health {
+        if previous_health != self.health && (self.health != "up" || health_established) {
             let mut details = gateway_identity(&self.config);
             details["previous_health"] = json!(previous_health);
             details["health"] = json!(self.health);
@@ -546,6 +547,49 @@ mod tests {
         assert_eq!(a["sample_status"], "unavailable");
         assert_eq!(a["health"], "unknown");
     }
+    #[test]
+    fn performance_log_omits_healthy_startup_but_preserves_coverage_recovery()
+    -> Result<(), anyhow::Error> {
+        let directory = tempfile::tempdir()?;
+        let log = netcontrol_core::PerformanceLog::open(&directory.path().join("performance"))?;
+        let start = Instant::now();
+        let mut w = Window::new(config(), start);
+        for attempt in 0..2 {
+            if attempt > 0 {
+                w = Window::new(config(), start);
+            }
+            w.sent(1, start + Duration::from_millis(900));
+            w.received(1, start + Duration::from_millis(910));
+            w.observe(start + Duration::from_millis(1000), &log);
+            let stats = w.observe(start + Duration::from_millis(1100), &log);
+            assert_eq!(stats["health"], "up");
+            assert!(stats["health_changed_at"].is_string());
+        }
+        assert!(
+            log.read(&netcontrol_core::LogQuery::parse("")?)?["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        w.observe(start + Duration::from_millis(2000), &log);
+        w.sent(2, start + Duration::from_millis(2100));
+        w.received(2, start + Duration::from_millis(2110));
+        w.observe(start + Duration::from_millis(2110), &log);
+        w.observe(start + Duration::from_millis(2210), &log);
+        let page = log.read(&netcontrol_core::LogQuery::parse("")?)?;
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let unavailable: Value = serde_json::from_str(entries[0]["message"].as_str().unwrap())?;
+        let recovered: Value = serde_json::from_str(entries[1]["message"].as_str().unwrap())?;
+        assert_eq!(unavailable["event"], "gateway_health_change");
+        assert_eq!(unavailable["details"]["previous_health"], "up");
+        assert_eq!(unavailable["details"]["health"], "unknown");
+        assert_eq!(recovered["event"], "gateway_health_change");
+        assert_eq!(recovered["details"]["previous_health"], "unknown");
+        assert_eq!(recovered["details"]["health"], "up");
+        Ok(())
+    }
+
     #[test]
     fn performance_log_records_new_timeouts_once_and_health_recovery() -> Result<(), anyhow::Error>
     {

@@ -3473,8 +3473,12 @@ Events:
 - `gateway_health_change`: the same gateway identity, string `previous_health`
   and `health`, `window`, and numeric `latency_threshold_ms`,
   `loss_threshold_percent`, `rtt_variation_threshold_ms`. Log actual held
-  transitions, including initial health, degraded/down, unknown and recovery;
-  unchanged rolling-window loss/high latency is not repeatedly logged as a new
+  transitions to degraded/down, unknown after established health, and recovery;
+  omit an initial healthy `unknown` to `up` transition on each worker start.
+  Initial degraded/down health still produces an event. Runtime health and
+  `health_changed_at` still update normally even when the log event is omitted;
+  already retained startup events are not deleted or rewritten.
+  Unchanged rolling-window loss/high latency is not repeatedly logged as a new
   health change. The existing configured thresholds/holds are unchanged.
 - `gateway_unavailable`: gateway identity plus `error:string` when preparation
   or a running probe worker fails. Retry attempts can produce more than one

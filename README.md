@@ -73,7 +73,8 @@ host-services opt-in. Existing collectors record newly observed qdisc drops,
 interface RX+TX errors/drops, local-router TCP retransmissions, and diagnostic
 capture drops (not user-packet loss). Configured explicit and DHCP gateway
 monitors record each newly timed-out probe once, plus held health changes
-(including recovery) with measured loss/latency/RTT variation and configured
+(including recovery, but not initial healthy startup) with measured
+loss/latency/RTT variation and configured
 thresholds. Collector failures/recovery and gateway worker failures distinguish
 missing measurements from clean measurements. No additional poller, probes,
 thresholds, configuration changes or automatic tuning are added.

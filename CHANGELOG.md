@@ -12,6 +12,12 @@
 
 ### Changed
 
+- Omit the initial healthy gateway `unknown` to `up` performance-log event
+  on each probe-worker start. Preserve initial degraded/down events, probe
+  timeouts, later coverage failures and recovery, and runtime health/timestamps.
+  Fix to event selection only; no API/schema/frontend change, next automatic
+  calendar version.
+
 - Apply/verify panic reboot policy once at native startup instead of supervising
   it continuously; remove `runtime.kernel_panic` and its process-health row.
   Apply hostname/timezone at manager startup and confirmed value changes, with
