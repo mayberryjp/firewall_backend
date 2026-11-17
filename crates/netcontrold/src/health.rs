@@ -269,7 +269,7 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn engine_contention_keeps_original_freshness_and_poison_is_explicit() {
+    fn process_health_waits_for_engine_without_masking_staleness_or_poison() {
         use crate::http::{App, Authentication};
         use netcontrol_core::{Engine, Simulator};
         use std::sync::{Arc, Mutex};
@@ -289,8 +289,23 @@ mod tests {
         app.health.snapshot.lock().unwrap().sampled =
             Some(Instant::now() - STALE_AFTER - Duration::from_secs(1));
         let guard = engine.lock().unwrap();
-        app.refresh_health(false, &[]);
+        let (started, starting) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let collecting = app.clone();
+        let collection = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            collecting.refresh_health(false, &[]);
+            finished.send(()).unwrap();
+        });
+        starting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let during_contention = completion.recv_timeout(Duration::from_millis(100));
         let stale = app.health.snapshot();
+        drop(guard);
+        collection.join().unwrap();
+        assert!(matches!(
+            during_contention,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
         assert_eq!(stale["process_health"]["status"], "unknown");
         assert_eq!(stale["process_health"]["stale"], true);
         assert_eq!(
@@ -304,8 +319,6 @@ mod tests {
                 .iter()
                 .any(|alert| alert["code"] == "monitor_stale")
         );
-        drop(guard);
-        app.refresh_health(false, &[]);
         assert_eq!(app.health.snapshot()["process_health"]["status"], "healthy");
         assert_eq!(app.health.snapshot()["active_alerts"], json!([]));
         assert!(

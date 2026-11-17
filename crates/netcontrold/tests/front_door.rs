@@ -505,6 +505,7 @@ async fn platform_status_is_authenticated_nonblocking_and_included_with_configur
 fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
     use netcontrol_core::{Backend, Config};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
     struct CachedHealth(Simulator, Arc<AtomicBool>);
     impl Backend for CachedHealth {
         fn scope(&self) -> anyhow::Result<String> {
@@ -550,13 +551,31 @@ fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
         .unwrap(),
     ));
     let app = App::new(engine.clone(), Authentication::Scoped(vec![]), false);
+    fn start_collection(
+        app: Arc<App>,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+        let (started, starting) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            app.refresh_health(false, &[]);
+            finished.send(()).unwrap();
+        });
+        starting.recv_timeout(Duration::from_secs(2)).unwrap();
+        (thread, completion)
+    }
     let guard = engine.lock().unwrap();
-    app.refresh_health(false, &[]);
+    let (collection, completion) = start_collection(app.clone());
+    let waiting = completion.recv_timeout(Duration::from_millis(100));
     let initial = app.health.snapshot();
+    drop(guard);
+    collection.join().unwrap();
+    assert!(matches!(
+        waiting,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
     assert_eq!(initial["process_health"]["status"], "unknown");
     assert!(initial["process_health"]["collected_at"].is_null());
-    drop(guard);
-    app.refresh_health(false, &[]);
     let health = app.health.snapshot();
     assert_eq!(health["process_health"]["status"], "degraded");
     assert!(
@@ -567,9 +586,20 @@ fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
             .any(|row| row["resource"] == "cached-worker")
     );
     let guard = engine.lock().unwrap();
-    app.refresh_health(false, &[]);
-    assert_eq!(app.health.snapshot(), health);
+    let (collection, completion) = start_collection(app.clone());
+    let waiting = completion.recv_timeout(Duration::from_millis(100));
+    let retained = app.health.snapshot();
     drop(guard);
+    collection.join().unwrap();
+    assert!(matches!(
+        waiting,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(retained, health);
+    assert_eq!(
+        app.health.snapshot()["process_health"]["status"],
+        "degraded"
+    );
     engine.lock().unwrap().tick().unwrap();
     app.refresh_health(false, &[]);
     assert_eq!(

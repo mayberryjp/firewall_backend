@@ -3246,12 +3246,16 @@ The monitor samples approximately every two seconds independently of engine
 deadline ticks and watchdog progress. It reads nonblocking cached native worker
 snapshots, not the live runtime diagnostic API. A contended worker reports
 temporary unavailability/retrying rather than blocking collection. Engine-lock
-contention skips the entire health sample, retaining the previous observations,
-alerts and original `collected_at` without extending freshness. Before the first
-sample health remains unknown; after 15 seconds without a completed collection
-it becomes stale/unknown as below. Collector errors and a poisoned engine lock
-still report runtime unavailable immediately. Live diagnostic collectors and
-their sampling intervals are unchanged.
+contention queues the cached native read on the existing blocking health task
+instead of skipping the sample. Collection completes when the lock becomes
+available, without requiring another interval tick. While waiting, previous
+observations, alerts and original `collected_at` remain unchanged without
+extending freshness. Before the first sample health remains unknown; after
+15 seconds without a completed collection it becomes stale/unknown as below.
+Collector errors and a poisoned engine lock still report runtime unavailable
+immediately. The async executor, deadline ticks and watchdog do not wait for
+health collection. Live diagnostic collectors and their sampling intervals
+are unchanged.
 `process_health.status` is `healthy`, `degraded`, `unhealthy`
 or `unknown`; `healthy` is respectively `true`, `null`, `false` or `null`.
 Use `status` to distinguish a known degraded condition from unknown health.

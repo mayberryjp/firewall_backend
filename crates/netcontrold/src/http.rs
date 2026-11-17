@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     path::Path,
-    sync::{Arc, Mutex, TryLockError},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -187,7 +187,8 @@ impl App {
         Ok(())
     }
     pub fn refresh_health(&self, watchdog: bool, tasks: &[(&str, bool)]) {
-        let runtime = match self.engine.try_lock() {
+        // Queue behind engine activity instead of repeatedly dropping busy samples.
+        let runtime = match self.engine.lock() {
             Ok(mut engine) => match engine.process_health() {
                 Ok(status) => Some(status),
                 Err(error) => {
@@ -195,9 +196,7 @@ impl App {
                     None
                 }
             },
-            // A skipped sample must not refresh the cache's freshness deadline.
-            Err(TryLockError::WouldBlock) => return,
-            Err(TryLockError::Poisoned(error)) => {
+            Err(error) => {
                 tracing::warn!(%error, "process health engine lock poisoned");
                 None
             }

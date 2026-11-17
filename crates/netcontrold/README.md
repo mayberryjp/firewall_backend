@@ -54,9 +54,11 @@ aggregate status, and after 15 seconds without collection it is unknown/stale.
 Collection runs separately from transaction deadlines/watchdog progress and
 uses nonblocking cached native worker snapshots, not full live runtime diagnostics.
 Contended worker snapshots report temporary unavailability rather than waiting
-behind network reconciliation. A busy engine skips the entire health sample
-without changing cached observations, alerts or their freshness timestamp;
-15 seconds without collection still makes health stale/unknown. Actual
+behind network reconciliation. The existing blocking health task waits for a
+busy engine rather than dropping the sample; collection resumes when the lock
+is released without waiting for another interval. Cached observations, alerts
+and their freshness timestamp stay unchanged while waiting; 15 seconds without
+collection still makes health stale/unknown. Actual
 collector failures or a poisoned engine lock report unknown immediately.
 The live runtime API remains unchanged except
 that startup-only panic policy has no `kernel_panic` object.
