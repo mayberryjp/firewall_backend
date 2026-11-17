@@ -3245,8 +3245,12 @@ the daemon-enriched fields; the GET responses above do.
 The monitor samples approximately every two seconds independently of engine
 deadline ticks and watchdog progress. It reads nonblocking cached native worker
 snapshots, not the live runtime diagnostic API. A contended worker reports
-temporary unavailability/retrying rather than blocking collection; engine
-contention makes the native sample unavailable. Live diagnostic collectors and
+temporary unavailability/retrying rather than blocking collection. Engine-lock
+contention skips the entire health sample, retaining the previous observations,
+alerts and original `collected_at` without extending freshness. Before the first
+sample health remains unknown; after 15 seconds without a completed collection
+it becomes stale/unknown as below. Collector errors and a poisoned engine lock
+still report runtime unavailable immediately. Live diagnostic collectors and
 their sampling intervals are unchanged.
 `process_health.status` is `healthy`, `degraded`, `unhealthy`
 or `unknown`; `healthy` is respectively `true`, `null`, `false` or `null`.

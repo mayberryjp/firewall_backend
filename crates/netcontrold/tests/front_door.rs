@@ -504,7 +504,8 @@ async fn platform_status_is_authenticated_nonblocking_and_included_with_configur
 #[test]
 fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
     use netcontrol_core::{Backend, Config};
-    struct CachedHealth(Simulator);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct CachedHealth(Simulator, Arc<AtomicBool>);
     impl Backend for CachedHealth {
         fn scope(&self) -> anyhow::Result<String> {
             self.0.scope()
@@ -530,20 +531,31 @@ fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
             self.0.statistics(config, path, query)
         }
         fn process_health(&mut self, _: &Config) -> anyhow::Result<Value> {
+            anyhow::ensure!(
+                !self.1.load(Ordering::SeqCst),
+                "synthetic collector failure"
+            );
             Ok(
                 json!({"appliance_services":[{"name":"cached-worker","state":"error","retrying":true}]}),
             )
         }
     }
     let directory = tempfile::tempdir().unwrap();
+    let failed = Arc::new(AtomicBool::new(false));
     let engine = Arc::new(Mutex::new(
         Engine::open(
             &directory.path().join("state.json"),
-            Box::new(CachedHealth(Simulator::new())),
+            Box::new(CachedHealth(Simulator::new(), failed.clone())),
         )
         .unwrap(),
     ));
     let app = App::new(engine.clone(), Authentication::Scoped(vec![]), false);
+    let guard = engine.lock().unwrap();
+    app.refresh_health(false, &[]);
+    let initial = app.health.snapshot();
+    assert_eq!(initial["process_health"]["status"], "unknown");
+    assert!(initial["process_health"]["collected_at"].is_null());
+    drop(guard);
     app.refresh_health(false, &[]);
     let health = app.health.snapshot();
     assert_eq!(health["process_health"]["status"], "degraded");
@@ -556,7 +568,7 @@ fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
     );
     let guard = engine.lock().unwrap();
     app.refresh_health(false, &[]);
-    assert_eq!(app.health.snapshot()["process_health"]["status"], "unknown");
+    assert_eq!(app.health.snapshot(), health);
     drop(guard);
     engine.lock().unwrap().tick().unwrap();
     app.refresh_health(false, &[]);
@@ -564,6 +576,24 @@ fn process_health_uses_cached_workers_without_live_runtime_diagnostics() {
         app.health.snapshot()["process_health"]["status"],
         "degraded"
     );
+    failed.store(true, Ordering::SeqCst);
+    app.refresh_health(false, &[]);
+    let unavailable = app.health.snapshot();
+    assert_eq!(unavailable["process_health"]["status"], "unknown");
+    assert_eq!(unavailable["process_health"]["runtime_available"], false);
+    assert!(
+        unavailable["active_alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alert| alert["code"] == "runtime_unavailable")
+    );
+    failed.store(false, Ordering::SeqCst);
+    app.refresh_health(false, &[]);
+    let recovered = app.health.snapshot();
+    assert_eq!(recovered["process_health"]["status"], "degraded");
+    assert_eq!(recovered["active_alerts"].as_array().unwrap().len(), 1);
+    assert_eq!(recovered["active_alerts"][0]["code"], "worker_unavailable");
 }
 
 #[tokio::test]

@@ -269,6 +269,67 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn engine_contention_keeps_original_freshness_and_poison_is_explicit() {
+        use crate::http::{App, Authentication};
+        use netcontrol_core::{Engine, Simulator};
+        use std::sync::{Arc, Mutex};
+
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(
+            Engine::open(
+                &directory.path().join("state.json"),
+                Box::new(Simulator::new()),
+            )
+            .unwrap(),
+        ));
+        let app = App::new(engine.clone(), Authentication::Scoped(vec![]), false);
+        app.refresh_health(false, &[]);
+        let healthy = app.health.snapshot();
+        assert_eq!(healthy["process_health"]["status"], "healthy");
+        app.health.snapshot.lock().unwrap().sampled =
+            Some(Instant::now() - STALE_AFTER - Duration::from_secs(1));
+        let guard = engine.lock().unwrap();
+        app.refresh_health(false, &[]);
+        let stale = app.health.snapshot();
+        assert_eq!(stale["process_health"]["status"], "unknown");
+        assert_eq!(stale["process_health"]["stale"], true);
+        assert_eq!(
+            stale["process_health"]["collected_at"],
+            healthy["process_health"]["collected_at"]
+        );
+        assert!(
+            stale["active_alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|alert| alert["code"] == "monitor_stale")
+        );
+        drop(guard);
+        app.refresh_health(false, &[]);
+        assert_eq!(app.health.snapshot()["process_health"]["status"], "healthy");
+        assert_eq!(app.health.snapshot()["active_alerts"], json!([]));
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = engine.lock().unwrap();
+                panic!("synthetic engine lock failure");
+            })
+            .join()
+            .is_err()
+        );
+        app.refresh_health(false, &[]);
+        let poisoned = app.health.snapshot();
+        assert_eq!(poisoned["process_health"]["status"], "unknown");
+        assert_eq!(poisoned["process_health"]["runtime_available"], false);
+        assert!(
+            poisoned["active_alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|alert| alert["code"] == "runtime_unavailable")
+        );
+    }
+
+    #[test]
     fn discord_ready_is_healthy_and_clears_observed_failure() {
         let monitor = super::Monitor::default();
         for state in ["error", "ready"] {

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Avoid healthy/unknown process-health flicker during brief networking-engine
+  lock contention. Skip that health sample without refreshing its timestamp or
+  clearing existing failures; retain the 15-second stale/unknown timeout and
+  immediate reporting of collector failures or a poisoned engine lock.
+  Status-observation contract fix; next automatic calendar version.
+  [Optional frontend handoff 2026-11-17-03](docs/frontend-handoffs/2026-11-17.md#2026-11-17-03-health-sampling-under-engine-contention).
+
 ### Security
 
 - Restore terminal packet drops after protected-host drop accounting. The shared

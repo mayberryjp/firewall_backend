@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, TryLockError},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -187,17 +187,21 @@ impl App {
         Ok(())
     }
     pub fn refresh_health(&self, watchdog: bool, tasks: &[(&str, bool)]) {
-        let runtime =
-            self.engine
-                .try_lock()
-                .ok()
-                .and_then(|mut engine| match engine.process_health() {
-                    Ok(status) => Some(status),
-                    Err(error) => {
-                        tracing::warn!(%error, "cached native process health unavailable");
-                        None
-                    }
-                });
+        let runtime = match self.engine.try_lock() {
+            Ok(mut engine) => match engine.process_health() {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    tracing::warn!(%error, "cached native process health unavailable");
+                    None
+                }
+            },
+            // A skipped sample must not refresh the cache's freshness deadline.
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(error)) => {
+                tracing::warn!(%error, "process health engine lock poisoned");
+                None
+            }
+        };
         let mut managers = Vec::new();
         for (name, status) in [
             ("mqtt", self.mqtt.as_ref().map(|manager| manager.status())),
