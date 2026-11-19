@@ -1960,11 +1960,24 @@ per receive round, tracks at most 8192 directed flow keys and interface rows,
 and expires directions after 120 seconds idle. Shutdown joins the owned thread;
 collection errors retry without blocking configuration or restarting the daemon.
 
-`interfaces: object[]|null`: rows have numeric `index`, string `name`,
-`errors` (RX+TX errors), `drops` (RX+TX drops), and nullable `errors_delta`,
-`drops_delta`. Counters/deltas are exact unsigned decimal strings, not JSON
-numbers. First/reset/new-identity deltas are null; indexes/names cannot detect
-every recreation. Counts are observations, not unique packet-loss totals.
+`interfaces: object[]|null`: rows have numeric `index`, string `name`, and
+six cumulative counters: `rx_errors`, `tx_errors`, `rx_drops`, `tx_drops`,
+`rx_frame_errors`, `rx_length_errors`. Each has a corresponding nullable
+`<field>_delta`, such as `rx_frame_errors_delta`. Cumulative counters are
+non-null exact unsigned decimal strings; deltas are exact unsigned decimal
+strings or null, never JSON numbers. First/new-identity/after-unavailability
+deltas are null; a decreasing counter resets only its own delta to null.
+Unchanged counters have `"0"` deltas. Indexes/names cannot detect every
+recreation. This replaces the combined `errors`, `drops`, `errors_delta` and
+`drops_delta` fields; no aggregate aliases are returned.
+
+RX is local interface receive; TX is local interface transmit, not feedback
+from the remote peer. Frame/length errors are RX error subcategories: display
+them as detail, never add them to RX errors or claim unique packet-loss totals.
+On WireGuard, RX frame errors can mean a disallowed inner source address or
+an invalid inner IP packet type. Label these as RX frame errors, not confirmed
+AllowedIPs mismatches. RX length errors describe invalid inner packet length.
+No rejection reason, peer, packet source or destination is inferred.
 
 `queues: object[]|null`: each row has `index: number`, `name: string|null`,
 `handle: number`, `parent: number`, `kind: string`, `status:
@@ -3581,10 +3594,15 @@ Events:
     decimal-string `drops_delta` and `queue.drops` cumulative total.
     First/reset/new identity deltas are not loss; parent and child counters
     remain separate and may describe the same dropped packets.
-  - `event:"interface_errors_or_drops", interface:object`: existing interface
-    row with `index`, `name`, decimal-string cumulative `errors`/`drops` and
-    nullable decimal-string `errors_delta`/`drops_delta`. These combine RX+TX,
-    not direction-specific or unique packet-loss totals.
+  - `event:"interface_errors_or_drops", interface:object`: the directional
+    interface row defined in link diagnostics: `index`, `name`, six cumulative
+    counters and their nullable deltas (`rx_errors`, `tx_errors`, `rx_drops`,
+    `tx_drops`, `rx_frame_errors`, `rx_length_errors`, each with `_delta`).
+    Emit when any of those deltas is positive, retaining one row per interface,
+    not separate events for a total and its subcategories. No combined
+    `errors`/`drops` or corresponding aggregate deltas are emitted. Never sum
+    RX frame/length errors with RX errors. Counts do not identify a confirmed
+    WireGuard AllowedIPs mismatch, affected peer or packet endpoints.
   - `event:"local_tcp_retransmissions", local_tcp:object`: existing local TCP
     summary, including positive decimal-string `retransmissions_delta`.
     This covers router-terminated established sockets, **not forwarded TCP
@@ -3653,6 +3671,8 @@ complete voice-loss detection or performance improvement is promised.
 
 Required frontend tasks/acceptance:
 [2026-11-17-02](docs/frontend-handoffs/2026-11-17.md#2026-11-17-02-durable-performance-evidence-log).
+Directional counter replacement and display requirements:
+[2026-11-19-06](docs/frontend-handoffs/2026-11-19.md#2026-11-19-06-directional-interface-error-and-drop-counters).
 
 ### 6.1.4 Home Assistant MQTT Streaming
 

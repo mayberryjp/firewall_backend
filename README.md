@@ -70,7 +70,8 @@ recovery events provide troubleshooting context without request/packet logging.
 
 The performance stream is always available in native mode, without the
 host-services opt-in. Existing collectors record newly observed qdisc drops,
-interface RX+TX errors/drops, local-router TCP retransmissions, and diagnostic
+separate interface RX/TX errors and drops, RX frame/length errors,
+local-router TCP retransmissions, and diagnostic
 capture drops (not user-packet loss). Configured explicit and DHCP gateway
 monitors record each newly timed-out probe once, plus held health changes
 (including recovery, but not initial healthy startup) with measured
@@ -82,6 +83,11 @@ Gateway replies use kernel arrival timestamps and per-monitor socket filters,
 so delayed userspace processing does not itself become probe loss or RTT.
 Detected local receive overflow/backlog or invalid timing reports unavailable,
 not a remote outage; clock steps invalidate the attempt and restart warmup.
+RX frame/length errors are subcategories of RX errors, not additional packets
+to sum. WireGuard RX frame errors can indicate an incoming AllowedIPs rejection
+or an invalid inner packet type; they do not confirm a mismatch or identify a
+peer/source address. The same directional counters are available in link
+diagnostics; first/reset observations have null deltas.
 
 Records contain UTC observation times, interval/identity/counter evidence, and
 gateway probe send times/timeouts; they do not recover exact packet-drop times

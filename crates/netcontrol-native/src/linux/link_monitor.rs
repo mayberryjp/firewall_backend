@@ -200,7 +200,17 @@ fn record_observation(
     }
     if let Some(rows) = sample["interfaces"].as_array() {
         for row in rows {
-            if positive(&row["errors_delta"]) || positive(&row["drops_delta"]) {
+            if [
+                "rx_errors_delta",
+                "tx_errors_delta",
+                "rx_drops_delta",
+                "tx_drops_delta",
+                "rx_frame_errors_delta",
+                "rx_length_errors_delta",
+            ]
+            .iter()
+            .any(|field| positive(&row[field]))
+            {
                 evidence.push(json!({"event":"interface_errors_or_drops","interface":row}));
             }
         }
@@ -260,7 +270,9 @@ mod tests {
                 {"name":"wan0","handle":3,"parent":1,"kind":"fq_codel","drops_delta":null},
                 {"name":"wan0","handle":4,"parent":1,"kind":"fq_codel","drops_delta":"0"}
             ],
-            "interfaces":[{"name":"lan0","errors_delta":"1","drops_delta":"0"}],
+            "interfaces":[{"name":"lan0","rx_errors_delta":"1","tx_errors_delta":"0",
+                "rx_drops_delta":"0","tx_drops_delta":"0","rx_frame_errors_delta":"1",
+                "rx_length_errors_delta":"0"}],
             "local_tcp":{"retransmissions_delta":"3"},
             "packet_headers":{"kernel_drops":"8"}
         });
@@ -277,9 +289,12 @@ mod tests {
         assert_eq!(evidence.len(), 5);
         assert_eq!(evidence[0]["qdisc"]["drops_delta"], "2");
         assert_eq!(evidence[1]["qdisc"]["drops_delta"], "2");
+        assert_eq!(evidence[2]["interface"], sample["interfaces"][0]);
         let mut quiet = sample.clone();
         quiet["queues"] = json!([{"drops_delta":null},{"drops_delta":"0"}]);
-        quiet["interfaces"] = json!([{"errors_delta":null,"drops_delta":null}]);
+        quiet["interfaces"] = json!([{"rx_errors_delta":null,"tx_errors_delta":"0",
+            "rx_drops_delta":null,"tx_drops_delta":"0","rx_frame_errors_delta":null,
+            "rx_length_errors_delta":"0"}]);
         quiet["local_tcp"]["retransmissions_delta"] = Value::Null;
         quiet["packet_headers"]["kernel_drops"] = json!("0");
         record_observation(&log, Some(&sample), &quiet);
@@ -287,6 +302,97 @@ mod tests {
             log.read(&netcontrol_core::LogQuery::parse("")?)?["entries"],
             page["entries"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn interface_counters_decode_direction_and_receive_subtypes() -> Result<()> {
+        let mut bytes = vec![0u8; 112];
+        for (offset, value) in [
+            (32, 9_007_199_254_740_993u64),
+            (40, 3),
+            (48, 5),
+            (56, 51),
+            (64, 99),
+            (72, 98),
+            (80, 7),
+            (88, 97),
+            (96, 96),
+            (104, 5037),
+        ] {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+        }
+        let counters = InterfaceCounters::decode(&bytes)?;
+        let row = counters.observation(13, "tun_wg0", None);
+        assert_eq!(row["rx_errors"], "9007199254740993");
+        assert_eq!(row["tx_errors"], "3");
+        assert_eq!(row["rx_drops"], "5");
+        assert_eq!(row["tx_drops"], "51");
+        assert_eq!(row["rx_frame_errors"], "5037");
+        assert_eq!(row["rx_length_errors"], "7");
+        assert!(row.get("errors").is_none());
+        assert!(row.get("drops").is_none());
+        assert!(InterfaceCounters::decode(&bytes[..111]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn interface_counter_deltas_preserve_baselines_and_log_each_category() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let log = netcontrol_core::PerformanceLog::open(&directory.path().join("performance"))?;
+        let previous = InterfaceCounters {
+            rx_errors: 5037,
+            tx_errors: 3,
+            rx_drops: 0,
+            tx_drops: 51,
+            rx_frame_errors: 5037,
+            rx_length_errors: 0,
+        };
+        let current = InterfaceCounters {
+            rx_errors: 5039,
+            rx_frame_errors: 5039,
+            ..previous
+        };
+        let row = current.observation(13, "tun_wg0", Some(&previous));
+        assert_eq!(row["rx_errors_delta"], "2");
+        assert_eq!(row["rx_frame_errors_delta"], "2");
+        assert_eq!(row["tx_errors_delta"], "0");
+        assert_eq!(row["rx_drops_delta"], "0");
+        assert_eq!(row["tx_drops_delta"], "0");
+        assert_eq!(row["rx_length_errors_delta"], "0");
+        let reset = InterfaceCounters {
+            rx_errors: 0,
+            ..current
+        }
+        .observation(13, "tun_wg0", Some(&previous));
+        assert!(reset["rx_errors_delta"].is_null());
+        assert_eq!(reset["rx_frame_errors_delta"], "2");
+        let first = current.observation(13, "tun_wg0", None);
+        let unchanged = current.observation(13, "tun_wg0", Some(&current));
+        let mut sample = json!({"collected_at":"2026-11-19T08:00:00Z",
+            "interfaces":[first, unchanged]});
+        record_observation(&log, None, &sample);
+        assert!(
+            log.read(&netcontrol_core::LogQuery::parse("")?)?["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        for field in [
+            "rx_errors_delta",
+            "tx_errors_delta",
+            "rx_drops_delta",
+            "tx_drops_delta",
+            "rx_frame_errors_delta",
+            "rx_length_errors_delta",
+        ] {
+            let mut positive = current.observation(13, "tun_wg0", None);
+            positive[field] = json!("2");
+            sample["interfaces"] = json!([positive]);
+            record_observation(&log, None, &sample);
+        }
+        let page = log.read(&netcontrol_core::LogQuery::parse("")?)?;
+        assert_eq!(page["entries"].as_array().unwrap().len(), 6);
         Ok(())
     }
 
@@ -1120,12 +1226,61 @@ fn dump(protocol: i32, kind: u16, payload: &[u8], response_kind: u16) -> Result<
     }
 }
 
+#[derive(Clone, Copy)]
+struct InterfaceCounters {
+    rx_errors: u64,
+    tx_errors: u64,
+    rx_drops: u64,
+    tx_drops: u64,
+    rx_frame_errors: u64,
+    rx_length_errors: u64,
+}
+
+impl InterfaceCounters {
+    fn decode(stats: &[u8]) -> Result<Self> {
+        ensure!(stats.len() >= 112, "short interface counters");
+        let counter = |offset| {
+            u64::from_ne_bytes(
+                stats[offset..offset + 8]
+                    .try_into()
+                    .expect("checked counter length"),
+            )
+        };
+        Ok(Self {
+            rx_errors: counter(32),
+            tx_errors: counter(40),
+            rx_drops: counter(48),
+            tx_drops: counter(56),
+            rx_frame_errors: counter(104),
+            rx_length_errors: counter(80),
+        })
+    }
+
+    fn observation(&self, index: u32, name: &str, previous: Option<&Self>) -> Value {
+        json!({
+            "index":index, "name":name,
+            "rx_errors":self.rx_errors.to_string(),
+            "tx_errors":self.tx_errors.to_string(),
+            "rx_drops":self.rx_drops.to_string(),
+            "tx_drops":self.tx_drops.to_string(),
+            "rx_frame_errors":self.rx_frame_errors.to_string(),
+            "rx_length_errors":self.rx_length_errors.to_string(),
+            "rx_errors_delta":delta(previous.map(|v| v.rx_errors), self.rx_errors).map(|v| v.to_string()),
+            "tx_errors_delta":delta(previous.map(|v| v.tx_errors), self.tx_errors).map(|v| v.to_string()),
+            "rx_drops_delta":delta(previous.map(|v| v.rx_drops), self.rx_drops).map(|v| v.to_string()),
+            "tx_drops_delta":delta(previous.map(|v| v.tx_drops), self.tx_drops).map(|v| v.to_string()),
+            "rx_frame_errors_delta":delta(previous.map(|v| v.rx_frame_errors), self.rx_frame_errors).map(|v| v.to_string()),
+            "rx_length_errors_delta":delta(previous.map(|v| v.rx_length_errors), self.rx_length_errors).map(|v| v.to_string())
+        })
+    }
+}
+
 #[derive(Default)]
 struct Baseline {
     time: Option<Instant>,
     queues: BTreeMap<(u32, u32, u32, String), (u64, u64)>,
     sockets: BTreeMap<[u8; 8], (u64, u32, Option<u64>)>,
-    interfaces: BTreeMap<u32, (String, u64, u64)>,
+    interfaces: BTreeMap<u32, (String, InterfaceCounters)>,
     rtt: Option<f64>,
     zero_observations: Option<u64>,
 }
@@ -1159,31 +1314,24 @@ fn sample(
         let name = crate::netlink_decode::c_string(&name.1)?.to_string();
         names.insert(index, name.clone());
         if let Some((_, stats)) = attrs.iter().find(|(kind, _)| *kind & 0x3fff == 23) {
-            ensure!(stats.len() >= 64, "short interface counters");
-            let counter = |offset| -> Result<u64> {
-                Ok(u64::from_ne_bytes(stats[offset..offset + 8].try_into()?))
-            };
-            let errors = counter(32)?
-                .checked_add(counter(40)?)
-                .context("interface error counter overflow")?;
-            let drops = counter(48)?
-                .checked_add(counter(56)?)
-                .context("interface drop counter overflow")?;
+            let counters = InterfaceCounters::decode(stats)?;
             let old = baseline
                 .interfaces
                 .get(&index)
-                .filter(|(old_name, _, _)| old_name == &name);
-            let error_delta = delta(old.map(|(_, e, _)| *e), errors);
-            let drop_delta = delta(old.map(|(_, _, d)| *d), drops);
-            if error_delta.is_some_and(|v| v > 0) {
+                .filter(|(old_name, _)| old_name == &name)
+                .map(|(_, counters)| counters);
+            if delta(old.map(|v| v.rx_errors), counters.rx_errors).is_some_and(|v| v > 0)
+                || delta(old.map(|v| v.tx_errors), counters.tx_errors).is_some_and(|v| v > 0)
+            {
                 signals.insert("interface_errors");
             }
-            if drop_delta.is_some_and(|v| v > 0) {
+            if delta(old.map(|v| v.rx_drops), counters.rx_drops).is_some_and(|v| v > 0)
+                || delta(old.map(|v| v.tx_drops), counters.tx_drops).is_some_and(|v| v > 0)
+            {
                 signals.insert("interface_drops");
             }
-            interface_rows.push(json!({"index":index,"name":name,"errors":errors.to_string(),"drops":drops.to_string(),
-                "errors_delta":error_delta.map(|v| v.to_string()),"drops_delta":drop_delta.map(|v| v.to_string())}));
-            interfaces.insert(index, (name, errors, drops));
+            interface_rows.push(counters.observation(index, &name, old));
+            interfaces.insert(index, (name, counters));
         }
     }
     let mut queues = Vec::new();

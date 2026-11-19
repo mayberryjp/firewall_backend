@@ -77,6 +77,14 @@
 
 ### Changed
 
+- Replace combined interface error/drop totals and deltas in link diagnostics
+  and new performance evidence with separate RX/TX errors/drops and RX
+  frame/length error subcategories. Preserve exact counters, per-counter reset
+  baselines and positive-delta-only logging; do not infer confirmed WireGuard
+  AllowedIPs mismatches or packet endpoints. Breaking response/log-detail
+  contract; next automatic calendar version.
+  [Required frontend handoff 2026-11-19-06](docs/frontend-handoffs/2026-11-19.md#2026-11-19-06-directional-interface-error-and-drop-counters).
+
 - Change NTP polling from fifteen minutes to 24 hours after each completed
   round, preserving immediate startup and full forward/backward clock steps.
   Reuse the targeted NTP restart API for manual Force sync; no gradual
