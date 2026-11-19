@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Fix musl compilation of gateway receive timestamps by respecting libc-specific
+  ancillary-message length types. Preserve receive validation and timing behavior.
+  Build portability fix; no frontend action, next automatic calendar version.
+
 - Harden shared explicit/DHCP gateway probing: use kernel receive timestamps
   rather than worker processing time, isolate each monitor's replies before
   queueing and drain receptions before finalizing deadlines. Report detected

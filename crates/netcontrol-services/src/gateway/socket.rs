@@ -158,7 +158,7 @@ pub(super) fn recv(
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = mem::size_of_val(&control);
+    message.msg_controllen = mem::size_of_val(&control) as _;
     let n = loop {
         let n = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_TRUNC) };
         if n >= 0 {
@@ -180,9 +180,8 @@ pub(super) fn recv(
     while !header.is_null() {
         let h = unsafe { &*header };
         if h.cmsg_level == libc::SOL_SOCKET {
-            let payload = h
-                .cmsg_len
-                .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
+            let payload =
+                (h.cmsg_len as usize).saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
             if h.cmsg_type == libc::SCM_TIMESTAMPNS {
                 ensure!(
                     payload >= mem::size_of::<libc::timespec>(),
