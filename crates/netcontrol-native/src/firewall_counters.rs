@@ -92,7 +92,7 @@ pub fn userdata(generation: &str, key: &str) -> Result<Vec<u8>> {
         (key.starts_with("/firewall/") || key.starts_with("generated/"))
             && key
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"/_-".contains(&byte)),
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte)),
         "invalid firewall counter key"
     );
     let bytes = format!("{PREFIX}|{generation}|{key}").into_bytes();
@@ -265,6 +265,23 @@ mod tests {
             attribute(7, &userdata(generation, key).unwrap()),
         ]
         .concat()
+    }
+
+    #[test]
+    fn counter_snapshot_preserves_dotted_generated_keys_and_rejects_delimiters() {
+        for kind in ["clients", "servers"] {
+            let key = format!("generated/input/dhcp_relay/eth0.30/{kind}");
+            let expected = BTreeMap::from([(("forward".into(), key.clone()), 1)]);
+            let result = snapshot(&[payload(1, GENERATION, &key, 3, 240)], &expected).unwrap();
+            assert_eq!(result["rules"][0]["id"], format!("forward:{key}"));
+            assert!(result["rules"][0]["config_path"].is_null());
+            assert_eq!(result["rules"][0]["packets"], "3");
+            assert_eq!(result["rules"][0]["bytes"], "240");
+        }
+        for name in ["eth0|30", "eth0 30", "eth0\n30", "eth0\0"] {
+            let key = format!("generated/input/dhcp_relay/{name}/clients");
+            assert!(userdata(GENERATION, &key).is_err());
+        }
     }
 
     #[test]

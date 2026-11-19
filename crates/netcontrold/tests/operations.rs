@@ -44,6 +44,16 @@ impl Fixture {
                     permissions: vec!["state.read".into()],
                 },
                 Credential {
+                    name: "log-reader".into(),
+                    token_sha256: netcontrold::identity::digest("synthetic-log-reader"),
+                    permissions: vec!["logs.read".into()],
+                },
+                Credential {
+                    name: "log-operator".into(),
+                    token_sha256: netcontrold::identity::digest("synthetic-log-operator"),
+                    permissions: vec!["logs.delete".into()],
+                },
+                Credential {
                     name: "operator".into(),
                     token_sha256: netcontrold::identity::digest("synthetic-operator"),
                     permissions: vec!["system.restart".into(), "diagnostics.run".into()],
@@ -98,6 +108,26 @@ impl Fixture {
         let status = reply.status().as_u16();
         let bytes = to_bytes(reply.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+}
+
+#[tokio::test]
+async fn performance_log_purge_authentication_validation_and_unsupported_mode() {
+    let fixture = Fixture::new();
+    let path = "/api/v1/logs/performance";
+    for (token, query, body, expected) in [
+        ("", "", "", 401),
+        ("synthetic-reader", "", "", 403),
+        ("synthetic-log-reader", "", "", 403),
+        ("synthetic-log-operator", "?limit=100", "", 400),
+        ("synthetic-log-operator", "", "{}", 400),
+        ("synthetic-log-operator", "", "", 503),
+    ] {
+        let (status, error) = fixture
+            .request_body("DELETE", &format!("{path}{query}"), Body::from(body), token)
+            .await;
+        assert_eq!(status, expected, "{error}");
+        assert!(error["error"].is_string());
     }
 }
 

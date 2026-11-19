@@ -397,6 +397,13 @@ drift and durable transaction recovery safeguards remain enforced.
   nonce/id/sequence checks, rolling loss/RTT/stddev/percentiles/consecutive RTT
   variation, warmup, and failure/recovery holds. Missing/late/duplicate replies
   are not successes. No configured-route mutation or automatic failover.
+  Kernel socket filters isolate each identifier/nonce before queueing.
+  Kernel receive timestamps exclude worker scheduling, route-check and log-write
+  delays from RTT/deadline decisions; finalization follows a bounded receive
+  drain. Local receive drops/backlog, invalid metadata and receive-clock steps
+  fail explicitly as unavailable/Unknown and enter normal supervised retry,
+  restarting warmup instead of inventing remote loss. Timing/health settings
+  and genuine unanswered/late-probe reporting are unchanged.
   `mode: "explicit"` is the default. DHCPv4 mode omits pinned source/gateway/table;
   this manager reports waiting/Unknown until the native lease coordinator supplies
   a binding. The coordinator uses public `GatewayProbe` to reuse the same ICMP

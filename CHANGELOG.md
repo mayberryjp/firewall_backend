@@ -4,6 +4,40 @@
 
 ### Fixed
 
+- Harden shared explicit/DHCP gateway probing: use kernel receive timestamps
+  rather than worker processing time, isolate each monitor's replies before
+  queueing and drain receptions before finalizing deadlines. Report detected
+  local receive drops/backlog, invalid metadata and receive-clock steps as
+  unavailable with supervised retry, not remote loss. Preserve genuine
+  unanswered/late-probe evidence and configured health thresholds.
+  Measurement-contract fix; no frontend action, next automatic calendar version.
+
+- Preserve the owned protected-host experience nftables table during host
+  takeover, preventing Netcontrol from deleting its own telemetry and leaving
+  the Network Experience page at HTTP 503 with misleading cleanup/drift errors.
+  Keep exact table-family/name/owner checks and foreign-table cleanup; preserve
+  live counters across repeated takeover. Existing-contract fix; no frontend
+  action, next automatic calendar version.
+
+- Resolve service aliases to unique canonical units and stop them before
+  disabling them, preventing Chrony's removed `chronyd.service` alias from
+  aborting installation or full source upgrades. Preserve persistent masks,
+  state verification and explicit failures. Deployment-contract fix; no
+  frontend action, next automatic calendar version.
+
+- Accept dots in firewall counter identifiers so DHCP relay can be applied on
+  valid dotted interface names such as `eth0.30`, and its counters can be read
+  without rejecting the generated identity. Preserve delimiter and size checks.
+  Existing-contract fix; no frontend action, next automatic calendar version.
+
+- Allow fresh installation and full source upgrades to finish while AppArmor
+  remains active. Show a visible recommendation to reboot afterward; reboot
+  may be deferred and no installer rerun is needed. Keep verified GRUB settings,
+  persistent service masks, preserved packages/profiles and genuine setup errors.
+  Successful installer steps now surface warnings without dumping routine logs.
+  Deployment-contract fix; next automatic calendar version.
+  [Required operator-help handoff 2026-11-19-01](docs/frontend-handoffs/2026-11-19.md#2026-11-19-01-deferred-apparmor-reboot).
+
 - Fix process-health sampling starvation under networking-engine lock
   contention: queue the cached read on the existing blocking health task
   rather than repeatedly skipping samples. Preserve timestamps and existing
@@ -21,6 +55,17 @@
   or frontend schema change; next automatic calendar version.
 
 ### Changed
+
+- Replace LAN-only fresh-install prompts and implicit imported WAN settings with
+  an explicitly confirmed IPv4 interface/VLAN wizard: per-port roles and
+  DHCP/static addressing, static WAN gateway/DNS, multiple LANs, new/nested
+  VLANs and single-port WAN/LAN trunks. Apply an explicit LAN-to-WAN starter
+  firewall/NAT policy instead of imported rules. Unattended setup now requires
+  `--network-plan FILE --yes`; IPv6 and DHCP/DNS servers remain outside setup.
+  Permit DHCPv4 clients on managed VLANs as well as Ethernet.
+  Breaking installer/deployment contract and additive DHCP eligibility;
+  next automatic calendar version.
+  [Required frontend/operator handoff 2026-11-19-03](docs/frontend-handoffs/2026-11-19.md#2026-11-19-03-interface-and-vlan-installation-wizard).
 
 - Omit the initial healthy gateway `unknown` to `up` performance-log event
   on each probe-worker start. Preserve initial degraded/down events, probe
@@ -104,6 +149,13 @@
   [handoff 2026-11-12-02](docs/frontend-handoffs/2026-11-12.md#2026-11-12-02-installer-disables-sysstat-collection).
 
 ### Added
+
+- Add bodyless `DELETE /api/v1/logs/performance` with separate `logs.delete`
+  authority to durably purge retained performance evidence while collectors
+  continue. Reset cursor identity, recover interrupted purges on startup and
+  preserve other logs/configuration. Additive API/permission contract; next
+  automatic calendar version.
+  [Required frontend/proxy handoff 2026-11-19-02](docs/frontend-handoffs/2026-11-19.md#2026-11-19-02-performance-log-purge).
 
 - Add a separate durable performance log at `GET /api/v1/logs/performance`
   (`logs.read`): observed qdisc/interface drops/errors, router-local TCP
@@ -377,13 +429,13 @@
   calendar version. Required operator-help review:
   [handoff 2026-11-10-05](docs/frontend-handoffs/2026-11-10.md#2026-11-10-05-network-online-boot-wait).
 
-- Fresh installation and full source upgrades require kernel AppArmor disablement
-  via verified GRUB boot settings, stopping for manual reboot/rerun when active.
+- Fresh installation and full source upgrades prepare kernel AppArmor disablement
+  via verified GRUB boot settings, continuing with a deferred-reboot warning when active.
   Persistently mask its service while preserving all packages (including Ubuntu
   metapackages), profiles, caches and APT preferences. No AppArmor purge,
   autoremove or pin writing; supersedes the earlier removal policy and avoids
   `ubuntu-server-minimal` dependency-removal failures. Source upgrades stop before
-  old-daemon shutdown/binary replacement on failure or reboot requirement.
+  old-daemon shutdown/binary replacement on configuration failure, not a pending reboot.
   Build-only, HTTP/automatic binary upgrades, signed packages, reset and
   standalone hardening do not establish this policy. Release impact: breaking
   installation/security policy; next automatic calendar version.

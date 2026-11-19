@@ -1671,6 +1671,9 @@ impl Backend for Native {
             }
         }
     }
+    fn purge_performance_log(&mut self) -> Result<Value> {
+        self.services.performance_log().purge()
+    }
     fn dhcp_relay_log(&mut self, query: &netcontrol_core::DHCPRelayLogQuery) -> Result<Value> {
         let mut value = self.services.dhcp_relay_log(query)?;
         value["scope"] = json!(self.identity);

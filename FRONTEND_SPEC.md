@@ -61,7 +61,7 @@ Support:
 - Read-only host NIC discovery and explicit Ethernet static configuration.
 - Initial physical-NIC inheritance on supported native host installations,
   in-process DHCPv4 clients and per-interface systemd-resolved configuration.
-- Ubuntu import-preserving console LAN/WAN provisioning, explicit factory-reset
+- Ubuntu console IPv4 interface/VLAN wizard with explicit starter policy, explicit factory-reset
   LAN-to-WAN masquerade and
   service-managed host IPv4 forwarding after native policy reconciliation.
 - Persisted host-input default policy and managed-ingress rules, with implicit
@@ -650,12 +650,14 @@ authentication, schemas, statuses or saved configuration change. Required
 frontend action is operator boot/deployment help, not forms/types/polling;
 see [boot-wait guidance](docs/BUILD_AND_INSTALL.md#network-online-boot-wait) and
 [handoff 2026-11-10-05](docs/frontend-handoffs/2026-11-10.md#2026-11-10-05-network-online-boot-wait).
-Fresh installation additionally requires AppArmor disabled before downloading/
-provisioning Netcontrol. It writes/verifies a GRUB `apparmor=0` drop-in; active
-AppArmor stops deployment for a manual console reboot and rerun, not a
-successful install or automatic reboot. Once the live kernel is verified
-disabled, it stops/disables and persistently masks `apparmor.service` (including
-absent units). All packages, including Ubuntu metapackages, profiles, caches and
+Fresh installation prepares AppArmor disablement before downloading/
+provisioning Netcontrol. It writes/verifies a GRUB `apparmor=0` drop-in and
+stops/disables and persistently masks `apparmor.service` (including absent
+units). Active AppArmor does not abort installation: a visible warning recommends
+a manual console reboot after Netcontrol is installed. Reboot may be deferred;
+no installer rerun or reboot confirmation is required and no automatic reboot
+occurs. Existing kernel confinement may remain active until reboot.
+All packages, including Ubuntu metapackages, profiles, caches and
 APT preferences are preserved. No package queries, purge, autoremove, pin writing
 or profile cleanup is performed by AppArmor preparation. This disables
 confinement protection and must not be described as a security improvement.
@@ -666,14 +668,14 @@ kernel before reboot. Required frontend work is installation/reboot/operator-hel
 disclosure, including preservation of custom profiles, not API forms/types/polling.
 Full source `upgrade.sh` now applies the same shared policy after build and
 before other host setup, old-daemon shutdown or binary replacement. If AppArmor
-is enabled, prepare boot disablement and stop with manual reboot/upgrade-rerun
-instructions; never claim live disablement from a stopped service. Existing
+is enabled, prepare boot disablement and continue binary replacement with the
+same deferred-reboot warning; never claim live disablement from a stopped service. Existing
 AppArmor-disabled hosts still verify boot/live state and mask the service.
 Requires supported GRUB and systemd; full source upgrades do not install prerequisites.
 `--build-only`, HTTP/automatic binary self-upgrades, signed packages, reset and
 standalone hardening do not establish this policy.
 See [scope](docs/BUILD_AND_INSTALL.md#apparmor-disablement) and
-[disable-only handoff 2026-11-10-04](docs/frontend-handoffs/2026-11-10.md#2026-11-10-04-apparmor-disable-only).
+[deferred-reboot handoff 2026-11-19-01](docs/frontend-handoffs/2026-11-19.md#2026-11-19-01-deferred-apparmor-reboot).
 Fresh installation and full source `upgrade.sh` deployments also remove standard
 Ubuntu MOTD files, generator directories and cached messages, remove active
 `pam_motd.so` lines from regular PAM configuration files, and stop/disable and
@@ -697,11 +699,22 @@ jobs are unchanged. No API, authentication, schema or polling changes;
 optional installation-help disclosure only. See
 [operator scope](docs/BUILD_AND_INSTALL.md#sysstat-collection) and
 [handoff 2026-11-12-02](docs/frontend-handoffs/2026-11-12.md#2026-11-12-02-installer-disables-sysstat-collection).
-Interactive installs prompt for missing LAN interface and IPv4
-host/prefix, suggesting the second physical port and `192.168.0.1/24`.
-`--wan` overrides WAN independently; `--lan` and `--lan-address` skip their
-individual prompts. Unattended installs require both LAN flags and fail if either
-is missing. Invalid interactive answers are prompted again; EOF cancels.
+Interactive installs review every physical Ethernet port and existing 802.1Q
+VLAN, offer new VLANs with explicit name/parent/ID, then ask for each interface's
+WAN/LAN/unassigned role and DHCP/static IPv4. Unassigned means no address, suitable
+for a trunk. Static WAN requires an on-link gateway and 1..8 unique IPv4 DNS
+servers. Select exactly one WAN and a private static management LAN; multiple
+trusted LANs, nested VLANs and WAN/LAN on a single shared physical trunk are
+supported. At least one physical Ethernet port is required; Wi-Fi/other virtual
+links are not wizard candidates. All planned links are up at MTU 1500.
+Invalid fields are prompted again; invalid combinations restart role/address
+review. A full summary and explicit `yes` are required before takeover; EOF,
+empty confirmation and `no` cancel. Dependencies/releases are installed/downloaded
+before the wizard, but service/network preparation waits for confirmation.
+Unattended installation requires `--network-plan FILE --yes`; interactive
+`--network-plan FILE` displays/validates the supplied plan and requires `yes`.
+The old installer `--wan`/`--lan`/`--lan-address` arguments are rejected.
+See the exact [installer plan schema](docs/BUILD_AND_INSTALL.md#installer-network-plan).
 The stable-release download mechanism itself adds no HTTP endpoint,
 authentication permission or saved configuration schema.
 An initial capture failure can leave an empty journal lock without a saved
@@ -711,30 +724,35 @@ only while both journal and appliance environment are absent. Existing state,
 environment and active/unsafe locks still block installation; no files are
 deleted to force setup. See the installation guide for operator recovery.
 Alpine packages and the bare daemon default to HTTP on `0.0.0.0:8080`.
-Ubuntu's fresh appliance installer defaults WAN to the first physical Ethernet
-NIC in natural name order (Wi-Fi/virtual NICs excluded). LAN is explicitly
-selected through a prompt or flag. It can be a physical Ethernet port or an
-existing standard 802.1Q VLAN on another physical port, with ID 1..4094.
-Enter its real name, for example `vlan50`, not `vlan50@enp2s0`. Tagged LAN uses
-the VLAN for its address, role, input/forwarding rules and NAT subnet; the physical
-parent remains up, unassigned and without an untagged LAN address. VLAN-on-WAN,
-stacked VLANs and unsupported ownership are rejected. The selected release must
-support tagged provisioning; no physical-parent fallback is allowed.
-LAN addresses must be canonical usable RFC1918 IPv4 hosts, prefixes 8..30,
-entirely within RFC1918 space and not a network/broadcast address. WAN
-retains imported static IPv4, routes and DNS; an empty WAN receives DHCPv4.
-Provisioning preserves imported supported interfaces/firewall/MTU/routes/DNS
-instead of replacing them with factory policy. It sets the chosen WAN/LAN roles,
-enables those ports and replaces only the LAN's addresses/DHCP client. It does
-not invent LAN allow-all, WAN input denial or NAT; operators must review the
-imported rules, including literal subnets affected by the LAN address choice.
+Existing VLAN names/parent/IDs must match live discovery and the imported
+baseline. New parent/ID pairs must be unique, ID 1..4094, parents explicitly in
+the plan, without cycles. The release must advertise `--plan-network`,
+`--check-network-plan` and `--provision-network`; no older-contract fallback.
+Management LAN addresses must be canonical usable RFC1918 IPv4 hosts, prefixes
+8..30, entirely within private space and not a network/broadcast address.
+Other static addresses use usable unicast IPv4 hosts/prefixes 1..32; all static
+subnets must be nonoverlapping. DHCP subnet conflicts/reachability require live
+acceptance. DHCP-client installer route metrics are WAN 100 and LAN 600.
+The reviewed plan replaces imported addressing/routes/DNS/firewall, retaining
+captured kernel ownership and system/software metadata. Other imported Ethernet
+links outside physical discovery are down/unassigned/unaddressed; omitted virtual
+topology is removed from desired state.
+The starter input policy trusts **all configured LANs**, not only management.
+Forwarding allows new traffic only from LAN ingress to the selected WAN egress;
+new inter-LAN and unsolicited WAN forwarding are dropped. Input default is drop,
+with LAN allow-all and WAN UDP destination-port 68 only when it uses DHCP.
+Loopback and established/related replies remain implicit; global ICMP bypass is
+disabled. IPv4 masquerade matches static LAN subnets out WAN; if any LAN uses a
+DHCP client, masquerade has no source filter because that subnet is unknown,
+while forwarding ingress/egress policy still applies. No DHCP/DNS server,
+IPv6 setup, multi-WAN failover, bridge/bond, Wi-Fi association or PPPoE wizard.
 The console transaction commits after verification without a connectivity or
 WAN-readiness timer, and interrupted provisioning resumes its durable candidate.
 Unsupported networking/managers are not restored on connectivity loss.
 Explicit factory reset retains its separate factory contract.
 The installer starts/enables the service with `--appliance` and binds HTTP to the selected LAN address using
 `/etc/netcontrol/appliance.env`; there is no new HTTP provisioning endpoint.
-LAN clients need static addressing/gateway; no DHCP/DNS server is provisioned.
+LAN clients need their own addressing, gateway and DNS; no DHCP/DNS server is provisioned.
 Existing installations are not rerun or reset by the installer. A root-only
 local `--configure-lan NAME --lan-parent NAME --lan-vlan ID --lan-address CIDR`
 command can move an unchanged factory physical LAN to an explicitly identified
@@ -985,6 +1003,10 @@ General socket/daemon log viewing has the separate `logs.read` permission,
 not granted by `state.read`, `syslog.write` or `firewall.logs.read`. Device-account
 keys include it; scoped keys must grant it explicitly. Logs may contain sensitive
 third-party message text; do not grant general readers log access implicitly.
+Performance-history purge requires the separate `logs.delete` permission,
+not `logs.read` or configuration-write permissions. Device-account keys include
+it; scoped keys must grant it explicitly. It currently authorizes only
+`DELETE /api/v1/logs/performance`, not deletion of other log streams.
 Configuration changes additionally require permissions for every changed area:
 
 | Change | Additional permission |
@@ -2878,6 +2900,17 @@ freshness; and **RTT variation (not one-way/RTP jitter)**:
 Never bridge losses/pending probes or turn loss into zero RTT. Null variation
 with no pairs is normal. `sent = received + lost + pending`; loss excludes
 pending from its denominator. Last success may precede the current window.
+RTT and reply deadlines use the kernel's receive timestamp, not the time the
+worker eventually processes the reply. Local scheduling, route checks and log
+writes therefore do not turn an already-arrived, on-time reply into a timeout.
+Each raw socket admits only its own reply type, identifier and random nonce
+before queueing; target, sequence and packet validation still apply.
+Detected local socket drops, excessive receive backlog, missing/truncated
+receive metadata or an unreliable receive clock report unavailable/Unknown
+with an explicit worker error and automatic retry, not remote Down.
+Because Linux receive timestamps use wall time, a detected clock step
+invalidates the measurement attempt and restarts warmup; monotonic scheduling
+and genuine late/unanswered-probe loss thresholds are unchanged.
 Do not derive cumulative packet totals or rates from these rolling-window
 counts. Histories reset on affected settings/network changes, repair/restart;
 configuration revisions do not restore measurements.
@@ -3350,14 +3383,15 @@ Standalone helper/conversion/local-key CLI output and failures before logging
 initialization are not included in direct daemon history. The host journal
 still retains stderr, including early daemon failures; daemon-tagged forwards
 are excluded from syslog even before direct logging initializes, so operators
-must use the host journal for those failures. No new configuration/editor fields
-or clear/delete endpoint. Simulator returns 503 rather than modeled log messages.
+must use the host journal for those failures. No new configuration/editor
+fields. Only performance history has the explicit purge operation below.
+Simulator returns 503 rather than modeled log messages.
 
 All three are bodyless GETs with optional strict `cursor` and `limit` query fields.
 Default `limit=100`, canonical integer 1..500; query maximum 1024 bytes.
 Unknown/duplicate fields, empty/malformed cursors and noncanonical limits are
-400. Other methods are 405, missing/invalid authentication 401, missing
-`logs.read` 403. Storage/backend unavailability is 503 with the existing
+400. Other methods are 405 except the performance DELETE below; missing/invalid
+authentication 401, missing `logs.read` 403. Storage/backend unavailability is 503 with the existing
 `{error:string}` envelope; never return an empty success on corruption/I/O failure.
 Responses retain `Cache-Control: no-store`; do not store log text in browser
 local storage, analytics or shared caches.
@@ -3422,6 +3456,49 @@ written/imported/exposed; no compatibility path or migration is added.
 
 Required frontend work and acceptance:
 [handoff 2026-11-11-05](docs/frontend-handoffs/2026-11-11.md#2026-11-11-05-persistent-socket-and-netcontrol-log-apis).
+
+#### Purging performance evidence
+
+`DELETE /api/v1/logs/performance` requires API-key Bearer authentication and
+`logs.delete` only; `logs.read` is not additionally required. It accepts no
+body (not even `{}`) and no query parameters, including `limit` or `cursor`.
+Success is `200` with:
+
+```json
+{"source":"performance","purged":true}
+```
+
+Deletes all retained performance records across all four segments, without
+changing configuration, revisions, other log streams or collector baselines.
+Collectors remain running. Writes and purge share the storage lock: records
+appended before the purge are removed; records appended afterward remain,
+including in-flight observations whose `observed_at` predates the purge.
+New evidence can therefore appear immediately after success. An empty stream
+can be purged again successfully. This is retained-history deletion, not a
+promise of forensic secure erasure or deletion of external copies.
+
+Each successful purge creates a new persisted cursor identity. Existing GET
+cursors return `reset:true` rather than an ahead-cursor error. Discard local
+performance rows and paging cursors after success, then restart GET polling
+without a cursor. Other viewers must honor `reset:true` and replace their
+local rows; do not merge pre-purge history back into the view.
+
+Missing/invalid authentication is `401`, missing `logs.delete` is `403`,
+any body/query is `400`, unsupported methods are `405`, and unsupported backend,
+storage corruption or I/O failure is `503` with `{error:string}`. Responses are
+`Cache-Control: no-store`. Never infer deletion from a timeout or failed request;
+an I/O failure may leave partial deletion. A synchronized purge intent allows
+restart to finish an interrupted deletion before exposing retained history.
+An in-process storage failure stays explicitly unavailable until restart and
+successful recovery; no empty-success fallback or collector restart is used.
+
+Frontend/proxy work is required: offer an explicitly confirmed destructive
+action, forward bodyless DELETE and `logs.delete` authority, display errors,
+and reset only the performance view after success. The separate device proxy's
+route is `/api/v1/devices/{device_id}/proxy/logs/performance`; its implementation
+is outside this repository and DELETE forwarding remains unverified. Do not
+send the GET page's `cursor`/`limit` or a JSON body when purging.
+See [handoff 2026-11-19-02](docs/frontend-handoffs/2026-11-19.md#2026-11-19-02-performance-log-purge).
 
 #### Performance evidence log
 
@@ -5555,6 +5632,9 @@ Known units are persistently masked/stopped; same-namespace standalone
 competitors are terminated with pidfds. Resolved, SSH, Netcontrol and Wi-Fi
 authentication remain. Inactive manager profiles/private keys are not translated;
 custom launchers/renamed competitors require operator review.
+This import is the ownership/recovery baseline: the fresh installer's approved
+interface/VLAN plan subsequently replaces its addresses/routes/DNS/firewall with
+the explicit starter configuration described in the deployment contract.
 Explicit read-only parents retain link-level settings. Removing a managed
 interface from an aggressively adopted host does not hand it back to an OS
 manager: unconfigured links remain down/address-cleared, except read-only parents.
@@ -5592,7 +5672,7 @@ identity) or hex encoding of 2..255 bytes including the identifier type;
 `hostname` is empty or a canonical hostname, max 253 characters; `route_metric`
 is integer 0..4294967295, default 0; `use_mtu` is boolean, default false;
 `use_domains` is `no` (default), `route`, or `yes`. Clients require a configured
-Ethernet interface, no enabled relay on it and no static IPv4 address in its
+Ethernet or VLAN interface, no enabled relay on it and no static IPv4 address in its
 address list. Static IPv6 may coexist. An administratively down NIC does not run
 a client. DHCP-supplied MTU must fit 1280..65535.
 
@@ -5806,6 +5886,10 @@ Validate entries even when disabled. Enabling requires at least one server,
 an administratively up Ethernet/dummy/VLAN interface, and a configured unicast IPv4
 address. WireGuard cannot be enabled for relay. WAN/LAN role does not restrict
 relay or select upstream interfaces.
+
+Valid dotted interface names (for example `eth0.30`) are supported. Generated
+firewall counter IDs preserve the interface name, including dots; do not rename
+the interface or strip dots when matching these rows.
 
 The first IPv4 address in lexicographically sorted canonical interface prefixes
 is the relay address (`giaddr`). Show it in the editor/review when more than one
@@ -6184,7 +6268,7 @@ resolved address. Runtime lease routes remain numeric/direct learned routes;
 they are not a list of resolved configured routes. No new status field is added.
 
 Offer a Direct / Static address / DHCP gateway selector and only enable the last
-choice for IPv4 routes on draft DHCP-managed Ethernet interfaces. Preserve this
+choice for IPv4 routes on draft DHCP-managed Ethernet or VLAN interfaces. Preserve this
 choice across draft edits, exports, disabled routes, history and rollback.
 Show waiting/error state using the applied runtime lease/error map, not a
 fabricated installed gateway. Keep the existing transaction permissions,
@@ -7214,10 +7298,10 @@ implicit. The forwarding policy has a LAN allow-all rule without egress matching
 default-drop for other new traffic, and stateful returns. NAT remains restricted
 to LAN-subnet IPv4 traffic exiting WAN. Show the DHCP exception and implicit
 rules clearly; deleting the DHCP/LAN allowances can affect reachability/renewal.
-Explicit factory reset sets `firewall.allow_all_icmp: true`. Initial provisioning
-instead retains supported imported policy; imported existing chains disable
-the default implicit ICMP bypass rather than silently widening their policy.
-This allows all IPv4 ICMP types/codes on every interface, including WAN, before
+Explicit factory reset sets `firewall.allow_all_icmp: true`. The fresh installer
+instead creates the reviewed egress-restricted starter policy and sets this
+flag false; it does not retain imported firewall rules.
+When enabled, this allows all IPv4 ICMP types/codes on every interface, including WAN, before
 input/forwarding drops, and accepts local IPv4 ICMP output. It does not cover
 ICMPv6. Show the enabled exception rather than describing WAN as blocking all
 new traffic. Ordinary startup/upgrades do not rewrite existing saved values.
@@ -7851,6 +7935,7 @@ Paths below are relative to `/api/v1`.
 | GET | `/logs/syslog` | Bounded persistent socket-log page; `logs.read`, optional cursor/limit |
 | GET | `/logs/netcontrol` | Bounded persistent daemon/native diagnostic page; `logs.read`, optional cursor/limit |
 | GET | `/logs/performance` | Bounded persistent performance evidence page; `logs.read`, optional cursor/limit |
+| DELETE | `/logs/performance` | Purge all retained performance evidence; `logs.delete`, no body/query; collectors continue |
 | GET | `/firewall/hosts` | Observed `FirewallHost[]`; empty in legacy mode |
 | GET | `/firewall/interface-policies` | Observed ingress `InterfacePolicy[]`; empty in legacy mode |
 | GET | `/firewall/nat` | Observed `{ "masquerade": [...], "destination_rewrite": [...] }` |

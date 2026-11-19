@@ -191,6 +191,14 @@ NAT, rule order, recovery and rollback. Counters that reset within a bucket
 produce null deltas/gap reasons, never a huge subtraction or a guessed zero.
 No per-host full conntrack dumps and no per-packet database writes.
 
+Host takeover preserves the existing `inet netcontrol_experience` table only
+when preserving owned firewall state and its table userdata exactly matches
+`netcontrol-experience-v1`. Repeated takeover must not reset its counters or
+terminate collection. A matching name alone, a different family or a different
+owner does not exempt a table from foreign-firewall cleanup. Full takeover
+without owned-state preservation still clears all tables. Genuine experience
+policy drift continues to fail explicitly rather than deleting changed state.
+
 ### 4.2 Firewall drops
 
 Instrument **managed terminal drop paths** with per-host counter attribution;

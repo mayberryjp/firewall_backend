@@ -175,12 +175,12 @@ impl Store {
     }
 }
 #[cfg(not(windows))]
-fn replace(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn replace(from: &Path, to: &Path) -> Result<()> {
     fs::rename(from, to)?;
     Ok(())
 }
 #[cfg(windows)]
-fn replace(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn replace(from: &Path, to: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {

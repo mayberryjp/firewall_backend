@@ -136,7 +136,7 @@ deploy_upgrade() {
     installer_message warning 'Configuration SSH defaults to localhost TCP 2222 only; explicit overrides are kept. Competing syslog receivers will be disabled.'
     installer_message warning 'Startup owns missing conntrack tuning settings using current values; existing saved tuning is kept.'
     installer_message warning 'OS NTP clients will be stopped and masked. Only explicitly enabled Netcontrol NTP will synchronize the clock.'
-    installer_message warning 'AppArmor confinement will be disabled; packages and profiles are preserved. GRUB is required; active AppArmor requires manual reboot and upgrade rerun before binary replacement.'
+    installer_message warning 'AppArmor confinement will be disabled on the next boot; packages and profiles are preserved. GRUB is required. Upgrade continues without a reboot; reboot manually afterward when convenient.'
     installer_step 'Configuring kernel modules and system services' root_command bash -c 'source "$1"; configure_apparmor && configure_conntrack && configure_link_diagnostics && configure_deny_logging && configure_motd && configure_ntp && configure_appliance_services && configure_logging_units && systemctl daemon-reload' bash "$installer" || return 1
     upgrade_binary "$binary" "$destination" "$installer"
 }
@@ -155,7 +155,8 @@ main() {
             'Disables competing syslog receivers. SSH defaults to localhost TCP 2222 only; explicit overrides are kept.' \
             'Removes MOTD login messages/generators and stops/masks MOTD services.' \
             'Stops/masks OS NTP clients; only explicitly enabled Netcontrol NTP synchronizes the clock.' \
-            'Disables AppArmor via GRUB; if active, stops for manual reboot/rerun before binary replacement.' \
+            'Schedules AppArmor disablement via GRUB; if active, recommends a manual reboot after upgrade.' \
+            'Upgrade continues without rebooting; reboot may be deferred and no upgrade rerun is needed.' \
             'Persistently masks AppArmor service; preserves all packages, profiles, caches and APT preferences.' \
             'Use a local console or independent OS SSH session. Review firewall access.' \
             'No provisioning, reset, git pull, prerequisite installation or boot enablement.' \

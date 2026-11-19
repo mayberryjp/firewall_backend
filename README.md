@@ -78,6 +78,10 @@ loss/latency/RTT variation and configured
 thresholds. Collector failures/recovery and gateway worker failures distinguish
 missing measurements from clean measurements. No additional poller, probes,
 thresholds, configuration changes or automatic tuning are added.
+Gateway replies use kernel arrival timestamps and per-monitor socket filters,
+so delayed userspace processing does not itself become probe loss or RTT.
+Detected local receive overflow/backlog or invalid timing reports unavailable,
+not a remote outage; clock steps invalidate the attempt and restart warmup.
 
 Records contain UTC observation times, interval/identity/counter evidence, and
 gateway probe send times/timeouts; they do not recover exact packet-drop times
@@ -89,6 +93,12 @@ bounded log storage, under `<services-state-dir>/logs/performance`: four 2 MiB
 segments, retained across restart, not an unlimited archive or retention period.
 Busy failure periods can expire history quickly; copy evidence promptly.
 See the [performance log contract](FRONTEND_SPEC.md#performance-evidence-log).
+
+`DELETE /api/v1/logs/performance` with `logs.delete` and no body or query
+durably purges only retained performance evidence. Collection continues;
+new records can appear immediately. Successful purges reset the stream's
+cursor identity, including across restart. Read permission does not authorize
+deletion. See the [purge contract](FRONTEND_SPEC.md#purging-performance-evidence).
 
 Host-wide traffic accounting uses one Rust worker for every kernel interface,
 including unmanaged, VLAN, tunnel, veth and loopback links. Optional
@@ -788,10 +798,11 @@ and Netcontrol release checks remain available; operators must schedule OS
 patching. Running APT jobs are never forcibly stopped; wait for completion and
 retry if verification fails. Binary/source upgrades alone do not apply these
 host policies; existing hosts can use the reviewed hardening workflow.
-Fresh installation and full source upgrades require AppArmor disabled: they
-prepare a GRUB `apparmor=0` boot setting and, if AppArmor is active, stop for a
-manual reboot and rerun before provisioning or binary replacement. Once
-verified disabled, the shared preparation persistently masks its service.
+Fresh installation and full source upgrades prepare a verified GRUB `apparmor=0`
+boot setting and persistently mask its service. Active AppArmor does not block
+installation or binary replacement: a visible warning recommends a manual
+console reboot afterward, which may be deferred without rerunning the installer.
+Existing kernel confinement may remain active until that reboot.
 All packages (including Ubuntu metapackages), profiles, caches and APT preferences
 are preserved; no AppArmor purge, autoremove or package pin is performed.
 This disables confinement protection; it is not
@@ -1238,8 +1249,8 @@ An Ubuntu amd64 [prebuilt installer](install.sh) downloads verified binaries
 from the latest published stable GitHub Release. No Rust/compiler installation,
 GitHub login, CI run ID or manual workflow dispatch is needed on the firewall.
 See the [download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-prebuilt-installation-amd64).
-From a local terminal, it prompts for the LAN interface and IPv4 address/prefix
-before provisioning a fresh appliance:
+From a local terminal, it walks through all Ethernet ports and VLANs, WAN/LAN
+roles, DHCP/static IPv4, WAN gateway/DNS and the management LAN before takeover:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fL https://raw.githubusercontent.com/mayberryjp/firewall_backend/main/install.sh -o /tmp/netcontrol-install.sh
@@ -1251,33 +1262,36 @@ The installer selects one stable version, verifies its manifest, binary size,
 SHA-256, amd64 ELF header and compiled version, and fetches its systemd unit from
 the same release tag. Downloads use verified HTTPS; Ubuntu release assets are
 unsigned, unlike `.ncpkg` packages. Missing or invalid releases fail explicitly.
-The first physical Ethernet interface
-in natural name order (`eno1`, `eno2`, ...; Wi-Fi/virtual links excluded) is WAN.
-The prompts suggest the second physical port and `192.168.0.1/24`, but you can
-choose an existing VLAN such as `vlan50` and `192.168.50.1/24`. The list shows
-the VLAN's ID and physical parent; enter `vlan50`, not `vlan50@enp2s0`.
-Its parent must differ from WAN. An existing VLAN requires explicit safe
-ownership handoff and a release containing VLAN provisioning support.
-Override WAN with `--wan`. Unattended installation must provide both
-`--lan NAME --lan-address CIDR`; omitted values are not silently selected without
-a terminal. Console-only takeover imports supported host networking as owned
-configuration, retaining static WAN, routes, DNS, firewall and other interfaces.
-An empty WAN uses DHCPv4; no lease/connectivity timer gates commitment.
+No WAN is selected silently. Review every physical Ethernet port and existing
+802.1Q VLAN; create additional VLANs by name, parent and ID (1..4094), including
+tagged WAN/LAN on a single shared trunk and nested VLANs. Choose exactly one WAN
+and one or more trusted LANs. Each assigned link uses DHCPv4 or static IPv4;
+unassigned ports have no IP and can serve as VLAN parents. Static WAN requires
+an on-link gateway and DNS servers. Select a private static management LAN,
+then review the complete plan and explicitly confirm. EOF or declining cancels.
+For unattended use supply `--network-plan FILE --yes`; the old installer
+`--wan`/`--lan`/`--lan-address` flags are not accepted. See the
+[plan schema and example](docs/BUILD_AND_INSTALL.md#installer-network-plan).
+Console-only takeover captures supported host networking for ownership/recovery,
+then replaces addressing, routes, DNS and firewall with the reviewed plan.
+No lease/connectivity timer gates commitment.
 Unsupported topology/routes/policy/firewall/traffic control and known competing
 managers are disabled, not left active or used as reasons to refuse discovery.
 IPv6 is disabled by default. Private capture and explicit runtime takeover
 status support interruption/retry, not automatic connectivity rollback.
-The installer assigns WAN/LAN roles and the chosen LAN address, enables/starts
-the service and binds HTTP management to LAN. It does not replace imported
-firewall policy with factory allow-all/NAT rules; review management permissions
-and client forwarding from console. Explicit factory reset remains separate.
+The installer enables/starts the service and binds HTTP to the management LAN.
+The starter firewall trusts all selected LANs for router access, allows new
+forwarding only from LAN to WAN, and masquerades IPv4 on WAN. Unsolicited WAN
+input/forwarding is dropped, except DHCP replies; established/related replies
+and loopback remain implicit. There is no inter-LAN forwarding allowance or
+global ICMP bypass. Explicit factory reset remains separate.
 Existing appliance state is not reset.
 The packaged systemd service starts without waiting for `network-online.target`.
 Installation and full source upgrades persistently mask
 `systemd-networkd-wait-online.service` to avoid its boot timeout; this does not
 disable networkd itself or guarantee WAN connectivity at startup. See the
 [boot-wait operator guidance](docs/BUILD_AND_INSTALL.md#network-online-boot-wait).
-LAN clients currently need static addresses and the appliance as their gateway;
+LAN clients need their own addressing, DNS and the appliance as their gateway;
 no LAN DHCP or DNS server is installed. IPv6 forwarding is not enabled.
 Use console access during provisioning. See the
 [service commands](docs/BUILD_AND_INSTALL.md#ubuntu-systemd-service). The GitHub

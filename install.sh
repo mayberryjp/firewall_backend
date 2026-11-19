@@ -31,6 +31,8 @@ installer_step() (
         if [[ $status -ne 0 ]]; then
             installer_message error "$label (exit $status)"
             cat -- "$output" >&2
+        else
+            sed -n '/^\[WARN\] /p' "$output" >&2 || status=$?
         fi
         rm -f -- "$output"
         exit "$status"
@@ -126,9 +128,10 @@ configure_deny_logging() (
 
 configure_masked_units() (
     set -euo pipefail
-    local label=$1 unit state status
+    local label=$1 unit state status canonical
     shift
     local -a loaded=() masked=() present=() jobs=()
+    local -A seen=()
     for unit in "$@"; do
         if ! state=$(systemctl show "$unit" --property LoadState --value); then
             [[ $state == not-found ]] || {
@@ -140,7 +143,16 @@ configure_masked_units() (
             loaded)
                 case $unit in
                     apt-daily.service|apt-daily-upgrade.service) jobs+=("$unit") ;;
-                    *) loaded+=("$unit") ;;
+                    *)
+                        if ! canonical=$(systemctl show "$unit" --property Id --value) ||
+                           [[ -z $canonical || $canonical == *[[:space:]]* || $canonical == -* ]]; then
+                            printf 'Cannot resolve canonical %s unit %s.\n' "$label" "$unit" >&2
+                            exit 1
+                        fi
+                        if [[ ! ${seen[$canonical]+present} ]]; then
+                            loaded+=("$canonical")
+                            seen[$canonical]=1
+                        fi ;;
                 esac
                 present+=("$unit") ;;
             masked) masked+=("$unit"); present+=("$unit") ;;
@@ -153,7 +165,9 @@ configure_masked_units() (
     fi
     installer_message step "Disabling $label services."
     if [[ ${#loaded[@]} -gt 0 ]]; then
-        systemctl disable --now "${loaded[@]}" || exit 1
+        # Disabling a unit can remove its aliases before --now tries to stop them.
+        systemctl stop "${loaded[@]}" || exit 1
+        systemctl disable "${loaded[@]}" || exit 1
     fi
     for unit in "${masked[@]}"; do
         case $unit in
@@ -200,7 +214,7 @@ configure_sysstat_collection() (
 
 configure_apparmor() (
     set -euo pipefail
-    local root=${1:-/} path parent work previous=false enabled status
+    local root=${1:-/} path parent work previous=false enabled status active=false
     local grub="$root/etc/default/grub.d/99-netcontrol-apparmor.cfg"
     local generated="$root/boot/grub/grub.cfg"
     [[ $root == /* && -d $root && ! -L $root ]] || {
@@ -259,9 +273,7 @@ configure_apparmor() (
         enabled=$(cat -- "$root/sys/module/apparmor/parameters/enabled") || exit 1
         case $enabled in
             N|0) ;;
-            Y|1)
-                printf 'AppArmor is still enabled in the running kernel. Boot disable is prepared; reboot manually from a local console, then rerun the same install.sh or upgrade.sh command. Deployment has not continued; packages and profiles are preserved.\n' >&2
-                exit 1 ;;
+            Y|1) active=true ;;
             *) printf 'Cannot verify running AppArmor state: %s\n' "$enabled" >&2; exit 1 ;;
         esac
     elif [[ -e $root/sys/module/apparmor ]]; then
@@ -270,7 +282,7 @@ configure_apparmor() (
     if [[ -e $root/sys/kernel/security/lsm ]]; then
         enabled=$(cat -- "$root/sys/kernel/security/lsm") || exit 1
         if [[ ,$enabled, == *,apparmor,* ]]; then
-            printf 'AppArmor remains in the active kernel LSM list; reboot into apparmor=0 before deployment.\n' >&2; exit 1
+            active=true
         fi
     fi
     configure_masked_units AppArmor apparmor.service || exit 1
@@ -280,7 +292,10 @@ configure_apparmor() (
         grep -Eq '^ActiveState=(inactive|failed)$' <<< "$status" || {
             printf 'AppArmor service is not stopped and persistently masked.\n' >&2; exit 1;
         }
-    installer_message success 'AppArmor disabled in the running kernel and GRUB; service persistently masked. All packages, profiles, caches and APT preferences preserved.'
+    installer_message success 'AppArmor disablement configured in GRUB; service persistently masked. All packages, profiles, caches and APT preferences preserved.'
+    if [[ $active == true ]]; then
+        installer_message warning 'AppArmor is still enabled in the running kernel. Installation/upgrade will continue without rebooting. Please reboot manually from a local console after Netcontrol is installed to apply apparmor=0; you may defer this reboot. Existing kernel confinement may remain active until then. No installer rerun is needed.'
+    fi
 )
 
 configure_ntp() (
@@ -629,55 +644,6 @@ lan_vlan_details() {
     printf '%s\n' "$found"
 }
 
-prompt_appliance_lan() {
-    local wan=$1 lan=$2 address=$3 directory=${4:-/sys/class/net} vlan_table=${5:-/proc/net/vlan/config} defaults answer
-    defaults=$(select_appliance_ports '' '' "$directory" "$vlan_table") || return 1
-    local default_wan default_lan
-    read -r default_wan default_lan <<< "$defaults"
-    wan=${wan:-$default_wan}
-    if [[ $default_lan == "$wan" ]]; then default_lan=$default_wan; fi
-    select_appliance_ports "$wan" "${lan:-$default_lan}" "$directory" "$vlan_table" >/dev/null || return 1
-    printf 'WAN: %s (use --wan NAME to change).\n' "$wan" >&2
-    if [[ -z $lan ]]; then
-        printf 'Available LAN interfaces:\n' >&2
-        local path name details parent id
-        for path in "$directory"/*; do
-            name=${path##*/}
-            if [[ $name != lo && -d $path/device && -r $path/type && $(< "$path/type") == 1 &&
-               ! -d $path/wireless && ! -e $path/phy80211 ]]; then
-                printf '  %s%s\n' "$name" "$([[ $name == "$wan" ]] && printf ' (selected WAN)')" >&2
-            elif details=$(lan_vlan_details "$name" "$vlan_table"); then
-                read -r parent id <<< "$details"
-                if select_appliance_ports "$wan" "$name" "$directory" "$vlan_table" >/dev/null 2>&1; then
-                    printf '  %s (VLAN %s on %s)\n' "$name" "$id" "$parent" >&2
-                fi
-            fi
-        done
-        while :; do
-            printf 'LAN interface [%s]: ' "$default_lan" >&2
-            if ! IFS= read -r answer; then
-                printf '\nInstallation cancelled: LAN selection input ended.\n' >&2
-                return 1
-            fi
-            lan=${answer:-$default_lan}
-            if select_appliance_ports "$wan" "$lan" "$directory" "$vlan_table" >/dev/null; then break; fi
-        done
-    fi
-    if [[ -z $address ]]; then
-        while :; do
-            printf 'LAN IPv4 address/prefix [192.168.0.1/24]: ' >&2
-            if ! IFS= read -r answer; then
-                printf '\nInstallation cancelled: LAN address input ended.\n' >&2
-                return 1
-            fi
-            address=${answer:-192.168.0.1/24}
-            if valid_lan_address "$address"; then break; fi
-            printf 'Enter a usable private IPv4 host address/prefix (8..30), for example 192.168.50.1/24.\n' >&2
-        done
-    fi
-    printf '%s %s %s\n' "$wan" "$lan" "$address"
-}
-
 valid_lan_address() {
     local address=$1 a b c d prefix ip mask network
     [[ $address =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
@@ -695,30 +661,49 @@ valid_lan_address() {
 }
 
 provision_appliance() {
-    local binary=$1 wan=$2 lan=$3 address=$4 details parent id
-    local -a vlan_arguments=()
-    if details=$(lan_vlan_details "$lan"); then
-        read -r parent id <<< "$details"
-        vlan_arguments=(--provision-lan-parent "$parent" --provision-lan-vlan "$id")
-    fi
+    local binary=$1 plan=$2 address=$3
     "$binary" --backend linux --appliance \
         --state /var/lib/netcontrol/native-state.json \
         --credential-db /var/lib/netcontrol/credentials.json \
         --keys /etc/netcontrol/keys \
         --services-state-dir /var/lib/netcontrol/services \
-        --provision-wan "$wan" --provision-lan "$lan" --provision-lan-address "$address" \
-        "${vlan_arguments[@]}" || return 1
-    printf 'NETCONTROL_LISTEN=%s:8080\n' "${address%/*}" |
+        --provision-network "$plan" || return 1
+    printf 'NETCONTROL_LISTEN=%s:8080\n' "$address" |
         install -o root -g root -m 0600 /dev/stdin /etc/netcontrol/appliance.env || return 1
     systemctl daemon-reload || return 1
     systemctl enable --now netcontrold.service || return 1
     curl --noproxy '*' --silent --show-error --fail --retry 15 \
         --retry-connrefused --retry-all-errors --retry-delay 1 --max-time 2 \
-        "http://${address%/*}:8080/" >/dev/null || return 1
+        "http://$address:8080/" >/dev/null || return 1
     [[ $(sysctl -n net.ipv4.ip_forward) == 1 ]] || {
         printf 'Appliance startup did not enable IPv4 forwarding. Inspect the service journal.\n' >&2
         return 1
     }
+}
+
+prepare_network_plan() {
+    local binary=$1 plan=$2 supplied=$3 approved=$4 address answer
+    if [[ $supplied == false ]]; then
+        "$binary" --plan-network "$plan" || return 1
+    fi
+    address=$("$binary" --check-network-plan "$plan") || return 1
+    if [[ $supplied == true ]]; then
+        printf 'Proposed network plan (replaces imported networking/firewall):\n' >&2
+        cat -- "$plan" >&2 || return 1
+        printf '\nAll LANs are trusted for router access; LAN -> WAN forwarding and IPv4 masquerade only. No DHCP/DNS server.\n' >&2
+        if [[ $approved != true ]]; then
+            printf 'Apply this plan without connectivity rollback? Type yes: ' >&2
+            if ! IFS= read -r answer || [[ $answer != yes ]]; then
+                printf '\nInstallation cancelled.\n' >&2
+                return 1
+            fi
+        fi
+    fi
+    [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        printf 'Daemon returned an invalid management IPv4 address.\n' >&2
+        return 1
+    }
+    printf '%s\n' "$address"
 }
 
 download_prebuilt() {
@@ -835,7 +820,9 @@ check_prebuilt() (
         exit 1
     fi
     help=$(./netcontrold --help) || exit 1
-    if ! grep -q -- --provision-wan <<< "$help" ||
+    if ! grep -q -- --provision-network <<< "$help" ||
+       ! grep -q -- --plan-network <<< "$help" ||
+       ! grep -q -- --check-network-plan <<< "$help" ||
        ! grep -q console-host-takeover <<< "$help" ||
        ! grep -q conntrack-tuning-ownership <<< "$help" ||
        ! grep -q NETCONTROL_ALLOW_HOST_SERVICES <<< "$help" ||
@@ -845,12 +832,6 @@ check_prebuilt() (
        ! grep -q -- --configure-updates <<< "$help"; then
         printf 'Release lacks current appliance provisioning/service/SSH environment support. No older-contract fallback is provided.\n' >&2
         exit 1
-    fi
-    if [[ -n ${2:-} ]] && lan_vlan_details "$2" >/dev/null; then
-        if ! grep -q -- --provision-lan-parent <<< "$help" || ! grep -q -- --provision-lan-vlan <<< "$help"; then
-            printf 'This release does not support VLAN LAN provisioning; install a release containing tagged LAN support.\n' >&2
-            exit 1
-        fi
     fi
 )
 
@@ -880,27 +861,33 @@ check_fresh_installation() {
 }
 
 main() {
-    local wan='' lan='' lan_address='' ports
+    local network_plan='' management_address supplied=false approved=false
     if [[ ${1:-} == --help ]]; then
         printf '%s\n' \
-            'Usage: sudo bash install.sh [--wan NAME] [--lan NAME] [--lan-address CIDR]' \
+            'Usage: sudo bash install.sh [--network-plan FILE [--yes]]' \
             '' \
             'Install the latest stable release on a fresh Ubuntu amd64 host.' \
             'Requires root, systemd-networkd, systemd-resolved and a local console.' \
             '' \
-            '  --wan NAME          WAN port (default: first physical Ethernet port)' \
-            '  --lan NAME          LAN port or existing VLAN (prompted if omitted)' \
-            '  --lan-address CIDR  Private LAN IPv4 address (prompt: 192.168.0.1/24)' \
+            'Walks through every Ethernet port and VLAN: roles, DHCP/static IPv4, WAN gateway/DNS.' \
+            'Create VLANs with explicit parent/ID, including shared WAN/LAN trunks.' \
+            'Select a private static management LAN; review and confirm before network takeover.' \
+            'Exactly one WAN; multiple trusted LANs; IPv6 configured later in the controller.' \
+            '  --network-plan FILE  Use a reviewed JSON network plan instead of the wizard' \
+            '  --yes                Approve that supplied plan without a confirmation prompt' \
             '' \
-            'Unattended installs require --lan and --lan-address.' \
-            'Imports supported host networking; disables unsupported settings and competing managers.' \
+            'Unattended installs require --network-plan FILE --yes.' \
+            'Replaces imported interface addressing/routes/DNS and firewall with the reviewed plan.' \
+            'Allows router access from all LANs, LAN-to-WAN forwarding/NAT; drops unsolicited WAN traffic.' \
+            'Disables unsupported settings and competing managers.' \
             'Captures current conntrack tuning values into owned configuration.' \
-            'No connectivity rollback. Review imported firewall rules from the console.' \
+            'No connectivity rollback. Review the starter firewall policy from the console.' \
             'Disables Snap, competing syslog receivers and automatic OS updates, including security fixes.' \
             'Removes MOTD login messages/generators and stops/masks MOTD services.' \
             'Stops/masks OS NTP clients; Netcontrol NTP remains disabled until explicitly configured.' \
             'Stops/masks the sysstat collection timer and service; preserves existing statistics.' \
-            'Disables AppArmor via GRUB; if active, stops for manual reboot/rerun before proceeding.' \
+            'Schedules AppArmor disablement via GRUB; if active, recommends a manual reboot after installation.' \
+            'Installation continues without rebooting; reboot may be deferred and no installer rerun is needed.' \
             'Persistently masks AppArmor service; preserves all packages, profiles, caches and APT preferences.' \
             'Schedule manual OS patching. LAN clients need static addresses; no DHCP/DNS server is installed.' \
             'Enables LAN HTTP setup, localhost configuration SSH on TCP 2222 and startup at boot.' \
@@ -910,20 +897,23 @@ main() {
         return
     fi
     while [[ $# -gt 0 ]]; do
-        [[ $# -ge 2 ]] || { printf 'Missing option value; use --help.\n' >&2; return 1; }
         case $1 in
-            --wan) [[ -z $wan ]] || return 1; wan=$2 ;;
-            --lan) [[ -z $lan ]] || return 1; lan=$2 ;;
-            --lan-address) lan_address=$2 ;;
+            --network-plan)
+                [[ $# -ge 2 && -z $network_plan && -n $2 ]] || { printf 'Specify --network-plan FILE once.\n' >&2; return 1; }
+                network_plan=$2; supplied=true; shift 2 ;;
+            --yes)
+                [[ $approved == false ]] || { printf 'Specify --yes once.\n' >&2; return 1; }
+                approved=true; shift ;;
             *) printf 'Unknown option: %s. Use --help.\n' "$1" >&2; return 1 ;;
         esac
-        shift 2
     done
-    if [[ ( -n $wan && ! $wan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
-            ( -n $lan && ! $lan =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$ ) ||
-          ( -n $lan_address && ! $lan_address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ) ]]; then
-        printf 'Specify valid interface names and an IPv4 LAN host/prefix; --wan may be overridden independently. Use --help.\n' >&2
+    if [[ $approved == true && $supplied == false ]]; then
+        printf '%s\n' '--yes requires --network-plan FILE.' >&2
         return 1
+    fi
+    if [[ $supplied == true ]]; then
+        [[ -f $network_plan && ! -L $network_plan ]] || { printf 'Network plan must be a regular, non-symlink file.\n' >&2; return 1; }
+        network_plan=$(readlink -f -- "$network_plan") || return 1
     fi
     if [[ $(uname -s) != Linux || ! -r /etc/os-release ]]; then
         printf 'This prebuilt installer requires Ubuntu Linux amd64.\n' >&2
@@ -945,29 +935,15 @@ main() {
     fi
 
     check_fresh_installation /var/lib/netcontrol/native-state.json /etc/netcontrol/appliance.env || return 1
-    if [[ -z $lan || -z $lan_address ]]; then
-        if [[ ! -t 0 ]]; then
-            printf 'Noninteractive installation requires --lan NAME and --lan-address CIDR; use a local terminal for prompted setup.\n' >&2
-            return 1
-        fi
-        ports=$(prompt_appliance_lan "$wan" "$lan" "$lan_address") || return 1
-        read -r wan lan lan_address <<< "$ports"
-    elif [[ -z $wan ]]; then
-        ports=$(select_appliance_ports '' '') || return 1
-        read -r wan _ <<< "$ports"
-    fi
-    valid_lan_address "$lan_address" || {
-        printf 'LAN address must be a usable RFC1918 IPv4 host prefix (8..30).\n' >&2
+    if [[ ! -t 0 && ( $supplied == false || $approved == false ) ]]; then
+        printf 'Noninteractive installation requires --network-plan FILE --yes; use a local terminal for the wizard.\n' >&2
         return 1
-    }
-    ports=$(select_appliance_ports "$wan" "$lan") || return 1
-    read -r wan lan <<< "$ports"
-    printf 'WAN: %s; LAN: %s (%s)\n' "$wan" "$lan" "$lan_address"
+    fi
     installer_message warning 'Use a local console. Host networking will be taken over without connectivity rollback.'
     installer_message warning 'Automatic OS updates, including security fixes, and Snap will be disabled. Schedule manual patching.'
     installer_message warning 'Competing syslog receivers will be disabled. Configuration SSH listens on localhost TCP 2222 only by default.'
     installer_message warning 'OS NTP clients will be stopped and masked. Configure Netcontrol NTP explicitly to synchronize the clock.'
-    installer_message warning 'AppArmor confinement will be disabled; packages and profiles are preserved. GRUB is required; active AppArmor requires a manual reboot and installer rerun.'
+    installer_message warning 'AppArmor confinement will be disabled on the next boot; packages and profiles are preserved. GRUB is required. Installation continues without a reboot; reboot manually afterward when convenient.'
     systemctl is-active --quiet systemd-networkd.service || {
         installer_message error 'systemd-networkd must be running.'
         return 1
@@ -978,7 +954,6 @@ main() {
     }
     installer_step 'Refreshing package lists' apt-get update || return 1
     installer_step 'Installing prerequisites' apt-get install --no-install-recommends -y ca-certificates python3 procps kmod curl || return 1
-    installer_step 'Disabling AppArmor' configure_apparmor || return 1
     if pgrep -x netcontrold >/dev/null; then
         printf 'Stop the running netcontrold before installing; networking will not be stopped automatically.\n' >&2
         return 1
@@ -988,8 +963,14 @@ main() {
     printf -v cleanup 'rm -rf -- %q' "$work"
     trap "$cleanup" EXIT
     installer_step 'Downloading and verifying the latest release' download_prebuilt "$work" || return 1
-    installer_step 'Checking release support' check_prebuilt "$work" "$lan" || return 1
+    installer_step 'Checking release support' check_prebuilt "$work" || return 1
     installer_message success "Release v$(< "$work/release-version") ready."
+    if [[ $supplied == true ]]; then
+        install -m 0600 -- "$network_plan" "$work/network-plan.json" || return 1
+    fi
+    network_plan="$work/network-plan.json"
+    management_address=$(prepare_network_plan "$work/netcontrold" "$network_plan" "$supplied" "$approved") || return 1
+    installer_step 'Disabling AppArmor' configure_apparmor || return 1
     cd "$work"
     check_systemd_unit || return 1
     installer_step 'Configuring connection tracking' configure_conntrack || return 1
@@ -998,10 +979,10 @@ main() {
     installer_step 'Creating the install directory' install -d -m 0755 /usr/local/sbin || return 1
     installer_step 'Installing netcontrold' install -m 0755 netcontrold /usr/local/sbin/netcontrold || return 1
     installer_step 'Configuring system services' install_systemd_service || return 1
-    installer_step 'Taking over networking and starting Netcontrol' provision_appliance /usr/local/sbin/netcontrold "$wan" "$lan" "$lan_address" || return 1
+    installer_step 'Taking over networking and starting Netcontrol' provision_appliance /usr/local/sbin/netcontrold "$network_plan" "$management_address" || return 1
     installer_message success 'Installed. Service enabled at boot.'
-    printf 'Setup: http://%s:8080/\nSSH: localhost TCP 2222; ssh -p 2222 apikey@127.0.0.1; use an API key created after setup.\nLogs: journalctl -u netcontrold -f\n' "${lan_address%/*}"
-    installer_message warning 'Review imported firewall rules from the console. LAN clients need static addresses and this gateway; no DHCP/DNS server was installed.'
+    printf 'Setup: http://%s:8080/\nSSH: localhost TCP 2222; ssh -p 2222 apikey@127.0.0.1; use an API key created after setup.\nLogs: journalctl -u netcontrold -f\n' "$management_address"
+    installer_message warning 'All configured LANs are trusted for router access. LAN clients need addressing, this gateway and DNS; no DHCP/DNS server was installed. Verify WAN connectivity from the console.'
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

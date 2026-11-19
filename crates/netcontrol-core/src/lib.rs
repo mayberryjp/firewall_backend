@@ -107,6 +107,9 @@ pub trait Backend: Send {
     fn logs(&mut self, _source: LogSource, _query: &LogQuery) -> Result<Value> {
         anyhow::bail!("log history requires the native Linux backend")
     }
+    fn purge_performance_log(&mut self) -> Result<Value> {
+        anyhow::bail!("performance log purge requires the native Linux backend")
+    }
     fn dhcp_relay_log(&mut self, _query: &DHCPRelayLogQuery) -> Result<Value> {
         anyhow::bail!("DHCP relay logs require the native Linux backend")
     }

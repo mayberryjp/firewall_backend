@@ -236,7 +236,7 @@ impl DiskLog {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_str().context("invalid log history filename")?;
-            if name == "writer.lock" || name == "identity" {
+            if name == "writer.lock" || name == "identity" || name == "purge.pending" {
                 continue;
             }
             let sequence = name
@@ -254,6 +254,14 @@ impl DiskLog {
             paths.len() <= segment_count + 1,
             "log history exceeds segment bound"
         );
+        match fs::symlink_metadata(directory.join("purge.pending")) {
+            Ok(_) => {
+                finish_purge(directory, paths.iter().map(|(_, path)| path.as_path()))?;
+                paths.clear();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let identity = directory.join("identity");
         let epoch = match open_file(&identity, false) {
             Ok(file) => {
@@ -396,6 +404,44 @@ impl DiskLog {
         Ok(())
     }
 
+    pub fn purge(&self) -> Result<()> {
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("log storage lock poisoned"))?;
+        ensure!(
+            inner.error.is_none(),
+            "log storage unavailable: {:?}",
+            inner.error
+        );
+        let result = (|| -> Result<()> {
+            inner.check_active()?;
+            for segment in &inner.segments {
+                open_file(&segment.path, false)?;
+            }
+            open_file(&inner.directory.join("identity"), false)?;
+            let epoch = format!("{:032x}", rand::random::<u128>());
+            let mut intent = open_file(&inner.directory.join("purge.pending"), true)?;
+            intent.write_all(epoch.as_bytes())?;
+            intent.sync_all()?;
+            sync_directory(&inner.directory)?;
+            drop(intent);
+            inner.file = None;
+            finish_purge(
+                &inner.directory,
+                inner.segments.iter().map(|segment| segment.path.as_path()),
+            )?;
+            inner.segments.clear();
+            inner.sequence = 0;
+            inner.epoch = epoch;
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            inner.error = Some(format!("{error:#}"));
+        }
+        result
+    }
+
     pub fn read(&self, query: &LogQuery) -> Result<LogPage> {
         let inner = self
             .0
@@ -469,6 +515,28 @@ impl DiskLog {
             max_message_bytes: LOG_MESSAGE_BYTES,
         })
     }
+}
+
+fn finish_purge<'a>(directory: &Path, paths: impl Iterator<Item = &'a Path>) -> Result<()> {
+    let pending = directory.join("purge.pending");
+    let intent = open_file(&pending, false)?;
+    ensure!(
+        intent.metadata()?.len() == 32,
+        "invalid log purge identity size"
+    );
+    let epoch = fs::read_to_string(&pending)?;
+    ensure!(valid_epoch(&epoch), "invalid log purge identity");
+    drop(intent);
+    // The durable intent makes an interrupted purge finish before history is exposed.
+    for path in paths {
+        let file = open_file(path, false)?;
+        drop(file);
+        fs::remove_file(path)?;
+    }
+    sync_directory(directory)?;
+    crate::store::replace(&pending, &directory.join("identity"))?;
+    sync_directory(directory)?;
+    Ok(())
 }
 
 impl Inner {
@@ -570,6 +638,131 @@ mod tests {
             assert!(LogQuery::parse(query).is_err(), "{query}");
         }
         assert!(LogQuery::parse(&"x".repeat(1025)).is_err());
+    }
+
+    #[test]
+    fn purge_removes_all_segments_resets_cursors_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("logs");
+        let log = DiskLog::open_bounded(&path, 200, 4).unwrap();
+        for _ in 0..4 {
+            log.append(&"x".repeat(60)).unwrap();
+        }
+        let before = log.read(&LogQuery::parse("").unwrap()).unwrap();
+        assert_eq!(before.entries.len(), 4);
+        let producer = log.clone();
+        log.purge().unwrap();
+        let query = LogQuery::parse(&format!("cursor={}", before.next_cursor)).unwrap();
+        let empty = producer.read(&query).unwrap();
+        assert!(empty.reset && empty.entries.is_empty());
+        assert!(empty.oldest_cursor.is_none());
+        assert!(!empty.gap && !empty.has_more);
+        assert!(empty.next_cursor.ends_with(":0"));
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 2);
+        drop(producer);
+        drop(log);
+        let log = DiskLog::open_bounded(&path, 200, 4).unwrap();
+        assert_eq!(
+            log.read(&LogQuery::parse("").unwrap()).unwrap().next_cursor,
+            empty.next_cursor
+        );
+        log.append("new evidence").unwrap();
+        let page = log.read(&query).unwrap();
+        assert!(page.reset);
+        assert_eq!(page.entries[0].message, "new evidence");
+        assert_eq!(page.entries[0].sequence, "1");
+        log.purge().unwrap();
+        log.purge().unwrap();
+    }
+
+    #[test]
+    fn concurrent_purge_and_appends_keep_one_consistent_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("logs");
+        let log = DiskLog::open(&path).unwrap();
+        log.append("before purge").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let log = log.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10 {
+                        log.append("racing producer").unwrap();
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        log.purge().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        log.append("after purge").unwrap();
+        let page = log.read(&LogQuery::parse("").unwrap()).unwrap();
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| entry.message != "before purge")
+        );
+        assert_eq!(page.entries.last().unwrap().message, "after purge");
+        for (index, entry) in page.entries.iter().enumerate() {
+            assert_eq!(entry.sequence, (index + 1).to_string());
+        }
+        drop(log);
+        let reopened = DiskLog::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.read(&LogQuery::parse("").unwrap()).unwrap()).unwrap(),
+            serde_json::to_value(page).unwrap()
+        );
+    }
+
+    #[test]
+    fn interrupted_purge_finishes_before_reopening_history() {
+        for deleted in 0..=3 {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("logs");
+            let log = DiskLog::open_bounded(&path, 200, 4).unwrap();
+            for _ in 0..3 {
+                log.append(&"x".repeat(60)).unwrap();
+            }
+            drop(log);
+            let epoch = "0123456789abcdef0123456789abcdef";
+            let mut intent = open_file(&path.join("purge.pending"), true).unwrap();
+            intent.write_all(epoch.as_bytes()).unwrap();
+            intent.sync_all().unwrap();
+            drop(intent);
+            for sequence in 1..=deleted {
+                fs::remove_file(path.join(format!("{sequence:020}.jsonl"))).unwrap();
+            }
+            let log = DiskLog::open_bounded(&path, 200, 4).unwrap();
+            let page = log.read(&LogQuery::parse("").unwrap()).unwrap();
+            assert!(page.entries.is_empty());
+            assert_eq!(page.next_cursor, format!("{epoch}:0"));
+            assert!(!path.join("purge.pending").exists());
+            log.append("after interrupted purge").unwrap();
+        }
+    }
+
+    #[test]
+    fn purge_rejects_modified_storage_without_deleting_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("logs");
+        let log = DiskLog::open(&path).unwrap();
+        log.append("preserved on failure").unwrap();
+        let segment = path.join("00000000000000000001.jsonl");
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(b"corruption")
+            .unwrap();
+        let before = fs::read(&segment).unwrap();
+        assert!(log.purge().is_err());
+        assert_eq!(fs::read(&segment).unwrap(), before);
+        assert!(!path.join("purge.pending").exists());
+        assert!(log.read(&LogQuery::parse("").unwrap()).is_err());
     }
 
     #[test]

@@ -54,7 +54,7 @@ fn checked(reply: Reply) -> Result<Value> {
     Ok(reply.body)
 }
 
-fn overlaps(first: &str, second: &str) -> Result<bool> {
+pub(crate) fn overlaps(first: &str, second: &str) -> Result<bool> {
     let (first, first_prefix) = canonical_prefix(first, false)?;
     let (second, second_prefix) = canonical_prefix(second, false)?;
     let (IpAddr::V4(first), IpAddr::V4(second)) = (first, second) else {

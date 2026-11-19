@@ -117,14 +117,15 @@ configuration commands after login to set LAN addresses and VLANs.
 
 ## Correcting an initially untagged factory LAN
 
-The installer now prompts for an existing physical or VLAN LAN and its IPv4
-address. It does not reconfigure already-provisioned devices. If an unchanged
+The installer now walks all physical Ethernet/VLAN interfaces, can create VLANs,
+and prompts for roles, DHCP/static IPv4 and management addressing. See the
+[initial plan contract](BUILD_AND_INSTALL.md#installer-network-plan). It does not
+reconfigure already-provisioned devices. If an unchanged
 factory installation selected the physical parent instead of the intended VLAN,
 use the updated daemon's root-only local command:
 
 ```sh
-sudo netcontrold --configure-lan vlan50 \
-  --lan-parent enp2s0 --lan-vlan 50 --lan-address 192.168.50.1/24
+sudo netcontrold --configure-lan vlan50 --lan-parent enp2s0 --lan-vlan 50 --lan-address 192.168.50.1/24
 ```
 
 This is not a factory reset. It first validates that saved network policy is the
@@ -183,8 +184,9 @@ The VLAN's actual identity is still checked before mutation.
 
 Initial host inheritance instead uses aggressive console-only takeover:
 import supported IPv4/interfaces/routes/DNS/firewall, disable unsupported
-networking and mask competing managers. It preserves the import during local
-provisioning, without a connectivity confirmation deadline. Startup uses saved
+networking and mask competing managers. The fresh installer then applies its
+approved IPv4 interface/VLAN plan and explicit starter firewall, replacing
+imported networking policy without a connectivity confirmation deadline. Startup uses saved
 desired state, not recapture. This differs from explicit later VLAN adoption,
 whose targeted handover and provisional LAN move still require confirmation.
 See [host takeover](BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).

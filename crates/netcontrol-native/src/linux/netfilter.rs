@@ -373,21 +373,40 @@ pub(super) fn clear_host_firewall(_preserve_owned: bool) -> Result<()> {
 }
 
 #[cfg(feature = "nftables")]
+fn preserved_host_table(payload: &[u8], preserve_owned: bool) -> Result<bool> {
+    ensure!(payload.len() >= 4, "short host nftables table");
+    let attrs = attributes(&payload[4..])?;
+    let name = c_string(
+        &attrs
+            .iter()
+            .find(|(kind, _)| kind & 0x3fff == 1)
+            .context("nftables table name missing")?
+            .1,
+    )?;
+    Ok(preserve_owned
+        && payload[0] == libc::NFPROTO_INET as u8
+        && (name == "netcontrol"
+            || (name == super::experience_kernel::TABLE
+                && attrs.iter().any(|(kind, value)| {
+                    kind & 0x3fff == 6 && value == super::experience_kernel::OWNER
+                }))))
+}
+
+#[cfg(feature = "nftables")]
 pub(super) fn clear_host_firewall(preserve_owned: bool) -> Result<()> {
     use rustables::{Batch, MsgType, ProtocolFamily, Table};
     let mut batch = Batch::new();
     let mut count = 0;
     for payload in dump_messages(10, 1, libc::NFPROTO_UNSPEC as u8, &[])? {
-        ensure!(payload.len() >= 4, "short host nftables table");
+        if preserved_host_table(&payload, preserve_owned)? {
+            continue;
+        }
         let attrs = attributes(&payload[4..])?;
         let name = attrs
             .iter()
             .find(|(kind, _)| kind & 0x3fff == 1)
             .context("nftables table name missing")?;
         let name = c_string(&name.1)?;
-        if preserve_owned && payload[0] == libc::NFPROTO_INET as u8 && name == "netcontrol" {
-            continue;
-        }
         let family = match i32::from(payload[0]) {
             libc::NFPROTO_INET => ProtocolFamily::Inet,
             libc::NFPROTO_IPV4 => ProtocolFamily::Ipv4,
@@ -404,18 +423,12 @@ pub(super) fn clear_host_firewall(preserve_owned: bool) -> Result<()> {
         send_batch(&batch.finalize(), count)?;
     }
     let remaining = dump_messages(10, 1, libc::NFPROTO_UNSPEC as u8, &[])?;
-    ensure!(
-        remaining.iter().all(|payload| {
-            preserve_owned
-                && payload.first() == Some(&(libc::NFPROTO_INET as u8))
-                && attributes(&payload[4..]).is_ok_and(|attrs| {
-                    attrs
-                        .iter()
-                        .any(|(kind, name)| kind & 0x3fff == 1 && name == b"netcontrol\0")
-                })
-        }),
-        "foreign nftables tables remain after takeover"
-    );
+    for payload in remaining {
+        ensure!(
+            preserved_host_table(&payload, preserve_owned)?,
+            "foreign nftables tables remain after takeover"
+        );
+    }
     Ok(())
 }
 
@@ -822,6 +835,42 @@ fn exchange_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_takeover_preserves_only_owned_experience_tables() -> Result<()> {
+        let table = |family: u8, name: &str, owner: Option<&[u8]>| {
+            let mut payload = vec![family, 0, 0, 0];
+            payload.extend(super::super::nft_wire::attribute(
+                1,
+                format!("{name}\0").as_bytes(),
+            ));
+            if let Some(owner) = owner {
+                payload.extend(super::super::nft_wire::attribute(6, owner));
+            }
+            payload
+        };
+        let inet = libc::NFPROTO_INET as u8;
+        let experience = super::super::experience_kernel::TABLE;
+        let owner = super::super::experience_kernel::OWNER;
+        for (payload, preserved) in [
+            (table(inet, "netcontrol", None), true),
+            (table(inet, experience, Some(owner)), true),
+            (table(inet, experience, None), false),
+            (table(inet, experience, Some(b"foreign")), false),
+            (table(inet, "foreign", Some(owner)), false),
+            (
+                table(libc::NFPROTO_IPV4 as u8, experience, Some(owner)),
+                false,
+            ),
+            (table(libc::NFPROTO_IPV4 as u8, "netcontrol", None), false),
+        ] {
+            assert_eq!(preserved_host_table(&payload, true)?, preserved);
+            assert!(!preserved_host_table(&payload, false)?);
+        }
+        assert!(preserved_host_table(&[inet, 0, 0], true).is_err());
+        assert!(preserved_host_table(&[inet, 0, 0, 0], true).is_err());
+        Ok(())
+    }
 
     #[test]
     fn atomic_batch_requests_only_the_final_success_ack() -> Result<()> {

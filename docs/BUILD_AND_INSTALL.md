@@ -897,8 +897,9 @@ and [original recovery design](journal/2026-10-24.md#signed-ubuntu-self-upgrade)
 
 ## AppArmor disablement
 
-Fresh `install.sh` requires AppArmor disabled before downloading the release
-or provisioning Netcontrol. Full source `upgrade.sh` uses the same policy after
+Fresh `install.sh` prepares AppArmor disablement before downloading the release
+or provisioning Netcontrol, without requiring a reboot to continue.
+Full source `upgrade.sh` uses the same policy after
 building and before kernel/service setup, old-daemon shutdown or binary replacement.
 This deliberately removes mandatory-access-control
 confinement, not a security improvement. Use a local console and take a protected
@@ -914,19 +915,18 @@ cleanup paths. It writes root-owned mode-0644
 `apparmor=0`. A generation/readback failure restores the prior drop-in (or removes
 the new one) and aborts; inspect generated GRUB output before rebooting.
 
-If `/sys/module/apparmor/parameters/enabled` reports enabled, either deployment script
-**stops with an error requiring manual reboot and rerun**. It does not reboot
-automatically, purge profiles/packages or claim existing kernel enforcement
-is off. For fresh installs this occurs after ordinary prerequisite installation
-but before release download, network takeover or daemon provisioning; source
-upgrades stop before old-daemon shutdown and binary replacement.
-Rerun the same `install.sh` or `upgrade.sh` command after the console reboot.
-The live
-parameter must report `N`/`0`, or the AppArmor module must be absent; unknown/
-missing module parameters fail. A readable kernel LSM list must not include
-AppArmor. Unsupported boot layouts and indeterminate state fail explicitly.
+If `/sys/module/apparmor/parameters/enabled` reports `Y`/`1`, or a readable
+kernel LSM list includes AppArmor, either script **continues deployment with a
+visible warning**. Reboot manually from a local console after Netcontrol is
+installed to apply `apparmor=0`; this reboot may be deferred and no installer
+or upgrade rerun is needed. There is no automatic reboot, interactive reboot
+confirmation or claim that stopping the service disables running kernel
+enforcement. Existing confinement may remain active until reboot.
+The live parameter may also report `N`/`0`, or the AppArmor module may be absent.
+Unknown/missing module parameters, unsupported boot layouts and unreadable
+state still fail explicitly.
 
-After confirming kernel disablement, both scripts use the shared preparation:
+Both scripts use the shared preparation regardless of whether AppArmor is active:
 
 - Stops/disables and persistently masks `apparmor.service`, including an absent
   unit, verifying inactive/failed state and persistent `masked` enablement.
@@ -935,13 +935,14 @@ After confirming kernel disablement, both scripts use the shared preparation:
   Existing APT preferences are left untouched, including any previously created
   `99-netcontrol-no-apparmor` file. No APT/dpkg tools are required by this helper.
 
-Each error aborts deployment. Completed boot/service/package/file changes
+Actual configuration/inspection errors abort deployment; an active kernel
+requiring a later reboot is a warning, not an error. Completed boot/service/package/file changes
 are not transactionally rolled back. Repeating preparation is supported; an
 already-disabled kernel does not bypass boot/live-state and mask verification.
 An earlier installer that reports `Refusing collateral AppArmor dependency
 removal: ubuntu-server-minimal` has stopped before purge, boot preparation and
 binary replacement. Use the updated disable-only scripts rather than forcing
-package removal; a reboot may then be required before rerunning deployment.
+package removal; complete deployment first and reboot afterward when convenient.
 Build-only runs, HTTP/automatic HTTPS upgrades, signed packages, reset and
 standalone hardening do not establish this policy. The persisted mask/GRUB
 setting remains across ordinary reboots, but a root user, direct package
@@ -1010,47 +1011,110 @@ or foreign asset URLs. All subsequent downloads are pinned to that version:
 
 Only after verification is the binary executed to check its compiled version
 and required provisioning/service options. It is installed at
-`/usr/local/sbin/netcontrold`. No installation arguments are required when run
-from an interactive local terminal. The installer lists physical Ethernet ports
-and eligible existing VLANs, then asks for the LAN interface and IPv4
-address/prefix. Invalid selections/addresses are prompted again; EOF cancels
-without provisioning. Explicit `--lan` or `--lan-address` skips that individual
-prompt. Noninteractive invocation requires both; it never silently chooses a LAN
-or management address. Example:
+`/usr/local/sbin/netcontrold`. No installation arguments are required with a
+local terminal. The downloaded daemon's `--plan-network FILE` wizard lists every
+physical Ethernet port (excluding Wi-Fi/virtual/loopback links) and existing
+802.1Q VLAN. At least one physical Ethernet port is required, not two.
+It offers additional VLAN creation with explicit name, parent and ID 1..4094;
+parents can be physical ports or listed VLANs, including nested VLANs.
+Tagged WAN and LAN may share one unaddressed physical trunk.
+
+The wizard then reviews every listed interface:
+
+- Select `wan`, `lan` or `unassigned`; there is no automatic WAN choice.
+  Exactly one WAN and at least one LAN are required.
+- Assigned links use DHCPv4 or static IPv4. Unassigned links have no IP and
+  remain up for use as trunks. All planned links start at MTU 1500.
+- Static addressing requires a canonical usable IPv4 host/prefix, 1..32,
+  excluding unspecified, loopback, link-local, multicast/reserved, and subnet/
+  broadcast addresses (the latter checks apply below /31). Static WAN also
+  requires a different usable on-link gateway and 1..8 unique IPv4 DNS servers.
+- Select the management LAN, which must have a private static IPv4 host/prefix,
+  8..30 entirely within RFC1918 space. Other LANs may use DHCP clients, not DHCP
+  servers. Overlapping static subnets, invalid VLAN identity/parents, duplicate
+  parent/ID pairs and cycles are rejected.
+- Review the full JSON summary and starter firewall warning; only explicit
+  `yes` authorizes network takeover. Empty confirmation, `no` and EOF cancel.
+  Field errors are prompted again; invalid combinations restart role/address
+  review. Dependencies and release downloads occur before the wizard, but
+  AppArmor/service/network configuration waits until approval.
+
+Example single-port topology (all names/addresses synthetic):
 
 ```text
-WAN: enp1s0 (use --wan NAME to change).
-Available LAN interfaces:
-  enp1s0 (selected WAN)
-  enp2s0
-  vlan50 (VLAN 50 on enp2s0)
-LAN interface [enp2s0]: vlan50
-LAN IPv4 address/prefix [192.168.0.1/24]: 192.168.50.1/24
+enp1s0: unassigned, no IP
+wan20: VLAN 20, parent enp1s0, WAN, DHCPv4
+lan50: VLAN 50, parent enp1s0, LAN, static 192.168.50.1/24, management
+lan60: VLAN 60, parent enp1s0, LAN, static 192.168.60.1/24
 ```
 
-For unattended installation, for example:
+### Installer network plan
+
+For unattended installation use a reviewed private JSON file and explicit
+approval; interactive `--network-plan FILE` displays the plan and asks for
+`yes`. The old installer `--wan`, `--lan` and `--lan-address` flags are rejected.
 
 ```sh
-sudo bash /tmp/netcontrol-install.sh --wan enp1s0 --lan vlan50 --lan-address 192.168.50.1/24
+sudo bash /tmp/netcontrol-install.sh --network-plan /root/network-plan.json --yes
 ```
 
-The first physical Ethernet interface in natural name order is the default WAN
-(`eno1`, `eno2`, ...; `eno2` precedes `eno10`); the second is only a suggested LAN.
-Use `--wan WAN_NIC` to override WAN. Physical-port discovery excludes loopback,
-virtual and Wi-Fi links and requires at least two physical Ethernet ports.
-An existing VLAN may be selected by its real name (for example `vlan50`, not the
-displayed `vlan50@enp2s0`). `/proc/net/vlan/config` supplies its ID/parent; the
-daemon independently validates live 802.1Q identity and explicitly acquires
-ownership without deleting the interface. Stacked VLANs, VLANs on WAN and
-unsupported ownership/configurations are rejected. A release must expose the
-tagged provisioning options; the installer rejects an older binary rather than
-misconfigure its physical parent. Additional VLANs may be configured later
-through normal confirmed transactions.
+Plan schema: at most 64 KiB, 1..64 `interfaces`; existing core firewall/interface
+limits also apply. `management_interface` and `interfaces` are required.
+Each entry requires `name`, `role` and `ipv4`; `vlan` is null/omitted for Ethernet
+or `{parent:string,id:integer}` for VLAN. Names use the normal 1..15-byte Linux
+interface-name contract. IPv4 uses exactly one of `{"method":"none"}`,
+`{"method":"dhcp"}`, or `{"method":"static","address":"CIDR","gateway":null,"dns":[]}`.
+Static `address` and `dns` are required; omitted/null gateway means none, but a
+static WAN must specify one. LAN gateways are forbidden. Unknown fields, kinds,
+addressing methods and non-IPv4 values are rejected, not ignored.
 
-Selection does not depend on current addresses or the current default route.
-Extra physical ports retain `unassigned` roles. The proposed address must describe a usable host
-inside an RFC1918 subnet with prefix length 8..30, entirely within private
-space and not overlapping another interface or active DHCP lease. There is no
+For example, a static tagged WAN and management LAN on one physical trunk:
+
+```json
+{
+  "management_interface": "lan50",
+  "interfaces": [
+    {"name":"enp1s0","role":"unassigned","vlan":null,"ipv4":{"method":"none"}},
+    {"name":"wan20","role":"wan","vlan":{"parent":"enp1s0","id":20},"ipv4":{"method":"static","address":"198.51.100.2/24","gateway":"198.51.100.1","dns":["192.0.2.53"]}},
+    {"name":"lan50","role":"lan","vlan":{"parent":"enp1s0","id":50},"ipv4":{"method":"static","address":"192.168.50.1/24","gateway":null,"dns":[]}}
+  ]
+}
+```
+
+Include every discovered physical Ethernet port and existing VLAN, preserving
+each existing VLAN's name/parent/ID. Use the actual name (`lan50`, not
+`lan50@enp1s0`). Existing topology is checked before takeover and again against
+the imported baseline. New names must not collide with any live link. Unsupported
+existing VLAN parents require console correction before installation. Dynamic
+DHCP subnet conflicts and reachability cannot be established by static validation.
+DHCP uses the normal in-process worker on Ethernet or VLAN; installer WAN route
+metric is 100 and LAN-client metric is 600, with other DHCP options defaulted.
+No WAN lease or successful internet probe is required to commit.
+
+The plan replaces imported addresses, routes, DNS and firewall, preserving captured
+kernel ownership and system/software metadata. Other imported Ethernet links
+(such as Wi-Fi/veth outside physical discovery) are left down, unassigned and
+unaddressed; omitted imported virtual topology is removed from desired state.
+The starter input policy trusts **all LANs**, not only the management LAN;
+HTTP binds only to the management IPv4 on port 8080, SSH stays localhost:2222.
+Forwarding allows new traffic only from each LAN out the selected WAN; other
+new forwarding, including between LANs, is dropped. WAN input permits only
+DHCP UDP/68 when configured; loopback and established/related replies remain
+implicit. `allow_all_icmp` is false. IPv4 masquerade uses static LAN subnets;
+if a LAN uses DHCP, its subnet is unknown so masquerade has no source filter,
+with ingress/egress forwarding policy still enforced. No DHCP/DNS server,
+IPv6 setup, multi-WAN failover, Wi-Fi association, bridge, bond or PPPoE wizard
+is provided. Configure additional supported features through the controller.
+All switches/peers must already have matching VLAN tags; installation does not
+configure the upstream switch or test physical connectivity.
+
+Use the daemon's `--check-network-plan FILE` to validate the plan against this
+host without takeover and print the management IPv4; `--provision-network FILE`
+with `--backend linux --appliance` performs initial-only provisioning. The
+installer requires a release advertising all three plan options and fails
+explicitly for a release without them. Reset and source upgrades keep their
+separate contracts; configured journals are never overwritten by initial setup.
+There is no
 source-build fallback or `--ref` option. No checkout is needed.
 Checksums detect corruption; authenticity relies on the reviewed source and
 verified HTTPS to the trusted GitHub repository/account, not an independently trusted
@@ -1148,6 +1212,11 @@ units, and creates persistent masks for all of these names, including absent uni
 - `ntpdate.service`, `ntpdate.timer`, `ntpdate-debian.service`;
 - `sntp.service`, `sntp.timer`, `ntpdig.service`, `ntpdig.timer`.
 
+Loaded aliases (for example `chronyd.service` pointing to `chrony.service`)
+are resolved to unique canonical units and stopped before disablement removes
+alias links. Both standard names are still persistently masked and verified.
+Identity lookup and genuine stop/disable failures remain fatal.
+
 Each unit must report inactive/failed and `UnitFileState=masked`, not merely a
 runtime mask. Package installation or reboot cannot start these masked units
 unless an operator explicitly removes the masks. NTP packages, configuration,
@@ -1200,22 +1269,21 @@ Mocked installer tests do not prove production packet behavior.
 
 Use a local console. Initial provisioning aggressively takes ownership of the
 host, including supported settings from networkd or active NetworkManager
-connections. Static WAN addressing, routes, resolver configuration and supported
-firewall policy are retained; an empty WAN receives an in-process DHCPv4 client.
-An unplugged/unleased WAN does not prevent commitment. systemd and resolved must
+connections as a captured recovery baseline. The reviewed installer plan then
+replaces interface addressing, routes, DNS and firewall with its explicit
+IPv4 choices and LAN-to-WAN starter policy, rather than retaining imported WAN
+settings or rules. An unplugged/unleased WAN does not prevent commitment.
+systemd and resolved must
 be available; competing networking managers are persistently masked and stopped.
 
 The install-time root-only daemon invocation uses `--backend linux --appliance
---provision-wan WAN_NIC --provision-lan LAN_NIC --provision-lan-address LAN_CIDR`
-with the installed state paths. For an existing selected VLAN it additionally
-supplies `--provision-lan-parent PHYSICAL_NIC --provision-lan-vlan ID`; `--provision-lan`
-is then the actual VLAN name. Only the selected LAN's addresses and DHCP client
-are replaced by the explicit static LAN choice; WAN/LAN roles are assigned and
-those ports are enabled. Other imported interfaces, MTUs, routes, DNS and firewall
-rules remain. Subnet overlap and invalid current configurations fail explicitly.
-Literal firewall subnets are not automatically rewritten to the chosen LAN.
-No factory NAT or LAN allow-all policy is invented: inspect the imported policy
-from console before exposing management or expecting routed client access.
+--provision-network FILE` with the installed state paths. Before this invocation
+the installer uses the read-only wizard/host checks and requires explicit plan
+approval. See the [complete plan contract](#installer-network-plan) for all
+interface/VLAN fields, validation, trust policy and unattended use.
+Kernel ownership and system/software metadata are retained, not arbitrary
+imported networking. Review trusted LAN selection before exposing management;
+successful provisioning is not evidence that the upstream switch/DHCP/DNS works.
 
 The local transaction has `confirmation_deadline: null` and commits after
 apply/readback, without connectivity confirmation or a WAN-readiness timer.
@@ -1912,14 +1980,18 @@ unattended use. Optional paired `--wan`/`--lan` overrides select specific ports.
 Omit both port arguments for the install defaults: first and second naturally
 ordered physical Ethernet ports, excluding Wi-Fi/virtual links. LAN defaults to
 `192.168.0.1/24`; `--lan-address` can explicitly select another valid private host
-prefix. WAN becomes DHCPv4. The factory input/forwarding/NAT policy is the same
-as installation. Other saved Ethernet interfaces are up, MTU 1500, unassigned,
+prefix. WAN becomes DHCPv4. Factory policy permits LAN forwarding without an
+egress restriction and enables the global IPv4 ICMP exception; this differs
+from the installer's reviewed LAN-to-WAN-only starter policy. Both use input
+default-drop, LAN router access and IPv4 masquerade. Other saved Ethernet
+interfaces are up, MTU 1500, unassigned,
 without configured IPs, DNS or DHCP clients. VLAN/WireGuard, custom routes,
 policy, service settings and tunable overrides are removed from current desired
 configuration. Supplicant credentials/association definitions are not rewritten.
 Re-enable Wi-Fi DHCP through a subsequent confirmed configuration if required.
-Initial installation uses the same clean factory configuration builder; inherited
-OS settings serve only as handover/rollback data before the initial transaction.
+Initial installation instead uses its reviewed multi-interface network plan and
+egress-restricted starter policy; inherited OS settings serve as takeover/recovery
+evidence before the initial transaction, not the new desired configuration.
 
 After confirmation, the script stops the daemon and writes a private backup under
 `/var/lib/netcontrol/factory-reset.XXXXXX` before changing configuration. It uses

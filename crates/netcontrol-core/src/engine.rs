@@ -22,6 +22,7 @@ pub const PERMISSIONS: &[&str] = &[
     "firewall.write",
     "firewall.logs.read",
     "logs.read",
+    "logs.delete",
     "nat.write",
     "wireguard.write",
     "softflowd.write",
@@ -953,6 +954,20 @@ impl Engine {
             path,
             "/api/v1/logs/syslog" | "/api/v1/logs/netcontrol" | "/api/v1/logs/performance"
         ) {
+            if path == "/api/v1/logs/performance" && method == "DELETE" {
+                require(permissions, "logs.delete")?;
+                if !query.is_empty() || !body.is_empty() {
+                    return Err(ApiError::new(
+                        400,
+                        "performance log purge accepts no body or query parameters",
+                    ));
+                }
+                return self
+                    .backend
+                    .purge_performance_log()
+                    .map(|v| Reply::value(200, v))
+                    .map_err(service_error);
+            }
             require(permissions, "logs.read")?;
             if method != "GET" {
                 return Err(ApiError::new(405, "method not allowed"));

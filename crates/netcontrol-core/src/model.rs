@@ -1355,8 +1355,9 @@ impl Config {
                 .find(|link| &link.name == name)
                 .ok_or_else(|| anyhow::anyhow!("DHCP client interface {name} is not configured"))?;
             ensure!(
-                interface.kind == "ethernet" && !interface.dhcp_relay.enabled,
-                "DHCP clients require Ethernet without a DHCP relay"
+                matches!(interface.kind.as_str(), "ethernet" | "vlan")
+                    && !interface.dhcp_relay.enabled,
+                "DHCP clients require Ethernet or VLAN without a DHCP relay"
             );
             ensure!(
                 client.hostname.len() <= 253

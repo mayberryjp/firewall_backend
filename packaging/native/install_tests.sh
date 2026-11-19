@@ -20,7 +20,9 @@ for sysstat_scenario in success repeat absent masked mixed inspect_failure unkno
             if [[ $action == show ]]; then
                 unit=$1
                 [[ $unit == sysstat-collect.timer || $unit == sysstat-collect.service ]] || return 1
-                if [[ ${3:-} == LoadState ]]; then
+                if [[ ${3:-} == Id ]]; then
+                    printf '%s\n' "$unit"
+                elif [[ ${3:-} == LoadState ]]; then
                     case $sysstat_scenario in
                         inspect_failure) printf 'Fixture inspection failure.\n' >&2; return 1 ;;
                         unknown_state) printf 'error\n'; return 0 ;;
@@ -57,8 +59,8 @@ for sysstat_scenario in success repeat absent masked mixed inspect_failure unkno
             case $sysstat_scenario in
                 absent) ! grep -Eq '^(disable|stop) ' "$sysstat_directory/commands" ;;
                 masked) grep -Fxq 'stop sysstat-collect.timer' "$sysstat_directory/commands"; grep -Fxq 'stop sysstat-collect.service' "$sysstat_directory/commands" ;;
-                mixed) grep -Fxq 'disable --now sysstat-collect.timer' "$sysstat_directory/commands" ;;
-                *) grep -Fxq 'disable --now sysstat-collect.timer sysstat-collect.service' "$sysstat_directory/commands" ;;
+                mixed) grep -Fxq 'disable sysstat-collect.timer' "$sysstat_directory/commands" ;;
+                *) grep -Fxq 'disable sysstat-collect.timer sysstat-collect.service' "$sysstat_directory/commands" ;;
             esac
         else
             case $sysstat_scenario in success|repeat|absent|masked|mixed) cat "$sysstat_directory/stderr" >&2; exit 1 ;; esac
@@ -68,7 +70,7 @@ for sysstat_scenario in success repeat absent masked mixed inspect_failure unkno
 done
 printf 'Sysstat collection stop/disable, persistent masks, absent/mixed units, repeats and failure tests passed (mocked systemd).\n'
 
-for apparmor_scenario in success repeat absent existing_pin reboot unknown_kernel missing_parameter active_lsm \
+for apparmor_scenario in success repeat absent existing_pin reboot reboot_numeric unknown_kernel missing_parameter active_lsm \
     grub_failure bad_grub conflicting_grub missing_grub symlink_grub symlink_pin symlink_profiles \
     directory_failure grub_write_failure disable_failure mask_failure verify_failure; do
     (
@@ -92,6 +94,7 @@ for apparmor_scenario in success repeat absent existing_pin reboot unknown_kerne
         case $apparmor_scenario in
             existing_pin) printf 'existing preferences\n' > "$apparmor_root/etc/apt/preferences.d/99-netcontrol-no-apparmor" ;;
             reboot) printf 'Y\n' > "$apparmor_root/sys/module/apparmor/parameters/enabled" ;;
+            reboot_numeric) printf '1\n' > "$apparmor_root/sys/module/apparmor/parameters/enabled" ;;
             unknown_kernel) printf 'unknown\n' > "$apparmor_root/sys/module/apparmor/parameters/enabled" ;;
             missing_parameter) rm "$apparmor_root/sys/module/apparmor/parameters/enabled" ;;
             active_lsm) printf 'capability,apparmor,yama\n' > "$apparmor_root/sys/kernel/security/lsm" ;;
@@ -133,7 +136,9 @@ for apparmor_scenario in success repeat absent existing_pin reboot unknown_kerne
             printf 'systemctl %s\n' "$*" >> "$apparmor_directory/commands"
             case $1 in
                 show)
-                    if [[ ${4:-} == LoadState ]]; then
+                    if [[ ${4:-} == Id ]]; then
+                        printf '%s\n' "$2"
+                    elif [[ ${4:-} == LoadState ]]; then
                         if [[ -e $apparmor_directory/masked ]]; then printf 'masked\n'
                         elif [[ $apparmor_scenario == absent ]]; then printf 'not-found\n'; return 4
                         else printf 'loaded\n'; fi
@@ -167,23 +172,28 @@ for apparmor_scenario in success repeat absent existing_pin reboot unknown_kerne
             done
             command install "${arguments[@]}"
         }
-        if configure_apparmor "$apparmor_root" > "$apparmor_directory/stdout" 2> "$apparmor_directory/stderr"; then
-            case $apparmor_scenario in success|repeat|absent|existing_pin|symlink_pin|symlink_profiles) ;; *) printf 'Unexpected AppArmor success: %s\n' "$apparmor_scenario" >&2; exit 1 ;; esac
+        if installer_step 'Disabling AppArmor' configure_apparmor "$apparmor_root" > "$apparmor_directory/stdout" 2> "$apparmor_directory/stderr"; then
+            case $apparmor_scenario in success|repeat|absent|existing_pin|symlink_pin|symlink_profiles|reboot|reboot_numeric|active_lsm) ;; *) printf 'Unexpected AppArmor success: %s\n' "$apparmor_scenario" >&2; exit 1 ;; esac
             if [[ $apparmor_scenario == repeat ]]; then configure_apparmor "$apparmor_root" || exit 1; fi
             grep -Fxq 'systemctl mask apparmor.service' "$apparmor_directory/commands"
             [[ -f $apparmor_directory/masked ]]
             [[ $(stat -c %a "$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg") == 644 ]]
+            case $apparmor_scenario in
+                reboot|reboot_numeric|active_lsm)
+                    grep -Fq '[WARN] AppArmor is still enabled' "$apparmor_directory/stderr"
+                    grep -Fq 'continue without rebooting' "$apparmor_directory/stderr"
+                    grep -Fq 'you may defer this reboot' "$apparmor_directory/stderr"
+                    grep -Fq 'No installer rerun is needed' "$apparmor_directory/stderr"
+                    grep -Fq 'apparmor=0' "$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg" ;;
+                *) ! grep -Fq '[WARN]' "$apparmor_directory/stderr" ;;
+            esac
         else
-            case $apparmor_scenario in success|repeat|absent|existing_pin|symlink_pin|symlink_profiles) cat "$apparmor_directory/stderr" >&2; exit 1 ;; esac
+            case $apparmor_scenario in success|repeat|absent|existing_pin|symlink_pin|symlink_profiles|reboot|reboot_numeric|active_lsm) cat "$apparmor_directory/stderr" >&2; exit 1 ;; esac
             [[ -s $apparmor_directory/stderr ]]
             case $apparmor_scenario in
-                reboot|unknown_kernel|missing_parameter|active_lsm)
+                unknown_kernel|missing_parameter)
                     ! grep -q '^systemctl ' "$apparmor_directory/commands"
-                    [[ -f $apparmor_root/etc/apparmor.d/custom ]]
-                    if [[ $apparmor_scenario == reboot ]]; then
-                        grep -Fq 'reboot manually' "$apparmor_directory/stderr"
-                        grep -Fq 'apparmor=0' "$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg"
-                    fi ;;
+                    [[ -f $apparmor_root/etc/apparmor.d/custom ]] ;;
                 grub_failure|bad_grub|conflicting_grub)
                     [[ $(< "$apparmor_root/etc/default/grub.d/99-netcontrol-apparmor.cfg") == 'original drop-in' ]]
                     ! grep -q '^systemctl ' "$apparmor_directory/commands" ;;
@@ -213,17 +223,17 @@ python3 - <<'PY'
 from pathlib import Path
 install = Path("install.sh").read_text()
 main = install[install.index("\nmain() {"):]
-assert main.index("'Installing prerequisites'") < main.index("'Disabling AppArmor'") < main.index("'Downloading and verifying")
+assert main.index("'Installing prerequisites'") < main.index("'Downloading and verifying") < main.index("management_address=$(prepare_network_plan") < main.index("'Disabling AppArmor'")
 upgrade = Path("upgrade.sh").read_text()
 deployment = upgrade[upgrade.index("\ndeploy_upgrade() {"):upgrade.index("\nmain() {")]
 assert "configure_apparmor && configure_conntrack" in deployment
 assert deployment.index("configure_apparmor") < deployment.index('upgrade_binary "$binary"')
 PY
-printf 'AppArmor boot gate, service masks, package/profile/cache/APT preservation, repeat and failure tests passed (mocked host operations).\n'
+printf 'AppArmor deferred reboot warnings, service masks, package/profile/cache/APT preservation, repeat and failure tests passed (mocked host operations).\n'
 
 for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_failure unknown_state \
     disable_failure stop_failure mask_failure verify_failure still_active runtime_only \
-    unmanaged process_failure; do
+    unmanaged process_failure alias alias_repeat id_failure empty_id; do
     (
         ntp_directory="$temporary/ntp-$ntp_scenario"
         mkdir "$ntp_directory"
@@ -239,7 +249,17 @@ for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_fail
             shift
             if [[ $operation == show ]]; then
                 [[ " ${ntp_units[*]} " == *" $unit "* ]] || return 1
-                if [[ $3 == LoadState ]]; then
+                if [[ $3 == Id ]]; then
+                    case $ntp_scenario in
+                        id_failure) printf 'Fixture identity failure.\n' >&2; return 1 ;;
+                        empty_id) return 0 ;;
+                    esac
+                    if [[ $ntp_scenario == alias* && $unit == chronyd.service ]]; then
+                        printf 'chrony.service\n'
+                    else
+                        printf '%s\n' "$unit"
+                    fi
+                elif [[ $3 == LoadState ]]; then
                     case $ntp_scenario in
                         inspect_failure) printf 'Fixture inspection failure.\n' >&2; return 1 ;;
                         unknown_state) printf 'error\n'; return 0 ;;
@@ -270,15 +290,30 @@ for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_fail
                 return
             fi
             if [[ $operation == disable ]]; then
-                [[ $1 == --now ]] || return 1
-                shift
+                if [[ $ntp_scenario == alias* ]]; then
+                    if [[ $1 != --now && ! -e $ntp_directory/chrony.service.stopped ]]; then
+                        printf 'Fixture canonical Chrony unit was not stopped before disablement.\n' >&2
+                        return 1
+                    fi
+                    : > "$ntp_directory/alias-removed"
+                fi
+                if [[ $1 == --now ]]; then shift; fi
             fi
             for unit in "$@"; do
                 [[ " ${ntp_units[*]} " == *" $unit "* ]] || return 1
+                if [[ $ntp_scenario == alias* && $unit == chronyd.service &&
+                      -e $ntp_directory/alias-removed && $operation != mask &&
+                      ! -e $ntp_directory/$unit.masked ]]; then
+                    printf 'Fixture alias chronyd.service no longer exists.\n' >&2
+                    return 1
+                fi
                 case $operation in
                     disable|stop)
                         [[ $ntp_scenario != "${operation}_failure" ]] || { printf 'Fixture %s failure.\n' "$operation" >&2; return 1; }
-                        : > "$ntp_directory/$unit.stopped" ;;
+                        : > "$ntp_directory/$unit.stopped"
+                        if [[ $ntp_scenario == alias* && $unit == chrony.service ]]; then
+                            : > "$ntp_directory/chronyd.service.stopped"
+                        fi ;;
                     mask)
                         [[ $ntp_scenario != mask_failure ]] || { printf 'Fixture mask failure.\n' >&2; return 1; }
                         : > "$ntp_directory/$unit.masked" ;;
@@ -294,8 +329,14 @@ for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_fail
             return 1
         }
         if configure_ntp > "$ntp_directory/stdout" 2> "$ntp_directory/stderr"; then
-            case $ntp_scenario in success|repeat|absent|masked|runtime_mask|mixed) ;; *) exit 1 ;; esac
-            if [[ $ntp_scenario == repeat ]]; then configure_ntp || exit 1; fi
+            case $ntp_scenario in success|repeat|absent|masked|runtime_mask|mixed|alias|alias_repeat) ;; *) exit 1 ;; esac
+            if [[ $ntp_scenario == repeat || $ntp_scenario == alias_repeat ]]; then configure_ntp || exit 1; fi
+            if [[ $ntp_scenario == alias* ]]; then
+                ! grep -Eq '^disable.*chronyd.service' "$ntp_directory/commands"
+                [[ $(grep -m1 '^stop ' "$ntp_directory/commands") != *chronyd.service* ]]
+                [[ $(grep -c '^disable ' "$ntp_directory/commands") == 1 ]]
+                [[ $(grep '^disable ' "$ntp_directory/commands" | grep -oF 'chrony.service' | wc -l) == 1 ]]
+            fi
             for ntp_unit in "${ntp_units[@]}"; do
                 [[ -e $ntp_directory/$ntp_unit.masked ]]
             done
@@ -311,9 +352,10 @@ for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_fail
                 grep -Fxq -- "-x $ntp_process" "$ntp_directory/processes"
             done
         else
-            case $ntp_scenario in success|repeat|absent|masked|runtime_mask|mixed) cat "$ntp_directory/stderr" >&2; exit 1 ;; esac
+            case $ntp_scenario in success|repeat|absent|masked|runtime_mask|mixed|alias|alias_repeat) cat "$ntp_directory/stderr" >&2; exit 1 ;; esac
             [[ -s $ntp_directory/stderr ]]
-            if [[ $ntp_scenario == inspect_failure || $ntp_scenario == unknown_state ]]; then
+            if [[ $ntp_scenario == inspect_failure || $ntp_scenario == unknown_state ||
+                  $ntp_scenario == id_failure || $ntp_scenario == empty_id ]]; then
                 ! grep -Eq '^(disable|stop|mask) ' "$ntp_directory/commands"
             fi
             if [[ $ntp_scenario == unmanaged ]]; then
@@ -324,7 +366,7 @@ for ntp_scenario in success repeat absent masked runtime_mask mixed inspect_fail
         fi
     )
 done
-printf 'NTP stop/disable/persistent masks, absent units, repeats, runtime masks, residual clients and failure tests passed (mocked systemd/processes).\n'
+printf 'NTP canonical aliases, stop/disable/persistent masks, absent units, repeats, runtime masks, residual clients and failure tests passed (mocked systemd/processes).\n'
 
 for motd_scenario in success repeat absent masked inspect_failure stop_failure mask_failure verify_failure active \
     unsafe_parent pam_directory_symlink pam_symlink pam_failure remove_failure; do
@@ -370,6 +412,7 @@ for motd_scenario in success repeat absent masked inspect_failure stop_failure m
                     case $3 in
                         --property)
                             case $4 in
+                                Id) printf '%s\n' "$2" ;;
                                 LoadState)
                                     [[ $motd_scenario != inspect_failure ]] || { printf 'Fixture inspection failure.\n' >&2; return 1; }
                                     case $motd_scenario in
@@ -433,7 +476,7 @@ for motd_scenario in success repeat absent masked inspect_failure stop_failure m
                 grep -Fxq "stop $motd_unit" "$motd_directory/commands"
             done
         else
-            grep -Fxq "disable --now $motd_units" "$motd_directory/commands"
+            grep -Fxq "disable $motd_units" "$motd_directory/commands"
         fi
     else
         [[ $motd_scenario != success && $motd_scenario != repeat &&
@@ -464,6 +507,11 @@ printf 'MOTD service masks, login suppression, file/generator removal, repeat cl
     installer_step 'Installing a fixture' noisy_success > "$temporary/step.stdout" 2> "$temporary/step.stderr"
     [[ ! -s $temporary/step.stdout ]]
     [[ $(< "$temporary/step.stderr") == '[..] Installing a fixture' ]]
+    [[ -z $(find "$TMPDIR" -type f -print) ]]
+    warning_success() { noisy_success; installer_message warning 'Reboot may be deferred.'; }
+    installer_step 'Warning fixture' warning_success > "$temporary/step.stdout" 2> "$temporary/step.stderr"
+    [[ ! -s $temporary/step.stdout ]]
+    [[ $(< "$temporary/step.stderr") == $'[..] Warning fixture\n[WARN] Reboot may be deferred.' ]]
     [[ -z $(find "$TMPDIR" -type f -print) ]]
     noisy_failure() { printf 'failure stdout\n'; printf 'failure stderr\n' >&2; return 23; }
     if installer_step 'Failing fixture' noisy_failure > "$temporary/step.stdout" 2> "$temporary/step.stderr"; then
@@ -751,7 +799,9 @@ for wait_scenario in success repeat absent masked inspect_failure disable_failur
             [[ $2 == systemd-networkd-wait-online.service || ${3:-} == systemd-networkd-wait-online.service ]] || return 1
             case $1 in
                 show)
-                    if [[ ${4:-} == LoadState ]]; then
+                    if [[ ${4:-} == Id ]]; then
+                        printf '%s\n' "$2"
+                    elif [[ ${4:-} == LoadState ]]; then
                         case $wait_scenario in
                             inspect_failure) printf 'Fixture inspection failure.\n' >&2; return 1 ;;
                             absent) printf 'not-found\n'; return 4 ;;
@@ -775,7 +825,7 @@ for wait_scenario in success repeat absent masked inspect_failure disable_failur
             case $wait_scenario in
                 absent) ! grep -Eq '^(disable|stop) ' "$wait_directory/commands" ;;
                 masked) grep -Fxq 'stop systemd-networkd-wait-online.service' "$wait_directory/commands" ;;
-                *) grep -Fxq 'disable --now systemd-networkd-wait-online.service' "$wait_directory/commands" ;;
+                *) grep -Fxq 'disable systemd-networkd-wait-online.service' "$wait_directory/commands" ;;
             esac
         else
             case $wait_scenario in success|repeat|absent|masked) cat "$wait_directory/stderr" >&2; exit 1 ;; esac
@@ -968,23 +1018,13 @@ for port_fixture_pair in 'eno1 eno1' 'eno1 missing' 'wlan0 eno1' 'eno1'; do
     read -r fixture_wan fixture_lan <<< "$port_fixture_pair"
     if select_appliance_ports "$fixture_wan" "$fixture_lan" "$ports_fixture"; then exit 1; fi
 done
-[[ $(prompt_appliance_lan '' '' '' "$ports_fixture" <<< $'eno10\n10.4.50.1/24') == 'eno1 eno10 10.4.50.1/24' ]]
-[[ $(prompt_appliance_lan '' '' '' "$ports_fixture" <<< $'\n') == 'eno1 eno2 192.168.0.1/24' ]]
-[[ $(prompt_appliance_lan eno2 '' '' "$ports_fixture" <<< $'\n') == 'eno2 eno1 192.168.0.1/24' ]]
-[[ $(prompt_appliance_lan eno1 eno10 '' "$ports_fixture" <<< '10.4.50.1/24') == 'eno1 eno10 10.4.50.1/24' ]]
-[[ $(prompt_appliance_lan eno1 '' '10.4.50.1/24' "$ports_fixture" <<< 'eno10') == 'eno1 eno10 10.4.50.1/24' ]]
-[[ $(prompt_appliance_lan eno1 '' '' "$ports_fixture" <<< $'missing\neno2\ninvalid\n192.168.0.0/24\n10.4.50.1/24') == 'eno1 eno2 10.4.50.1/24' ]]
-if prompt_appliance_lan '' '' '' "$ports_fixture" </dev/null; then exit 1; fi
-if prompt_appliance_lan eno1 eno2 '' "$ports_fixture" </dev/null; then exit 1; fi
-if prompt_appliance_lan missing '' '' "$ports_fixture" </dev/null 2>"$temporary/invalid-wan"; then exit 1; fi
-! grep -q '^LAN interface' "$temporary/invalid-wan"
 for address in 10.4.50.1/24 172.16.0.1/12 192.168.0.1/16 10.0.0.1/30; do
     valid_lan_address "$address"
 done
 for address in 10.4.50.0/24 10.4.50.255/24 192.168.0.1/15 172.16.0.1/11 172.32.0.1/24 8.8.8.8/24 999.1.1.1/24 10.0.0.1/31 010.0.0.1/24 10.0.0.1/08 '10.0.0.1/24 extra'; do
     if valid_lan_address "$address"; then printf 'Invalid LAN address accepted: %s\n' "$address" >&2; exit 1; fi
 done
-printf 'Interactive LAN selection, address validation, defaults, overrides and cancellation tests passed.\n'
+printf 'Factory-reset port and LAN address validation tests passed.\n'
 mkdir "$ports_fixture/vlan50" "$ports_fixture/wanvlan" "$ports_fixture/stacked"
 printf '1\n' > "$ports_fixture/vlan50/type"
 printf '1\n' > "$ports_fixture/wanvlan/type"
@@ -993,7 +1033,6 @@ vlan_fixture="$temporary/vlans"
 printf 'VLAN Dev name | VLAN ID | Interface\nvlan50 | 50 | eno2\nwanvlan | 20 | eno1\nstacked | 51 | vlan50\n' > "$vlan_fixture"
 [[ $(lan_vlan_details vlan50 "$vlan_fixture") == 'eno2 50' ]]
 [[ $(select_appliance_ports eno1 vlan50 "$ports_fixture" "$vlan_fixture") == 'eno1 vlan50' ]]
-[[ $(prompt_appliance_lan eno1 '' '' "$ports_fixture" "$vlan_fixture" <<< $'vlan50\n10.4.50.1/24') == 'eno1 vlan50 10.4.50.1/24' ]]
 if select_appliance_ports eno1 wanvlan "$ports_fixture" "$vlan_fixture"; then exit 1; fi
 if select_appliance_ports eno1 stacked "$ports_fixture" "$vlan_fixture"; then exit 1; fi
 printf 'invalid | 4095 | eno2\n' >> "$vlan_fixture"
@@ -1116,7 +1155,7 @@ PY
     fi
 done
 unset -f curl
-for scenario in valid wrong_version version_failure help_failure missing_option missing_takeover missing_conntrack_ownership vlan_supported vlan_missing_parent vlan_missing_id vlan_unsupported; do
+for scenario in valid wrong_version version_failure help_failure missing_option missing_takeover missing_conntrack_ownership missing_plan missing_wizard missing_check; do
     destination="$temporary/prebuilt-$scenario"
     mkdir "$destination"
     printf '2026.11.05.2\n' > "$destination/release-version"
@@ -1129,28 +1168,31 @@ case $1 in
         else printf 'netcontrold 2026.11.05.2\n'; fi ;;
     --help)
         [[ $prebuilt_scenario != help_failure ]] || exit 1
-        printf '%s\n' --provision-wan NETCONTROL_ALLOW_HOST_SERVICES NETCONTROL_GATEWAY_MONITORING NETCONTROL_SSH_LISTEN NETCONTROL_UPGRADE_CONFIG
+        printf '%s\n' NETCONTROL_ALLOW_HOST_SERVICES NETCONTROL_GATEWAY_MONITORING NETCONTROL_SSH_LISTEN NETCONTROL_UPGRADE_CONFIG
+        if [[ $prebuilt_scenario != missing_plan ]]; then printf '%s\n' --provision-network; fi
+        if [[ $prebuilt_scenario != missing_wizard ]]; then printf '%s\n' --plan-network; fi
+        if [[ $prebuilt_scenario != missing_check ]]; then printf '%s\n' --check-network-plan; fi
         if [[ $prebuilt_scenario != missing_takeover ]]; then printf '%s\n' console-host-takeover; fi
         if [[ $prebuilt_scenario != missing_conntrack_ownership ]]; then printf '%s\n' conntrack-tuning-ownership; fi
         if [[ $prebuilt_scenario != missing_option ]]; then printf '%s\n' --configure-updates; fi
-        if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_id ]]; then printf '%s\n' --provision-lan-parent; fi
-        if [[ $prebuilt_scenario == vlan_supported || $prebuilt_scenario == vlan_missing_parent ]]; then printf '%s\n' --provision-lan-vlan; fi ;;
+        ;;
     *) exit 1 ;;
 esac
 SH
     export prebuilt_scenario=$scenario
-    selected_lan=''
-    if [[ $scenario == vlan_* ]]; then selected_lan=vlan50; fi
-    if (lan_vlan_details() { [[ $1 == vlan50 ]]; }; check_prebuilt "$destination" "$selected_lan"); then
-        [[ $scenario == valid || $scenario == vlan_supported ]] || exit 1
+    if check_prebuilt "$destination"; then
+        [[ $scenario == valid ]] || exit 1
     else
-        [[ $scenario != valid && $scenario != vlan_supported ]] || exit 1
+        [[ $scenario != valid ]] || exit 1
     fi
 done
 unset prebuilt_scenario
 (
     [[ $(main --help) != *--run-id* ]]
     if main --run-id 123; then exit 1; fi
+    if main --wan eno1; then exit 1; fi
+    if main --yes; then exit 1; fi
+    if main --network-plan; then exit 1; fi
     uname() { printf 'unsupported-test-platform\n'; }
     if output=$(main 2>&1); then exit 1; fi
     [[ $output == *'requires Ubuntu Linux amd64'* ]]
@@ -1231,16 +1273,43 @@ done
 )
 printf 'Prebuilt download verification and service-installation tests passed (mocked GitHub/system commands).\n'
 
-for provision_scenario in success tagged_success config_failure env_failure reload_failure start_failure http_failure forwarding_failure; do
+for plan_scenario in wizard supplied approved declined eof wizard_failure check_failure invalid_address; do
+    (
+        plan_fixture() {
+            printf '%s\n' "$*" >> "$temporary/plan-$plan_scenario.commands"
+            case $1 in
+                --plan-network) [[ $plan_scenario != wizard_failure ]] || return 1; printf '{}\n' > "$2" ;;
+                --check-network-plan)
+                    [[ $plan_scenario != check_failure ]] || return 1
+                    if [[ $plan_scenario == invalid_address ]]; then printf 'not-an-address\n'; else printf '192.168.50.1\n'; fi ;;
+                *) return 1 ;;
+            esac
+        }
+        plan_path="$temporary/plan-$plan_scenario.json"
+        supplied=true; approved=false
+        case $plan_scenario in
+            wizard|wizard_failure) supplied=false ;;
+            approved) approved=true ;;
+        esac
+        if [[ $supplied == true ]]; then printf '{}\n' > "$plan_path"; fi
+        case $plan_scenario in declined) answer=no ;; eof) answer='' ;; *) answer=yes ;; esac
+        if [[ $plan_scenario == eof ]]; then
+            if prepare_network_plan plan_fixture "$plan_path" "$supplied" "$approved" </dev/null; then exit 1; fi
+        elif address=$(prepare_network_plan plan_fixture "$plan_path" "$supplied" "$approved" <<< "$answer"); then
+            case $plan_scenario in wizard|supplied|approved) ;; *) exit 1 ;; esac
+            [[ $address == 192.168.50.1 ]]
+        else
+            case $plan_scenario in wizard|supplied|approved) exit 1 ;; esac
+        fi
+        if [[ $supplied == true ]]; then ! grep -q -- --plan-network "$temporary/plan-$plan_scenario.commands"; fi
+    )
+done
+printf 'Network plan review, confirmation, cancellation and validation gates passed.\n'
+
+for provision_scenario in success config_failure env_failure reload_failure start_failure http_failure forwarding_failure; do
     provision_directory="$temporary/provision-$provision_scenario"
     mkdir "$provision_directory"
-    selected_lan=lan0
-    if [[ $provision_scenario == tagged_success ]]; then selected_lan=vlan50; fi
     if (
-        lan_vlan_details() {
-            [[ $provision_scenario == tagged_success && $1 == vlan50 ]] || return 1
-            printf 'lan0 50\n'
-        }
         provision_fixture() {
             printf 'configure %s\n' "$*" >> "$provision_directory/commands"
             [[ $provision_scenario != config_failure ]]
@@ -1262,16 +1331,13 @@ for provision_scenario in success tagged_success config_failure env_failure relo
         sysctl() {
             if [[ $provision_scenario == forwarding_failure ]]; then printf '0\n'; else printf '1\n'; fi
         }
-        provision_appliance provision_fixture wan0 "$selected_lan" 192.168.50.1/24
+        provision_appliance provision_fixture "$provision_directory/network-plan.json" 192.168.50.1
     ); then
-        [[ $provision_scenario == success || $provision_scenario == tagged_success ]] || exit 1
+        [[ $provision_scenario == success ]] || exit 1
     else
-        [[ $provision_scenario != success && $provision_scenario != tagged_success ]] || exit 1
+        [[ $provision_scenario != success ]] || exit 1
     fi
-    grep -q -- "--provision-wan wan0 --provision-lan $selected_lan --provision-lan-address 192.168.50.1/24" "$provision_directory/commands"
-    if [[ $provision_scenario == tagged_success ]]; then
-        grep -q -- '--provision-lan-parent lan0 --provision-lan-vlan 50' "$provision_directory/commands"
-    fi
+    grep -q -- "--provision-network $provision_directory/network-plan.json" "$provision_directory/commands"
     if [[ $provision_scenario == config_failure ]]; then
         ! grep -Eq '^(install|systemctl|curl) ' "$provision_directory/commands"
     else
@@ -1280,7 +1346,7 @@ for provision_scenario in success tagged_success config_failure env_failure relo
     if [[ $provision_scenario == env_failure || $provision_scenario == reload_failure ]]; then
         ! grep -q '^systemctl enable' "$provision_directory/commands"
     fi
-    if [[ $provision_scenario == success || $provision_scenario == tagged_success ]]; then
+    if [[ $provision_scenario == success ]]; then
         grep -q '^systemctl enable --now netcontrold.service' "$provision_directory/commands"
         grep -q 'http://192.168.50.1:8080/' "$provision_directory/commands"
     fi
@@ -1333,8 +1399,7 @@ cat > "$temporary/setup-fixture.sh" <<'EOF'
 configure_apparmor() {
     printf 'apparmor\n' >> "$SETUP_TRACE"
     if [[ $SETUP_SCENARIO == apparmor_reboot ]]; then
-        printf 'AppArmor enabled; manual reboot and upgrade rerun required.\n' >&2
-        return 1
+        printf '[WARN] AppArmor enabled; reboot may be deferred until after upgrade.\n' >&2
     fi
     [[ $SETUP_SCENARIO != apparmor_failure ]]
 }
@@ -1378,13 +1443,13 @@ for setup_scenario in success apparmor_failure apparmor_reboot conntrack_failure
         root_command() { "$@"; }
         upgrade_binary() { printf 'deploy\n' >> "$SETUP_TRACE"; }
         if deploy_upgrade new-binary installed-binary "$temporary/setup-fixture.sh"; then
-            [[ $setup_scenario == success ]] || exit 1
+            [[ $setup_scenario == success || $setup_scenario == apparmor_reboot ]] || exit 1
         else
-            [[ $setup_scenario != success ]] || exit 1
+            [[ $setup_scenario != success && $setup_scenario != apparmor_reboot ]] || exit 1
         fi
         case $setup_scenario in
-            success) expected=$'apparmor\nconntrack\nlink-diagnostics\ndeny-log\nmotd\nntp\nservices\nlogging-units\nreload\ndeploy' ;;
-            apparmor_failure|apparmor_reboot) expected=apparmor ;;
+            success|apparmor_reboot) expected=$'apparmor\nconntrack\nlink-diagnostics\ndeny-log\nmotd\nntp\nservices\nlogging-units\nreload\ndeploy' ;;
+            apparmor_failure) expected=apparmor ;;
             conntrack_failure) expected=$'apparmor\nconntrack' ;;
             diagnostics_failure) expected=$'apparmor\nconntrack\nlink-diagnostics' ;;
             deny_log_failure) expected=$'apparmor\nconntrack\nlink-diagnostics\ndeny-log' ;;
@@ -1397,7 +1462,7 @@ for setup_scenario in success apparmor_failure apparmor_reboot conntrack_failure
         [[ $(< "$SETUP_TRACE") == "$expected" ]]
     )
 done
-printf 'Upgrade aborts before replacement on AppArmor failure/reboot requirement, conntrack, service setup or systemd reload failure.\n'
+printf 'Upgrade continues with deferred AppArmor reboot; AppArmor setup, conntrack, service setup or systemd reload failures abort before replacement.\n'
 
 for scenario in missing loaded unmanaged conflicting masked install_failure reload_failure; do
     destination="$temporary/setup-$scenario"
@@ -1780,6 +1845,10 @@ for policy_profile in snap apt; do
                 if [[ $operation == show ]]; then
                     unit=$1
                     [[ " ${policy_units[*]} " == *" $unit "* ]] || return 1
+                    if [[ ${3:-} == Id ]]; then
+                        printf '%s\n' "$unit"
+                        return 0
+                    fi
                     if [[ $* == *LoadState* ]]; then
                         case $policy_scenario in
                             absent) printf 'not-found\n'; return 4 ;;

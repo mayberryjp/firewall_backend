@@ -43,6 +43,11 @@ impl PerformanceLog {
         page["capture"] = json!({"state":"running","retrying":false,"error":null});
         Ok(page)
     }
+
+    pub fn purge(&self) -> Result<Value> {
+        self.log.purge()?;
+        Ok(json!({"source":"performance","purged":true}))
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +96,44 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn purge_is_shared_with_active_producers_and_leaves_other_logs_untouched() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("performance");
+        let other = DiskLog::open(&directory.path().join("netcontrol"))?;
+        other.append("keep this diagnostic")?;
+        let log = PerformanceLog::open(&path)?;
+        let producer = log.clone();
+        producer.record("link_observation", "2026-11-17T01:00:00Z", json!({}));
+        let cursor = log.read(&LogQuery::parse("")?)?["next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(log.purge()?, json!({"source":"performance","purged":true}));
+        assert_eq!(other.read(&LogQuery::parse("")?)?.entries.len(), 1);
+        let query = LogQuery::parse(&format!("cursor={cursor}"))?;
+        assert_eq!(producer.read(&query)?["entries"], json!([]));
+        let handle = std::thread::spawn(move || {
+            producer.record("gateway_probe_loss", "2026-11-17T01:00:01Z", json!({}));
+        });
+        handle.join().unwrap();
+        let page = log.read(&query)?;
+        assert_eq!(page["reset"], true);
+        assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+        assert!(
+            page["entries"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("gateway_probe_loss")
+        );
+        drop(log);
+        assert_eq!(
+            PerformanceLog::open(&path)?.read(&query)?["entries"],
+            page["entries"]
         );
         Ok(())
     }

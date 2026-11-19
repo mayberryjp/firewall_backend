@@ -93,6 +93,33 @@ fn loopback_role_and_addressing_are_readonly_inventory_only() {
 }
 
 #[test]
+fn vlan_dhcp_clients_allow_tagged_addressing_but_not_static_ipv4_or_relay() {
+    let mut config: Config = serde_json::from_value(json!({
+        "interfaces":[
+            {"name":"eth0","kind":"ethernet","role":"unassigned","mtu":1500,"up":true},
+            {"name":"eth0.20","kind":"vlan","role":"wan","mtu":1500,"up":true,
+             "vlan":{"parent":"eth0","id":20}}
+        ],
+        "dhcp_clients":{"eth0.20":{}}
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    config.interfaces[1].addresses.push("192.0.2.2/24".into());
+    assert!(config.validate().is_err());
+    config.interfaces[1].dhcp_relay.enabled = true;
+    config.interfaces[1]
+        .dhcp_relay
+        .servers
+        .push("198.51.100.1".into());
+    assert!(config.validate().is_err());
+    config.interfaces[1].dhcp_relay = Default::default();
+    config.interfaces[1].addresses.clear();
+    config.interfaces[1].kind = "dummy".into();
+    config.interfaces[1].vlan = None;
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn vnstat_collector_requires_explicit_valid_socket_address() {
     let mut config = candidate();
     config.ipv6_enabled = true;

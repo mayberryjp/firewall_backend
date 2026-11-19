@@ -622,6 +622,29 @@ mod tests {
     }
 
     #[test]
+    fn relay_input_counter_identities_accept_dotted_interface_names() {
+        let generation = "01234567-89ab-cdef-0123-456789abcdef";
+        for name in ["eth0.30", "eth0.30.40"] {
+            let mut interfaces = relay_interfaces();
+            interfaces[0].name = name.into();
+            let firewall = json!({
+                "policy":"drop","allow_all_icmp":false,"rules":[],"nat":{"masquerade":[]}
+            });
+            let plans = compile_input(&firewall, &interfaces).unwrap();
+            assert_eq!(plans.len(), 4);
+            assert_eq!(plans[0].ingress, name);
+            let layout = counter_layout(&firewall, &interfaces).unwrap();
+            for kind in ["clients", "servers"] {
+                let key = format!("generated/input/dhcp_relay/{name}/{kind}");
+                assert_eq!(layout[&("input".into(), key.clone())], 2);
+                for plan in plans.iter().filter(|plan| plan.counter_key == key) {
+                    crate::firewall_counters::userdata(generation, &plan.counter_key).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn relay_input_changes_replace_addresses_servers_and_reject_invalid_or_excess_rules() {
         let mut interfaces = relay_interfaces();
         interfaces[0].name = "vlan60".into();

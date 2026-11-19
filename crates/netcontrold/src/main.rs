@@ -26,6 +26,12 @@ struct Options {
     appliance: bool,
     #[arg(long, requires_all = ["appliance", "provision_lan"], help = "One-time console-host-takeover WAN; preserve imported settings and commit without connectivity confirmation")]
     provision_wan: Option<String>,
+    #[arg(long, requires = "appliance", conflicts_with_all = ["provision_wan", "factory_reset", "plan_network", "check_network_plan", "configure_lan", "confirm_network_change", "create_api_key", "create_wireguard_key", "wireguard_public_key", "configure_updates", "upgrade_worker", "upgrade_recover", "auth_file"], help = "One-time console-host-takeover using a validated IPv4 interface/VLAN JSON plan; replaces imported networking/firewall without connectivity confirmation")]
+    provision_network: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["provision_wan", "factory_reset", "configure_lan", "create_api_key", "create_wireguard_key", "wireguard_public_key", "configure_updates", "upgrade_worker", "upgrade_recover", "confirm_network_change"], help = "Interactively review all Ethernet/VLAN interfaces and write a new IPv4 installer plan without changing networking")]
+    plan_network: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["plan_network", "provision_wan", "factory_reset", "configure_lan", "create_api_key", "create_wireguard_key", "wireguard_public_key", "configure_updates", "upgrade_worker", "upgrade_recover", "confirm_network_change"], help = "Validate an IPv4 installer plan against this host without takeover and print its management IPv4 address")]
+    check_network_plan: Option<PathBuf>,
     #[arg(
         long,
         requires = "provision_wan",
@@ -194,6 +200,33 @@ fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
     }
 }
 async fn run(options: Options) -> Result<()> {
+    if let Some(path) = &options.plan_network {
+        return netcontrold::provision_network::create_plan(path);
+    }
+    if let Some(path) = &options.check_network_plan {
+        let plan = netcontrold::provision_network::NetworkPlan::load(path)?;
+        plan.validate_host()?;
+        println!(
+            "{}",
+            plan.management_address()?
+                .split('/')
+                .next()
+                .context("missing management IPv4")?
+        );
+        return Ok(());
+    }
+    let network_plan = options
+        .provision_network
+        .as_deref()
+        .map(netcontrold::provision_network::NetworkPlan::load)
+        .transpose()?;
+    if let Some(plan) = &network_plan {
+        anyhow::ensure!(
+            options.backend == "linux" && options.namespace.is_empty(),
+            "network plan provisioning requires the Linux host backend"
+        );
+        plan.validate_host()?;
+    }
     if options.configure_lan.is_some() || options.confirm_network_change.is_some() {
         let path = options
             .control_socket
@@ -243,7 +276,8 @@ async fn run(options: Options) -> Result<()> {
         (options.backend == "linux"
             && options.namespace.is_empty()
             && options.auth_file.is_none()
-            && options.provision_wan.is_none())
+            && options.provision_wan.is_none()
+            && network_plan.is_none())
         .then(|| PathBuf::from(netcontrold::local_control::DEFAULT_SOCKET))
     });
     if options.create_wireguard_key.is_some() || options.wireguard_public_key.is_some() {
@@ -353,7 +387,8 @@ async fn run(options: Options) -> Result<()> {
     }
     let saved_native_startup = options.backend == "linux"
         && options.namespace.is_empty()
-        && options.provision_wan.is_none();
+        && options.provision_wan.is_none()
+        && network_plan.is_none();
     if saved_native_startup && !options.state.try_exists()? {
         bail!(
             "no saved native configuration; run install.sh for initial provisioning instead of upgrading an unconfigured device"
@@ -394,6 +429,12 @@ async fn run(options: Options) -> Result<()> {
             revision = ?transaction.committed_revision,
             "captured and took ownership of missing conntrack tuning settings"
         );
+    }
+    if let Some(plan) = network_plan {
+        plan.apply(&mut engine)?;
+        engine.shutdown()?;
+        tracing::info!("appliance network plan provisioned; forwarding enables on service startup");
+        return Ok(());
     }
     if let (Some(wan), Some(lan)) = (&options.provision_wan, &options.provision_lan) {
         if options.factory_reset {
@@ -810,6 +851,48 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_plan_commands_require_explicit_appliance_and_exclude_other_actions() {
+        assert!(
+            Options::try_parse_from(["netcontrold", "--provision-network", "plan.json"]).is_err()
+        );
+        let options = Options::try_parse_from([
+            "netcontrold",
+            "--appliance",
+            "--provision-network",
+            "plan.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.provision_network.as_deref(),
+            Some(std::path::Path::new("plan.json"))
+        );
+        for action in [
+            "--plan-network",
+            "--check-network-plan",
+            "--configure-updates",
+            "--configure-lan",
+            "--create-api-key",
+            "--confirm-network-change",
+        ] {
+            assert!(
+                Options::try_parse_from([
+                    "netcontrold",
+                    "--appliance",
+                    "--provision-network",
+                    "plan.json",
+                    action,
+                    "other"
+                ])
+                .is_err()
+            );
+        }
+        assert!(Options::try_parse_from(["netcontrold", "--plan-network", "plan.json"]).is_ok());
+        assert!(
+            Options::try_parse_from(["netcontrold", "--check-network-plan", "plan.json"]).is_ok()
+        );
+    }
 
     #[test]
     fn tagged_lan_commands_require_complete_explicit_topology() {

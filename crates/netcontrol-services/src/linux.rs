@@ -126,6 +126,7 @@ pub(crate) fn send(fd: RawFd, payload: &[u8], address: SocketAddr, scope: u32) -
     ensure!(n as usize == payload.len(), "short socket send");
     Ok(())
 }
+#[cfg(test)]
 pub(crate) fn recv(fd: RawFd, buffer: &mut [u8]) -> Result<Option<(usize, SocketAddr)>> {
     let mut a: libc::sockaddr_storage = unsafe { mem::zeroed() };
     let mut len = mem::size_of_val(&a) as libc::socklen_t;

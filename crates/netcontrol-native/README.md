@@ -520,8 +520,11 @@ Netcontrol/resolved/SSH/Wi-Fi authentication and original OS files remain.
 IPv6 is disabled initially, including DHCPv6/SLAAC and IPv6 routes/DNS.
 This is console-only takeover, without connectivity rollback; partial failures
 retain capture and an explicit failed phase for correction/retry. Native
-`host_takeover` runtime reports decisions but never raw captures. Provisioning
-preserves the import except selected WAN/LAN roles and explicit LAN addressing.
+`host_takeover` runtime reports capture decisions but never raw captures.
+The fresh installer's explicitly approved multi-interface plan replaces the
+imported addressing/routes/DNS/firewall with its chosen IPv4 topology and
+LAN-to-WAN starter policy, retaining kernel ownership and system/software
+metadata. Capture remains recovery evidence, not the final installer policy.
 Explicit later VLAN adoption retains its separate networkd restrictions and
 normal confirmed transactions; it is not another host recapture.
 See [installation prerequisites and acceptance limits](../../docs/BUILD_AND_INSTALL.md#automatic-physical-interface-inheritance).
@@ -669,7 +672,7 @@ protection; physical-appliance DHCP/networkd/resolved acceptance remains separat
 
 Routes may explicitly set `"gateway":"dhcp"` to follow the interface lease's
 lowest-metric IPv4 default-route gateway. This requires an IPv4 destination and
-a configured DHCPv4 client on the same managed Ethernet interface, including
+a configured DHCPv4 client on the same managed Ethernet or VLAN interface, including
 when the route is disabled. Equal-best leased defaults must agree on one numeric
 unicast gateway; missing/direct defaults, invalid gateways and ambiguous next
 hops fail explicitly. Classless lease routes remain authoritative; there is no

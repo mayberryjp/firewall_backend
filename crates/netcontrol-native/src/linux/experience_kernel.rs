@@ -741,9 +741,16 @@ mod tests {
             client.send_to(b"hello", server.local_addr()?)?;
             let mut buf = [0; 32];
             server.recv_from(&mut buf)?;
+            super::super::nft_wire::send(&[
+                (0, 0x605, string(1, "netcontrol")),
+                (0, 0x605, string(1, "foreign_takeover_fixture")),
+            ])?;
+            for _ in 0..2 {
+                super::super::netfilter::clear_host_firewall(true)?;
+            }
             ensure!(
                 fingerprint == super::super::netfilter::experience_fingerprint()?,
-                "mutable accounting changed policy fingerprint"
+                "takeover or mutable accounting changed experience policy fingerprint"
             );
             for name in ["exp_sent4", "exp_received4"] {
                 let values = counts(TABLE, name)?;
@@ -826,6 +833,13 @@ mod tests {
             }
             ensure!(full, "full 4096-byte IPv6 DNS capture absent");
             remove(&fingerprint)?;
+            install(&hosts)?;
+            super::super::netfilter::clear_host_firewall(false)?;
+            ensure!(
+                super::super::netfilter::dump_messages(10, 1, libc::NFPROTO_UNSPEC as u8, &[])?
+                    .is_empty(),
+                "full takeover retained firewall tables"
+            );
             Ok(())
         })
         .join()

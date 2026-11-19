@@ -5,6 +5,8 @@ use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+mod socket;
 pub(crate) fn checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
     for part in bytes.chunks(2) {
@@ -469,7 +471,9 @@ fn prepare_inner(
     l::bind(fd.as_raw_fd(), SocketAddr::new(src, 0), index)?;
     let id = rand::random::<u16>();
     let nonce = rand::random::<[u8; 16]>();
+    socket::configure(fd.as_raw_fd(), id, &nonce, ipv6)?;
     Ok(Box::new(move |ctx| {
+        let clock = socket::ReceiveClock::now()?;
         let mut window = Window::new(config.clone(), Instant::now());
         let mut seq = 0;
         let mut next = Instant::now();
@@ -491,18 +495,25 @@ fn prepare_inner(
                 window.sent(seq, sent);
                 next = sent + Duration::from_millis(config.probe_interval_ms);
             }
-            for _ in 0..128 {
-                let Some((n, from)) = l::recv(fd.as_raw_fd(), &mut buffer)? else {
+            let observed = Instant::now();
+            let mut drained = false;
+            for _ in 0..1024 {
+                let Some((n, from, arrived)) = socket::recv(fd.as_raw_fd(), &mut buffer)? else {
+                    drained = true;
                     break;
                 };
                 if from.ip() == target {
                     if let Some(seq) = reply(&buffer[..n], id, &nonce, ipv6) {
-                        window.received(seq, Instant::now());
+                        window.received(seq, clock.arrival(arrived)?);
                     }
                 }
             }
+            ensure!(drained, "gateway receive backlog exceeds processing budget");
+            clock.validate()?;
             if sampled.elapsed() >= Duration::from_millis(100) {
-                let stats = window.observe(Instant::now(), &performance_log);
+                socket::check_queue(fd.as_raw_fd())?;
+                // Finalize only deadlines preceding the receive drain.
+                let stats = window.observe(observed, &performance_log);
                 ctx.update(|s| s["statistics"] = stats);
                 sampled = Instant::now();
             }
@@ -525,7 +536,7 @@ mod tests {
         let p = echo(1, 2, &nonce, false);
         assert_eq!(checksum(&p), 0);
     }
-    fn config() -> super::super::config::Gateway {
+    pub(super) fn config() -> super::super::config::Gateway {
         serde_json::from_value(json!({"name":"test","enabled":true,"interface":"test0","source_address":"192.0.2.1","gateway":"192.0.2.2","target":"192.0.2.3","routing_table":10000,"probe_interval_ms":100,"loss_timeout_ms":100,"window_ms":1000,"latency_threshold_ms":100,"loss_threshold_percent":20,"rtt_variation_threshold_ms":0,"failure_hold_ms":100,"recovery_hold_ms":100})).unwrap()
     }
     #[test]

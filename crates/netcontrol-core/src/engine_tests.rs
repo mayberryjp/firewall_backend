@@ -149,6 +149,63 @@ fn separate_log_apis_require_logs_permission_and_preserve_state() {
 }
 
 #[test]
+fn performance_log_purge_requires_delete_permission_and_preserves_configuration() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let saved = fs::read(fixture.path()).unwrap();
+    let path = "/api/v1/logs/performance";
+    for (actor, permissions, query, body, status) in [
+        ("", vec!["logs.delete".into()], "", "", 401),
+        ("reader", vec!["logs.read".into()], "", "", 403),
+        ("reader", vec!["state.read".into()], "", "", 403),
+        ("operator", vec!["logs.delete".into()], "limit=100", "", 400),
+        ("operator", vec!["logs.delete".into()], "cursor=x", "", 400),
+        ("operator", vec!["logs.delete".into()], "", "{}", 400),
+        ("operator", vec!["logs.delete".into()], "", "", 200),
+        ("operator", vec!["logs.delete".into()], "", "", 200),
+    ] {
+        let reply = engine.request("DELETE", path, query, actor, &permissions, body.as_bytes());
+        assert_eq!(reply.status, status, "{}", reply.body);
+        if status == 200 {
+            assert_eq!(reply.body, json!({"source":"performance","purged":true}));
+        }
+    }
+    assert_eq!(faults.lock().unwrap().performance_purges, 2);
+    for source in ["syslog", "netcontrol"] {
+        assert_eq!(
+            engine
+                .request(
+                    "DELETE",
+                    &format!("/api/v1/logs/{source}"),
+                    "",
+                    "operator",
+                    &all(),
+                    &[]
+                )
+                .status,
+            405
+        );
+    }
+    faults.lock().unwrap().fail_performance_purge = true;
+    assert_eq!(
+        engine
+            .request("DELETE", path, "", "operator", &all(), &[])
+            .status,
+        503
+    );
+    let simulator_fixture = Fixture::new();
+    assert_eq!(
+        simulator_fixture
+            .engine()
+            .request("DELETE", path, "", "operator", &all(), &[])
+            .status,
+        503
+    );
+    assert_eq!(fs::read(fixture.path()).unwrap(), saved);
+}
+
+#[test]
 fn dhcp_relay_diagnostics_api_is_authorized_validated_and_read_only() {
     let fixture = Fixture::new();
     let faults = Arc::new(Mutex::new(Faults::default()));
@@ -2172,6 +2229,8 @@ struct Faults {
     route_table_calls: usize,
     log_response: Option<Value>,
     log_sources: Vec<String>,
+    performance_purges: usize,
+    fail_performance_purge: bool,
     dhcp_relay_log_response: Option<Value>,
     dhcp_relay_log_calls: usize,
     conntrack_capture: Option<KernelConfig>,
@@ -2215,6 +2274,12 @@ struct Faults {
 }
 struct FaultBackend(Arc<Mutex<Faults>>);
 impl Backend for FaultBackend {
+    fn purge_performance_log(&mut self) -> Result<Value> {
+        let mut faults = self.0.lock().unwrap();
+        faults.performance_purges += 1;
+        ensure!(!faults.fail_performance_purge, "injected purge failure");
+        Ok(json!({"source":"performance","purged":true}))
+    }
     fn route_table(&mut self) -> Result<Value> {
         let mut faults = self.0.lock().unwrap();
         faults.route_table_calls += 1;
