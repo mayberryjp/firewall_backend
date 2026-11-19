@@ -363,6 +363,20 @@ Both routes require authenticated `state.read`, no body, and return no-store
 | `GET /api/v1/statistics/host-experience/history` | Required canonical `address` only | Exactly 360 chronological ten-second observed/missing slots; at most one hour, no pagination |
 | `GET /api/v1/statistics/host-experience/summary` | Optional canonical `address`, managed-LAN `interface`, canonical `limit` 1..256 (default 25), opaque `cursor` <=2048 bytes | One pinned rolling-hour summary per currently eligible IP; numeric IP ordering and `next_cursor:string|null` |
 
+Summary aggregation has a bounded SQLite read budget of 900 ms per started
+64-host batch: 900/1800/2700/3600 ms for 1..64/65..128/129..192/193..256
+selected hosts. Empty pages retain the 900 ms budget. This replaces the former
+900 ms budget for every summary page; latest/history remain unchanged.
+This is not an end-to-end HTTP deadline: allow additional time for storage-lock
+acquisition, snapshot/metadata reads, serialization and proxy/network overhead.
+Review frontend and device-proxy timeouts accordingly, avoid overlapping polls,
+and keep cursor pagination (default 25) for lower-latency updates. The four
+shared read slots, 4 MiB response ceiling and explicit `429`/`503` errors remain;
+deadline exhaustion returns `503` with
+`{"error":"experience query read deadline exceeded","transaction":null}`,
+not omitted hosts or partial-success pages. See
+[required timeout review 2026-11-19-05](docs/frontend-handoffs/2026-11-19.md#2026-11-19-05-large-experience-summary-read-budget).
+
 Common fields: `kind`, `interval_seconds:10`, `retention_seconds:3600`,
 `collection_id:string|null`, `collected_at:string|null`, `age_ms:number|null`,
 `status:starting|available|partial|stale|unavailable`, `error:string|null`,

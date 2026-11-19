@@ -596,8 +596,10 @@ direct nftables bindings. See the [build prerequisites](docs/BUILD_AND_INSTALL.m
 
 The test profile minimally optimizes core/native code (`opt-level=1`) so bounded
 read regressions exercise compiled code rather than wholly unoptimized debug
-execution. Test debug assertions, the 900 ms read deadline and all test cases
-remain enabled; development and release build profiles are unchanged.
+execution. Test debug assertions and bounded read deadlines remain enabled:
+900 ms normally, with hourly-summary aggregation allowing 900 ms per started
+64-host batch (at most 3.6 seconds for 256 hosts). Development and release
+build profiles are unchanged.
 
 ```sh
 cargo test --workspace --locked

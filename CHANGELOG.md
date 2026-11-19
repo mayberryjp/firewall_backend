@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- Fix hourly Network Experience summary timeouts for dense 256-host pages:
+  stream samples/reasons in bucket order, reuse bounded validated decoding,
+  and allow 900 ms per started 64-host batch, capped at 3.6 seconds. Preserve
+  small-page/latest/history deadlines, pinned pagination, precise counters,
+  retained timing evidence and explicit failures. Normalize summary SQLite
+  interruptions to a descriptive deadline error. Read-timing contract fix;
+  next automatic calendar version.
+  [Required proxy/client timeout review 2026-11-19-05](docs/frontend-handoffs/2026-11-19.md#2026-11-19-05-large-experience-summary-read-budget).
+
 - Make fresh-installer release downloads resilient to slow/interrupted links:
   retry transient failures up to five total attempts, allow one hour per
   attempt, detect transfers below 1 byte/s for five minutes and resume the

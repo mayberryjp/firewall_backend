@@ -1017,6 +1017,16 @@ impl Store {
         window: &SummaryWindow,
         now_ms: i64,
     ) -> Result<Vec<Value>> {
+        self.read_summaries(addresses, window, now_ms)
+            .map_err(summary_read_error)
+    }
+
+    fn read_summaries(
+        &self,
+        addresses: &[IpAddr],
+        window: &SummaryWindow,
+        now_ms: i64,
+    ) -> Result<Vec<Value>> {
         ensure!(addresses.len() <= 256, "summary page exceeds 256 addresses");
         let keys = addresses
             .iter()
@@ -1033,7 +1043,7 @@ impl Store {
                 && now_ms.saturating_sub(window.end_ms) < RETENTION_MS,
             CursorError::Expired
         );
-        let deadline = ReadDeadline::new(&self.reader);
+        let deadline = ReadDeadline::summary(&self.reader, addresses.len())?;
         let logical = self.clock(now_ms)?;
         ensure!(
             !self.has_discontinuity(logical),
@@ -1059,59 +1069,90 @@ impl Store {
             }
             _ => bail!(CursorError::Invalid),
         };
-        let sql = format!(
-            "{} WHERE s.address=?1 AND b.seq>?2 AND b.seq<=?3 AND b.retention_ms>?4
-            AND b.end_ms>?5 AND b.end_ms<=?6 ORDER BY s.bucket_id LIMIT 361",
-            select_sql()
+        let positions: BTreeMap<_, _> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_slice(), index))
+            .collect();
+        let mut accumulators = keys
+            .iter()
+            .map(|_| {
+                netcontrol_core::experience_summary::Accumulator::new(
+                    window.end_ms - RETENTION_MS,
+                    window.end_ms,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut previous: Vec<Option<SummarySample>> = (0..keys.len()).map(|_| None).collect();
+        let placeholders = (6..keys.len() + 6)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Stream both cursors in bucket/index order without sorting full history rows.
+        let source = "buckets b CROSS JOIN host_samples s INDEXED BY sample_bucket_address ON s.bucket_id=b.seq";
+        let predicate = format!(
+            "b.seq>?1 AND b.seq<=?2 AND b.retention_ms>?3
+            AND b.end_ms>?4 AND b.end_ms<=?5 AND s.address IN ({placeholders})"
         );
-        let mut result = Vec::with_capacity(keys.len());
+        let sql = format!(
+            "{} WHERE {predicate} ORDER BY b.seq,s.address LIMIT {}",
+            select_sql_from(source),
+            keys.len() * MAX_SLOTS + 1
+        );
+        let mut parameters = vec![
+            rusqlite::types::Value::Integer(self.quarantine.get()),
+            rusqlite::types::Value::Integer(high),
+            rusqlite::types::Value::Integer(logical.saturating_sub(RETENTION_MS)),
+            rusqlite::types::Value::Integer(window.end_ms - RETENTION_MS),
+            rusqlite::types::Value::Integer(window.end_ms),
+        ];
+        parameters.extend(keys.iter().cloned().map(rusqlite::types::Value::Blob));
         {
             let mut statement = tx.prepare(&sql)?;
             let summary_columns = SummaryColumns::new()?;
-            let mut coverage_statement = tx.prepare(
-                "SELECT r.sample_id,r.reason FROM host_samples s
-                JOIN buckets b ON b.seq=s.bucket_id JOIN coverage_reasons r ON r.sample_id=s.id
-                WHERE s.address=?1 AND b.seq>?2 AND b.seq<=?3 AND b.retention_ms>?4
-                AND b.end_ms>?5 AND b.end_ms<=?6 ORDER BY s.bucket_id,r.position LIMIT 11521",
-            )?;
-            for key in keys {
-                let parameters = params![
-                    key,
-                    self.quarantine.get(),
-                    high,
-                    logical.saturating_sub(RETENTION_MS),
-                    window.end_ms - RETENTION_MS,
-                    window.end_ms
-                ];
-                let mut coverage_reasons: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-                {
-                    let mut rows = coverage_statement.query(parameters)?;
-                    let mut count = 0;
-                    while let Some(row) = rows.next()? {
-                        deadline.check()?;
-                        count += 1;
-                        ensure!(count <= MAX_SLOTS * 32, "too many summary coverage reasons");
-                        let reasons = coverage_reasons.entry(row.get(0)?).or_default();
-                        ensure!(reasons.len() < 32, "too many coverage reasons");
-                        let reason: String = row.get(1)?;
-                        bounded_text(&reason, 128)?;
-                        reasons.push(reason);
-                    }
-                }
-                let mut accumulator = netcontrol_core::experience_summary::Accumulator::new(
-                    window.end_ms - RETENTION_MS,
-                    window.end_ms,
-                )?;
-                let mut rows = statement.query(parameters)?;
-                while let Some(row) = rows.next()? {
-                    deadline.check()?;
-                    let reasons = coverage_reasons.remove(&row.get(0)?).unwrap_or_default();
-                    accumulator.push(&read_summary_sample(row, &summary_columns, reasons)?)?;
-                }
-                result.push(accumulator.finish()?);
+            let mut coverage_statement = tx.prepare(&format!(
+                "SELECT r.sample_id,r.reason FROM {source}
+                JOIN coverage_reasons r ON r.sample_id=s.id WHERE {predicate}
+                ORDER BY b.seq,s.address,r.position LIMIT {}",
+                keys.len() * MAX_SLOTS * 32 + 1,
+            ))?;
+            let mut coverage_rows =
+                coverage_statement.query(rusqlite::params_from_iter(&parameters))?;
+            let mut next_reason = coverage_rows.next()?;
+            let mut rows = statement.query(rusqlite::params_from_iter(&parameters))?;
+            let mut count = 0;
+            while let Some(row) = rows.next()? {
                 deadline.check()?;
+                count += 1;
+                ensure!(count <= keys.len() * MAX_SLOTS, "too many summary samples");
+                let id = row.get::<_, i64>(0)?;
+                let mut reasons = Vec::new();
+                while let Some(reason) = next_reason {
+                    if reason.get::<_, i64>(0)? != id {
+                        break;
+                    }
+                    deadline.check()?;
+                    ensure!(reasons.len() < 32, "too many coverage reasons");
+                    let reason: String = reason.get(1)?;
+                    bounded_text(&reason, 128)?;
+                    reasons.push(reason);
+                    next_reason = coverage_rows.next()?;
+                }
+                let address = row.get_ref(1)?.as_blob()?;
+                let index = positions
+                    .get(address)
+                    .context("unexpected summary address")?;
+                let decoded =
+                    read_summary_sample(row, &summary_columns, reasons, previous[*index].take())?;
+                accumulators[*index].push(&decoded.sample)?;
+                previous[*index] = Some(decoded);
             }
+            ensure!(next_reason.is_none(), "unmatched summary coverage reasons");
         }
+        let result = accumulators
+            .into_iter()
+            .map(|accumulator| accumulator.finish())
+            .collect::<Result<Vec<_>>>()?;
         tx.commit()?;
         deadline.check()?;
         Ok(result)
@@ -1380,15 +1421,21 @@ impl Store {
 }
 
 fn select_sql() -> String {
+    select_sql_from("host_samples s JOIN buckets b ON b.seq=s.bucket_id")
+}
+
+fn select_sql_from(source: &str) -> String {
     let metrics = COLUMNS
         .iter()
         .map(|column| format!("s.{}", column_name(column.path)))
         .collect::<Vec<_>>()
         .join(",");
-    format!("SELECT s.id,s.address,e.epoch,e.host_id,e.revision,e.interface_name,e.interface_index,
+    format!(
+        "SELECT s.id,s.address,e.epoch,e.host_id,e.revision,e.interface_name,e.interface_index,
         e.interface_kind,e.vlan_id,b.start_ms,b.end_ms,e.configured_name,{metrics},t.distributions
-        FROM host_samples s JOIN buckets b ON b.seq=s.bucket_id JOIN host_epochs e ON e.id=s.identity_id
-        LEFT JOIN sample_timings t ON t.sample_id=s.id")
+        FROM {source} JOIN host_epochs e ON e.id=s.identity_id
+        LEFT JOIN sample_timings t ON t.sample_id=s.id"
+    )
 }
 
 fn read_diagnostics(tx: &Transaction<'_>, bucket: i64) -> Result<Diagnostics> {
@@ -1645,6 +1692,14 @@ struct SummaryScalars<'a, 'row> {
     row: &'a rusqlite::Row<'row>,
 }
 impl SummaryScalars<'_, '_> {
+    fn text_reusing(&self, index: usize, mut previous: String) -> Result<String> {
+        let rusqlite::types::ValueRef::Text(bytes) = self.scalar(index)? else {
+            bail!("invalid persisted text metric");
+        };
+        std::str::from_utf8(bytes)?.clone_into(&mut previous);
+        Ok(previous)
+    }
+
     fn scalar(&self, index: usize) -> Result<rusqlite::types::ValueRef<'_>> {
         use rusqlite::types::ValueRef as Sql;
         let column = &COLUMNS[index];
@@ -1747,6 +1802,28 @@ impl SummaryScalars<'_, '_> {
             _ => bail!("invalid persisted boolean metric"),
         }
     }
+    fn timestamp(&self, index: usize) -> Result<Option<DateTime<Utc>>> {
+        use rusqlite::types::ValueRef;
+        match self.row.get_ref(index + 12)? {
+            ValueRef::Null => Ok(None),
+            ValueRef::Text(bytes) => {
+                let text = std::str::from_utf8(bytes)?;
+                bounded_text(text, 255)?;
+                let milliseconds = timestamp_ms(text)?;
+                let nanos = if text.len() == 20 {
+                    0
+                } else {
+                    let digits = &text[20..text.len() - 1];
+                    digits.parse::<u32>()? * 10u32.pow(9 - digits.len() as u32)
+                };
+                Ok(Some(
+                    DateTime::from_timestamp(milliseconds / 1000, nanos)
+                        .context("invalid persisted timestamp")?,
+                ))
+            }
+            _ => bail!("invalid persisted timestamp type"),
+        }
+    }
     fn explanation<T: serde::de::DeserializeOwned>(&self, index: usize) -> Result<T> {
         ensure!(
             matches!(COLUMNS[index].kind, Kind::ScoreJson),
@@ -1754,6 +1831,22 @@ impl SummaryScalars<'_, '_> {
         );
         let value = decode_metric(self.row.get(index + 12)?, &COLUMNS[index])?;
         serde_json::from_value(value).context("invalid persisted score explanation")
+    }
+
+    fn explanation_reusing<T: serde::de::DeserializeOwned>(
+        &self,
+        index: usize,
+        previous: T,
+        encoded: &mut Option<String>,
+    ) -> Result<T> {
+        let text = self.row.get_ref(index + 12)?.as_str()?;
+        // The identical bytes were already validated in this read snapshot.
+        if encoded.as_deref() == Some(text) {
+            return Ok(previous);
+        }
+        let decoded = self.explanation(index)?;
+        text.clone_into(encoded.get_or_insert_with(String::new));
+        Ok(decoded)
     }
 }
 
@@ -1765,11 +1858,23 @@ fn summary_timestamp(milliseconds: i64) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp_millis(milliseconds).context("invalid persisted sample timestamp")
 }
 
+struct SummarySample {
+    sample: Sample,
+    components_json: Option<String>,
+    reasons_json: Option<String>,
+}
+
+fn summary_text(row: &rusqlite::Row<'_>, index: usize, mut previous: String) -> Result<String> {
+    row.get_ref(index)?.as_str()?.clone_into(&mut previous);
+    Ok(previous)
+}
+
 fn read_summary_sample(
     row: &rusqlite::Row<'_>,
     columns: &SummaryColumns,
     reasons: Vec<String>,
-) -> Result<Sample> {
+    previous: Option<SummarySample>,
+) -> Result<SummarySample> {
     use netcontrol_core::experience::{
         Connections, Coverage, Dns, Experience, Firewall, InterfaceIdentity, Tcp, Timing, Traffic,
     };
@@ -1785,14 +1890,37 @@ fn read_summary_sample(
     };
     let interface_index: i64 = row.get(6)?;
     let vlan: i64 = row.get(8)?;
+    let start_at = summary_timestamp(row.get(9)?)?;
+    let end_at = summary_timestamp(row.get(10)?)?;
+    let previous = previous.unwrap_or_else(|| SummarySample {
+        sample: Sample::new(
+            ip_address,
+            String::new(),
+            String::new(),
+            String::new(),
+            start_at,
+            end_at,
+        ),
+        components_json: None,
+        reasons_json: None,
+    });
+    let SummarySample {
+        sample: mut previous,
+        mut components_json,
+        mut reasons_json,
+    } = previous;
     ensure!(vlan == 0 || (1..=4094).contains(&vlan), "invalid VLAN ID");
     let interface = if interface_index == 0 {
         None
     } else {
+        let previous = previous.interface.take();
+        let (name, kind) = previous
+            .map(|interface| (interface.name, interface.kind))
+            .unwrap_or_default();
         Some(InterfaceIdentity {
-            name: row.get(5)?,
+            name: summary_text(row, 5, name)?,
             index: u32::try_from(interface_index).context("invalid interface index")?,
-            kind: row.get(7)?,
+            kind: summary_text(row, 7, kind)?,
             vlan_id: if vlan == 0 {
                 None
             } else {
@@ -1802,15 +1930,15 @@ fn read_summary_sample(
     };
     let sample = Sample {
         ip_address,
-        configured_host_id: row.get(3)?,
-        configured_name: row.get(11)?,
-        configuration_revision: row.get(4)?,
-        observation_epoch: row.get(2)?,
-        start_at: summary_timestamp(row.get(9)?)?,
-        end_at: summary_timestamp(row.get(10)?)?,
+        configured_host_id: summary_text(row, 3, previous.configured_host_id)?,
+        configured_name: summary_text(row, 11, previous.configured_name)?,
+        configuration_revision: summary_text(row, 4, previous.configuration_revision)?,
+        observation_epoch: summary_text(row, 2, previous.observation_epoch)?,
+        start_at,
+        end_at,
         measured_duration_ms: scalar.integer(columns.measured_duration_ms)?,
         interface,
-        last_seen_at: scalar.optional_text(columns.last_seen_at)?,
+        last_seen_at: scalar.timestamp(columns.last_seen_at)?,
         activity: scalar.text(columns.activity)?,
         traffic: Traffic {
             status: scalar.text(columns.traffic_status)?,
@@ -1821,20 +1949,25 @@ fn read_summary_sample(
             received_bytes: scalar.count(columns.traffic_received_bytes)?,
             sent_bps: scalar.real(columns.traffic_sent_bps)?,
             received_bps: scalar.real(columns.traffic_received_bps)?,
-            packet_unit: scalar.text(columns.traffic_packet_unit)?,
-            byte_unit: scalar.text(columns.traffic_byte_unit)?,
+            packet_unit: scalar
+                .text_reusing(columns.traffic_packet_unit, previous.traffic.packet_unit)?,
+            byte_unit: scalar
+                .text_reusing(columns.traffic_byte_unit, previous.traffic.byte_unit)?,
         },
         firewall: Firewall {
             status: scalar.text(columns.firewall_status)?,
             error: scalar.optional_text(columns.firewall_error)?,
             dropped_sent_packets: scalar.count(columns.firewall_dropped_sent_packets)?,
             dropped_received_packets: scalar.count(columns.firewall_dropped_received_packets)?,
-            drop_coverage: scalar.text(columns.firewall_drop_coverage)?,
+            drop_coverage: scalar.text_reusing(
+                columns.firewall_drop_coverage,
+                previous.firewall.drop_coverage,
+            )?,
         },
         connections: Connections {
             status: scalar.text(columns.connections_status)?,
             error: scalar.optional_text(columns.connections_error)?,
-            observed_at: scalar.optional_text(columns.connections_observed_at)?,
+            observed_at: scalar.timestamp(columns.connections_observed_at)?,
             measurement_duration_ms: scalar
                 .optional_integer(columns.connections_measurement_duration_ms)?,
             total: scalar.count(columns.connections_total)?,
@@ -1901,28 +2034,42 @@ fn read_summary_sample(
             unanswered_percent: scalar.real(columns.dns_unanswered_percent)?,
         },
         experience: Experience {
-            algorithm: scalar.text(columns.experience_algorithm)?,
+            algorithm: scalar
+                .text_reusing(columns.experience_algorithm, previous.experience.algorithm)?,
             score: scalar.optional_integer(columns.experience_score)?,
             level: scalar.text(columns.experience_level)?,
             status: scalar.text(columns.experience_status)?,
             confidence: scalar.text(columns.experience_confidence)?,
             basis_seconds: scalar.integer(columns.experience_basis_seconds)?,
-            components: scalar.explanation(columns.experience_components)?,
-            reasons: scalar.explanation(columns.experience_reasons)?,
+            components: scalar.explanation_reusing(
+                columns.experience_components,
+                previous.experience.components,
+                &mut components_json,
+            )?,
+            reasons: scalar.explanation_reusing(
+                columns.experience_reasons,
+                previous.experience.reasons,
+                &mut reasons_json,
+            )?,
         },
         coverage: Coverage {
             complete: scalar.boolean(columns.coverage_complete)?,
             reasons,
-            traffic: scalar.text(columns.coverage_traffic)?,
-            firewall: scalar.text(columns.coverage_firewall)?,
-            tcp: scalar.text(columns.coverage_tcp)?,
-            dns: scalar.text(columns.coverage_dns)?,
-            connections: scalar.text(columns.coverage_connections)?,
+            traffic: scalar.text_reusing(columns.coverage_traffic, previous.coverage.traffic)?,
+            firewall: scalar.text_reusing(columns.coverage_firewall, previous.coverage.firewall)?,
+            tcp: scalar.text_reusing(columns.coverage_tcp, previous.coverage.tcp)?,
+            dns: scalar.text_reusing(columns.coverage_dns, previous.coverage.dns)?,
+            connections: scalar
+                .text_reusing(columns.coverage_connections, previous.coverage.connections)?,
         },
         timing_distributions: decode_timings(row.get_ref(COLUMNS.len() + 12)?)?,
     };
     validate_sample(&sample)?;
-    Ok(sample)
+    Ok(SummarySample {
+        sample,
+        components_json,
+        reasons_json,
+    })
 }
 
 fn decode_metric(value: rusqlite::types::Value, column: &Column) -> Result<Value> {
@@ -1949,27 +2096,57 @@ fn decode_metric(value: rusqlite::types::Value, column: &Column) -> Result<Value
     Ok(decoded)
 }
 
+fn summary_read_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(|error| {
+            error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+        })
+    {
+        error.context("experience query read deadline exceeded")
+    } else {
+        error
+    }
+}
+
 struct ReadDeadline {
     connection: *mut rusqlite::ffi::sqlite3,
-    started: Box<Instant>,
+    budget: Box<ReadBudget>,
+}
+struct ReadBudget {
+    started: Instant,
+    timeout: Duration,
 }
 impl ReadDeadline {
     fn new(connection: &Connection) -> Self {
-        let mut started = Box::new(Instant::now());
+        Self::with_timeout(connection, Duration::from_millis(900))
+    }
+    fn summary(connection: &Connection, hosts: usize) -> Result<Self> {
+        ensure!(hosts <= 256, "summary page exceeds 256 addresses");
+        Ok(Self::with_timeout(
+            connection,
+            Duration::from_millis(900) * u32::try_from(hosts.div_ceil(64).max(1))?,
+        ))
+    }
+    fn with_timeout(connection: &Connection, timeout: Duration) -> Self {
+        let mut budget = Box::new(ReadBudget {
+            started: Instant::now(),
+            timeout,
+        });
         let handle = unsafe { connection.handle() };
-        let pointer = (&mut *started as *mut Instant).cast();
+        let pointer = (&mut *budget as *mut ReadBudget).cast();
         unsafe {
             rusqlite::ffi::sqlite3_progress_handler(handle, 1000, Some(read_progress), pointer);
             rusqlite::ffi::sqlite3_busy_handler(handle, Some(read_busy), pointer);
         }
         Self {
             connection: handle,
-            started,
+            budget,
         }
     }
     fn check(&self) -> Result<()> {
         ensure!(
-            self.started.elapsed() < Duration::from_millis(900),
+            self.budget.started.elapsed() < self.budget.timeout,
             "experience query read deadline exceeded"
         );
         Ok(())
@@ -1984,15 +2161,15 @@ impl Drop for ReadDeadline {
     }
 }
 unsafe extern "C" fn read_progress(pointer: *mut std::ffi::c_void) -> std::ffi::c_int {
-    let started = unsafe { &*pointer.cast::<Instant>() };
-    i32::from(started.elapsed() >= Duration::from_millis(900))
+    let budget = unsafe { &*pointer.cast::<ReadBudget>() };
+    i32::from(budget.started.elapsed() >= budget.timeout)
 }
 unsafe extern "C" fn read_busy(
     pointer: *mut std::ffi::c_void,
     retries: std::ffi::c_int,
 ) -> std::ffi::c_int {
-    let started = unsafe { &*pointer.cast::<Instant>() };
-    if retries >= 50 || started.elapsed() >= Duration::from_millis(900) {
+    let budget = unsafe { &*pointer.cast::<ReadBudget>() };
+    if retries >= 50 || budget.started.elapsed() >= budget.timeout {
         return 0;
     }
     std::thread::sleep(Duration::from_millis(5));
@@ -2960,14 +3137,14 @@ mod tests {
     fn dense_hourly_page_obeys_read_and_response_bounds() {
         let directory = TestDirectory::new();
         let mut store = directory.open(BASE);
-        let addresses: Vec<IpAddr> = (1..=64)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, i)))
+        let addresses: Vec<IpAddr> = (1..=256)
+            .map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
             .collect();
         for slot in 1..=360 {
             let end = BASE + slot * INTERVAL_MS;
             let samples = addresses
                 .iter()
-                .map(|ip| sample(&ip.to_string(), end))
+                .map(|ip| populated_summary_sample(&ip.to_string(), end))
                 .collect::<Vec<_>>();
             insert(&mut store, &format!("dense-{slot}"), end, &samples);
         }
@@ -2975,14 +3152,21 @@ mod tests {
         let window = store.summary_window(now).unwrap();
         let started = Instant::now();
         let page = store.summaries(&addresses, &window, now).unwrap();
-        println!("dense hourly summary read: {:?}", started.elapsed());
-        assert_eq!(page.len(), 64);
+        let elapsed = started.elapsed();
+        println!("dense hourly summary read: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(3600), "{elapsed:?}");
+        assert_eq!(page.len(), 256);
         for summary in &page {
             assert_eq!(summary["observed_slots"], 360);
-            assert_eq!(summary["traffic"]["sent_bytes"]["total"], "1080");
-            assert_eq!(summary["traffic"]["received_bytes"]["total"], "1440");
+            assert_eq!(
+                summary["traffic"]["sent_bytes"]["total"],
+                (u128::from(u64::MAX) * 360).to_string()
+            );
+            assert_eq!(summary["traffic"]["received_bytes"]["total"], "0");
             assert!(summary["coverage_complete"].as_bool().unwrap());
-            assert!(summary["tcp"]["rtt_remote"]["p95_ms"].is_null());
+            assert!(summary["tcp"]["rtt_remote"]["p95_ms"].as_f64().unwrap() > 0.0);
+            assert_eq!(summary["tcp"]["rtt_remote"]["timing_samples"], "1440");
+            assert_eq!(summary["dns"]["timing_samples"], "2520");
         }
         assert!(serde_json::to_vec(&page).unwrap().len() < 4 * 1024 * 1024);
         let excess: Vec<_> = (1_u128..=257)
@@ -2991,16 +3175,12 @@ mod tests {
         assert!(store.summaries(&excess, &window, now).is_err());
     }
 
-    #[test]
-    fn summary_decoder_roundtrips_complete_projection_and_rejects_corrupt_scalars() {
+    fn populated_summary_sample(address: &str, end: i64) -> Sample {
         use netcontrol_core::experience::{
             Activity, Component, Confidence, Connections, Dns, Experience, ExperienceLevel,
             ExperienceStatus, Firewall, SourceStatus, Tcp, Timing,
         };
-        let directory = TestDirectory::new();
-        let mut store = directory.open(BASE);
-        let end = BASE + INTERVAL_MS;
-        let mut item = sample("2001:db8::20", end);
+        let mut item = sample(address, end);
         item.activity = Activity::Active;
         item.last_seen_at = Some(timestamp_literal(end - 125).unwrap().parse().unwrap());
         item.traffic = Traffic::measured(u64::MAX, 0, u64::MAX, 0, INTERVAL_MS as u64);
@@ -3092,7 +3272,113 @@ mod tests {
         item.coverage.tcp = "complete".into();
         item.coverage.dns = "complete".into();
         item.coverage.connections = "partial".into();
-        insert(&mut store, "summary-projection", end, &[item.clone()]);
+        let mut streams = [
+            Distribution::default(),
+            Distribution::default(),
+            Distribution::default(),
+        ];
+        for (stream, values) in streams.iter_mut().zip([
+            &[10., 20., 30., 40.][..],
+            &[0., 5.][..],
+            &[7., 12., 13., 15., 17., 20., 25.][..],
+        ]) {
+            let mut previous = None;
+            for value in values {
+                stream.push(*value, previous);
+                previous = Some(*value);
+            }
+        }
+        item.tcp.rtt_remote = streams[0].summary();
+        item.tcp.rtt_host = streams[1].summary();
+        let dns = streams[2].summary();
+        item.dns.response_time_p50_ms = dns.p50_ms;
+        item.dns.response_time_p95_ms = dns.p95_ms;
+        item.dns.response_time_variation_mean_ms = dns.variation_mean_ms;
+        item.timing_distributions = Some(Box::new(streams.map(Some)));
+        item
+    }
+
+    #[test]
+    fn summary_stream_keeps_host_order_and_checks_changed_cached_fields() {
+        let directory = TestDirectory::new();
+        let mut store = directory.open(BASE);
+        let addresses: Vec<IpAddr> = ["2001:db8::2", "192.0.2.1"]
+            .into_iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        let now = BASE + 2 * INTERVAL_MS;
+        let mut expected: Vec<_> = addresses
+            .iter()
+            .map(|_| {
+                netcontrol_core::experience_summary::Accumulator::new(now - RETENTION_MS, now)
+                    .unwrap()
+            })
+            .collect();
+        let mut last = Vec::new();
+        for slot in 1..=2 {
+            let end = BASE + slot * INTERVAL_MS;
+            let mut samples: Vec<_> = addresses
+                .iter()
+                .map(|ip| populated_summary_sample(&ip.to_string(), end))
+                .collect();
+            if slot == 2 {
+                samples[0].experience.score = Some(75);
+                samples[0].experience.level = netcontrol_core::experience::ExperienceLevel::Good;
+                samples[0].experience.components[0].score = 75;
+                samples[0].experience.reasons = vec!["changed_score".into()];
+                samples[1].coverage.reasons = vec!["changed_coverage".into()];
+            }
+            for (accumulator, sample) in expected.iter_mut().zip(&samples) {
+                accumulator.push(sample).unwrap();
+            }
+            insert(&mut store, &format!("stream-{slot}"), end, &samples);
+            last = samples;
+        }
+        let window = store.summary_window(now).unwrap();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|value| value.finish().unwrap())
+            .collect();
+        assert_eq!(store.summaries(&addresses, &window, now).unwrap(), expected);
+        for (column, bad, restored) in [
+            (
+                "experience_components",
+                "",
+                serde_json::to_string(&last[0].experience.components).unwrap(),
+            ),
+            (
+                "experience_reasons",
+                "[\"duplicate\",\"duplicate\"]",
+                serde_json::to_string(&last[0].experience.reasons).unwrap(),
+            ),
+            ("traffic_sent_packets", "01", u64::MAX.to_string()),
+        ] {
+            let sql = format!(
+                "UPDATE host_samples SET {column}=?1 WHERE bucket_id=(SELECT max(seq) FROM buckets) AND address=?2"
+            );
+            let key = address_key(&addresses[0].to_string()).unwrap();
+            store.writer.execute(&sql, params![bad, key]).unwrap();
+            assert!(
+                store.summaries(&addresses, &window, now).is_err(),
+                "{column}"
+            );
+            store.writer.execute(&sql, params![restored, key]).unwrap();
+            assert_eq!(store.summaries(&addresses, &window, now).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn summary_decoder_roundtrips_complete_projection_and_rejects_corrupt_scalars() {
+        let directory = TestDirectory::new();
+        let mut store = directory.open(BASE);
+        let end = BASE + INTERVAL_MS;
+        let item = populated_summary_sample("2001:db8::20", end);
+        insert(
+            &mut store,
+            "summary-projection",
+            end,
+            std::slice::from_ref(&item),
+        );
         let columns = SummaryColumns::new().unwrap();
         let decode = || -> Result<Sample> {
             let tx = store.reader.unchecked_transaction()?;
@@ -3105,10 +3391,41 @@ mod tests {
             let reasons = reasons
                 .query_map([row.get::<_, i64>(0)?], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            read_summary_sample(row, &columns, reasons)
+            read_summary_sample(row, &columns, reasons, None).map(|decoded| decoded.sample)
         };
         let decoded = decode().unwrap();
         assert_eq!(decoded, item);
+        for value in [
+            "2026-11-19T00:00:00.000000125Z",
+            "2026-11-19T00:00:00.123456789Z",
+        ] {
+            store
+                .writer
+                .execute(
+                    "UPDATE host_samples SET last_seen_at=?1,connections_observed_at=?1",
+                    [value],
+                )
+                .unwrap();
+            let decoded = decode().unwrap();
+            let timestamp: DateTime<Utc> = value.parse().unwrap();
+            assert_eq!(decoded.last_seen_at, Some(timestamp));
+            assert_eq!(decoded.connections.observed_at, Some(timestamp));
+        }
+        store
+            .writer
+            .execute(
+                "UPDATE host_samples SET last_seen_at=?1,connections_observed_at=?2",
+                params![
+                    item.last_seen_at
+                        .unwrap()
+                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                    item.connections
+                        .observed_at
+                        .unwrap()
+                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+                ],
+            )
+            .unwrap();
         let mut accumulator =
             netcontrol_core::experience_summary::Accumulator::new(end - RETENTION_MS, end).unwrap();
         accumulator.push(&decoded).unwrap();
@@ -4031,15 +4348,48 @@ mod tests {
     }
 
     #[test]
+    fn summary_deadline_scales_at_page_boundaries_and_still_interrupts_sql() {
+        let directory = TestDirectory::new();
+        let store = directory.open(BASE);
+        for (hosts, elapsed, expired) in [
+            (0, 1000, true),
+            (64, 1000, true),
+            (65, 1000, false),
+            (128, 1900, true),
+            (129, 1900, false),
+            (192, 2800, true),
+            (193, 2800, false),
+            (256, 3700, true),
+        ] {
+            {
+                let mut deadline = ReadDeadline::summary(&store.reader, hosts).unwrap();
+                deadline.budget.started = Instant::now() - Duration::from_millis(elapsed);
+                assert_eq!(deadline.check().is_err(), expired, "hosts={hosts}");
+                let result = store.reader.query_row(
+                    "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<10000) SELECT sum(v) FROM n",
+                    [], |row| row.get::<_, i64>(0),
+                );
+                assert_eq!(result.is_err(), expired, "hosts={hosts}: {result:?}");
+            }
+            assert_eq!(count(&store, "host_samples"), 0);
+        }
+        assert!(ReadDeadline::summary(&store.reader, 257).is_err());
+    }
+
+    #[test]
     fn deadline_interrupts_sql_and_restores_connection_for_following_reads() {
         let directory = TestDirectory::new();
         let store = directory.open(BASE);
         {
             let mut deadline = ReadDeadline::new(&store.reader);
-            *deadline.started = Instant::now() - Duration::from_secs(2);
-            assert!(store.reader.query_row(
+            deadline.budget.started = Instant::now() - Duration::from_secs(2);
+            let error = store.reader.query_row(
                     "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<1000000) SELECT sum(v) FROM n",
-                    [],|r|r.get::<_,i64>(0)).is_err());
+                    [],|r|r.get::<_,i64>(0)).unwrap_err();
+            assert_eq!(
+                summary_read_error(error.into()).to_string(),
+                "experience query read deadline exceeded"
+            );
         }
         assert_eq!(count(&store, "host_samples"), 0);
     }

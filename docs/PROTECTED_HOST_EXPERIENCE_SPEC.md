@@ -742,13 +742,22 @@ row/graph; do not fetch all hosts' hour histories on every table refresh.
 Additive read-only API: authenticated `state.read`, no body. Optional canonical
 `address`, existing managed-LAN `interface`, canonical `limit` 1..256 (default
 25), opaque `cursor` <=2048 bytes. Strict unknown/duplicate/canonical validation
-matches latest. Four shared concurrent reads, the existing storage read deadline
-and 4 MiB response ceiling apply. SQL is streamed per address in one page
-transaction; no all-host history array, probes, rescore or persisted-schema
-change. A timeout/storage failure returns an explicit error, not partial success.
-Coverage reasons are loaded in one bounded query per address, not one query per
-sample. Typed timestamp decoding and index-ordered reads avoid unnecessary
-conversion/sorting work without relaxing the read deadline or validation.
+matches latest. Four shared concurrent reads and the 4 MiB response ceiling
+apply. Summary aggregation allows 900 ms per started 64-host batch, up to
+3600 ms for 256 selected hosts; empty pages and pages of at most 64 retain
+900 ms. Latest/history deadlines and storage-lock/busy handling are unchanged.
+This replaces the previous 900 ms budget for all summary pages, not an
+end-to-end HTTP deadline; clients/proxies must also allow lock, snapshot,
+metadata, serialization and network overhead.
+
+Samples and coverage reasons use two bucket/address-ordered streaming cursors
+in one page transaction, without an all-host history array, probes, rescore or
+persisted-schema change. Bounded request-local per-host decoding reuses string
+allocations and identical already-validated score JSON; timestamp nanoseconds,
+canonical counters, validation and source evidence remain intact. A timeout or
+storage failure returns an explicit error, not partial success. Summary SQLite
+interruptions are reported as `experience query read deadline exceeded`
+rather than the unhelpful raw `interrupted` message.
 
 Common envelope plus:
 
@@ -997,11 +1006,14 @@ capture loss/analysis exclusions as collector diagnostics and per-source reasons
 - With readable committed storage but a failed live source, return `200` with
   partial/stale/unavailable source status and real retained evidence, not a
   success-shaped live fallback. Completely unavailable storage remains `503`.
-- Both response bodies have a **4 MiB** hard ceiling; the original 1 MiB latest
+- Experience response bodies have a **4 MiB** hard ceiling; the original 1 MiB latest
   target was too small for 256 fully populated samples even before enrichment.
-  SQLite statement/busy deadlines and storage-lock acquisition are bounded to
-  one second; four concurrent requests bound response work. Capacity/contention
-  returns explicit `503`; hosts/samples are never silently truncated to fit.
+  The ordinary SQLite read budget remains 900 ms; hourly-summary aggregation
+  scales to 1800/2700/3600 ms for 65..128/129..192/193..256 selected hosts.
+  Storage-lock acquisition remains bounded to one second and busy handling is
+  unchanged; four concurrent requests bound response work. Capacity/contention
+  and exhausted read deadlines return explicit `503`; hosts/samples are never
+  silently truncated to fit.
 
 ## 9. Frontend table and graph handoff
 
