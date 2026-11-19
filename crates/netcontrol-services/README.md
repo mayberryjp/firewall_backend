@@ -179,7 +179,7 @@ drift and durable transaction recovery safeguards remain enforced.
   See the [API contract](../../FRONTEND_SPEC.md#dhcp-relay-diagnostics)
   for cursor gaps, filtering, nullability and counter semantics.
 * **NTP:** host UDP poll client, one resolved endpoint per configured server,
-  immediate startup polling, then fifteen-minute polling and three-second
+  immediate startup polling, then 24-hour polling and three-second
   response deadlines. Validates
   server mode, v3/v4, leap, stratum, originate/receive/transmit timestamps,
   round-trip bounds and root distance, including NTP era rollover. Chooses the
@@ -194,6 +194,16 @@ drift and durable transaction recovery safeguards remain enforced.
   of another clock manager. Missing/invalid samples remain visibly unavailable
   with a row-local error while the worker keeps running and polling, even after
   three failed rounds. A valid sample clears the warning automatically.
+  The 24-hour monotonic wait begins after each completed polling round, not at
+  a fixed time of day. Manual **Force sync** uses
+  `POST /api/v1/processes/restart` with `{"target":"ntp"}` and the existing
+  `system.restart` permission: join only the NTP worker and start an immediate
+  fresh poll, resetting its daily wait without changing saved configuration.
+  Disabled NTP cannot be force-enabled this way. The restart response is not a
+  synchronization acknowledgment; follow the fresh runtime sample/error.
+  Scheduled and manual corrections both immediately step the whole host clock
+  regardless of offset size; neither slews. Gateway measurements may restart
+  when the clock jumps.
   This condition does not fail configuration observation or confirmation;
   startup, socket I/O and clock-adjustment failures are reported while the
   supervisor automatically retries resource preparation and polling.

@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
 const EPOCH: f64 = 2_208_988_800.;
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 fn timestamp_seconds(bytes: &[u8], around: f64) -> i64 {
     let seconds = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as f64;
     let era = ((around + EPOCH - seconds) / 4_294_967_296.).round();
@@ -117,7 +118,7 @@ pub(crate) fn prepare(
             sockets,
             pending,
             move |host| open_server(host, ipv6_enabled),
-            Duration::from_secs(15 * 60),
+            POLL_INTERVAL,
             Duration::from_secs(3),
             |target| {
                 let target = libc::timespec {
@@ -404,7 +405,7 @@ mod tests {
                     vec![],
                     vec![],
                     |_| anyhow::bail!("unused"),
-                    Duration::from_secs(15 * 60),
+                    POLL_INTERVAL,
                     Duration::from_secs(3),
                     |_| panic!("no samples must not adjust the clock"),
                 )
@@ -510,7 +511,7 @@ mod tests {
         assert!(corrected_time(local, Duration::MAX).is_err());
     }
     #[test]
-    fn polling_steps_large_offsets_in_both_directions_without_changing_host_clock() {
+    fn manual_restart_interrupts_daily_wait_and_steps_offsets_without_changing_host_clock() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -519,26 +520,39 @@ mod tests {
         client.connect(server.local_addr().unwrap()).unwrap();
         client.set_nonblocking(true).unwrap();
         let (step_tx, step_rx) = mpsc::channel();
-        let mut worker = Worker::start("ntp".into(), None, json!({}), move || {
-            let client = client.try_clone()?;
-            let step_tx = step_tx.clone();
-            Ok(Box::new(move |ctx| {
-                poll(
-                    ctx,
-                    vec![("fixture".into(), client)],
-                    vec![],
-                    |_| anyhow::bail!("unused"),
-                    Duration::from_millis(5),
-                    Duration::from_secs(1),
-                    |target| {
-                        step_tx.send(target)?;
-                        Ok(())
-                    },
-                )
-            }))
-        })
+        let mut worker = Worker::start(
+            "ntp".into(),
+            None,
+            json!({"sample_status":"warming_up"}),
+            move || {
+                let client = client.try_clone()?;
+                let step_tx = step_tx.clone();
+                Ok(Box::new(move |ctx| {
+                    poll(
+                        ctx,
+                        vec![("fixture".into(), client)],
+                        vec![],
+                        |_| anyhow::bail!("unused"),
+                        POLL_INTERVAL,
+                        Duration::from_secs(1),
+                        |target| {
+                            step_tx.send(target)?;
+                            Ok(())
+                        },
+                    )
+                }))
+            },
+        )
         .unwrap();
-        for offset in [-259200., 259200.] {
+        for (round, offset) in [0., -259200., 259200.].into_iter().enumerate() {
+            if round > 0 {
+                let start = Instant::now();
+                worker.restart().unwrap();
+                assert!(start.elapsed() < Duration::from_secs(1));
+                let warming = worker.snapshot();
+                assert_eq!(warming["sample_status"], "warming_up");
+                assert!(warming.get("collected_at").is_none());
+            }
             let server_time = respond_with_offset(&server, offset);
             let target = step_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!((target.as_secs_f64() - server_time).abs() < 1.);

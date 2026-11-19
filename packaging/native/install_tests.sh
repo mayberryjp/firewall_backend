@@ -1053,7 +1053,7 @@ for download_scenario in resume metadata_restart no_range range_416 unavailable 
         if [[ $download_scenario == metadata_restart ]]; then download_resume=false; fi
         curl() {
             local output='' resume=false
-            [[ $* == *'--connect-timeout 30 --max-time 900 --speed-limit 1024 --speed-time 60'* ]] || return 1
+            [[ $* == *'--connect-timeout 30 --max-time 3600 --speed-limit 1 --speed-time 300'* ]] || return 1
             while [[ $# -gt 1 ]]; do
                 case $1 in
                     --output) output=$2; shift 2 ;;

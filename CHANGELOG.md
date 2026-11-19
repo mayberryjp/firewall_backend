@@ -5,8 +5,9 @@
 ### Fixed
 
 - Make fresh-installer release downloads resilient to slow/interrupted links:
-  retry transient failures up to five total attempts, allow 15 minutes per
-  attempt, detect stalled transfers and resume the version-pinned binary.
+  retry transient failures up to five total attempts, allow one hour per
+  attempt, detect transfers below 1 byte/s for five minutes and resume the
+  version-pinned binary without rejecting merely slow links below 1 KiB/s.
   Restart partial metadata and unsupported range transfers safely; preserve
   HTTPS, size, manifest and binary verification. Installer reliability fix;
   no frontend action, next automatic calendar version.
@@ -66,6 +67,13 @@
   or frontend schema change; next automatic calendar version.
 
 ### Changed
+
+- Change NTP polling from fifteen minutes to 24 hours after each completed
+  round, preserving immediate startup and full forward/backward clock steps.
+  Reuse the targeted NTP restart API for manual Force sync; no gradual
+  correction, new endpoint or configuration field.
+  Changed scheduling contract; next automatic calendar version.
+  [Required Force sync frontend handoff 2026-11-19-04](docs/frontend-handoffs/2026-11-19.md#2026-11-19-04-daily-ntp-and-force-sync).
 
 - Replace LAN-only fresh-install prompts and implicit imported WAN settings with
   an explicitly confirmed IPv4 interface/VLAN wizard: per-port roles and

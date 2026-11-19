@@ -808,8 +808,8 @@ release_download() {
     for attempt in 1 2 3 4 5; do
         if [[ $resume != true ]]; then : > "$partial" || return 1; fi
         if http_status=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
-            --silent --show-error --connect-timeout 30 --max-time 900 \
-            --speed-limit 1024 --speed-time 60 --max-filesize "$limit" \
+            --silent --show-error --connect-timeout 30 --max-time 3600 \
+            --speed-limit 1 --speed-time 300 --max-filesize "$limit" \
             "${continuation[@]}" --write-out '%{http_code}' --output "$partial" "$url"); then
             size=$(stat -c %s -- "$partial") || return 1
             if [[ $size -le $limit ]]; then

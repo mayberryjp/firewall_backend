@@ -1123,9 +1123,11 @@ An absent release, missing assets/tagged service source, GitHub rate limiting,
 exhausted transient download failures, permanent HTTP/TLS failures or invalid contents cause explicit errors, never a fallback
 to a CI artifact or source build. HTTPS redirects are restricted to HTTPS;
 downloads retain size limits. Each file has at most five attempts with five
-seconds between retries, a 30-second connection timeout and a 15-minute limit
-per attempt (at most about 75 minutes per file). A transfer averaging less than
-1 KiB/s for 60 seconds is retried rather than waiting for the full limit.
+seconds between retries, a 30-second connection timeout and a one-hour limit
+per attempt (at most about five hours per file). A transfer averaging less than
+1 byte/s for five minutes is retried rather than waiting for the full limit.
+Slow transfers that continue making progress are not rejected merely for
+falling below 1 KiB/s.
 Transient DNS/connection/interrupted-transfer errors and HTTP
 408/429/500/502/503/504 are retried; missing assets and certificate-validation
 errors fail immediately.

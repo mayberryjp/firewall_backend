@@ -1448,7 +1448,11 @@ complete schema, host keys, authentication, recovery and limitations.
 The native protocol implementations have explicit boundaries: flow filters are
 limited to empty/ip/ip6/tcp/udp/icmp/icmp6 and exclude fragments; NTP immediately
 steps the whole host clock to the lowest-delay valid configured server sample
-on startup and every fifteen minutes, without a correction-size cap.
+on startup and every 24 hours after a completed polling round, without a
+correction-size cap. Manual Force sync reuses the targeted restart API:
+`POST /api/v1/processes/restart` with `{"target":"ntp"}` (`system.restart`).
+It triggers an immediate fresh poll and resets the daily wait; inspect
+`GET /api/v1/services/ntp/status` for its result, not just the restart response.
 Forward/backward jumps affect timestamps and time-based expiry; there is no
 NTS or server consensus. Syslog has no durable
 forwarding queue or automatic reconnect; traffic history is per-sample, not

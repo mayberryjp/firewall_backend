@@ -611,9 +611,9 @@ calendar version, verifies the Ubuntu manifest, binary size/SHA-256, amd64 ELF
 header and compiled version, and fetches the systemd unit from the same immutable
 tag's source over verified HTTPS. Missing/invalid releases, rate limiting or
 exhausted transient download failures stop installation; there is no CI-artifact/source fallback.
-Downloads use at most five attempts with 15-minute per-attempt limits,
-30-second connect timeouts, five-second retry waits and a 60-second
-below-1-KiB/s stall limit. Only the version-pinned binary resumes between
+Downloads use at most five attempts with one-hour per-attempt limits,
+30-second connect timeouts, five-second retry waits and a five-minute
+below-1-byte/s stall limit. Only the version-pinned binary resumes between
 attempts; metadata starts fresh and unsupported ranges discard partial data
 before retrying. Permanent HTTP/certificate failures remain explicit; all
 verification stays mandatory. Partial files are not retained across installer
@@ -1113,6 +1113,11 @@ connectivity, a new DHCP lease, clock synchronization, delivery or measurement
 health has been established. A recovering worker can report retry/error status.
 Simulator-native targets return `200` with `status:"simulated"` and do no work.
 Restart is targeted, not the broad service reconciliation action.
+
+For NTP, this existing action also backs the **Force sync** button described
+in section 6.1.3: restarting only `ntp` triggers a fresh immediate polling
+round and resets the 24-hour schedule. It does not enable disabled NTP or
+acknowledge that a clock correction succeeded.
 
 Async manager requests return `202`, for example:
 
@@ -2973,13 +2978,37 @@ servers and preserving the actual complete network configuration.
 - NTP editor: enabled toggle and 0..8 unique server host/IP strings; enabling
   requires at least one. This disciplines the **whole appliance clock**, not an
   isolated clock, with host networking. Client only, immediate clock stepping,
-  no NTP serving or NTS. Polls immediately on startup, then every fifteen minutes.
+  no NTP serving or NTS. Polls immediately on startup, then waits 24 hours
+  after each completed polling round using monotonic time, not local midnight.
+  Missing/invalid samples wait for the next daily round unless manually
+  retriggered; existing supervisor retries for worker failures are unchanged.
   Applies the full lowest-delay valid sample correction forward or backward
   without an offset-size cap; only representable kernel times are supported.
   Warn that clock jumps affect timestamps, expiry and schedules, and a wrong
   configured server can immediately set the wrong time. Running is not
   synchronized. Rollback restores
   settings, not time. No server-consensus/falseticker algorithm is provided.
+  Add a **Force sync** button for enabled NTP using the existing
+  `POST /api/v1/processes/restart` with exactly `{"target":"ntp"}` and bearer
+  permission `system.restart` (NTP editing permission alone is insufficient).
+  It joins/restarts only NTP, immediately polls the saved configured servers,
+  and resets the daily wait. Scheduled and manual accepted corrections both
+  step immediately regardless of offset size; do not offer gradual adjustment.
+  A clock step can temporarily restart gateway measurements without proving
+  a WAN outage. Disable the button when NTP is disabled, permission is absent,
+  a configuration/upgrade/restart transaction is active or this request is in
+  flight. Never use broad service reconciliation for this button.
+  Native HTTP `200` with `status:"restarted"` means supervisor restart only:
+  show "Sync requested", then poll `GET /api/v1/services/ntp/status`
+  (`state.read`) for the new `warming_up`/`available`/`unavailable` sample or
+  worker error. The restart replaces prior sample state; do not label a cached
+  pre-request sample as this request's success. If needed, wait for the new
+  worker `started_at` from the response, not a numerically later
+  `collected_at` (the clock can move backward). A quick new `available` row in
+  the response is valid too. No per-request completion token is supplied.
+  Keep errors visible and support retry; HTTP `401`/`403`, `400`, `409` and
+  `503` retain the operational-action semantics in section 5.
+  Simulator `status:"simulated"` does not adjust a clock; label it explicitly.
   Ubuntu fresh installation and full source upgrades now stop/disable and
   persistently mask standard OS NTP clients and one-shot services/timers,
   including absent units, with stopped/persistent-mask verification and remaining
