@@ -1045,6 +1045,88 @@ mv "$ports_fixture/eno1" "$temporary/one-port/"
 if select_appliance_ports '' '' "$temporary/one-port"; then exit 1; fi
 printf 'Automatic Ethernet port selection and override validation passed.\n'
 
+for download_scenario in resume metadata_restart no_range range_416 unavailable exhausted not_found certificate oversized; do
+    (
+        download_directory="$temporary/download-$download_scenario"
+        mkdir "$download_directory"
+        download_resume=true
+        if [[ $download_scenario == metadata_restart ]]; then download_resume=false; fi
+        curl() {
+            local output='' resume=false
+            [[ $* == *'--connect-timeout 30 --max-time 900 --speed-limit 1024 --speed-time 60'* ]] || return 1
+            while [[ $# -gt 1 ]]; do
+                case $1 in
+                    --output) output=$2; shift 2 ;;
+                    --continue-at) [[ $2 == - ]] || return 1; resume=true; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
+            [[ $resume == "$download_resume" ]] || return 1
+            printf 'attempt\n' >> "$download_directory/attempts"
+            local attempt
+            attempt=$(wc -l < "$download_directory/attempts")
+            case $download_scenario in
+                not_found) printf '404'; return 22 ;;
+                certificate) return 60 ;;
+                exhausted) printf 'part' >> "$output"; return 28 ;;
+                oversized) printf '12345678901234567' > "$output"; return 0 ;;
+                unavailable)
+                    if [[ $attempt -eq 1 ]]; then printf '503'; return 22; fi ;;
+                resume|metadata_restart|no_range|range_416)
+                    if [[ $attempt -eq 1 ]]; then
+                        printf 'part' > "$output"
+                        return 28
+                    fi
+                    if [[ $download_scenario == resume ]]; then
+                        [[ $(< "$output") == part ]] || return 1
+                    elif [[ ( $download_scenario == no_range || $download_scenario == range_416 ) && $attempt -eq 2 ]]; then
+                        [[ $(< "$output") == part ]] || return 1
+                        if [[ $download_scenario == range_416 ]]; then printf '416'; return 22; fi
+                        return 33
+                    else
+                        [[ ! -s $output ]] || return 1
+                    fi ;;
+            esac
+            if [[ $download_scenario == resume ]]; then printf 'complete' >> "$output"
+            else printf 'complete' > "$output"; fi
+            printf '200'
+        }
+        sleep() {
+            [[ $1 == 5 ]] || return 1
+            printf 'wait\n' >> "$download_directory/waits"
+        }
+        if release_download https://example.invalid/release "$download_directory/output" 16 "$download_resume" \
+            > "$download_directory/stdout" 2> "$download_directory/stderr"; then
+            case $download_scenario in
+                resume) [[ $(< "$download_directory/output") == partcomplete ]] ;;
+                metadata_restart|no_range|range_416|unavailable) [[ $(< "$download_directory/output") == complete ]] ;;
+                *) printf 'Unexpected download success: %s\n' "$download_scenario" >&2; exit 1 ;;
+            esac
+        else
+            case $download_scenario in
+                exhausted|not_found|certificate|oversized) ;;
+                *) cat "$download_directory/stderr" >&2; exit 1 ;;
+            esac
+            [[ ! -e $download_directory/output ]]
+            grep -Fq 'Release download failed after' "$download_directory/stderr"
+        fi
+        case $download_scenario in
+            exhausted) expected_attempts=5 ;;
+            no_range|range_416) expected_attempts=3 ;;
+            not_found|certificate|oversized) expected_attempts=1 ;;
+            *) expected_attempts=2 ;;
+        esac
+        [[ $(wc -l < "$download_directory/attempts") -eq $expected_attempts ]]
+        if [[ $expected_attempts -gt 1 ]]; then
+            [[ $(wc -l < "$download_directory/waits") -eq $((expected_attempts - 1)) ]]
+        else
+            [[ ! -e $download_directory/waits ]]
+        fi
+        [[ ! -e $download_directory/output.part && ! -s $download_directory/stdout ]]
+    )
+done
+printf 'Release download resume, fresh metadata retries, range fallback, retry limits and permanent failure tests passed.\n'
+
 curl() {
     local url=${!#} output='' limit=''
     [[ $* == *"--proto =https --proto-redir =https --tlsv1.2 --fail --location"* ]] || return 1

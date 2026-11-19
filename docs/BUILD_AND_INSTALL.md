@@ -1120,9 +1120,25 @@ Checksums detect corruption; authenticity relies on the reviewed source and
 verified HTTPS to the trusted GitHub repository/account, not an independently trusted
 publisher signature. This is not a signed `.ncpkg` installation.
 An absent release, missing assets/tagged service source, GitHub rate limiting,
-download/TLS failures or invalid contents cause explicit errors, never a fallback
+exhausted transient download failures, permanent HTTP/TLS failures or invalid contents cause explicit errors, never a fallback
 to a CI artifact or source build. HTTPS redirects are restricted to HTTPS;
-downloads have size limits and connection/overall timeouts. CI artifact expiry
+downloads retain size limits. Each file has at most five attempts with five
+seconds between retries, a 30-second connection timeout and a 15-minute limit
+per attempt (at most about 75 minutes per file). A transfer averaging less than
+1 KiB/s for 60 seconds is retried rather than waiting for the full limit.
+Transient DNS/connection/interrupted-transfer errors and HTTP
+408/429/500/502/503/504 are retried; missing assets and certificate-validation
+errors fail immediately.
+
+The version-pinned binary resumes from its partial file between attempts.
+If the server refuses ranges, discard that partial file and retry from zero
+within the same attempt limit. Metadata, manifests and service files restart
+from zero on each attempt, so a partially fetched latest-release response is
+never combined with a different response. Downloads are promoted from `.part`
+files only after curl succeeds and the size bound is checked; all existing
+manifest/size/SHA-256/ELF/compiled-version checks still apply before installation.
+There is no cross-invocation cache: rerunning after final failure starts fresh.
+CI artifact expiry
 does not govern installation. The removed `--run-id` option is rejected.
 Existing automated publication checks and distribution licensing obligations
 remain unchanged; the installer does not publish or dispatch builds.

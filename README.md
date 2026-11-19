@@ -1248,6 +1248,8 @@ using historical examples.
 An Ubuntu amd64 [prebuilt installer](install.sh) downloads verified binaries
 from the latest published stable GitHub Release. No Rust/compiler installation,
 GitHub login, CI run ID or manual workflow dispatch is needed on the firewall.
+Transient downloads retry automatically; the version-pinned binary resumes
+within the same installer run, with longer bounded timeouts for slow links.
 See the [download command and prerequisites](docs/BUILD_AND_INSTALL.md#ubuntu-prebuilt-installation-amd64).
 From a local terminal, it walks through all Ethernet ports and VLANs, WAN/LAN
 roles, DHCP/static IPv4, WAN gateway/DNS and the management LAN before takeover:

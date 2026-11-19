@@ -743,7 +743,7 @@ PY
     ) || { printf 'Cannot select a valid stable Ubuntu release.\n' >&2; return 1; }
     base="https://github.com/mayberryjp/firewall_backend/releases/download/v$version"
     release_download "$base/netcontrol-ubuntu-amd64.json" "$destination/manifest.json" 4096 || return 1
-    release_download "$base/netcontrold-ubuntu-amd64" "$destination/netcontrold" 268435456 || return 1
+    release_download "$base/netcontrold-ubuntu-amd64" "$destination/netcontrold" 268435456 true || return 1
     python3 - "$destination" "$version" <<'PY' || return 1
 import hashlib
 import json
@@ -800,12 +800,44 @@ PY
 }
 
 release_download() {
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
-        --silent --show-error --connect-timeout 15 --max-time 300 \
-        --max-filesize "$3" --output "$2" "$1" || {
-        printf 'Release download failed: %s. Check internet/DNS access and stable release availability.\n' "$1" >&2
-        return 1
-    }
+    local url=$1 destination=$2 limit=$3 resume=${4:-false}
+    local partial="$destination.part" attempt status http_status size
+    local -a continuation=()
+    : > "$partial" || return 1
+    if [[ $resume == true ]]; then continuation=(--continue-at -); fi
+    for attempt in 1 2 3 4 5; do
+        if [[ $resume != true ]]; then : > "$partial" || return 1; fi
+        if http_status=$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
+            --silent --show-error --connect-timeout 30 --max-time 900 \
+            --speed-limit 1024 --speed-time 60 --max-filesize "$limit" \
+            "${continuation[@]}" --write-out '%{http_code}' --output "$partial" "$url"); then
+            size=$(stat -c %s -- "$partial") || return 1
+            if [[ $size -le $limit ]]; then
+                mv -f -- "$partial" "$destination" || return 1
+                return 0
+            fi
+            printf 'Release download exceeds %s bytes: %s\n' "$limit" "$url" >&2
+            break
+        else
+            status=$?
+        fi
+        case $status:$http_status in
+            5:*|6:*|7:*|16:*|18:*|28:*|35:*|52:*|55:*|56:*|92:*) ;;
+            22:408|22:429|22:500|22:502|22:503|22:504) ;;
+            33:*|36:*|22:416)
+                [[ $resume == true ]] || break
+                installer_message warning 'Release server refused download resume; discarding partial data.'
+                : > "$partial" || return 1 ;;
+            *) break ;;
+        esac
+        if [[ $attempt -lt 5 ]]; then
+            installer_message warning "Release download attempt $attempt/5 failed (curl $status, HTTP ${http_status:-unknown}); retrying in 5 seconds."
+            sleep 5 || return 1
+        fi
+    done
+    rm -f -- "$partial" || return 1
+    printf 'Release download failed after %s attempt(s): %s. Check internet/DNS access and stable release availability; rerun the installer when connectivity recovers.\n' "$attempt" "$url" >&2
+    return 1
 }
 
 check_prebuilt() (

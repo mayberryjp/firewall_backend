@@ -610,7 +610,14 @@ without a CI run ID, GitHub login or manual build. It selects a single canonical
 calendar version, verifies the Ubuntu manifest, binary size/SHA-256, amd64 ELF
 header and compiled version, and fetches the systemd unit from the same immutable
 tag's source over verified HTTPS. Missing/invalid releases, rate limiting or
-download failures stop installation; there is no CI-artifact/source fallback.
+exhausted transient download failures stop installation; there is no CI-artifact/source fallback.
+Downloads use at most five attempts with 15-minute per-attempt limits,
+30-second connect timeouts, five-second retry waits and a 60-second
+below-1-KiB/s stall limit. Only the version-pinned binary resumes between
+attempts; metadata starts fresh and unsupported ranges discard partial data
+before retrying. Permanent HTTP/certificate failures remain explicit; all
+verification stays mandatory. Partial files are not retained across installer
+invocations. No frontend API, form or polling changes are needed.
 The installer uses Python 3 for metadata verification only; protocol services
 remain in-process Rust. The Ubuntu assets are unsigned; trust rests on HTTPS and
 the GitHub repository/account, not an independent publisher signature.

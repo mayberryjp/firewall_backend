@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- Make fresh-installer release downloads resilient to slow/interrupted links:
+  retry transient failures up to five total attempts, allow 15 minutes per
+  attempt, detect stalled transfers and resume the version-pinned binary.
+  Restart partial metadata and unsupported range transfers safely; preserve
+  HTTPS, size, manifest and binary verification. Installer reliability fix;
+  no frontend action, next automatic calendar version.
+
 - Fix musl compilation of gateway receive timestamps by respecting libc-specific
   ancillary-message length types. Preserve receive validation and timing behavior.
   Build portability fix; no frontend action, next automatic calendar version.
