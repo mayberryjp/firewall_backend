@@ -895,8 +895,15 @@ async fn host_system_endpoints_authentication_permissions_and_simulated_catalog(
         .0,
         400
     );
+    let before = time::OffsetDateTime::now_utc();
     let (status, body) = call(attached.clone(), "GET", "/api/v1/system/status", "reader").await;
     assert_eq!(status, 200);
+    let current = time::OffsetDateTime::parse(
+        body["current_time"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert!((before..=time::OffsetDateTime::now_utc()).contains(&current));
     assert_eq!(body["hostname"]["state"], "unmanaged");
     assert_eq!(body["timezone"]["configured"], "");
     assert!(body["last_applied_at_unix"].is_null());

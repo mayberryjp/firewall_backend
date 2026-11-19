@@ -301,11 +301,17 @@ impl Manager {
     }
 
     pub fn status(&self) -> Result<Value> {
-        Ok(self
+        let mut status = self
             .status
             .lock()
             .map_err(|_| anyhow::anyhow!("system status unavailable"))?
-            .clone())
+            .clone();
+        status["current_time"] = json!(
+            time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .context("format current system time")?
+        );
+        Ok(status)
     }
 
     pub fn reset_retry(&self) -> Result<()> {
@@ -623,6 +629,31 @@ mod tests {
 
         fn read(&self, relative: &str) -> String {
             fs::read_to_string(self.directory.path().join(relative)).unwrap()
+        }
+    }
+
+    #[test]
+    fn status_refreshes_current_time_without_refreshing_cached_settings() {
+        for mode in [Mode::Native, Mode::Simulated, Mode::Unsupported] {
+            let fixture = Fixture::new();
+            let manager = fixture.manager(mode);
+            let mut cached = manager.status().unwrap();
+            cached["current_time"] = json!("2000-01-01T00:00:00Z");
+            *manager.status.lock().unwrap() = cached.clone();
+
+            let before = time::OffsetDateTime::now_utc();
+            let status = manager.status().unwrap();
+            let after = time::OffsetDateTime::now_utc();
+            let timestamp = status["current_time"].as_str().unwrap();
+            let current = time::OffsetDateTime::parse(
+                timestamp,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+            assert!(timestamp.ends_with('Z'));
+            assert!((before..=after).contains(&current));
+            cached["current_time"] = status["current_time"].clone();
+            assert_eq!(status, cached);
         }
     }
 

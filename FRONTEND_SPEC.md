@@ -4276,7 +4276,7 @@ Read-only endpoints (`state.read`; no query parameters; `405` for other methods,
 
 | Method and path | Result |
 | --- | --- |
-| `GET /api/v1/system/status` | `SystemStatus`, confirmed settings and cached apply-time observations |
+| `GET /api/v1/system/status` | `SystemStatus`, fresh daemon clock time plus confirmed settings and cached apply-time observations |
 | `GET /api/v1/system/timezones` | `{"timezones":["America/Chicago","UTC",...]}` sorted valid zone names |
 
 ```ts
@@ -4289,6 +4289,7 @@ interface SystemSettingStatus {
   error: string | null;      // set when state is "error" or "unavailable"
 }
 interface SystemStatus {
+  current_time: string;      // RFC3339 UTC daemon clock, sampled on each status read
   hostname: SystemSettingStatus;
   timezone: SystemSettingStatus;
   last_applied_at_unix: number | null; // last time the daemon changed the host
@@ -4296,10 +4297,31 @@ interface SystemStatus {
 ```
 
 ```json
-{"hostname":{"configured":"fw-1","observed":"fw-1","state":"current","error":null},
+{"current_time":"2026-11-19T08:58:31.123456789Z",
+ "hostname":{"configured":"fw-1","observed":"fw-1","state":"current","error":null},
  "timezone":{"configured":"America/New_York","observed":"America/New_York","state":"current","error":null},
  "last_applied_at_unix":1792890000}
 ```
+
+`current_time` is a required non-null RFC3339 UTC string generated for each
+status read from the daemon's current system clock, independently of the cached
+hostname/timezone observations and `last_applied_at_unix`. Fractional seconds
+are optional, with up to nanosecond precision; it is not an integer timestamp.
+It is available in native, simulated and unsupported-host-setting modes; in
+simulation it describes the daemon host, not a simulated appliance clock.
+It requires no enabled NTP worker and does not query upstream servers or change
+their daily schedule. The system clock can be wrong or step in either direction;
+this value is not proof of NTP synchronization.
+
+For a live clock, anchor `current_time` when the response arrives and advance
+the display using a local monotonic timer (for example `performance.now()`).
+Refresh periodically and after visibility/resume or a newly accepted NTP sample,
+replacing the anchor even when the new time goes backward. Format in the selected
+display timezone; account for request latency and label between-refresh values as a
+local estimate, not a fresh NTP reading. Show refresh errors/staleness rather
+than silently substituting browser time. Retain the NTP `server_time`,
+`collected_at` and pre-step offset as separate historical sample evidence.
+See [live-clock handoff 2026-11-19-07](docs/frontend-handoffs/2026-11-19.md#2026-11-19-07-live-firewall-clock).
 
 `current` means the last startup/configuration application verified a match, not
 continuous proof that no external writer changed it. The previous `applying`

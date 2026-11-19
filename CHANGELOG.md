@@ -186,6 +186,13 @@
 
 ### Added
 
+- Add required `current_time` to `GET /api/v1/system/status`: a fresh RFC3339
+  UTC daemon-clock timestamp on every status read, separate from cached host
+  settings and historical NTP samples. Preserve daily NTP scheduling and
+  existing permissions/errors. Additive API contract; next automatic calendar
+  version.
+  [Required live-clock frontend handoff 2026-11-19-07](docs/frontend-handoffs/2026-11-19.md#2026-11-19-07-live-firewall-clock).
+
 - Add bodyless `DELETE /api/v1/logs/performance` with separate `logs.delete`
   authority to durably purge retained performance evidence while collectors
   continue. Reset cursor identity, recover interrupted purges on startup and
