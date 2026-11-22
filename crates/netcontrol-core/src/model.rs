@@ -708,6 +708,8 @@ pub struct SoftflowdConfig {
     pub collector: String,
     pub export_version: i64,
     pub sampling_rate: i64,
+    #[serde(default = "default_flow_message_size")]
+    pub max_message_size: i64,
     pub max_flows: i64,
     pub snaplen: i64,
     pub promiscuous: bool,
@@ -715,6 +717,9 @@ pub struct SoftflowdConfig {
     pub capture_filter: String,
     #[serde(default)]
     pub timeouts: BTreeMap<String, i64>,
+}
+fn default_flow_message_size() -> i64 {
+    1200
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -1744,8 +1749,8 @@ impl Config {
                 "invalid collector address"
             );
             ensure!(
-                [1, 5, 9, 10].contains(&s.export_version),
-                "export version must be 1, 5, 9, or 10"
+                [5, 10].contains(&s.export_version),
+                "export version must be 5 or 10"
             );
             ensure!(
                 (1..=1000000).contains(&s.sampling_rate),
@@ -1754,6 +1759,10 @@ impl Config {
             ensure!(
                 s.export_version != 5 || s.sampling_rate <= 16383,
                 "NetFlow v5 sampling interval is limited to 16383"
+            );
+            ensure!(
+                (132..=65507).contains(&s.max_message_size),
+                "max_message_size must be between 132 and 65507 UDP payload bytes"
             );
             ensure!(
                 (1..=1000000).contains(&s.max_flows) && (64..=65535).contains(&s.snaplen),

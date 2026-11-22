@@ -50,6 +50,8 @@ pub(crate) struct Flow {
     pub collector: String,
     pub export_version: u16,
     pub sampling_rate: u32,
+    #[serde(default = "default_flow_message_size")]
+    pub max_message_size: usize,
     pub max_flows: usize,
     pub snaplen: usize,
     pub promiscuous: bool,
@@ -58,7 +60,14 @@ pub(crate) struct Flow {
     #[serde(default)]
     pub timeouts: BTreeMap<String, u64>,
 }
+fn default_flow_message_size() -> usize {
+    1200
+}
 pub(crate) fn validate_sampling(export_version: u16, sampling_rate: u32) -> Result<()> {
+    ensure!(
+        [5, 10].contains(&export_version),
+        "export version must be 5 or 10"
+    );
     ensure!(
         (1..=1_000_000).contains(&sampling_rate),
         "sampling_rate must be between 1 and 1000000"
@@ -360,11 +369,11 @@ impl Config {
                     && (unicast(a.ip(), false) || a.ip().is_loopback()),
                 "invalid collector address"
             );
-            ensure!(
-                [1, 5, 9, 10].contains(&f.export_version),
-                "invalid NetFlow version"
-            );
             validate_sampling(f.export_version, f.sampling_rate)?;
+            ensure!(
+                (132..=65507).contains(&f.max_message_size),
+                "max_message_size must be between 132 and 65507 UDP payload bytes"
+            );
             ensure!(
                 (1..=1_000_000).contains(&f.max_flows) && (64..=65535).contains(&f.snaplen),
                 "invalid flow capacity/snaplen"
@@ -561,15 +570,16 @@ mod tests {
     }
     #[test]
     fn supported_flow_versions_and_typed_filters() {
-        let mut flow = json!({"name":"flows","enabled":false,"interface":"wan.100","collector":"192.0.2.100:2055","export_version":9,"sampling_rate":1,"max_flows":100,"snaplen":128,"promiscuous":false,"capture_filter":"udp","timeouts":{}});
+        let mut flow = json!({"name":"flows","enabled":false,"interface":"wan.100","collector":"192.0.2.100:2055","export_version":10,"sampling_rate":1,"max_flows":100,"snaplen":128,"promiscuous":false,"capture_filter":"udp","timeouts":{}});
         assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_ok());
         let parsed: Flow = serde_json::from_value(flow.clone()).unwrap();
+        assert_eq!(parsed.max_message_size, 1200);
         assert!(parsed.filter().unwrap().matches(true, 17));
         assert!(!parsed.filter().unwrap().matches(false, 6));
         flow["capture_filter"] = json!("udp port 53");
         assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_err());
         flow["capture_filter"] = json!("");
-        for version in [1, 5, 9, 10] {
+        for version in [5, 10] {
             flow["export_version"] = json!(version);
             for enabled in [false, true] {
                 flow["enabled"] = json!(enabled);
@@ -588,6 +598,24 @@ mod tests {
                         "{error}"
                     );
                 }
+            }
+        }
+        flow["sampling_rate"] = json!(1);
+        for enabled in [false, true] {
+            flow["enabled"] = json!(enabled);
+            for version in [1, 9] {
+                flow["export_version"] = json!(version);
+                assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_err());
+            }
+            flow["export_version"] = json!(10);
+            for size in [132, 1200, 65507] {
+                flow["max_message_size"] = json!(size);
+                assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_ok());
+            }
+            for size in [0, 131, 65508] {
+                flow["max_message_size"] = json!(size);
+                assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_err());
+                flow["max_message_size"] = json!(1200);
             }
         }
     }

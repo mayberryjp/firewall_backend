@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 #[cfg(any(target_os = "linux", test))]
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -35,35 +35,14 @@ struct ExportCounters {
 
 #[cfg(any(target_os = "linux", test))]
 impl ExportCounters {
-    fn export(
-        &mut self,
-        batch: &[(Key, Flow)],
-        version: u16,
-        mut send: impl FnMut(&[(Key, Flow)]) -> Result<usize>,
-    ) -> Result<()> {
-        let begin = std::time::Instant::now();
-        let result = (|| {
-            for chunk in batch.chunks(if version == 1 { 24 } else { 30 }) {
-                ensure!(
-                    begin.elapsed() < std::time::Duration::from_secs(2),
-                    "NetFlow export batch exceeded 2s bound; {} records could not be delivered",
-                    batch.len()
-                );
-                let bytes = send(chunk)?;
-                self.flows = self.flows.saturating_add(chunk.len() as u64);
-                self.packets = self.packets.saturating_add(1);
-                self.bytes = self.bytes.saturating_add(bytes as u64);
-                for (_, flow) in chunk {
-                    self.flow_packets = self.flow_packets.saturating_add(flow.packets);
-                    self.flow_bytes = self.flow_bytes.saturating_add(flow.bytes);
-                }
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            self.errors = self.errors.saturating_add(1);
+    fn sent(&mut self, batch: &[(Key, Flow)], bytes: usize) {
+        self.flows = self.flows.saturating_add(batch.len() as u64);
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        for (_, flow) in batch {
+            self.flow_packets = self.flow_packets.saturating_add(flow.packets);
+            self.flow_bytes = self.flow_bytes.saturating_add(flow.bytes);
         }
-        result
     }
 
     fn publish(&self, status: &mut serde_json::Value) {
@@ -77,6 +56,285 @@ impl ExportCounters {
         ] {
             status[field] = serde_json::json!(value.to_string());
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+trait DatagramSender {
+    fn limit(&mut self) -> Result<usize>;
+    fn send(&mut self, packet: &[u8]) -> std::io::Result<usize>;
+    fn reduce_limit(&mut self, failed_size: usize) -> Result<()>;
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct ExportSession<S> {
+    sender: S,
+    version: u16,
+    sampling: u32,
+    start: std::time::Instant,
+    domain: u32,
+    sequence: u32,
+    template_refreshed: Option<std::time::Instant>,
+    data_messages: u32,
+    counters: ExportCounters,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl<S: DatagramSender> ExportSession<S> {
+    fn new(sender: S, version: u16, sampling: u32) -> Result<Self> {
+        super::config::validate_sampling(version, sampling)?;
+        Ok(Self {
+            sender,
+            version,
+            sampling,
+            start: std::time::Instant::now(),
+            domain: rand::random(),
+            sequence: 0,
+            template_refreshed: None,
+            data_messages: 0,
+            counters: ExportCounters::default(),
+        })
+    }
+
+    fn publish(&mut self, status: &mut serde_json::Value) {
+        self.counters.publish(status);
+    }
+
+    fn check_deadline(begin: std::time::Instant) -> Result<()> {
+        ensure!(
+            begin.elapsed() < std::time::Duration::from_secs(2),
+            "flow export batch exceeded two-second deadline"
+        );
+        Ok(())
+    }
+
+    fn recover_size(&mut self, size: usize) -> Result<()> {
+        self.sender.reduce_limit(size)?;
+        let limit = self.sender.limit()?;
+        ensure!(
+            limit < size,
+            "EMSGSIZE recovery did not reduce the message budget"
+        );
+        tracing::warn!(
+            failed_payload_bytes = size,
+            message_size_limit = limit,
+            "flow export EMSGSIZE; reducing payload budget and retrying unsent records"
+        );
+        Ok(())
+    }
+
+    fn refresh_inner(&mut self, now: std::time::Instant, begin: std::time::Instant) -> Result<()> {
+        if self.version != 10
+            || (self
+                .template_refreshed
+                .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(600))
+                && self.data_messages < 20)
+        {
+            return Ok(());
+        }
+        let copies = if self.template_refreshed.is_none() {
+            2
+        } else {
+            1
+        };
+        for _ in 0..copies {
+            loop {
+                Self::check_deadline(begin)?;
+                let limit = self.sender.limit()?;
+                let packet = ipfix_templates(
+                    self.sequence,
+                    std::time::SystemTime::now(),
+                    self.domain,
+                    limit,
+                )?;
+                match self.sender.send(&packet) {
+                    Ok(n) => {
+                        ensure!(n == packet.len(), "short IPFIX template UDP write");
+                        self.counters.sent(&[], n);
+                        break;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
+                        self.recover_size(packet.len())?;
+                    }
+                    Err(error) => return Err(error).context("IPFIX template UDP send"),
+                }
+            }
+        }
+        self.template_refreshed = Some(now);
+        self.data_messages = 0;
+        Ok(())
+    }
+
+    fn maintain_at(&mut self, now: std::time::Instant) -> Result<()> {
+        let result = self.refresh_inner(now, std::time::Instant::now());
+        if result.is_err() {
+            self.counters.errors = self.counters.errors.saturating_add(1);
+        }
+        result
+    }
+
+    fn export(&mut self, batch: &[(Key, Flow)]) -> Result<()> {
+        let begin = std::time::Instant::now();
+        let result = (|| {
+            let mut offset = 0;
+            while offset < batch.len() {
+                Self::check_deadline(begin)?;
+                self.refresh_inner(std::time::Instant::now(), begin)?;
+                let limit = self.sender.limit()?;
+                let count = record_batch_len(&batch[offset..], self.version, limit)?;
+                let chunk = &batch[offset..offset + count];
+                let uptime = self.start.elapsed().as_millis() as u32;
+                let epoch = std::time::SystemTime::now();
+                let packet = if self.version == 5 {
+                    v5(chunk, uptime, self.sequence, epoch, self.sampling, limit)?
+                } else {
+                    ipfix_data(
+                        chunk,
+                        uptime,
+                        self.sequence,
+                        epoch,
+                        self.sampling,
+                        self.domain,
+                        limit,
+                    )?
+                };
+                match self.sender.send(&packet) {
+                    Ok(n) => {
+                        ensure!(n == packet.len(), "short flow export UDP write");
+                        self.counters.sent(chunk, n);
+                        self.sequence = self.sequence.wrapping_add(count as u32);
+                        if self.version == 10 {
+                            self.data_messages += 1;
+                        }
+                        offset += count;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
+                        self.recover_size(packet.len())?;
+                    }
+                    Err(error) => return Err(error).context("flow export UDP send"),
+                }
+            }
+            self.refresh_inner(std::time::Instant::now(), begin)
+        })();
+        if result.is_err() {
+            self.counters.errors = self.counters.errors.saturating_add(1);
+        }
+        result
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn payload_budget(configured: usize, ipv6: bool, mtu: Option<usize>) -> Result<usize> {
+    let headers = if ipv6 { 48 } else { 28 };
+    let mtu = mtu.unwrap_or(512);
+    ensure!(mtu > headers, "route MTU cannot fit IP and UDP headers");
+    Ok(configured.min(mtu - headers))
+}
+
+#[cfg(target_os = "linux")]
+struct UdpSender {
+    socket: std::net::UdpSocket,
+    ipv6: bool,
+    configured: usize,
+    budget: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl UdpSender {
+    fn new(collector: std::net::SocketAddr, configured: usize) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let ipv6 = collector.is_ipv6();
+        let socket = std::net::UdpSocket::bind(if ipv6 { "[::]:0" } else { "0.0.0.0:0" })?;
+        crate::linux::option(
+            socket.as_raw_fd(),
+            if ipv6 {
+                libc::IPPROTO_IPV6
+            } else {
+                libc::IPPROTO_IP
+            },
+            if ipv6 {
+                libc::IPV6_MTU_DISCOVER
+            } else {
+                libc::IP_MTU_DISCOVER
+            },
+            &if ipv6 {
+                libc::IPV6_PMTUDISC_DO
+            } else {
+                libc::IP_PMTUDISC_DO
+            },
+        )?;
+        if ipv6 {
+            crate::linux::option(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_DONTFRAG,
+                &1i32,
+            )?;
+        }
+        socket.connect(collector)?;
+        socket.set_nonblocking(true)?;
+        let mut sender = Self {
+            socket,
+            ipv6,
+            configured,
+            budget: configured,
+        };
+        sender.limit()?;
+        Ok(sender)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl DatagramSender for UdpSender {
+    fn limit(&mut self) -> Result<usize> {
+        use std::{mem, os::fd::AsRawFd};
+        let mut mtu = 0i32;
+        let mut size = mem::size_of_val(&mtu) as libc::socklen_t;
+        crate::linux::check(unsafe {
+            libc::getsockopt(
+                self.socket.as_raw_fd(),
+                if self.ipv6 {
+                    libc::IPPROTO_IPV6
+                } else {
+                    libc::IPPROTO_IP
+                },
+                if self.ipv6 {
+                    libc::IPV6_MTU
+                } else {
+                    libc::IP_MTU
+                },
+                &mut mtu as *mut _ as *mut libc::c_void,
+                &mut size,
+            )
+        })?;
+        ensure!(
+            size as usize == mem::size_of_val(&mtu) && mtu >= 0,
+            "invalid route MTU response"
+        );
+        let mtu = if mtu == 0 {
+            tracing::warn!("flow export route MTU unknown; limiting total IP packet to 512 bytes");
+            None
+        } else {
+            Some(mtu as usize)
+        };
+        self.budget = self
+            .budget
+            .min(payload_budget(self.configured, self.ipv6, mtu)?);
+        Ok(self.budget)
+    }
+
+    fn send(&mut self, packet: &[u8]) -> std::io::Result<usize> {
+        self.socket.send(packet)
+    }
+
+    fn reduce_limit(&mut self, failed_size: usize) -> Result<()> {
+        self.limit()?;
+        ensure!(
+            failed_size > 1,
+            "EMSGSIZE: no smaller flow export message is possible"
+        );
+        self.budget = self.budget.min(failed_size - 1);
+        Ok(())
     }
 }
 
@@ -385,59 +643,79 @@ pub(crate) fn parse(frame: &[u8]) -> Result<Option<(Key, u32, u8)>> {
         flags,
     )))
 }
-pub(crate) fn v5(
-    flows: &[(Key, Flow)],
-    uptime: u32,
-    sequence: u32,
-    epoch: std::time::SystemTime,
-    sampling: u32,
-) -> Result<Vec<u8>> {
-    fixed_export(flows, 5, uptime, sequence, epoch, sampling)
-}
-pub(crate) fn v1(
-    flows: &[(Key, Flow)],
-    uptime: u32,
-    epoch: std::time::SystemTime,
-) -> Result<Vec<u8>> {
-    fixed_export(flows, 1, uptime, 0, epoch, 1)
-}
-fn fixed_export(
-    flows: &[(Key, Flow)],
-    version: u16,
-    uptime: u32,
-    sequence: u32,
-    epoch: std::time::SystemTime,
-    sampling: u32,
-) -> Result<Vec<u8>> {
-    super::config::validate_sampling(version, sampling)?;
-    let header = if version == 1 { 16 } else { 24 };
+fn record_batch_len(flows: &[(Key, Flow)], version: u16, limit: usize) -> Result<usize> {
+    ensure!([5, 10].contains(&version), "export version must be 5 or 10");
+    let mut size = if version == 5 { 24 } else { 16 };
+    let mut families = [false; 2];
+    let mut count = 0;
+    for (key, _) in flows {
+        ensure!(
+            key.src.is_ipv6() == key.dst.is_ipv6(),
+            "flow address family mismatch"
+        );
+        ensure!(
+            version != 5 || key.src.is_ipv4(),
+            "NetFlow v5 cannot represent IPv6"
+        );
+        let family = usize::from(key.src.is_ipv6());
+        let record_size = if version == 5 {
+            48
+        } else if family == 1 {
+            76
+        } else {
+            52
+        };
+        let set_header = if version == 10 && !families[family] {
+            4
+        } else {
+            0
+        };
+        if size + set_header + record_size > limit {
+            break;
+        }
+        size += set_header + record_size;
+        families[family] = true;
+        count += 1;
+    }
     ensure!(
-        [1, 5].contains(&version)
-            && !flows.is_empty()
-            && flows.len() <= if version == 1 { 24 } else { 30 },
-        "invalid fixed-format NetFlow version/batch"
+        count > 0,
+        "message budget of {limit} bytes cannot fit one flow record"
     );
-    let mut packet = vec![0u8; header + 48 * flows.len()];
-    packet[..2].copy_from_slice(&version.to_be_bytes());
+    Ok(count)
+}
+
+fn v5(
+    flows: &[(Key, Flow)],
+    uptime: u32,
+    sequence: u32,
+    epoch: std::time::SystemTime,
+    sampling: u32,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    super::config::validate_sampling(5, sampling)?;
+    ensure!(
+        limit <= 65507 && record_batch_len(flows, 5, limit)? == flows.len(),
+        "NetFlow v5 batch exceeds message budget"
+    );
+    let mut packet = vec![0u8; 24 + 48 * flows.len()];
+    packet[..2].copy_from_slice(&5u16.to_be_bytes());
     packet[2..4].copy_from_slice(&(flows.len() as u16).to_be_bytes());
     packet[4..8].copy_from_slice(&uptime.to_be_bytes());
     let t = epoch.duration_since(std::time::UNIX_EPOCH)?;
     packet[8..12].copy_from_slice(&(t.as_secs() as u32).to_be_bytes());
     packet[12..16].copy_from_slice(&t.subsec_nanos().to_be_bytes());
-    if version == 5 {
-        packet[16..20].copy_from_slice(&sequence.to_be_bytes());
-        let sample = if sampling > 1 {
-            0x4000 | sampling as u16
-        } else {
-            0
-        };
-        packet[22..24].copy_from_slice(&sample.to_be_bytes());
-    }
+    packet[16..20].copy_from_slice(&sequence.to_be_bytes());
+    let sample = if sampling > 1 {
+        0x4000 | sampling as u16
+    } else {
+        0
+    };
+    packet[22..24].copy_from_slice(&sample.to_be_bytes());
     for (i, (key, flow)) in flows.iter().enumerate() {
         let (IpAddr::V4(src), IpAddr::V4(dst)) = (key.src, key.dst) else {
-            anyhow::bail!("fixed-format NetFlow v1/v5 cannot represent IPv6")
+            anyhow::bail!("NetFlow v5 cannot represent IPv6")
         };
-        let p = &mut packet[header + 48 * i..header + 48 * (i + 1)];
+        let p = &mut packet[24 + 48 * i..24 + 48 * (i + 1)];
         p[..4].copy_from_slice(&src.octets());
         p[4..8].copy_from_slice(&dst.octets());
         ensure!(
@@ -450,49 +728,46 @@ fn fixed_export(
         p[28..32].copy_from_slice(&flow.last.to_be_bytes());
         p[32..34].copy_from_slice(&key.sport.to_be_bytes());
         p[34..36].copy_from_slice(&key.dport.to_be_bytes());
-        p[if version == 1 { 40 } else { 37 }] = flow.flags;
+        p[37] = flow.flags;
         p[38] = key.proto;
         p[39] = key.tos;
     }
     Ok(packet)
 }
-pub(crate) fn template_export(
-    flows: &[(Key, Flow)],
-    version: u16,
-    uptime: u32,
+fn ipfix_header(sequence: u32, epoch: std::time::SystemTime, domain: u32) -> Result<Vec<u8>> {
+    let t = epoch.duration_since(std::time::UNIX_EPOCH)?;
+    let mut packet = vec![0; 16];
+    packet[..2].copy_from_slice(&10u16.to_be_bytes());
+    packet[4..8].copy_from_slice(&(t.as_secs() as u32).to_be_bytes());
+    packet[8..12].copy_from_slice(&sequence.to_be_bytes());
+    packet[12..16].copy_from_slice(&domain.to_be_bytes());
+    Ok(packet)
+}
+fn append_set(packet: &mut Vec<u8>, id: u16, content: &[u8]) {
+    packet.extend_from_slice(&id.to_be_bytes());
+    let length = (content.len() + 4 + 3) & !3;
+    packet.extend_from_slice(&(length as u16).to_be_bytes());
+    packet.extend_from_slice(content);
+    while packet.len() % 4 != 0 {
+        packet.push(0);
+    }
+}
+fn finish_ipfix(mut packet: Vec<u8>) -> Vec<u8> {
+    let length = packet.len() as u16;
+    packet[2..4].copy_from_slice(&length.to_be_bytes());
+    packet
+}
+fn ipfix_templates(
     sequence: u32,
     epoch: std::time::SystemTime,
-    sampling: u32,
     domain: u32,
+    limit: usize,
 ) -> Result<Vec<u8>> {
-    super::config::validate_sampling(version, sampling)?;
     ensure!(
-        [9, 10].contains(&version) && !flows.is_empty() && flows.len() <= 30,
-        "invalid template export version/count"
+        limit >= 132,
+        "message budget of {limit} bytes cannot fit IPFIX templates"
     );
-    let t = epoch.duration_since(std::time::UNIX_EPOCH)?;
-    let mut packet = vec![0; if version == 9 { 20 } else { 16 }];
-    packet[..2].copy_from_slice(&version.to_be_bytes());
-    if version == 9 {
-        packet[2..4].copy_from_slice(&((flows.len() + 2) as u16).to_be_bytes());
-        packet[4..8].copy_from_slice(&uptime.to_be_bytes());
-        packet[8..12].copy_from_slice(&(t.as_secs() as u32).to_be_bytes());
-        packet[12..16].copy_from_slice(&sequence.to_be_bytes());
-        packet[16..20].copy_from_slice(&domain.to_be_bytes());
-    } else {
-        packet[4..8].copy_from_slice(&(t.as_secs() as u32).to_be_bytes());
-        packet[8..12].copy_from_slice(&sequence.to_be_bytes());
-        packet[12..16].copy_from_slice(&domain.to_be_bytes());
-    }
-    let append_set = |packet: &mut Vec<u8>, id: u16, content: &[u8]| {
-        packet.extend_from_slice(&id.to_be_bytes());
-        let length = (content.len() + 4 + 3) & !3;
-        packet.extend_from_slice(&(length as u16).to_be_bytes());
-        packet.extend_from_slice(content);
-        while packet.len() % 4 != 0 {
-            packet.push(0);
-        }
-    };
+    let mut packet = ipfix_header(sequence, epoch, domain)?;
     let mut templates = Vec::new();
     for ipv6 in [false, true] {
         let fields = [
@@ -505,14 +780,8 @@ pub(crate) fn template_export(
             (6, 1),
             (2, 8),
             (1, 8),
-            (
-                if version == 10 { 152 } else { 22 },
-                if version == 10 { 8 } else { 4 },
-            ),
-            (
-                if version == 10 { 153 } else { 21 },
-                if version == 10 { 8 } else { 4 },
-            ),
+            (152, 8),
+            (153, 8),
             (34, 4),
             (35, 1),
         ];
@@ -523,7 +792,25 @@ pub(crate) fn template_export(
             templates.extend_from_slice(&(len as u16).to_be_bytes());
         }
     }
-    append_set(&mut packet, if version == 9 { 0 } else { 2 }, &templates);
+    append_set(&mut packet, 2, &templates);
+    Ok(finish_ipfix(packet))
+}
+fn ipfix_data(
+    flows: &[(Key, Flow)],
+    uptime: u32,
+    sequence: u32,
+    epoch: std::time::SystemTime,
+    sampling: u32,
+    domain: u32,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    super::config::validate_sampling(10, sampling)?;
+    ensure!(
+        limit <= 65507 && record_batch_len(flows, 10, limit)? == flows.len(),
+        "IPFIX batch exceeds message budget"
+    );
+    let t = epoch.duration_since(std::time::UNIX_EPOCH)?;
+    let mut packet = ipfix_header(sequence, epoch, domain)?;
     for ipv6 in [false, true] {
         let mut records = Vec::new();
         for (key, flow) in flows.iter().filter(|(key, _)| key.src.is_ipv6() == ipv6) {
@@ -543,20 +830,15 @@ pub(crate) fn template_export(
             records.extend_from_slice(&[key.proto, key.tos, flow.flags]);
             records.extend_from_slice(&flow.packets.to_be_bytes());
             records.extend_from_slice(&flow.bytes.to_be_bytes());
-            if version == 10 {
-                let now = t.as_millis() as u64;
-                records.extend_from_slice(
-                    &now.saturating_sub(uptime.wrapping_sub(flow.first) as u64)
-                        .to_be_bytes(),
-                );
-                records.extend_from_slice(
-                    &now.saturating_sub(uptime.wrapping_sub(flow.last) as u64)
-                        .to_be_bytes(),
-                );
-            } else {
-                records.extend_from_slice(&flow.first.to_be_bytes());
-                records.extend_from_slice(&flow.last.to_be_bytes());
-            }
+            let now = t.as_millis() as u64;
+            records.extend_from_slice(
+                &now.saturating_sub(uptime.wrapping_sub(flow.first) as u64)
+                    .to_be_bytes(),
+            );
+            records.extend_from_slice(
+                &now.saturating_sub(uptime.wrapping_sub(flow.last) as u64)
+                    .to_be_bytes(),
+            );
             records.extend_from_slice(&sampling.to_be_bytes());
             records.push(1);
         }
@@ -564,12 +846,7 @@ pub(crate) fn template_export(
             append_set(&mut packet, if ipv6 { 257 } else { 256 }, &records);
         }
     }
-    ensure!(packet.len() <= 65507, "template export exceeds UDP limit");
-    if version == 10 {
-        let n = packet.len() as u16;
-        packet[2..4].copy_from_slice(&n.to_be_bytes());
-    }
-    Ok(packet)
+    Ok(finish_ipfix(packet))
 }
 #[cfg(target_os = "linux")]
 const CAPTURE_BATCH: usize = 64;
@@ -657,12 +934,16 @@ pub(crate) fn prepare(
     ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
     super::config::validate_sampling(config.export_version, config.sampling_rate)?;
+    ensure!(
+        (132..=65507).contains(&config.max_message_size),
+        "invalid max_message_size"
+    );
     use crate::linux as l;
     use std::{
         mem,
-        net::{SocketAddr, UdpSocket},
+        net::SocketAddr,
         os::fd::AsRawFd,
-        time::{Duration, Instant, SystemTime},
+        time::{Duration, Instant},
     };
     let filter = config.filter()?;
     let timeouts = FlowTimeouts::new(&config.timeouts);
@@ -701,72 +982,43 @@ pub(crate) fn prepare(
         )?;
     }
     let collector: SocketAddr = config.collector.parse()?;
-    let socket = UdpSocket::bind(if collector.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })?;
-    socket.connect(collector)?;
-    socket.set_nonblocking(true)?;
+    let sender = UdpSender::new(collector, config.max_message_size)?;
     Ok(Box::new(move |ctx| {
-        let start = Instant::now();
+        let mut exports = ExportSession::new(sender, config.export_version, config.sampling_rate)?;
+        let start = exports.start;
         let mut capture = CaptureBatch::new(config.snaplen);
         let mut pending = Vec::with_capacity(CAPTURE_BATCH);
-        let fixed_counters = [1, 5].contains(&config.export_version);
+        let fixed_counters = config.export_version == 5;
         let mut table = FlowTable::new(config.max_flows, fixed_counters, timeouts);
         let mut sampling_remaining = config.sampling_rate;
-        let mut sequence = 0u32;
-        let mut exports = ExportCounters::default();
         let mut ignored_ipv6 = 0u64;
         let mut malformed = 0u64;
         let mut filtered = 0u64;
         let mut dropped = 0u64;
         ctx.update(|s| {
             exports.publish(s);
+            s["message_size_limit"] = serde_json::json!(exports.sender.budget);
             s["dropped_packets"] = serde_json::json!("0");
             s["statistics_complete"] = serde_json::json!(true);
         });
-        let domain = rand::random::<u32>();
         let mut last_flush = Instant::now();
         let mut draining = false;
-        let export = |batch: &[(Key, Flow)],
-                      sequence: &mut u32,
-                      exports: &mut ExportCounters|
-         -> Result<()> {
-            let result = exports.export(batch, config.export_version, |chunk| {
-                let p = if config.export_version == 1 {
-                    v1(chunk, start.elapsed().as_millis() as u32, SystemTime::now())?
-                } else if config.export_version == 5 {
-                    v5(
-                        chunk,
-                        start.elapsed().as_millis() as u32,
-                        *sequence,
-                        SystemTime::now(),
-                        config.sampling_rate,
-                    )?
-                } else {
-                    template_export(
-                        chunk,
-                        config.export_version,
-                        start.elapsed().as_millis() as u32,
-                        *sequence,
-                        SystemTime::now(),
-                        config.sampling_rate,
-                        domain,
-                    )?
-                };
-                ensure!(socket.send(&p)? == p.len(), "short NetFlow UDP write");
-                *sequence = sequence.wrapping_add(if config.export_version == 9 {
-                    1
-                } else {
-                    chunk.len() as u32
+        let export =
+            |batch: &[(Key, Flow)], exports: &mut ExportSession<UdpSender>| -> Result<()> {
+                let result = exports.export(batch);
+                ctx.update(|s| {
+                    exports.publish(s);
+                    s["message_size_limit"] = serde_json::json!(exports.sender.budget);
                 });
-                Ok(p.len())
-            });
-            ctx.update(|s| exports.publish(s));
-            result
-        };
+                result
+            };
         while !ctx.stopping() {
+            let refresh = exports.maintain_at(Instant::now());
+            ctx.update(|s| {
+                exports.publish(s);
+                s["message_size_limit"] = serde_json::json!(exports.sender.budget);
+            });
+            refresh?;
             ensure!(
                 l::ifindex(&config.interface)? == index,
                 "capture interface replaced"
@@ -800,7 +1052,7 @@ pub(crate) fn prepare(
                         filtered += 1;
                         continue;
                     }
-                    if [1, 5].contains(&config.export_version) && key.src.is_ipv6() {
+                    if config.export_version == 5 && key.src.is_ipv6() {
                         ignored_ipv6 += 1;
                         continue;
                     }
@@ -815,7 +1067,7 @@ pub(crate) fn prepare(
                     }
                 }
                 if !pending.is_empty() {
-                    export(&pending, &mut sequence, &mut exports)?;
+                    export(&pending, &mut exports)?;
                     pending.clear();
                 }
                 if count < CAPTURE_BATCH || ctx.stopping() {
@@ -829,7 +1081,7 @@ pub(crate) fn prepare(
                     .expiry
                     .first()
                     .is_some_and(|(deadline, _)| *deadline <= now);
-                export(&batch, &mut sequence, &mut exports)?;
+                export(&batch, &mut exports)?;
                 last_flush = Instant::now();
                 // PACKET_STATISTICS is reset by getsockopt; accumulate drops explicitly.
                 let mut stats: libc::tpacket_stats = unsafe { mem::zeroed() };
@@ -871,7 +1123,7 @@ pub(crate) fn prepare(
                 };
                 batch.push(table.remove(&key).expect("oldest flow exists"));
             }
-            if let Err(error) = export(&batch, &mut sequence, &mut exports) {
+            if let Err(error) = export(&batch, &mut exports) {
                 tracing::warn!(%error, remaining_flows = table.flows.len() + batch.len(), "NetFlow final export failed; remaining records were not exported");
                 return Err(error);
             }
@@ -883,51 +1135,393 @@ pub(crate) fn prepare(
 mod tests {
     use super::*;
 
+    struct TestSender {
+        budget: usize,
+        attempts: usize,
+        packets: Vec<Vec<u8>>,
+        failures: BTreeMap<usize, i32>,
+        learned_limit: usize,
+    }
+    impl TestSender {
+        fn new(budget: usize) -> Self {
+            Self {
+                budget,
+                attempts: 0,
+                packets: Vec::new(),
+                failures: BTreeMap::new(),
+                learned_limit: budget,
+            }
+        }
+    }
+    impl DatagramSender for TestSender {
+        fn limit(&mut self) -> Result<usize> {
+            Ok(self.budget)
+        }
+        fn send(&mut self, packet: &[u8]) -> std::io::Result<usize> {
+            self.attempts += 1;
+            if let Some(code) = self.failures.remove(&self.attempts) {
+                return Err(std::io::Error::from_raw_os_error(code));
+            }
+            self.packets.push(packet.to_vec());
+            Ok(packet.len())
+        }
+        fn reduce_limit(&mut self, failed_size: usize) -> Result<()> {
+            self.budget = self.budget.min(self.learned_limit).min(failed_size - 1);
+            Ok(())
+        }
+    }
+    fn test_batch(count: u32) -> Vec<(Key, Flow)> {
+        (1..=count)
+            .map(|index| {
+                (
+                    flow_test_key(index),
+                    Flow {
+                        packets: u64::from(index),
+                        bytes: u64::from(index) * 40,
+                        first: 1,
+                        last: 2,
+                        flags: 0,
+                        changed: std::time::Instant::now(),
+                        expiry: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn byte_budgets_include_headers_and_both_address_family_sets() {
+        let ipv4 = test_batch(100);
+        let mut ipv6 = ipv4.clone();
+        for (key, _) in &mut ipv6 {
+            key.src = "2001:db8::1".parse().unwrap();
+            key.dst = "2001:db8::2".parse().unwrap();
+        }
+        let mixed = [ipv4[0].clone(), ipv6[0].clone()];
+        for (batch, version, exact) in [
+            (&ipv4[..1], 5, 72),
+            (&ipv4[..1], 10, 72),
+            (&ipv6[..1], 10, 96),
+            (&mixed[..], 10, 152),
+        ] {
+            assert_eq!(
+                record_batch_len(batch, version, exact).unwrap(),
+                batch.len()
+            );
+            assert!(record_batch_len(batch, version, exact - 1).is_err() || batch.len() == 2);
+            let packet = if version == 5 {
+                v5(batch, 0, 0, std::time::UNIX_EPOCH, 1, exact).unwrap()
+            } else {
+                ipfix_data(batch, 0, 0, std::time::UNIX_EPOCH, 1, 1, exact).unwrap()
+            };
+            assert_eq!(packet.len(), exact);
+        }
+        assert_eq!(record_batch_len(&mixed, 10, 151).unwrap(), 1);
+        assert!(ipfix_data(&mixed, 0, 0, std::time::UNIX_EPOCH, 1, 1, 151).is_err());
+        assert_eq!(record_batch_len(&ipv4, 5, 1200).unwrap(), 24);
+        assert_eq!(record_batch_len(&ipv4, 10, 1200).unwrap(), 22);
+        assert_eq!(record_batch_len(&ipv6, 10, 1200).unwrap(), 15);
+        assert_eq!(record_batch_len(&ipv4, 5, 4096).unwrap(), 84);
+        assert_eq!(record_batch_len(&ipv6, 10, 4096).unwrap(), 53);
+        assert!(ipfix_templates(0, std::time::UNIX_EPOCH, 1, 131).is_err());
+        assert_eq!(payload_budget(1200, false, None).unwrap(), 484);
+        assert_eq!(payload_budget(1200, true, None).unwrap(), 464);
+        assert_eq!(payload_budget(4096, false, Some(576)).unwrap(), 548);
+        assert_eq!(payload_budget(4096, true, Some(1280)).unwrap(), 1232);
+        assert!(payload_budget(1200, false, Some(28)).is_err());
+        for version in [1, 9] {
+            assert!(ExportSession::new(TestSender::new(1200), version, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn templates_refresh_independently_at_600_seconds_or_20_data_messages() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut session = ExportSession::new(TestSender::new(132), 10, 1).unwrap();
+        session.maintain_at(now).unwrap();
+        assert_eq!(
+            (
+                session.counters.packets,
+                session.counters.flows,
+                session.sequence
+            ),
+            (2, 0, 0)
+        );
+        assert_eq!(session.counters.bytes, 264);
+        session.maintain_at(now + Duration::from_secs(599)).unwrap();
+        assert_eq!(session.counters.packets, 2);
+        session.maintain_at(now + Duration::from_secs(600)).unwrap();
+        assert_eq!(session.counters.packets, 3);
+        // Use a separate clock/session so subsequent real-time exports do not precede a test refresh.
+        let mut session = ExportSession::new(TestSender::new(132), 10, 1).unwrap();
+        session.export(&test_batch(38)).unwrap();
+        assert_eq!(session.sender.packets.len(), 21);
+        assert!(
+            session.sender.packets[2..]
+                .iter()
+                .all(|p| p[16..18] == 256u16.to_be_bytes())
+        );
+        session.export(&test_batch(2)).unwrap();
+        assert_eq!(session.sender.packets.len(), 23);
+        let refresh = session.sender.packets.last().unwrap();
+        assert_eq!(&refresh[16..18], &2u16.to_be_bytes());
+        assert_eq!(&refresh[8..12], &40u32.to_be_bytes());
+        assert_eq!(
+            (
+                session.sequence,
+                session.counters.flows,
+                session.data_messages
+            ),
+            (40, 40, 0)
+        );
+        assert_eq!(
+            (session.counters.flow_packets, session.counters.flow_bytes),
+            (744, 29760)
+        );
+        assert!(
+            ExportSession::<TestSender>::check_deadline(Instant::now() - Duration::from_secs(2))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn emsgsize_rebatches_only_unsent_records_and_preserves_sequence() {
+        for version in [5, 10] {
+            let mut sender = TestSender::new(1200);
+            // Fail after a successful data message, not after the initial template copies.
+            sender
+                .failures
+                .insert(if version == 5 { 2 } else { 4 }, libc::EMSGSIZE);
+            sender.learned_limit = 548;
+            let mut session = ExportSession::new(sender, version, 3).unwrap();
+            session.export(&test_batch(61)).unwrap();
+            let mut count = 0u32;
+            for packet in &session.sender.packets {
+                let (sequence, records) = if version == 5 {
+                    (
+                        u32::from_be_bytes(packet[16..20].try_into().unwrap()),
+                        u16::from_be_bytes(packet[2..4].try_into().unwrap()) as u32,
+                    )
+                } else {
+                    (
+                        u32::from_be_bytes(packet[8..12].try_into().unwrap()),
+                        if packet[16..18] == 2u16.to_be_bytes() {
+                            0
+                        } else {
+                            ((packet.len() - 20) / 52) as u32
+                        },
+                    )
+                };
+                assert_eq!(sequence, count);
+                count += records;
+            }
+            assert_eq!(
+                (count, session.sequence, session.counters.flows),
+                (61, 61, 61)
+            );
+            assert_eq!(
+                (
+                    session.counters.flow_packets,
+                    session.counters.flow_bytes,
+                    session.counters.errors
+                ),
+                (1891, 75640, 0)
+            );
+            assert!(
+                session
+                    .sender
+                    .packets
+                    .iter()
+                    .skip(if version == 5 { 1 } else { 3 })
+                    .all(|p| p.len() <= 548)
+            );
+        }
+        for (version, budget) in [(5, 72), (10, 132)] {
+            let mut sender = TestSender::new(budget);
+            sender.failures.insert(1, libc::EMSGSIZE);
+            let mut session = ExportSession::new(sender, version, 1).unwrap();
+            assert!(session.export(&test_batch(1)).is_err());
+            assert_eq!(
+                (
+                    session.sender.attempts,
+                    session.counters.errors,
+                    session.sequence,
+                    session.counters.packets
+                ),
+                (1, 1, 0, 0)
+            );
+        }
+        let mut sender = TestSender::new(1200);
+        sender.failures = BTreeMap::from([(1, libc::EMSGSIZE), (2, libc::EMSGSIZE)]);
+        let mut session = ExportSession::new(sender, 5, 1).unwrap();
+        session.export(&test_batch(61)).unwrap();
+        assert!(session.sender.budget < 1128);
+        assert_eq!((session.sequence, session.counters.errors), (61, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
+    fn native_flow_mtu_reduction_recovers_emsgsize_without_fragments() {
+        use std::{mem, net::UdpSocket, os::fd::AsRawFd, time::Duration};
+        struct ShrinkingSender {
+            inner: UdpSender,
+            shrink: bool,
+            emsgsize: usize,
+        }
+        impl DatagramSender for ShrinkingSender {
+            fn limit(&mut self) -> Result<usize> {
+                self.inner.limit()
+            }
+            fn reduce_limit(&mut self, size: usize) -> Result<()> {
+                self.inner.reduce_limit(size)
+            }
+            fn send(&mut self, packet: &[u8]) -> std::io::Result<usize> {
+                if self.shrink && packet.len() > 132 {
+                    self.shrink = false;
+                    let mut request: libc::ifreq = unsafe { mem::zeroed() };
+                    request.ifr_name[0] = b'l' as _;
+                    request.ifr_name[1] = b'o' as _;
+                    request.ifr_ifru.ifru_mtu = if self.inner.ipv6 { 1280 } else { 576 };
+                    if unsafe {
+                        libc::ioctl(
+                            self.inner.socket.as_raw_fd(),
+                            libc::SIOCSIFMTU as _,
+                            &request,
+                        )
+                    } < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                let result = self.inner.send(packet);
+                if result
+                    .as_ref()
+                    .is_err_and(|e| e.raw_os_error() == Some(libc::EMSGSIZE))
+                {
+                    self.emsgsize += 1;
+                }
+                result
+            }
+        }
+        assert_eq!(std::env::var("NETCONTROL_INTEGRATION").as_deref(), Ok("1"));
+        for version in [5, 10] {
+            std::thread::spawn(move || -> Result<()> {
+                crate::linux::check(unsafe { libc::unshare(libc::CLONE_NEWNET) })?;
+                let control = crate::linux::socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
+                let mut request: libc::ifreq = unsafe { mem::zeroed() };
+                request.ifr_name[0] = b'l' as _;
+                request.ifr_name[1] = b'o' as _;
+                request.ifr_ifru.ifru_flags = libc::IFF_UP as i16;
+                crate::linux::check(unsafe {
+                    libc::ioctl(control.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request)
+                })?;
+                let ipv6 = version == 10;
+                let collector = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })?;
+                collector.set_read_timeout(Some(Duration::from_secs(1)))?;
+                let raw = crate::linux::socket(
+                    libc::AF_PACKET,
+                    libc::SOCK_RAW,
+                    (libc::ETH_P_ALL as u16).to_be() as i32,
+                )?;
+                let mut address: libc::sockaddr_ll = unsafe { mem::zeroed() };
+                address.sll_family = libc::AF_PACKET as u16;
+                address.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+                address.sll_ifindex = crate::linux::ifindex("lo")? as i32;
+                crate::linux::check(unsafe {
+                    libc::bind(
+                        raw.as_raw_fd(),
+                        &address as *const _ as *const _,
+                        mem::size_of_val(&address) as _,
+                    )
+                })?;
+                let sender = ShrinkingSender {
+                    inner: UdpSender::new(collector.local_addr()?, 4096)?,
+                    shrink: true,
+                    emsgsize: 0,
+                };
+                let mut session = ExportSession::new(sender, version, 1)?;
+                let mut batch = test_batch(80);
+                if ipv6 {
+                    for (key, _) in &mut batch {
+                        key.src = "2001:db8::1".parse()?;
+                        key.dst = "2001:db8::2".parse()?;
+                    }
+                }
+                session.export(&batch)?;
+                assert_eq!(session.sender.emsgsize, 1);
+                assert_eq!(session.sender.inner.budget, if ipv6 { 1232 } else { 548 });
+                assert_eq!(
+                    (
+                        session.sequence,
+                        session.counters.flows,
+                        session.counters.errors
+                    ),
+                    (80, 80, 0)
+                );
+                let mut received_records = 0;
+                let mut received_bytes = 0;
+                let mut buffer = [0; 4096];
+                for _ in 0..session.counters.packets {
+                    let n = collector.recv(&mut buffer)?;
+                    assert!(n <= session.sender.inner.budget);
+                    received_bytes += n as u64;
+                    received_records += if version == 5 {
+                        (n - 24) / 48
+                    } else if buffer[16..18] == 2u16.to_be_bytes() {
+                        0
+                    } else {
+                        (n - 20) / 76
+                    };
+                }
+                assert_eq!(received_records, 80);
+                assert_eq!(received_bytes, session.counters.bytes);
+                let mut capture = CaptureBatch::new(4096);
+                let mut wire_packets = 0;
+                loop {
+                    let count = capture.receive(raw.as_raw_fd())?;
+                    if count == 0 {
+                        break;
+                    }
+                    for index in 0..count {
+                        let packet = capture.packet(index);
+                        if ipv6 {
+                            assert_eq!(packet[20], 17, "fragment extension header emitted");
+                            assert!(
+                                40 + u16::from_be_bytes(packet[18..20].try_into()?) as usize
+                                    <= 1280
+                            );
+                        } else {
+                            let fragment = u16::from_be_bytes(packet[20..22].try_into()?);
+                            assert_eq!(fragment & 0x3fff, 0, "IPv4 fragmentation emitted");
+                            assert_ne!(fragment & 0x4000, 0, "IPv4 DF missing");
+                            assert!(u16::from_be_bytes(packet[16..18].try_into()?) <= 576);
+                        }
+                        wire_packets += 1;
+                    }
+                }
+                assert_eq!(wire_packets, session.counters.packets * 2);
+                Ok(())
+            })
+            .join()
+            .expect("MTU test thread panic")
+            .expect("native MTU validation failed");
+        }
+    }
+
     #[test]
     fn export_counters_match_udp_datagrams_and_sampled_flow_totals_for_all_versions() {
-        use std::{net::UdpSocket, time::Duration};
-        for version in [1, 5, 9, 10] {
+        for version in [5, 10] {
             for sampling in [1, 4, if version == 5 { 16383 } else { 1_000_000 }] {
-                let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
-                collector
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-                sender.connect(collector.local_addr().unwrap()).unwrap();
-                let batch: Vec<_> = (1..=61)
-                    .map(|index| {
-                        (
-                            flow_test_key(index),
-                            Flow {
-                                packets: u64::from(index),
-                                bytes: u64::from(index) * 40,
-                                first: 1,
-                                last: 2,
-                                flags: 0,
-                                changed: std::time::Instant::now(),
-                                expiry: None,
-                            },
-                        )
-                    })
-                    .collect();
-                let mut counters = ExportCounters::default();
-                counters
-                    .export(&batch, version, |chunk| {
-                        let epoch = std::time::SystemTime::now();
-                        let packet = match version {
-                            1 => v1(chunk, 3, epoch)?,
-                            5 => v5(chunk, 3, 0, epoch, sampling)?,
-                            _ => template_export(chunk, version, 3, 0, epoch, sampling, 7)?,
-                        };
-                        let n = sender.send(&packet)?;
-                        ensure!(n == packet.len(), "short test UDP write");
-                        Ok(n)
-                    })
-                    .unwrap();
+                let batch = test_batch(61);
+                let mut session =
+                    ExportSession::new(TestSender::new(1200), version, sampling).unwrap();
+                session.export(&batch).unwrap();
                 let mut bytes = 0u64;
-                let mut buffer = [0; 4096];
-                for _ in 0..3 {
-                    let n = collector.recv(&mut buffer).unwrap();
+                for buffer in &session.sender.packets {
+                    let n = buffer.len();
+                    assert!(n <= 1200);
                     assert_eq!(&buffer[..2], &version.to_be_bytes());
                     if version == 5 {
                         let field = if sampling == 1 {
@@ -936,21 +1530,21 @@ mod tests {
                             0x4000 | sampling as u16
                         };
                         assert_eq!(&buffer[22..24], &field.to_be_bytes());
-                    } else if [9, 10].contains(&version) {
-                        let header = if version == 9 { 20 } else { 16 };
-                        let record = header + 116 + 4;
-                        let interval = record + if version == 9 { 39 } else { 47 };
+                    } else if buffer[16..18] == 256u16.to_be_bytes() {
+                        let interval = 20 + 47;
                         assert_eq!(&buffer[interval..interval + 4], &sampling.to_be_bytes());
                         assert_eq!(buffer[interval + 4], 1);
                     }
                     bytes += n as u64;
                 }
-                assert_eq!(counters.packets, 3);
+                let counters = &session.counters;
+                assert_eq!(counters.packets, if version == 5 { 3 } else { 5 });
                 assert_eq!(counters.bytes, bytes);
                 assert_eq!(counters.flows, 61);
                 assert_eq!(counters.flow_packets, 1891);
                 assert_eq!(counters.flow_bytes, 75640);
                 assert_eq!(counters.errors, 0);
+                assert_eq!(session.sequence, 61);
             }
         }
     }
@@ -967,33 +1561,28 @@ mod tests {
             expiry: None,
         };
         let batch = vec![(flow_test_key(1), flow); 31];
-        let mut counters = ExportCounters::default();
-        let mut sends = 0;
-        let result = counters.export(&batch, 10, |_| {
-            sends += 1;
-            ensure!(sends == 1, "injected export failure");
-            Ok(1500)
-        });
-        assert!(result.unwrap_err().to_string().contains("injected"));
+        let mut sender = TestSender::new(1200);
+        sender.failures.insert(2, libc::ECONNREFUSED);
+        let mut session = ExportSession::new(sender, 5, 1).unwrap();
+        assert!(session.export(&batch).is_err());
         let mut status = serde_json::json!({});
-        counters.publish(&mut status);
+        session.publish(&mut status);
         assert_eq!(
             status,
             serde_json::json!({
-                "exported_flows":30,"exported_packets":"1","exported_bytes":"1500",
-                "exported_flow_packets":"90","exported_flow_bytes":"3600","export_errors":"1"
+                "exported_flows":24,"exported_packets":"1","exported_bytes":"1176",
+                "exported_flow_packets":"72","exported_flow_bytes":"2880","export_errors":"1"
             })
         );
-        counters
-            .export(&[], 10, |_| panic!("empty export"))
-            .unwrap();
-        assert_eq!(counters.errors, 1);
-        counters.export(&batch[..1], 10, |_| Ok(200)).unwrap();
+        session.export(&[]).unwrap();
+        assert_eq!(session.counters.errors, 1);
+        session.export(&batch[..1]).unwrap();
+        let counters = &session.counters;
         assert_eq!(
             (counters.flows, counters.packets, counters.bytes),
-            (31, 2, 1700)
+            (25, 2, 1248)
         );
-        assert_eq!((counters.flow_packets, counters.flow_bytes), (93, 3720));
+        assert_eq!((counters.flow_packets, counters.flow_bytes), (75, 3000));
         assert_eq!(counters.errors, 1);
         ExportCounters::default().publish(&mut status);
         assert_eq!(
@@ -1003,13 +1592,13 @@ mod tests {
                 "exported_flow_packets":"0","exported_flow_bytes":"0","export_errors":"0"
             })
         );
-        assert_eq!(counters.flows, 31);
+        assert_eq!(counters.flows, 25);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn preparation_rejects_invalid_sampling_before_opening_capture() {
-        for version in [1, 5, 9, 10] {
+        for version in [5, 10] {
             for rate in [0, if version == 5 { 16384 } else { 1_000_001 }] {
                 let config: super::super::config::Flow =
                     serde_json::from_value(serde_json::json!({
@@ -1053,12 +1642,7 @@ mod tests {
                 expiry: None,
             },
         )];
-        counters.export(&batch, 5, |_| Ok(72)).unwrap();
-        assert!(
-            counters
-                .export(&batch, 5, |_| anyhow::bail!("send failed"))
-                .is_err()
-        );
+        counters.sent(&batch, 72);
         let mut status = serde_json::json!({});
         counters.publish(&mut status);
         assert_eq!(status["exported_flows"], u64::MAX);
@@ -1417,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn netflow_v1_exact_header_records_lengths_and_endian_fields() {
+    fn netflow_v5_exact_header_records_lengths_and_endian_fields() {
         let key = Key {
             src: "192.0.2.1".parse().unwrap(),
             dst: "198.51.100.2".parse().unwrap(),
@@ -1436,34 +2020,35 @@ mod tests {
             expiry: None,
         };
         let epoch = std::time::UNIX_EPOCH + std::time::Duration::new(0x10203040, 100000000);
-        let p = v1(&[(key, flow.clone())], 0x99aabbcc, epoch).unwrap();
+        let p = v5(&[(key, flow.clone())], 0x99aabbcc, 0, epoch, 1, 1200).unwrap();
         let header = [
-            0, 1, 0, 1, 0x99, 0xaa, 0xbb, 0xcc, 0x10, 0x20, 0x30, 0x40, 0x05, 0xf5, 0xe1, 0x00,
+            0, 5, 0, 1, 0x99, 0xaa, 0xbb, 0xcc, 0x10, 0x20, 0x30, 0x40, 0x05, 0xf5, 0xe1, 0x00, 0,
+            0, 0, 0, 0, 0, 0, 0,
         ];
         let record = [
             192, 0, 2, 1, 198, 51, 100, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 0x0a, 0x0b, 0x0c,
-            0x0d, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x12, 0x34, 0xab, 0xcd, 0, 0, 6,
-            0x2e, 0x13, 0, 0, 0, 0, 0, 0, 0,
+            0x0d, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x12, 0x34, 0xab, 0xcd, 0, 0x13,
+            6, 0x2e, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
-        assert_eq!(p.len(), 16 + 48);
-        assert_eq!(&p[..16], &header);
-        assert_eq!(&p[16..], &record);
+        assert_eq!(p.len(), 24 + 48);
+        assert_eq!(&p[..24], &header);
+        assert_eq!(&p[24..], &record);
         let records = vec![(key, flow.clone()); 24];
-        let p = v1(&records, 0, epoch).unwrap();
-        assert_eq!(p.len(), 16 + 24 * 48);
+        let p = v5(&records, 0, 0, epoch, 1, 1200).unwrap();
+        assert_eq!(p.len(), 24 + 24 * 48);
         assert_eq!(&p[2..4], &24u16.to_be_bytes());
-        for r in p[16..].chunks_exact(48) {
+        for r in p[24..].chunks_exact(48) {
             assert_eq!(r, &record);
         }
-        assert!(v1(&vec![(key, flow.clone()); 25], 0, epoch).is_err());
-        assert!(v1(&[], 0, epoch).is_err());
+        assert!(v5(&vec![(key, flow.clone()); 25], 0, 0, epoch, 1, 1200).is_err());
+        assert!(v5(&[], 0, 0, epoch, 1, 1200).is_err());
         let mut ipv6 = key;
         ipv6.src = "2001:db8::1".parse().unwrap();
         ipv6.dst = "2001:db8::2".parse().unwrap();
-        assert!(v1(&[(ipv6, flow.clone())], 0, epoch).is_err());
+        assert!(v5(&[(ipv6, flow.clone())], 0, 0, epoch, 1, 1200).is_err());
         let mut overflow = flow;
         overflow.bytes = u32::MAX as u64 + 1;
-        assert!(v1(&[(key, overflow)], 0, epoch).is_err());
+        assert!(v5(&[(key, overflow)], 0, 0, epoch, 1, 1200).is_err());
     }
     #[test]
     fn ethernet_ipv4_udp_and_v5() {
@@ -1488,7 +2073,7 @@ mod tests {
             changed: std::time::Instant::now(),
             expiry: None,
         };
-        let p = v5(&[(k, f)], 3, 7, std::time::UNIX_EPOCH, 1).unwrap();
+        let p = v5(&[(k, f)], 3, 7, std::time::UNIX_EPOCH, 1, 1200).unwrap();
         assert_eq!(p.len(), 72);
         assert_eq!(&p[..4], &[0, 5, 0, 1]);
         assert_eq!(&p[24..28], &[192, 0, 2, 1]);
@@ -1506,7 +2091,7 @@ mod tests {
         let mut ipv6 = vec![0; 54];
         ipv6[12..14].copy_from_slice(&[0x86, 0xdd]);
         assert!(parse(&ipv6).is_err());
-        assert!(v5(&[], 0, 0, std::time::UNIX_EPOCH, 1).is_err());
+        assert!(v5(&[], 0, 0, std::time::UNIX_EPOCH, 1, 1200).is_err());
     }
     fn ipv6_udp() -> Vec<u8> {
         let mut frame = vec![0; 62];
@@ -1532,7 +2117,7 @@ mod tests {
         frame
     }
     #[test]
-    fn ipv6_parser_v9_and_ipfix_wire_fields() {
+    fn ipv6_parser_and_ipfix_wire_fields() {
         let (key, size, flags) = parse(&ipv6_udp()).unwrap().unwrap();
         assert!(key.src.is_ipv6());
         assert_eq!(size, 48);
@@ -1546,64 +2131,50 @@ mod tests {
             changed: std::time::Instant::now(),
             expiry: None,
         };
-        assert!(v5(&[(key, flow.clone())], 200, 7, std::time::UNIX_EPOCH, 1).is_err());
-        for version in [9, 10] {
-            for sampling in [1, 4, 1_000_000] {
-                let epoch =
-                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_800_000_000_000);
-                let p = template_export(
-                    &[(key, flow.clone())],
-                    version,
-                    200,
-                    7,
-                    epoch,
-                    sampling,
-                    123,
-                )
-                .unwrap();
-                assert_eq!(&p[..2], &version.to_be_bytes());
-                let header = if version == 9 { 20 } else { 16 };
-                if version == 9 {
-                    assert_eq!(&p[2..4], &3u16.to_be_bytes());
-                    assert_eq!(&p[12..16], &7u32.to_be_bytes())
-                } else {
-                    assert_eq!(
-                        u16::from_be_bytes(p[2..4].try_into().unwrap()) as usize,
-                        p.len()
-                    );
-                    assert_eq!(&p[8..12], &7u32.to_be_bytes());
-                }
-                assert_eq!(
-                    u16::from_be_bytes(p[header..header + 2].try_into().unwrap()),
-                    if version == 9 { 0 } else { 2 }
-                );
-                let template_size =
-                    u16::from_be_bytes(p[header + 2..header + 4].try_into().unwrap()) as usize;
-                assert_eq!(template_size, 116);
-                let data = header + template_size;
-                assert_eq!(&p[data..data + 2], &257u16.to_be_bytes());
-                let record = &p[data + 4..];
-                assert_eq!(
-                    &record[..16],
-                    &"2001:db8::1"
-                        .parse::<std::net::Ipv6Addr>()
-                        .unwrap()
-                        .octets()
-                );
-                assert_eq!(
-                    u64::from_be_bytes(record[47..55].try_into().unwrap()),
-                    u32::MAX as u64 + 17
-                );
-                if version == 10 {
-                    assert_eq!(
-                        u64::from_be_bytes(record[55..63].try_into().unwrap()),
-                        1_799_999_999_900
-                    );
-                }
-                let interval = if version == 9 { 63 } else { 71 };
-                assert_eq!(&record[interval..interval + 4], &sampling.to_be_bytes());
-                assert_eq!(record.last(), Some(&1));
-            }
+        assert!(
+            v5(
+                &[(key, flow.clone())],
+                200,
+                7,
+                std::time::UNIX_EPOCH,
+                1,
+                1200
+            )
+            .is_err()
+        );
+        for sampling in [1, 4, 1_000_000] {
+            let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_800_000_000_000);
+            let p = ipfix_data(&[(key, flow.clone())], 200, 7, epoch, sampling, 123, 1200).unwrap();
+            assert_eq!(&p[..2], &10u16.to_be_bytes());
+            assert_eq!(
+                u16::from_be_bytes(p[2..4].try_into().unwrap()) as usize,
+                p.len()
+            );
+            assert_eq!(&p[8..12], &7u32.to_be_bytes());
+            let templates = ipfix_templates(7, epoch, 123, 1200).unwrap();
+            assert_eq!(templates.len(), 132);
+            assert_eq!(&templates[16..20], &[0, 2, 0, 116]);
+            let data = 16;
+            assert_eq!(&p[data..data + 2], &257u16.to_be_bytes());
+            let record = &p[data + 4..];
+            assert_eq!(
+                &record[..16],
+                &"2001:db8::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets()
+            );
+            assert_eq!(
+                u64::from_be_bytes(record[47..55].try_into().unwrap()),
+                u32::MAX as u64 + 17
+            );
+            assert_eq!(
+                u64::from_be_bytes(record[55..63].try_into().unwrap()),
+                1_799_999_999_900
+            );
+            let interval = 71;
+            assert_eq!(&record[interval..interval + 4], &sampling.to_be_bytes());
+            assert_eq!(record.last(), Some(&1));
         }
     }
     #[test]

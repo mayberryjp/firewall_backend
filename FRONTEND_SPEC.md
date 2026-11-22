@@ -7623,19 +7623,19 @@ with the same fields. No backend change: enable/disable already uses the existin
 `softflowd.write` permission and complete configuration transaction.
 
 Editor: name, enabled, capture interface, numeric collector address/port, export
-version, configurable sampling rate, maximum flows, snap length, promiscuous capture, optional
+version, configurable sampling rate, maximum UDP message size, maximum flows, snap length, promiscuous capture, optional
 capture filter chosen from empty, `ip`, `ip6`, `tcp`, `udp`, `icmp`, `icmp6`,
 and optional timeout overrides. Arbitrary BPF expressions are not supported.
-Fragments and IPv6 jumbograms are excluded. Versions 1/5 export IPv4;
-9/IPFIX support IPv4 and IPv6. Required `sampling_rate` is configurable for
+Fragments and IPv6 jumbograms are excluded. Only NetFlow v5 and IPFIX v10 are
+supported; v1/v9 return `422`, including disabled entries. V5 exports IPv4;
+IPFIX supports IPv4 and IPv6. Required `sampling_rate` is configurable for
 all versions: 1..1,000,000, with v5 limited to 16,383, including disabled
 entries. Label 1 **Unsampled** and N>1 **1 in N**. Invalid integers return
 `422`; missing/wrong-type values retain `400`. Preserve the chosen rate in
-full submits; do not silently normalize it. IPFIX/v9 emit the configured
+full submits; do not silently normalize it. IPFIX emits the configured
 interval and algorithm 1. v5's sampling header is zero for rate 1 and
-packet-interval mode with the rate otherwise. Version 1 cannot convey sampling
-metadata: `sampling_metadata: false` means metadata absent, not unsampled
-capture; a v1 collector needs the rate out of band. Preserve raw sampled counts,
+packet-interval mode with the rate otherwise. `sampling_metadata` is true for
+supported workers. Preserve raw sampled counts,
 label any scaled full-traffic totals as estimates, and do not double-scale.
 Sampling and capture/UDP loss are separate concerns.
 
@@ -7646,6 +7646,26 @@ can share one UDP/IPv4 or UDP/IPv6 collector when IPv6 is enabled. Runtime
 `address_family` describes record capability, not the outer transport family.
 `capture_filter: "udp"` selects observed traffic, not export transport. The
 collector port is explicitly configured, with no implicit 4739 default.
+
+Optional `max_message_size` defaults to **1200 UDP payload bytes**; valid
+integers are **132..65,507**, including disabled entries. Include protocol
+headers/sets/padding, not UDP/IP/link headers. Omission uses this server default;
+null/wrong types return `400`, out-of-range integers `422`. Returned
+configuration includes the effective configured value. Byte-based batches send
+due records immediately without an extra fill timer. Runtime
+`max_message_size` is the configured cap and optional `message_size_limit`
+is the current PMTU-constrained budget; both are numbers in bytes. Missing
+runtime values mean unknown. The budget can decrease after `EMSGSIZE`; the
+exporter retries only unsent records, disables fragmentation and surfaces
+terminal failures. Kernel route PMTU is not proof of delivery.
+
+IPFIX sends two separate initial template-only datagrams, then one every
+**600 seconds or 20 successful data datagrams**, whichever first, even while
+idle and independently of `expint`. These limits are fixed, not editor fields.
+Data messages contain no templates. Receivers must cache session-scoped
+definitions and handle missing/reordered refreshes. Successful template sends
+contribute to UDP packet/byte totals, not flow totals or sequence; repeated
+sequence values on template messages are expected.
 
 Capture interface options include managed draft interfaces and available adopted
 parents. Mark adopted parents protected. Timeout overrides are optional named
@@ -7969,8 +7989,9 @@ unsupported route-table/port-uniqueness restrictions.
 | Name | `^[a-zA-Z0-9_-]{1,32}$`, unique |
 | Capture interface | Valid interface name; managed or operator-adopted interface; server preflight remains authoritative |
 | Collector | Canonical numeric unicast or loopback IP:port; nonzero port; bracketed IPv6; no zone/mapped IPv6/DNS |
-| Export version | 1, 5, 9, or 10; label 10 as IPFIX |
+| Export version | 5 or 10; label 10 as IPFIX; 1/9 rejected, including disabled entries |
 | Sampling rate | Required integer 1..1000000; v5 maximum 16383; 1 means unsampled; validate disabled entries too; invalid integers return 422 |
+| Maximum message size | Optional integer 132..65507 UDP payload bytes; default 1200; includes headers/sets/padding; actual PMTU-constrained budget may be smaller |
 | Max flows | 1..1000000 |
 | Snap length | 64..65535 bytes |
 | Capture filter | Optional; exactly empty, `ip`, `ip6`, `tcp`, `udp`, `icmp`, or `icmp6` |
@@ -8564,8 +8585,9 @@ interface SoftflowdConfig {
   enabled: boolean;
   interface: string;
   collector: string;
-  export_version: 1 | 5 | 9 | 10;
+  export_version: 5 | 10;
   sampling_rate: number;
+  max_message_size?: number; // Server default 1200; responses include it.
   max_flows: number;
   snaplen: number;
   promiscuous: boolean;
@@ -8646,12 +8668,14 @@ interface SoftflowdStatus {
   name: string;
   state: string;
   scope?: "managed";
-  export_version?: 1 | 5 | 9 | 10;
+  export_version?: 5 | 10;
   address_family?: "ipv4" | "dual";
   fragments?: "excluded";
   capture_filter?: string;
   sampling_rate?: number;
-  sampling_metadata?: boolean; // false only for NetFlow v1
+  sampling_metadata?: boolean; // True for supported exporter workers.
+  max_message_size?: number; // Configured UDP payload cap, bytes.
+  message_size_limit?: number; // Current route/EMSGSIZE-constrained budget, bytes.
   started_at?: Timestamp;
   error?: string;
   dropped_packets?: string; // Exact cumulative AF_PACKET drops since worker start.

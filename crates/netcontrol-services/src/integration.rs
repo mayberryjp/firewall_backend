@@ -36,6 +36,23 @@ fn isolated(test: impl FnOnce() -> Result<()> + Send + 'static) {
     .expect("native test thread panic")
     .expect("native integration failed");
 }
+fn receive_flow(collector: &UdpSocket, buffer: &mut [u8], version: u16) -> Result<usize> {
+    loop {
+        let n = collector.recv(buffer)?;
+        ensure!(
+            n >= 24 && buffer[..2] == version.to_be_bytes(),
+            "invalid flow message"
+        );
+        if version == 10 && buffer[16..18] == 2u16.to_be_bytes() {
+            ensure!(
+                n == 132 && buffer[18..20] == 116u16.to_be_bytes(),
+                "invalid template refresh"
+            );
+            continue;
+        }
+        return Ok(n);
+    }
+}
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
 fn native_icmp_v4_v6_echo_no_children() {
@@ -238,6 +255,7 @@ fn native_af_packet_drops_report_incomplete_statistics_and_keep_exporting() {
             collector: "127.0.0.1:2055".into(),
             export_version: 5,
             sampling_rate: 1,
+            max_message_size: 1200,
             max_flows: 100,
             snaplen: 128,
             promiscuous: false,
@@ -334,6 +352,7 @@ fn native_flow_expiry_backlog_drains_without_waiting_another_export_interval() {
             collector: "127.0.0.1:2055".into(),
             export_version: 5,
             sampling_rate: 1,
+            max_message_size: 1200,
             max_flows: 512,
             snaplen: 128,
             promiscuous: false,
@@ -364,7 +383,7 @@ fn native_flow_expiry_backlog_drains_without_waiting_another_export_interval() {
             );
             let records = usize::from(u16::from_be_bytes(buffer[2..4].try_into()?));
             ensure!(
-                count == 24 + records * 48 && records <= 30,
+                count == 24 + records * 48 && count <= 1200,
                 "invalid export size"
             );
             ensure!(
@@ -414,6 +433,7 @@ fn native_flow_capacity_exports_are_batched_and_lossless() {
             collector: "127.0.0.1:2055".into(),
             export_version: 5,
             sampling_rate: 1,
+            max_message_size: 1200,
             max_flows: 8,
             snaplen: 128,
             promiscuous: false,
@@ -444,7 +464,7 @@ fn native_flow_capacity_exports_are_batched_and_lossless() {
             );
             let records = usize::from(u16::from_be_bytes(buffer[2..4].try_into()?));
             ensure!(
-                records <= 30 && n == 24 + records * 48,
+                n <= 1200 && n == 24 + records * 48,
                 "invalid v5 record count"
             );
             ensure!(
@@ -486,7 +506,7 @@ fn native_flow_capacity_exports_are_batched_and_lossless() {
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
 fn native_flow_sustained_capture_above_old_receive_ceiling() {
     isolated(|| {
-        for version in [1, 5, 9, 10] {
+        for version in [5, 10] {
             for sampling_rate in [1, 3, 4] {
                 let collector = UdpSocket::bind("127.0.0.1:2055")?;
                 collector.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -499,6 +519,7 @@ fn native_flow_sustained_capture_above_old_receive_ceiling() {
                     collector: "127.0.0.1:2055".into(),
                     export_version: version,
                     sampling_rate,
+                    max_message_size: 1200,
                     max_flows: 100,
                     snaplen: 128,
                     promiscuous: false,
@@ -511,6 +532,24 @@ fn native_flow_sustained_capture_above_old_receive_ceiling() {
                     json!({"name":"throughput-test"}),
                     move || flow::prepare(config.clone(), true),
                 )?;
+                if version == 10 {
+                    let mut initial = [0; 132];
+                    for _ in 0..2 {
+                        ensure!(
+                            collector.recv(&mut initial)? == 132
+                                && initial[16..18] == 2u16.to_be_bytes(),
+                            "missing initial IPFIX template copy"
+                        );
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while worker.snapshot()["active_flows"] != 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    ensure!(
+                        worker.snapshot()["active_flows"] == 0,
+                        "initial template capture did not drain before measured traffic"
+                    );
+                }
                 let started = Instant::now();
                 const DATAGRAMS: u32 = 32_768;
                 for _ in 0..DATAGRAMS / 64 {
@@ -527,14 +566,13 @@ fn native_flow_sustained_capture_above_old_receive_ceiling() {
                     "fixture did not exceed the old 256 packets/10ms ceiling: {elapsed:?}"
                 );
                 let mut buffer = [0; 2048];
-                let n = collector.recv(&mut buffer)?;
-                let (packets, bytes) = if [1, 5].contains(&version) {
+                let n = receive_flow(&collector, &mut buffer, version)?;
+                let (packets, bytes) = if version == 5 {
                     ensure!(
-                        n == (if version == 1 { 64 } else { 72 })
-                            && buffer[..2] == version.to_be_bytes(),
+                        n == 72 && buffer[..2] == version.to_be_bytes(),
                         "expected one fixed-format flow, received {n} bytes"
                     );
-                    let record = if version == 1 { 16 } else { 24 };
+                    let record = 24;
                     (
                         u64::from(u32::from_be_bytes(
                             buffer[record + 16..record + 20].try_into()?,
@@ -544,10 +582,9 @@ fn native_flow_sustained_capture_above_old_receive_ceiling() {
                         )),
                     )
                 } else {
-                    let record = (if version == 9 { 20 } else { 16 }) + 116 + 4;
+                    let record = 20;
                     ensure!(
-                        n == record + (if version == 9 { 44 } else { 52 })
-                            && buffer[..2] == version.to_be_bytes(),
+                        n == record + 52 && buffer[..2] == version.to_be_bytes(),
                         "expected one template-based flow, received {n} bytes"
                     );
                     (
@@ -615,6 +652,7 @@ fn native_flow_shutdown_publishes_final_export_counters() {
             collector: "127.0.0.1:2055".into(),
             export_version: 5,
             sampling_rate: 1,
+            max_message_size: 1200,
             max_flows: 100,
             snaplen: 128,
             promiscuous: false,
@@ -668,14 +706,14 @@ fn native_flow_shutdown_publishes_final_export_counters() {
 
 #[test]
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
-fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
+fn native_af_packet_capture_exports_v5_ipfix_and_ipv6() {
     isolated(|| {
         let directory =
             std::env::current_dir()?.join(format!("native-flow-{}", rand::random::<u64>()));
         std::fs::create_dir(&directory)?;
         let collector = UdpSocket::bind("127.0.0.1:2055")?;
         collector.set_read_timeout(Some(Duration::from_secs(3)))?;
-        for version in [1u16, 5, 9, 10] {
+        for version in [5u16, 10] {
             let config = config::Flow {
                 name: "test".into(),
                 enabled: true,
@@ -683,6 +721,7 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                 collector: "127.0.0.1:2055".into(),
                 export_version: version,
                 sampling_rate: 1,
+                max_message_size: 1200,
                 max_flows: 100,
                 snaplen: 128,
                 promiscuous: false,
@@ -695,21 +734,21 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                 json!({"name":"flow-test"}),
                 move || flow::prepare(config.clone(), true),
             )?;
-            let target = UdpSocket::bind(if [1, 5].contains(&version) {
+            let target = UdpSocket::bind(if version == 5 {
                 "127.0.0.1:25001"
             } else {
                 "[::1]:25001"
             })?;
-            let sender = UdpSocket::bind(if [1, 5].contains(&version) {
+            let sender = UdpSocket::bind(if version == 5 {
                 "127.0.0.1:25002"
             } else {
                 "[::1]:25002"
             })?;
             sender.send_to(b"flow-test-native", target.local_addr()?)?;
             let mut buffer = [0; 2048];
-            let n = collector.recv(&mut buffer)?;
+            let n = receive_flow(&collector, &mut buffer, version)?;
             ensure!(
-                n >= if version == 1 { 64 } else { 72 } && buffer[..2] == version.to_be_bytes(),
+                (72..=1200).contains(&n) && buffer[..2] == version.to_be_bytes(),
                 "invalid native NetFlow export"
             );
             ensure!(buffer[2..4] != [0, 0], "empty native flow export");
@@ -746,11 +785,7 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                     && status["export_errors"] == "0",
                 "incorrect final export totals: {status}"
             );
-            let flow_bytes = if [1, 5].contains(&version) {
-                "88"
-            } else {
-                "128"
-            };
+            let flow_bytes = if version == 5 { "88" } else { "128" };
             ensure!(
                 status["exported_flow_packets"] == "2"
                     && status["exported_flow_bytes"] == flow_bytes,
@@ -759,20 +794,17 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
             if version == 5 {
                 ensure!(buffer[22..24] == [0, 0], "v5 advertised sampling");
             }
-            if ![1, 5].contains(&version) {
-                let header = if version == 9 { 20 } else { 16 };
-                let templates =
-                    u16::from_be_bytes(buffer[header + 2..header + 4].try_into()?) as usize;
+            if version == 10 {
                 ensure!(
-                    buffer[header + templates..header + templates + 2] == 257u16.to_be_bytes(),
+                    buffer[16..18] == 257u16.to_be_bytes(),
                     "IPv6 export did not use template257"
                 );
-                let record = header + templates + 4;
-                let interval = record + if version == 9 { 63 } else { 71 };
+                let record = 20;
+                let interval = record + 71;
                 ensure!(
                     buffer[interval..interval + 4] == 1u32.to_be_bytes()
                         && buffer[interval + 4] == 1,
-                    "v9/IPFIX advertised sampled records"
+                    "IPFIX advertised sampled records"
                 );
             }
         }

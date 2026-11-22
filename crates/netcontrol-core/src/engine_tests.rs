@@ -4385,7 +4385,8 @@ fn unsupported_flow_filters_and_sampling_fail_validation_before_backend_apply() 
         assert!(engine.state.transactions.is_empty());
     }
     config.softflowd[0].capture_filter.clear();
-    for version in [1, 5, 9, 10] {
+    assert_eq!(config.softflowd[0].max_message_size, 1200);
+    for version in [5, 10] {
         config.softflowd[0].export_version = version;
         for enabled in [false, true] {
             config.softflowd[0].enabled = enabled;
@@ -4407,6 +4408,29 @@ fn unsupported_flow_filters_and_sampling_fail_validation_before_backend_apply() 
                 assert!(engine.state.transactions.is_empty());
             }
         }
+    }
+    config.softflowd[0].sampling_rate = 1;
+    for enabled in [false, true] {
+        config.softflowd[0].enabled = enabled;
+        for version in [1, 9] {
+            config.softflowd[0].export_version = version;
+            let reply = submit(&mut engine, config.clone());
+            assert_eq!(reply.status, 422, "{}", reply.body);
+            assert!(engine.state.transactions.is_empty());
+        }
+        config.softflowd[0].export_version = 10;
+        for size in [132, 1200, 65507] {
+            config.softflowd[0].max_message_size = size;
+            config.validate().unwrap();
+        }
+        for size in [-1, 0, 131, 65508] {
+            config.softflowd[0].max_message_size = size;
+            let reply = submit(&mut engine, config.clone());
+            assert_eq!(reply.status, 422, "{}", reply.body);
+            assert!(reply.body.to_string().contains("max_message_size"));
+            assert!(engine.state.transactions.is_empty());
+        }
+        config.softflowd[0].max_message_size = 1200;
     }
 }
 

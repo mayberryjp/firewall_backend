@@ -28,6 +28,7 @@
         "collector": "198.51.100.50:4739",
         "export_version": 10,
         "sampling_rate": 1,
+        "max_message_size": 1200,
         "max_flows": 65536,
         "snaplen": 256,
         "promiscuous": false,

@@ -427,7 +427,7 @@ impl Services {
             }
             for f in c.softflowd.iter().filter(|f| f.enabled) {
                 let config = f.clone();
-                self.insert(&format!("flow:{}",f.name),managed.clone(),                                json!({"name":f.name,"scope":"managed","export_version":f.export_version,"address_family":if !ipv6_enabled || [1,5].contains(&f.export_version){"ipv4"}else{"dual"},"fragments":"excluded","capture_filter":f.capture_filter,"sampling_rate":f.sampling_rate,"sampling_metadata":f.export_version!=1}),move||flow::prepare(config.clone(),ipv6_enabled))?;
+                self.insert(&format!("flow:{}",f.name),managed.clone(),                                json!({"name":f.name,"scope":"managed","export_version":f.export_version,"address_family":if !ipv6_enabled || f.export_version==5{"ipv4"}else{"dual"},"fragments":"excluded","capture_filter":f.capture_filter,"sampling_rate":f.sampling_rate,"sampling_metadata":true,"max_message_size":f.max_message_size}),move||flow::prepare(config.clone(),ipv6_enabled))?;
             }
             for m in c
                 .gateway_monitors

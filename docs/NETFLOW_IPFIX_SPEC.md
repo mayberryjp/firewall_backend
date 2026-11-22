@@ -35,9 +35,9 @@ transport or feature permitted by the IPFIX standards.
 
 **Sampling is configurable for all versions.** Required `sampling_rate` accepts
 1..1,000,000, except v5 is limited to 16,383; disabled entries use the same
-validation. `1` is unsampled; N selects every Nth received frame. IPFIX/v9
+validation. `1` is unsampled; N selects every Nth received frame. IPFIX
 advertise the configured interval and algorithm 1, v5 advertises the interval
-in its header, and v1 has no sampling metadata. Raw counters are never scaled;
+in its header. Only v5 and IPFIX v10 are accepted. Raw counters are never scaled;
 collector full-traffic estimates must account for sampling. Even unsampled
 capture does not guarantee complete capture or delivery.
 
@@ -70,7 +70,7 @@ when confidentiality is required; neither is provided by this exporter.
 ## 1. What it does
 
 One **exporter instance** captures packets on one interface, groups them into
-unidirectional flows, and sends expired flows as NetFlow v1, v5, v9 or IPFIX records
+unidirectional flows, and sends expired flows as NetFlow v5 or IPFIX v10 records
 over UDP to one collector. Up to 16 instances can be configured (including disabled
 ones). Each enabled instance is one worker thread with its own packet socket.
 
@@ -95,8 +95,9 @@ Path: `config.softflowd[]` inside the complete configuration of
 | `enabled` | boolean | yes | Disabled entries are saved and fully validated but run nothing |
 | `interface` | string | yes | Valid interface name; a managed interface or an operator-adopted parent. The server preflight is authoritative |
 | `collector` | string | yes | Canonical numeric `IP:port`, nonzero port, IPv6 bracketed (`[2001:db8::1]:4739`); unicast or loopback; no DNS name, zone or mapped IPv6 |
-| `export_version` | integer | yes | `1`, `5`, `9` or `10`; **10 is IPFIX** |
+| `export_version` | integer | yes | `5` or `10`; **10 is IPFIX**. Versions 1 and 9 are rejected, including disabled entries |
 | `sampling_rate` | integer | yes | 1..1,000,000; v5 maximum 16,383. `1` = unsampled. Limits also apply to disabled entries; invalid integers return `422` |
+| `max_message_size` | integer | no | Default **1200**; 132..65,507 UDP payload bytes, including protocol headers/sets/padding. Actual budget is also constrained by route PMTU; disabled entries validate too |
 | `max_flows` | integer | yes | 1..1,000,000 concurrent flows held in memory |
 | `snaplen` | integer | yes | 64..65,535 bytes captured per packet |
 | `promiscuous` | boolean | yes | Adds packet-socket promiscuous membership on the interface |
@@ -128,6 +129,7 @@ Other rules:
   "collector": "198.51.100.50:4739",
   "export_version": 10,
   "sampling_rate": 1,
+  "max_message_size": 1200,
   "max_flows": 65536,
   "snaplen": 256,
   "promiscuous": false,
@@ -146,8 +148,9 @@ interface SoftflowdConfig {
   enabled: boolean;
   interface: string;
   collector: string;
-  export_version: 1 | 5 | 9 | 10;
+  export_version: 5 | 10;
   sampling_rate: number;
+  max_message_size?: number; // omission defaults to 1200; returned configuration includes it
   max_flows: number;
   snaplen: number;
   promiscuous: boolean;
@@ -198,7 +201,7 @@ A flow is exported when any of these happens, then removed from the table:
 | Idle | No packet for the idle timeout of its class: `tcp.rst` if a RST was seen, else `tcp.fin` if a FIN was seen, else `tcp`; `udp`; `icmp` (ICMP and ICMPv6); anything else uses `general`. Any class not set falls back to `general`, and `general` defaults to 60 s |
 | Maximum life | Older than `maxlife` seconds (default 3600) since the first packet |
 | Capacity | The table is full and a new flow arrives: the least recently updated flow is exported early |
-| Counter overflow | Versions 1 and 5 only: a flow nearing the 32-bit packet/byte limit is exported early |
+| Counter overflow | Version 5 only: a flow nearing the 32-bit packet/byte limit is exported early |
 | Shutdown | Best-effort flush in batches of at most 64 flows, with a two-second total deadline; incomplete flush/send failure is explicitly logged |
 
 A timeout of `0` disables that timeout (except `general`, which must be >= 1).
@@ -210,14 +213,16 @@ Status counters refresh during these checks. Export delay includes the initial
 check interval, backlog draining and scheduling/export cost; it is not bounded
 by `expint` alone.
 
-Export packets hold at most 24 records (v1) or 30 (v5, v9, IPFIX). UDP writes are
+Export packets are fitted by serialized bytes, not a fixed record count. Due
+records export immediately, splitting into complete records within the effective
+message budget; no batch-fill timer is added. UDP writes are
 nonblocking, without the former per-write 250 ms wait. A normal batch has a
 two-second local-send deadline; encode/send/deadline failure puts the worker in
 `error` (section 5). Local send success does not prove collector delivery.
 
 Capacity and counter-overflow expirations are coalesced at the end of the current
 receive batch (up to 64 frames), with at most 64 pending records, then split into
-the same wire-format record limits. They do not require one UDP datagram per
+the same byte budget. They do not require one UDP datagram per
 expired flow. Flows use ordered trees for keys, least-recently-updated entries
 and expiry deadlines. Removal releases tree nodes instead of retaining a
 high-water hash-bucket allocation; this does not promise immediate OS/RSS
@@ -229,35 +234,31 @@ unchanged; record ordering is not a collector contract.
 
 ## 4. Wire formats
 
-| | v1 | v5 | v9 | IPFIX (10) |
-| --- | --- | --- | --- | --- |
-| Header | 16 bytes | 24 bytes | 20 bytes | 16 bytes |
-| Address families | IPv4 | IPv4 | IPv4 + IPv6 | IPv4 + IPv6 |
-| Record | 48-byte fixed | 48-byte fixed | template | template |
-| Sequence | none | records exported | **packets** exported | **data records** exported |
-| Counters | 32-bit | 32-bit | 64-bit | 64-bit |
-| Timestamps | uptime ms | uptime ms | uptime ms | **absolute epoch ms** |
-| Sampling information | **none** | header field | per-record fields | per-record fields |
+| | v5 | IPFIX (10) |
+| --- | --- | --- |
+| Header | 24 bytes | 16 bytes |
+| Address families | IPv4 | IPv4 + IPv6 |
+| Record | 48-byte fixed | 52-byte IPv4 / 76-byte IPv6 |
+| Sequence | records exported | **data records** exported |
+| Counters | 32-bit | 64-bit |
+| Timestamps | uptime ms | **absolute epoch ms** |
+| Sampling information | header field | per-record fields |
 
-- **v1/v5:** integers are network byte order; TCP flags at record offset 40 (v1) or
-  37 (v5). Interface indexes, next hop and masks are zero. v5's sampling header
+- **v5:** integers are network byte order; TCP flags at record offset
+  37. Interface indexes, next hop and masks are zero. v5's sampling header
   is zero for rate 1; otherwise its high two bits are `01` (packet interval)
   and its low 14 bits carry the configured rate.
-- **v9 and IPFIX** use template IDs **256 (IPv4)** and **257 (IPv6)**, **resent in
-  every export packet**. Fields per record, in order: source address (IE 8 or 27),
+- **IPFIX** uses template IDs **256 (IPv4)** and **257 (IPv6)**, sent separately
+  at startup and periodically. Fields per record, in order: source address (IE 8 or 27),
   destination address (12 or 28), source port (7), destination port (11), protocol
   (4), type of service (5), TCP control bits (6, one byte), packets (2, 8 bytes),
-  octets (1, 8 bytes), start and end time (v9: first/last switched 22/21,
-  4 bytes; IPFIX: flowStartMilliseconds/flowEndMilliseconds 152/153, 8 bytes),
+  octets (1, 8 bytes), start and end time
+  (flowStartMilliseconds/flowEndMilliseconds 152/153, 8 bytes),
   sampling interval (34, 4 bytes, configured rate) and sampling algorithm (35,
   value `1` = deterministic; interval 1 means unsampled).
-- **Observation domain / source ID (v9, IPFIX)** is random and chosen each time the
+- **Observation domain (IPFIX)** is random and chosen each time the
   worker starts, so it changes after a restart or service reconcile. Do not use it
   as a stable exporter identity.
-- **Version 1 carries no sampling metadata.** Runtime reports
-  `sampling_metadata: false` for it. Metadata absence does not establish
-  unsampled capture: v1 still uses its configured rate. A v1 collector needs
-  the rate out of band to estimate full traffic.
 - Transport is UDP only, with no acknowledgement, retransmission or delivery
   confirmation.
 
@@ -274,8 +275,8 @@ IPFIX message, with the following 16-byte header:
 | 8 | 4 | Sequence number | Number of data records in preceding successfully sent messages; starts at zero, wraps at 32 bits |
 | 12 | 4 | Observation domain ID | Random 32-bit value per worker execution attempt |
 
-Every message includes Template Set **2**, containing both template 256 and
-template 257, even if its data records use only one address family. Each template
+Template-only messages include Template Set **2**, containing both template 256 and
+template 257, even if captured traffic uses only one address family. Each template
 defines these 13 fields in this exact order; no enterprise-specific fields,
 Options Templates or Options Data Sets are emitted.
 
@@ -298,18 +299,50 @@ Options Templates or Options Data Sets are emitted.
 IPv4 records are **52 bytes**; IPv6 records are **76 bytes**. Data Set IDs
 256/257 refer to the corresponding templates. Only nonempty Data Sets are
 included, IPv4 before IPv6. Set lengths include their four-byte header and
-zero padding to a four-byte boundary. A message carries at most **30 data
-records total**, possibly mixing address families.
+zero padding to a four-byte boundary. Data-only messages contain no Template Set.
+Their size is `16 + (IPv4 present ? 4 : 0) + 52 * IPv4_count +
+(IPv6 present ? 4 : 0) + 76 * IPv6_count`; all current record sizes are
+four-byte multiples. V5 size is `24 + 48 * count`. At a 1200-byte budget,
+single-family maxima are 24 v5, 22 IPFIX IPv4 or 15 IPFIX IPv6 records.
+The 64-record maintenance bound is not a protocol record-count ceiling.
 
-There is no periodic template-only message or template withdrawal. Templates
-are resent with every data export. Export timestamps use the current system
+IPFIX sends **two separate initial template-only datagrams**, each 132 bytes.
+It then sends one refresh after **600 seconds or 20 successfully sent data
+datagrams**, whichever comes first, including idle periods independently of
+`expint`. Both limits are fixed implementation policy, not configurable fields.
+No template withdrawals are sent. Template datagrams do not advance sequence
+or flow totals, but do count successful UDP packets/payload bytes. UDP can lose
+or reorder templates relative to data; receivers must cache definitions and
+handle missing templates explicitly. Export timestamps use the current system
 clock and elapsed worker milliseconds; they are not hardware packet timestamps
 or a guarantee of a synchronized wall clock.
 
-Batching is not path-MTU-aware. A message with 30 IPv6 records has a 2416-byte
-UDP payload, so it exceeds a typical 1500-byte link MTU. Operators must account
-for path MTU, IP fragmentation and firewall/collector handling; the exporter
-does not negotiate a smaller message size or guarantee fragment delivery.
+### MTU and EMSGSIZE policy
+
+The effective payload budget is the lesser of configured `max_message_size`
+and the connected socket's kernel route PMTU minus 28 bytes for IPv4/UDP or
+48 for IPv6/UDP. The kernel route value is an upper bound, not evidence of
+end-to-end delivery. A reported unknown MTU uses a logged **512-byte total IP
+packet** fallback (484 IPv4 / 464 IPv6 payload bytes); unexpected query errors
+are explicit failures. Linux IPv4 uses `IP_PMTUDISC_DO`; IPv6 uses
+`IPV6_PMTUDISC_DO` plus `IPV6_DONTFRAG`. The exporter does not fragment datagrams.
+
+Before each send the budget is rechecked and can only decrease during an
+execution. On `EMSGSIZE`, refresh the route bound and constrain the budget
+strictly below the failed payload length, then re-encode/re-batch **only unsent
+records** within the existing two-second deadline. Already-sent records and
+sequence/counters are not replayed. Recovered errors are logged but do not count
+as failed batches. An unfit single record/template, other send/query error or
+deadline expiry fails explicitly and increments `export_errors` once.
+Retry supervision recreates the session; it does not replay failed flow records.
+The configuration minimum 132 fits both templates and one data record; an
+actual learned budget below that may make IPFIX operation impossible.
+
+This follows the MTU guidance of RFC 7011 section 10.3.3, but is not a claim of
+full RFC compliance: section 8.4 requires configurable template refresh
+intervals, while this implementation deliberately uses the fixed policy above.
+PMTU discovery/ICMP filtering, encapsulation and external collector
+interoperability still require deployment acceptance tests.
 
 ## 5. Runtime and status API
 
@@ -334,12 +367,14 @@ interface SoftflowdStatus {
   name: string;
   state: string;               // see below; unknown future values must be shown raw
   scope?: "managed";
-  export_version?: 1 | 5 | 9 | 10;
-  address_family?: "ipv4" | "dual";   // ipv4 when IPv6 is off or version is 1/5
+  export_version?: 5 | 10;
+  address_family?: "ipv4" | "dual";   // ipv4 when IPv6 is off or version is 5
   fragments?: "excluded";
   capture_filter?: string;
   sampling_rate?: number;
-  sampling_metadata?: boolean;        // false only for version 1
+  sampling_metadata?: boolean;        // true for supported exporters
+  max_message_size?: number;          // configured UDP payload cap
+  message_size_limit?: number;        // current effective UDP payload budget
   started_at?: string;                // RFC 3339, when the worker became running
   error?: string;
   dropped_packets?: string;           // exact decimal string
@@ -464,7 +499,7 @@ without a running worker are unknown (not zero). See
   gateway monitors and the routes. A change to **any** of these (including an unrelated
   address or route edit) stops and restarts **all** native service workers, not only
   the exporter you edited. Each stopped exporter flushes its remaining flows, then
-  starts with an empty table, new counters, a new `started_at` and (v9/IPFIX) a new
+  starts with an empty table, new counters, a new `started_at` and (IPFIX) a new
   observation domain. Edits outside that view (for example firewall rules or MTU)
   leave workers running. If the restart fails, the previous services configuration is
   restored and the error is reported.
@@ -495,8 +530,7 @@ without a running worker are unknown (not zero). See
   its `error` text verbatim and never parse it for meaning.
 - Explain that counts are sampled observations when the rate exceeds 1; preserve
   raw totals and label scaled values as estimates. Capture drops and UDP loss
-  can still make totals incomplete. Version 1 requires out-of-band sampling
-  configuration at its collector.
+  can still make totals incomplete.
 - Show the `ignored_fields` list after every submit.
 
 ## 9. Acceptance checks
@@ -504,7 +538,7 @@ without a running worker are unknown (not zero). See
 1. Create an enabled instance, confirm it, and see `state: running`, `started_at`,
    and `active_flows` rising under traffic on that interface.
 2. A collector on the configured port receives packets of the chosen version; for
-   v9/IPFIX it receives templates 256/257 in every packet.
+   IPFIX it caches templates 256/257 from separate startup/periodic datagrams.
 3. Rates 1, 4 and 100 succeed for every version, enabled or disabled. Rates
    0 or 1,000,001 fail with `422`; v5 also rejects 16,384 and accepts 16,383.
 4. Point at an interface that does not exist: the transaction fails and rolls back.
@@ -523,6 +557,16 @@ without a running worker are unknown (not zero). See
    capture copies, exact bytes, contiguous v5 record sequence numbers, zero
    capture drops, and fewer than 64 export datagrams. This exercises capacity
    eviction, bounded early-export batching and the final idle flush together.
+10. Validate cap omission/default, 132/65,507 bounds, wrong types and v1/v9
+    rejection, including disabled entries. Verify exact byte sizes and
+    mixed-family Set overhead without splitting a record.
+11. Observe two startup template copies, data without templates, and refreshes
+    at 600 seconds or 20 data datagrams. Count templates as UDP totals only,
+    including idle refresh; recover missing templates in the receiver cache.
+12. Reduce a disposable route MTU between budgeting and send; verify actual
+    IPv4/IPv6 `EMSGSIZE`, re-batching, exact delivered records/sequence/counters,
+    IPv4 DF and no fragments in captured wire packets. Also verify minimum-size,
+    unrecovered send errors and bounded recovery failure.
 
 Backend validation for this feature (protocol encoders, IPv6 parsing, filters,
 timeouts, sampling, drops, real capture and export in a disposable namespace) is in

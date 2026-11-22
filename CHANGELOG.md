@@ -85,7 +85,17 @@
 
 ### Changed
 
-- Support configurable deterministic sampling for all NetFlow v1/v5/v9 and
+- Breaking flow-export contract: support only NetFlow v5 and IPFIX v10;
+  reject v1/v9. Add per-instance `max_message_size`, default 1200 UDP payload
+  bytes (132..65,507). Fit complete records by bytes and kernel route PMTU,
+  disable fragmentation, and recover `EMSGSIZE` by re-batching only unsent
+  records. Send IPFIX templates separately at startup and every 600 seconds
+  or 20 data datagrams, including idle refreshes. Preserve configurable
+  sampling/raw counters; template sends count UDP totals, not flow totals.
+  Next automatic calendar version; required frontend and receiver coordination.
+  [Handoff 2026-11-22-03](docs/frontend-handoffs/2026-11-22.md#2026-11-22-03-mtu-safe-byte-based-flow-export).
+
+- Support configurable deterministic sampling for NetFlow v5 and
   IPFIX exporters: 1..1,000,000, with v5 limited to 16,383; 1 is unsampled.
   Validate disabled entries, preserve sampling phase across capture batches,
   emit configured wire metadata and retain raw counts without scaling.
@@ -2062,7 +2072,7 @@
   durable confirmation/rollback/recovery, committed revisions, a simulator,
   direct Linux networking, embedded onboarding, API keys and optional native TLS.
 - In-process Rust DHCPv4 relay, slew-only NTP client, RFC5424 remote syslog,
-  persistent host/managed traffic counters and history, NetFlow v1/v5/v9/IPFIX
+  persistent host/managed traffic counters and history, NetFlow v5/IPFIX
   export, and ICMPv4/v6 gateway monitoring. Workers use sockets/kernel APIs,
   not supervised protocol daemons.
 - Native `netcontrol-package` tooling for Ed25519-signed `.ncpkg` construction,

@@ -5,8 +5,8 @@ Status: receiver requirements for the **current implemented exporter**;
 this document does not claim that a receiver is implemented in this repository
 or that third-party collector interoperability has been verified.
 
-The scope is `softflowd[].export_version: 10` only. NetFlow v1/v5/v9 decoding
-is not required unless those versions are separately enabled. See the
+The scope is `softflowd[].export_version: 10` only. NetFlow v5 decoding
+is separate; v1/v9 are not supported. See the
 [exporter specification](NETFLOW_IPFIX_SPEC.md) for appliance configuration,
 capture, expiry and runtime APIs.
 
@@ -22,7 +22,7 @@ These are requirements for a receiver being built, not new backend features.
 | Export transport | UDP; no TCP/SCTP listener or handshake required |
 | Outer IP family | IPv4 and/or IPv6 matching the configured collector addresses |
 | Record IP family | Decode both IPv4 and IPv6 records, regardless of outer IP family |
-| Templates | Template Set 2; templates 256 and 257, each with 13 fields |
+| Templates | Cache separate Template Set 2 messages; templates 256 and 257, each with 13 fields |
 | Counters | Exact unsigned 64-bit packet/octet values |
 | Timestamps | Unsigned 64-bit Unix epoch milliseconds, not uptime |
 | Sampling | Per-record IEs 34 and 35; configurable interval 1..1,000,000, algorithm 1 |
@@ -61,13 +61,15 @@ for Netcontrol.
 
 The receiver MUST preserve UDP datagram boundaries and detect truncated
 datagrams rather than parsing a truncated buffer as a complete message.
-It MUST accept the current maximum **2416-byte UDP payload**; a 1500-byte
-application receive limit is insufficient. A general-purpose IPFIX receiver
-SHOULD allow larger UDP payloads rather than hard-code this exporter maximum.
+It MUST accept the configured exporter payload cap (default **1200 bytes**,
+configurable 132..65,507), not assume a fixed record count. Actual packets are
+also constrained by kernel route PMTU, with a conservative 512-byte total-packet
+fallback when unknown. A general-purpose IPFIX receiver SHOULD allow the full
+UDP payload range instead of hard-coding the default.
 
-IP fragmentation/reassembly belongs to the network stack. Firewall rules,
-network MTU and operating-system reassembly limits must permit delivery.
-The exporter is not path-MTU-aware; the receiver cannot request smaller batches.
+The exporter disables fragmentation and re-batches unsent records on `EMSGSIZE`.
+Network MTU, encapsulation and ICMP/PMTU behavior still affect delivery; local
+send success is not a guarantee. The receiver cannot request smaller batches.
 Monitor kernel receive drops and application queue pressure under load.
 
 ## 3. Message framing
@@ -90,11 +92,14 @@ length. Set length includes that four-byte header and any padding.
 
 For current valid exports:
 
-1. Template Set ID **2** appears first and is **116 bytes** including its header.
-2. It contains template **256**, then template **257**.
-3. Nonempty IPv4 Data Set **256** follows, when IPv4 records exist.
-4. Nonempty IPv6 Data Set **257** follows, when IPv6 records exist.
-5. There are **1 to 30 data records total** across both families.
+1. Template-only messages contain Set ID **2**, **116 bytes** including its
+   header, with template **256**, then **257**. Total message size is 132.
+2. Data-only messages contain no Template Set.
+3. Nonempty IPv4 Data Set **256** appears first when IPv4 records exist.
+4. Nonempty IPv6 Data Set **257** follows when IPv6 records exist.
+5. Data messages contain complete records fitted by bytes, not a fixed count;
+   either/both families may be present. Never assume templates precede data
+   within the same message.
 
 The receiver MUST decode using the received template definitions, including
 their advertised IE widths, rather than assuming the template ID alone defines
@@ -137,13 +142,17 @@ assume aligned machine-word reads.
 
 Example message sizes, excluding UDP/IP/link headers:
 
-| Records | Template set | Data set(s) | Message length |
+| Message | Template set | Data set(s) | Message length |
 | --- | --- | --- | --- |
-| One IPv4 | 116 | 56 | 188 |
-| One IPv6 | 116 | 80 | 212 |
-| One IPv4 + one IPv6 | 116 | 56 + 80 | 268 |
-| Thirty IPv4 | 116 | 1564 | 1696 |
-| Thirty IPv6 | 116 | 2284 | 2416 |
+| Templates only | 116 | none | 132 |
+| One IPv4 | none | 56 | 72 |
+| One IPv6 | none | 80 | 96 |
+| One IPv4 + one IPv6 | none | 56 + 80 | 152 |
+| Twenty-two IPv4 | none | 1148 | 1164 |
+| Fifteen IPv6 | none | 1144 | 1160 |
+
+The last two fit the default 1200-byte cap; smaller PMTU budgets may split
+them further. Larger configured caps may carry more records.
 
 ## 5. Template scope, restarts and sequencing
 
@@ -152,11 +161,20 @@ observation domain ID and template ID. A practical session key includes source
 IP/port and local destination IP/port; do not share one global template cache
 keyed only by 256/257 or only by the observation domain.
 
-The receiver MUST process templates in a message before decoding that message's
-Data Sets. Both templates accompany every export, so the first received packet
-is independently decodable even if earlier packets were lost or a cached
-template expired. No template-only keepalive or withdrawal is emitted.
-Receiver-managed idle expiry SHOULD bound cached session/template state.
+The receiver MUST cache templates from separate template-only datagrams and
+decode later Data Sets against that session/domain cache. Two separate initial
+copies are sent, then one refresh every **600 seconds or 20 successful data
+datagrams**, whichever comes first, including idle periods. No withdrawals are
+emitted. Identical refreshes and repeated sequence values are normal.
+
+Joining mid-stream, lost initial templates and reordering can leave data
+undecodable. The receiver MUST report unknown-template data explicitly; it
+SHOULD either drop it with a counter or keep a bounded orphan queue until a
+refresh, never guess a schema or reuse another session's template. Expire
+cached state on a receiver-managed bounded policy with adequate margin beyond
+600 seconds and expected jitter/loss (for example 1800 seconds). Data receipt
+alone is not a template refresh. The exporter cannot guarantee UDP ordering
+or request receiver acknowledgements.
 
 On each worker execution attempt, the exporter starts its sequence at zero
 and chooses a random 32-bit observation domain. A restart can also change the
@@ -277,8 +295,9 @@ sequence-gap evidence, socket/queue drops and last receipt time. Bound template
 caches, queues and processing work so malformed or excessive input cannot
 consume unlimited receiver resources.
 
-No packets during an idle period is normal: export is driven by flow expiry,
-not a periodic heartbeat. A lack of traffic does not prove exporter failure;
+No data records during an idle period is normal: data export follows flow
+expiry, while template-only messages continue every 600 seconds. A lack of
+received templates is diagnostic evidence, not proof of exporter failure;
 a running exporter or recent message does not prove loss-free capture.
 
 ## 8. Receiver acceptance checklist
@@ -292,10 +311,11 @@ receiver in this documentation task**.
    arriving over UDP/IPv6. Accept both templates with IPv4-only data.
 3. Decode one-family and mixed-family messages using all 13 IE widths/offsets,
    including one-byte TCP flags and unaligned 64-bit counters.
-4. Verify the five message lengths in section 4, including 2416-byte payloads
-   without application truncation; separately verify actual path-MTU delivery.
-5. Join mid-stream and decode the first received message using its templates.
-   Accept repeated templates without duplicate flow creation.
+4. Verify all six message lengths in section 4 without application truncation;
+   test configurable caps, mixed-family set overhead and actual PMTU delivery.
+5. Cache startup templates and decode subsequent data-only messages. Join
+   mid-stream, lose/reorder templates, bound orphan handling, and recover on
+   refresh. Accept repeated templates without duplicate flow creation.
 6. Keep template/sequence state isolated for two senders with the same template
    IDs and domain, and for multiple domains from the same UDP endpoint.
 7. Advance sequence by total data records, not messages/templates; test loss,
@@ -312,8 +332,8 @@ receiver in this documentation task**.
     receiver arrival time, and surface clock anomalies without silent fixes.
 11. Sum repeated-key record segments as deltas, retain provenance and avoid
     claiming capture completeness from sequence continuity.
-12. Reject malformed lengths/truncated datagrams visibly; tolerate idle periods
-    without requiring nonexistent template-only keepalives.
+12. Reject malformed lengths/truncated datagrams visibly; accept idle template
+    refreshes without fabricating flow records or advancing sequence.
 
 ## References
 

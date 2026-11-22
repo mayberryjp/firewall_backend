@@ -2134,7 +2134,26 @@ fn softflowd_all_fields_and_timeout_limits_are_validated() {
         serde_json::from_str(include_str!("../../../examples/vlan-softflowd.json")).unwrap();
     let c: Config = serde_json::from_value(v["config"].clone()).unwrap();
     c.validate().unwrap();
-    for change in 0..9 {
+    assert_eq!(c.softflowd[0].max_message_size, 1200);
+    assert_eq!(
+        serde_json::to_value(&c).unwrap()["softflowd"][0]["max_message_size"],
+        1200
+    );
+    let mut omitted = v["config"].clone();
+    omitted["softflowd"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_message_size");
+    assert_eq!(
+        serde_json::from_value::<Config>(omitted).unwrap().softflowd[0].max_message_size,
+        1200
+    );
+    for value in [Value::Null, json!("1200"), json!(1200.5)] {
+        let mut bad = v["config"].clone();
+        bad["softflowd"][0]["max_message_size"] = value;
+        assert!(serde_json::from_value::<Config>(bad).is_err());
+    }
+    for change in 0..13 {
         let mut bad = c.clone();
         let s = &mut bad.softflowd[0];
         match change {
@@ -2150,6 +2169,10 @@ fn softflowd_all_fields_and_timeout_limits_are_validated() {
             7 => {
                 s.timeouts.insert("general".into(), 0);
             }
+            9 => s.export_version = 1,
+            10 => s.export_version = 9,
+            11 => s.max_message_size = 131,
+            12 => s.max_message_size = 65508,
             _ => {
                 s.timeouts.insert("udp".into(), 604801);
             }

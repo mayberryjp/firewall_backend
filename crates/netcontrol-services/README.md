@@ -335,7 +335,7 @@ drift and durable transaction recovery safeguards remain enforced.
   polling, DST, outages and reset boundaries are approximate by design. Uses
   host local time; restart the daemon after timezone changes to refresh libc's
   timezone cache. This is output-format compatibility, not vnStat DB compatibility.
-* **NetFlow:** AF_PACKET Ethernet/VLAN capture and NetFlow v1/v5/v9/IPFIX UDP export,
+* **NetFlow:** AF_PACKET Ethernet/VLAN capture and NetFlow v5/IPFIX v10 UDP export,
   bounded flow capacity, configurable deterministic sampling (`sampling_rate`
   1..1,000,000; v5 maximum 16,383; 1 is unsampled; disabled entries also validate),
   idle/protocol/flag/maxlife/export
@@ -374,18 +374,24 @@ drift and durable transaction recovery safeguards remain enforced.
   observations on failure/stop. New counters are exact decimal strings;
   `exported_flows` retains its numeric type. See the
   [counter contract](../../docs/NETFLOW_IPFIX_SPEC.md#5-runtime-and-status-api).
-  Versions 1 and 5 represent IPv4; v9 and IPFIX represent IPv4 and IPv6,
-  with template IDs 256/257 refreshed in every export packet, 64-bit counters,
+  V5 represents IPv4; IPFIX represents IPv4 and IPv6,
+  with template IDs 256/257 sent separately at startup and periodically, 64-bit counters,
   protocol/ports/flags/TOS/timestamps, and sampling interval/algorithm elements.
-  Version 9 sequence counts packets; IPFIX sequence counts data records, and
+  IPFIX sequence counts data records, and
   IPFIX timestamps are epoch milliseconds. Unsupported families, fragments,
   and IPv6 jumbograms are excluded/flagged in status rather than misparsed.
-  Version 1 uses a 16-byte header, 48-byte records, at most 24 records per packet,
-  network-byte-order integers, and TCP flags at record offset 40 (v5 uses 37).
-  V1 has no sequence or sampling-interval metadata fields; runtime exposes
-  `sampling_metadata: false`, but capture still uses its configured rate, which
-  a v1 collector needs out of band. V5's sampling header is zero at rate 1,
-  otherwise packet-interval mode and the rate. V9/IPFIX advertise the configured
+  V1/v9 are rejected. V5 uses a 24-byte header, 48-byte records and TCP flags
+  at record offset 37. Byte fitting uses `max_message_size` (default 1200,
+  range 132..65,507 UDP payload bytes) and the connected route PMTU less IP/UDP
+  headers, with a logged 512-byte total-packet fallback for unknown MTU.
+  Linux disables fragmentation. `EMSGSIZE` reduces the budget and re-batches
+  unsent records without replaying successes, within the two-second deadline;
+  unfit records/templates and other failures are explicit errors.
+  IPFIX sends two separate 132-byte initial template messages, then one every
+  600 seconds or 20 successful data messages, including idle refreshes.
+  Ordinary data messages contain no templates. Template sends count UDP totals
+  but not flows/sequence. V5's sampling header is zero at rate 1,
+  otherwise packet-interval mode and the rate. IPFIX advertises the configured
   interval/algorithm 1. Every Nth received frame is selected before parsing or
   filtering, with phase preserved across batches and reset on worker execution.
   Raw counts are not multiplied; any collector scaling is an estimate.
@@ -509,9 +515,10 @@ Common enabled appliance row:
   exclusive socket worker; a worker error affects every enabled relay row.
   Disabled rows contain only `interface` and `state: "disabled"`.
 * Exporter row: `name` instance identity, `scope: "managed"`, `state`,
-  `started_at`, `export_version: 1|5|9|10`, `address_family: "ipv4"|"dual"`,
+  `started_at`, `export_version: 5|10`, `address_family: "ipv4"|"dual"`,
   `fragments: "excluded"`, `capture_filter`, `sampling_rate` integer,
-  `sampling_metadata` boolean (false only for v1); after collection, nonnegative integer
+  `sampling_metadata: true`, configured `max_message_size` and current
+  `message_size_limit` in UDP payload bytes; after collection, nonnegative integer
   `active_flows`, `exported_flows`, `excluded_packets`, `filtered_packets`,
   `malformed_packets`; optional `error`. Export counters initialize at worker
   entry: numeric `exported_flows` and decimal-string `exported_packets`,
@@ -627,7 +634,7 @@ Linux privileged checks:
 `NETCONTROL_INTEGRATION=1 cargo test -p netcontrol-services -- --ignored`.
 These explicitly require namespace/raw-socket privileges and run on isolated
 network-namespace threads. They exercise actual IPv4/IPv6 echo sockets,
-AF_PACKET/v1/v5/v9/IPFIX UDP export including IPv6, counter persistence/joins, and an NTP UDP fixture
+AF_PACKET/v5/IPFIX UDP export including IPv6, counter persistence/joins, and an NTP UDP fixture
 without changing the host clock. They do not establish full production
 interoperability, TLS PKI end-to-end behavior, real DHCP client topology,
 privileged clock mutation, or whole-host log ownership safety on a target

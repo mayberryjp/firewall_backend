@@ -994,11 +994,16 @@ gauges, vnStat daily/monthly/lifetime and reporting summaries, software release
 checks and Sando sync summaries. The version sensor uses the embedded calendar
 release version, not Cargo's internal placeholder.
 
-All NetFlow/IPFIX versions support configurable `sampling_rate`: 1..1,000,000,
+Only NetFlow v5 and IPFIX v10 are supported; v1/v9 are rejected. Both support
+configurable `sampling_rate`: 1..1,000,000,
 with v5 limited to 16,383, including disabled instances. `1` is unsampled;
 N selects every Nth received frame. Raw flow counts are not scaled; collector
 full-traffic estimates must account for the interval. Capture exclusions/drops
-and UDP delivery loss can still make totals incomplete. See the
+and UDP delivery loss can still make totals incomplete. Byte-based exports use
+`max_message_size` (default 1200 UDP payload bytes, range 132..65,507), bounded
+by route PMTU with fragmentation disabled and `EMSGSIZE` re-batching of unsent
+records. IPFIX sends separate initial/periodic templates (600 seconds or 20
+data datagrams), not templates in every data message. See the
 [receiver requirements](docs/IPFIX_RECEIVER_SPEC.md) and
 [frontend contract](FRONTEND_SPEC.md#69-softflowd).
 
