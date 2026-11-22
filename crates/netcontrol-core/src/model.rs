@@ -1748,14 +1748,16 @@ impl Config {
                 "export version must be 1, 5, 9, or 10"
             );
             ensure!(
-                (1..=1000000).contains(&s.sampling_rate)
-                    && (1..=1000000).contains(&s.max_flows)
-                    && (64..=65535).contains(&s.snaplen),
-                "invalid sampling/max_flows/snaplen"
+                (1..=1000000).contains(&s.sampling_rate),
+                "sampling_rate must be between 1 and 1000000"
             );
             ensure!(
                 s.export_version != 5 || s.sampling_rate <= 16383,
                 "NetFlow v5 sampling interval is limited to 16383"
+            );
+            ensure!(
+                (1..=1000000).contains(&s.max_flows) && (64..=65535).contains(&s.snaplen),
+                "invalid max_flows/snaplen"
             );
             ensure!(
                 ["", "ip", "ip6", "tcp", "udp", "icmp", "icmp6"]

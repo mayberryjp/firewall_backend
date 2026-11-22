@@ -4352,7 +4352,7 @@ fn reconcile_still_rejects_network_drift_and_observation_errors() {
 }
 
 #[test]
-fn unsupported_flow_filters_and_v5_sampling_fail_validation_before_backend_apply() {
+fn unsupported_flow_filters_and_sampling_fail_validation_before_backend_apply() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();
     let mut config = config();
@@ -4360,7 +4360,7 @@ fn unsupported_flow_filters_and_v5_sampling_fail_validation_before_backend_apply
     config.softflowd = vec![
         serde_json::from_value(json!({
             "name":"flow0","enabled":true,"interface":"lan0","collector":"192.0.2.10:9995",
-            "export_version":10,"sampling_rate":100,"max_flows":1024,"snaplen":128,
+            "export_version":10,"sampling_rate":1,"max_flows":1024,"snaplen":128,
             "promiscuous":false,"capture_filter":""
         }))
         .unwrap(),
@@ -4385,17 +4385,28 @@ fn unsupported_flow_filters_and_v5_sampling_fail_validation_before_backend_apply
         assert!(engine.state.transactions.is_empty());
     }
     config.softflowd[0].capture_filter.clear();
-    config.softflowd[0].export_version = 5;
-    config.softflowd[0].sampling_rate = 16383;
-    config.validate().unwrap();
-    config.softflowd[0].sampling_rate = 16384;
-    let reply = submit(&mut engine, config.clone());
-    assert_eq!(reply.status, 422, "{}", reply.body);
-    assert!(engine.state.transactions.is_empty());
-    for version in [1, 9, 10] {
+    for version in [1, 5, 9, 10] {
         config.softflowd[0].export_version = version;
-        config.softflowd[0].sampling_rate = 1000000;
-        config.validate().unwrap();
+        for enabled in [false, true] {
+            config.softflowd[0].enabled = enabled;
+            let limit = if version == 5 { 16383 } else { 1000000 };
+            for rate in [1, 2, 4, 100, limit] {
+                config.softflowd[0].sampling_rate = rate;
+                config.validate().unwrap();
+            }
+            for rate in [-1, 0, limit + 1] {
+                config.softflowd[0].sampling_rate = rate;
+                let reply = submit(&mut engine, config.clone());
+                assert_eq!(reply.status, 422, "{}", reply.body);
+                assert!(
+                    reply.body.to_string().contains("sampling_rate")
+                        || reply.body.to_string().contains("sampling interval"),
+                    "{}",
+                    reply.body
+                );
+                assert!(engine.state.transactions.is_empty());
+            }
+        }
     }
 }
 

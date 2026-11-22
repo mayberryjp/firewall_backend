@@ -336,7 +336,9 @@ drift and durable transaction recovery safeguards remain enforced.
   host local time; restart the daemon after timezone changes to refresh libc's
   timezone cache. This is output-format compatibility, not vnStat DB compatibility.
 * **NetFlow:** AF_PACKET Ethernet/VLAN capture and NetFlow v1/v5/v9/IPFIX UDP export,
-  bounded flow capacity, configured sampling, idle/protocol/flag/maxlife/export
+  bounded flow capacity, configurable deterministic sampling (`sampling_rate`
+  1..1,000,000; v5 maximum 16,383; 1 is unsampled; disabled entries also validate),
+  idle/protocol/flag/maxlife/export
   timeouts, and best-effort shutdown flushing. Excludes its collector traffic to avoid
   export feedback. Capture uses nonblocking batches of up to 64 packets per
   `recvmmsg`, with at most 256 packets between maintenance checks. A readiness
@@ -362,11 +364,11 @@ drift and durable transaction recovery safeguards remain enforced.
   `statistics_complete: false` after any observed drop; flow totals may undercount
   traffic. Both reset on worker restart (initially `"0"` and `true`); loss remains
   recorded across later loss-free polls and shutdown. Counters cover socket drops
-  before application filtering/sampling and are read at the configured export-scan
+  before application sampling/parsing/filtering and are read at the configured export-scan
   interval. Capture/statistics socket errors and export failures remain fatal.
   Running does not verify collector delivery or loss-free capture.
   Per-instance export totals count successful UDP datagrams/payload bytes,
-  flow records and the sampled packet/layer-3 byte totals they represent.
+  flow records and the sampled observed packet/layer-3 byte totals they represent.
   `export_errors` counts failed encode/send/deadline batches. Publish partial
   successes and shutdown exports, reset on each execution attempt, and retain
   observations on failure/stop. New counters are exact decimal strings;
@@ -380,14 +382,17 @@ drift and durable transaction recovery safeguards remain enforced.
   and IPv6 jumbograms are excluded/flagged in status rather than misparsed.
   Version 1 uses a 16-byte header, 48-byte records, at most 24 records per packet,
   network-byte-order integers, and TCP flags at record offset 40 (v5 uses 37).
-  V1 has no sequence or sampling-interval metadata fields: configured capture
-  sampling still applies, reported counters describe captured samples and are
-  not artificially multiplied; runtime exposes `sampling_metadata: false`.
+  V1 has no sequence or sampling-interval metadata fields; runtime exposes
+  `sampling_metadata: false`, but capture still uses its configured rate, which
+  a v1 collector needs out of band. V5's sampling header is zero at rate 1,
+  otherwise packet-interval mode and the rate. V9/IPFIX advertise the configured
+  interval/algorithm 1. Every Nth received frame is selected before parsing or
+  filtering, with phase preserved across batches and reset on worker execution.
+  Raw counts are not multiplied; any collector scaling is an estimate.
   Next-hop/interface-index fields remain zero where not measured. `capture_filter`
   accepts exactly empty, `ip`, `ip6`, `tcp`, `udp`, `icmp`, or `icmp6`; other
   expressions are rejected, not silently ignored. Filters run natively after
-  bounded protocol parsing; they are not arbitrary BPF programs. Version 5
-  sampling is limited to 16,383. No BPF compiler, softflowd control
+  bounded protocol parsing; they are not arbitrary BPF programs. No BPF compiler, softflowd control
   socket, or external exporter is used. General idle defaults to 60 seconds,
   maximum life 3,600 seconds, scan/export interval one second; protocol-specific
   idle values fall back to general. Explicit protocol idle/maxlife zero disables

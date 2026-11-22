@@ -982,7 +982,7 @@ summaries, interface counters, configuration revision and daemon uptime, plus ho
 health: memory/swap, load, uptime, pressure, **per-core CPU busy percent**, **per
 temperature/fan sensor** (thermal zones and hwmon) and local filesystem space, and
 per-instance NetFlow/IPFIX export state, **dropped capture packets**, active/exported
-flows, exported UDP datagrams/payload bytes, sampled packets/bytes represented
+flows, exported UDP datagrams/payload bytes, sampled observed packets/bytes represented
 by sent flow records, export errors and excluded/filtered/malformed packet counters.
 The same per-instance totals are available in the
 [runtime/status API](docs/NETFLOW_IPFIX_SPEC.md#5-runtime-and-status-api);
@@ -993,6 +993,14 @@ DHCP lease summaries, WireGuard peer byte counters/handshakes, BGP neighbor
 gauges, vnStat daily/monthly/lifetime and reporting summaries, software release
 checks and Sando sync summaries. The version sensor uses the embedded calendar
 release version, not Cargo's internal placeholder.
+
+All NetFlow/IPFIX versions support configurable `sampling_rate`: 1..1,000,000,
+with v5 limited to 16,383, including disabled instances. `1` is unsampled;
+N selects every Nth received frame. Raw flow counts are not scaled; collector
+full-traffic estimates must account for the interval. Capture exclusions/drops
+and UDP delivery loss can still make totals incomplete. See the
+[receiver requirements](docs/IPFIX_RECEIVER_SPEC.md) and
+[frontend contract](FRONTEND_SPEC.md#69-softflowd).
 
 **Overall firewall dropped packets and bytes** sum the managed input/forward
 DROP rules and default policies, using exact kernel counters rather than sampled

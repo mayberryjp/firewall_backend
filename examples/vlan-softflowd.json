@@ -1,7 +1,7 @@
 {
   "base_revision": "2026.10.29.1",
   "confirm_timeout_seconds": 120,
-  "description": "Create office VLAN and export sampled flow records",
+  "description": "Create office VLAN and export unsampled flow records",
   "config": {
     "interfaces": [
       {
@@ -22,12 +22,12 @@
     "softflowd": [
       {
         "name": "office",
-        "metadata": {"display_name": "Office traffic export", "description": "Sampled IPFIX collector"},
+        "metadata": {"display_name": "Office traffic export", "description": "Unsampled IPFIX collector"},
         "enabled": true,
         "interface": "uplink.100",
         "collector": "198.51.100.50:4739",
         "export_version": 10,
-        "sampling_rate": 100,
+        "sampling_rate": 1,
         "max_flows": 65536,
         "snaplen": 256,
         "promiscuous": false,

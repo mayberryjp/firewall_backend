@@ -409,13 +409,13 @@ fn fixed_export(
     epoch: std::time::SystemTime,
     sampling: u32,
 ) -> Result<Vec<u8>> {
+    super::config::validate_sampling(version, sampling)?;
     let header = if version == 1 { 16 } else { 24 };
     ensure!(
         [1, 5].contains(&version)
             && !flows.is_empty()
-            && flows.len() <= if version == 1 { 24 } else { 30 }
-            && sampling <= 16383,
-        "invalid fixed-format NetFlow version/batch/sampling"
+            && flows.len() <= if version == 1 { 24 } else { 30 },
+        "invalid fixed-format NetFlow version/batch"
     );
     let mut packet = vec![0u8; header + 48 * flows.len()];
     packet[..2].copy_from_slice(&version.to_be_bytes());
@@ -465,6 +465,7 @@ pub(crate) fn template_export(
     sampling: u32,
     domain: u32,
 ) -> Result<Vec<u8>> {
+    super::config::validate_sampling(version, sampling)?;
     ensure!(
         [9, 10].contains(&version) && !flows.is_empty() && flows.len() <= 30,
         "invalid template export version/count"
@@ -655,6 +656,7 @@ pub(crate) fn prepare(
     config: super::config::Flow,
     ipv6_enabled: bool,
 ) -> Result<Box<dyn FnOnce(super::worker::ContextState) -> Result<()> + Send>> {
+    super::config::validate_sampling(config.export_version, config.sampling_rate)?;
     use crate::linux as l;
     use std::{
         mem,
@@ -712,7 +714,7 @@ pub(crate) fn prepare(
         let mut pending = Vec::with_capacity(CAPTURE_BATCH);
         let fixed_counters = [1, 5].contains(&config.export_version);
         let mut table = FlowTable::new(config.max_flows, fixed_counters, timeouts);
-        let mut sampled = 0u64;
+        let mut sampling_remaining = config.sampling_rate;
         let mut sequence = 0u32;
         let mut exports = ExportCounters::default();
         let mut ignored_ipv6 = 0u64;
@@ -775,10 +777,11 @@ pub(crate) fn prepare(
                     if ctx.stopping() {
                         break;
                     }
-                    sampled = sampled.wrapping_add(1);
-                    if sampled % config.sampling_rate as u64 != 0 {
+                    sampling_remaining -= 1;
+                    if sampling_remaining != 0 {
                         continue;
                     }
+                    sampling_remaining = config.sampling_rate;
                     let item = match parse(capture.packet(packet)) {
                         Ok(Some(v)) => v,
                         Ok(None) => {
@@ -884,55 +887,71 @@ mod tests {
     fn export_counters_match_udp_datagrams_and_sampled_flow_totals_for_all_versions() {
         use std::{net::UdpSocket, time::Duration};
         for version in [1, 5, 9, 10] {
-            let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
-            collector
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-            sender.connect(collector.local_addr().unwrap()).unwrap();
-            let batch: Vec<_> = (1..=61)
-                .map(|index| {
-                    (
-                        flow_test_key(index),
-                        Flow {
-                            packets: u64::from(index),
-                            bytes: u64::from(index) * 40,
-                            first: 1,
-                            last: 2,
-                            flags: 0,
-                            changed: std::time::Instant::now(),
-                            expiry: None,
-                        },
-                    )
-                })
-                .collect();
-            let mut counters = ExportCounters::default();
-            counters
-                .export(&batch, version, |chunk| {
-                    let epoch = std::time::SystemTime::now();
-                    let packet = match version {
-                        1 => v1(chunk, 3, epoch)?,
-                        5 => v5(chunk, 3, 0, epoch, 4)?,
-                        _ => template_export(chunk, version, 3, 0, epoch, 4, 7)?,
-                    };
-                    let n = sender.send(&packet)?;
-                    ensure!(n == packet.len(), "short test UDP write");
-                    Ok(n)
-                })
-                .unwrap();
-            let mut bytes = 0u64;
-            let mut buffer = [0; 4096];
-            for _ in 0..3 {
-                let n = collector.recv(&mut buffer).unwrap();
-                assert_eq!(&buffer[..2], &version.to_be_bytes());
-                bytes += n as u64;
+            for sampling in [1, 4, if version == 5 { 16383 } else { 1_000_000 }] {
+                let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+                collector
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+                sender.connect(collector.local_addr().unwrap()).unwrap();
+                let batch: Vec<_> = (1..=61)
+                    .map(|index| {
+                        (
+                            flow_test_key(index),
+                            Flow {
+                                packets: u64::from(index),
+                                bytes: u64::from(index) * 40,
+                                first: 1,
+                                last: 2,
+                                flags: 0,
+                                changed: std::time::Instant::now(),
+                                expiry: None,
+                            },
+                        )
+                    })
+                    .collect();
+                let mut counters = ExportCounters::default();
+                counters
+                    .export(&batch, version, |chunk| {
+                        let epoch = std::time::SystemTime::now();
+                        let packet = match version {
+                            1 => v1(chunk, 3, epoch)?,
+                            5 => v5(chunk, 3, 0, epoch, sampling)?,
+                            _ => template_export(chunk, version, 3, 0, epoch, sampling, 7)?,
+                        };
+                        let n = sender.send(&packet)?;
+                        ensure!(n == packet.len(), "short test UDP write");
+                        Ok(n)
+                    })
+                    .unwrap();
+                let mut bytes = 0u64;
+                let mut buffer = [0; 4096];
+                for _ in 0..3 {
+                    let n = collector.recv(&mut buffer).unwrap();
+                    assert_eq!(&buffer[..2], &version.to_be_bytes());
+                    if version == 5 {
+                        let field = if sampling == 1 {
+                            0
+                        } else {
+                            0x4000 | sampling as u16
+                        };
+                        assert_eq!(&buffer[22..24], &field.to_be_bytes());
+                    } else if [9, 10].contains(&version) {
+                        let header = if version == 9 { 20 } else { 16 };
+                        let record = header + 116 + 4;
+                        let interval = record + if version == 9 { 39 } else { 47 };
+                        assert_eq!(&buffer[interval..interval + 4], &sampling.to_be_bytes());
+                        assert_eq!(buffer[interval + 4], 1);
+                    }
+                    bytes += n as u64;
+                }
+                assert_eq!(counters.packets, 3);
+                assert_eq!(counters.bytes, bytes);
+                assert_eq!(counters.flows, 61);
+                assert_eq!(counters.flow_packets, 1891);
+                assert_eq!(counters.flow_bytes, 75640);
+                assert_eq!(counters.errors, 0);
             }
-            assert_eq!(counters.packets, 3);
-            assert_eq!(counters.bytes, bytes);
-            assert_eq!(counters.flows, 61);
-            assert_eq!(counters.flow_packets, 1891);
-            assert_eq!(counters.flow_bytes, 75640);
-            assert_eq!(counters.errors, 0);
         }
     }
 
@@ -985,6 +1004,31 @@ mod tests {
             })
         );
         assert_eq!(counters.flows, 31);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preparation_rejects_invalid_sampling_before_opening_capture() {
+        for version in [1, 5, 9, 10] {
+            for rate in [0, if version == 5 { 16384 } else { 1_000_001 }] {
+                let config: super::super::config::Flow =
+                    serde_json::from_value(serde_json::json!({
+                        "name":"unsampled","enabled":true,"interface":"absent",
+                        "collector":"192.0.2.1:4739","export_version":version,
+                        "sampling_rate":rate,"max_flows":100,"snaplen":128,"promiscuous":false
+                    }))
+                    .unwrap();
+                let error = match prepare(config, true) {
+                    Ok(_) => panic!("invalid sampling unexpectedly passed worker preparation"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains("sampling_rate")
+                        || error.to_string().contains("sampling interval"),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1504,49 +1548,62 @@ mod tests {
         };
         assert!(v5(&[(key, flow.clone())], 200, 7, std::time::UNIX_EPOCH, 1).is_err());
         for version in [9, 10] {
-            let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_800_000_000_000);
-            let p = template_export(&[(key, flow.clone())], version, 200, 7, epoch, 1000000, 123)
+            for sampling in [1, 4, 1_000_000] {
+                let epoch =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_800_000_000_000);
+                let p = template_export(
+                    &[(key, flow.clone())],
+                    version,
+                    200,
+                    7,
+                    epoch,
+                    sampling,
+                    123,
+                )
                 .unwrap();
-            assert_eq!(&p[..2], &version.to_be_bytes());
-            let header = if version == 9 { 20 } else { 16 };
-            if version == 9 {
-                assert_eq!(&p[2..4], &3u16.to_be_bytes());
-                assert_eq!(&p[12..16], &7u32.to_be_bytes())
-            } else {
+                assert_eq!(&p[..2], &version.to_be_bytes());
+                let header = if version == 9 { 20 } else { 16 };
+                if version == 9 {
+                    assert_eq!(&p[2..4], &3u16.to_be_bytes());
+                    assert_eq!(&p[12..16], &7u32.to_be_bytes())
+                } else {
+                    assert_eq!(
+                        u16::from_be_bytes(p[2..4].try_into().unwrap()) as usize,
+                        p.len()
+                    );
+                    assert_eq!(&p[8..12], &7u32.to_be_bytes());
+                }
                 assert_eq!(
-                    u16::from_be_bytes(p[2..4].try_into().unwrap()) as usize,
-                    p.len()
+                    u16::from_be_bytes(p[header..header + 2].try_into().unwrap()),
+                    if version == 9 { 0 } else { 2 }
                 );
-                assert_eq!(&p[8..12], &7u32.to_be_bytes());
-            }
-            assert_eq!(
-                u16::from_be_bytes(p[header..header + 2].try_into().unwrap()),
-                if version == 9 { 0 } else { 2 }
-            );
-            let template_size =
-                u16::from_be_bytes(p[header + 2..header + 4].try_into().unwrap()) as usize;
-            assert_eq!(template_size, 116);
-            let data = header + template_size;
-            assert_eq!(&p[data..data + 2], &257u16.to_be_bytes());
-            let record = &p[data + 4..];
-            assert_eq!(
-                &record[..16],
-                &"2001:db8::1"
-                    .parse::<std::net::Ipv6Addr>()
-                    .unwrap()
-                    .octets()
-            );
-            assert_eq!(
-                u64::from_be_bytes(record[47..55].try_into().unwrap()),
-                u32::MAX as u64 + 17
-            );
-            if version == 10 {
+                let template_size =
+                    u16::from_be_bytes(p[header + 2..header + 4].try_into().unwrap()) as usize;
+                assert_eq!(template_size, 116);
+                let data = header + template_size;
+                assert_eq!(&p[data..data + 2], &257u16.to_be_bytes());
+                let record = &p[data + 4..];
                 assert_eq!(
-                    u64::from_be_bytes(record[55..63].try_into().unwrap()),
-                    1_799_999_999_900
+                    &record[..16],
+                    &"2001:db8::1"
+                        .parse::<std::net::Ipv6Addr>()
+                        .unwrap()
+                        .octets()
                 );
+                assert_eq!(
+                    u64::from_be_bytes(record[47..55].try_into().unwrap()),
+                    u32::MAX as u64 + 17
+                );
+                if version == 10 {
+                    assert_eq!(
+                        u64::from_be_bytes(record[55..63].try_into().unwrap()),
+                        1_799_999_999_900
+                    );
+                }
+                let interval = if version == 9 { 63 } else { 71 };
+                assert_eq!(&record[interval..interval + 4], &sampling.to_be_bytes());
+                assert_eq!(record.last(), Some(&1));
             }
-            assert_eq!(record.last(), Some(&1));
         }
     }
     #[test]

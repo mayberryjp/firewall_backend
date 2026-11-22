@@ -486,92 +486,115 @@ fn native_flow_capacity_exports_are_batched_and_lossless() {
 #[ignore = "requires NETCONTROL_INTEGRATION=1 and Linux namespace/raw-socket privileges"]
 fn native_flow_sustained_capture_above_old_receive_ceiling() {
     isolated(|| {
-        for sampling_rate in [1, 4] {
-            let collector = UdpSocket::bind("127.0.0.1:2055")?;
-            collector.set_read_timeout(Some(Duration::from_secs(5)))?;
-            let target = UdpSocket::bind("127.0.0.1:25001")?;
-            let sender = UdpSocket::bind("127.0.0.1:25002")?;
-            let config = config::Flow {
-                name: "throughput-test".into(),
-                enabled: true,
-                interface: "lo".into(),
-                collector: "127.0.0.1:2055".into(),
-                export_version: 5,
-                sampling_rate,
-                max_flows: 100,
-                snaplen: 128,
-                promiscuous: false,
-                capture_filter: String::new(),
-                timeouts: std::collections::BTreeMap::from([("general".into(), 1)]),
-            };
-            let mut worker = worker::Worker::start(
-                "flow-throughput-test".into(),
-                None,
-                json!({"name":"throughput-test"}),
-                move || flow::prepare(config.clone(), true),
-            )?;
-            let started = Instant::now();
-            const DATAGRAMS: u32 = 32_768;
-            for _ in 0..DATAGRAMS / 64 {
-                for _ in 0..64 {
-                    sender.send_to(&[0; 16], target.local_addr()?)?;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            let elapsed = started.elapsed();
-            // Loopback delivers both outgoing and incoming copies to AF_PACKET.
-            let captured = DATAGRAMS * 2;
-            ensure!(
-                f64::from(captured) / elapsed.as_secs_f64() > 25_600.0,
-                "fixture did not exceed the old 256 packets/10ms ceiling: {elapsed:?}"
-            );
-            let mut buffer = [0; 2048];
-            let n = collector.recv(&mut buffer)?;
-            ensure!(
-                n == 72 && buffer[..2] == 5u16.to_be_bytes(),
-                "expected one v5 flow, received {n} bytes"
-            );
-            let packets = u32::from_be_bytes(buffer[40..44].try_into()?);
-            let bytes = u32::from_be_bytes(buffer[44..48].try_into()?);
-            ensure!(
-                packets == captured / sampling_rate && bytes == packets * 44,
-                "capture/sampling lost or duplicated packets: {packets}, {bytes} bytes, sampling {sampling_rate}"
-            );
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let sending = stop.clone();
-            let destination = target.local_addr()?;
-            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-            sender.set_write_timeout(Some(Duration::from_millis(250)))?;
-            let traffic = std::thread::spawn(move || -> Result<()> {
-                sender.send_to(&[0; 16], destination)?;
-                ready_tx.send(())?;
-                while !sending.load(std::sync::atomic::Ordering::Acquire) {
+        for version in [1, 5, 9, 10] {
+            for sampling_rate in [1, 3, 4] {
+                let collector = UdpSocket::bind("127.0.0.1:2055")?;
+                collector.set_read_timeout(Some(Duration::from_secs(5)))?;
+                let target = UdpSocket::bind("127.0.0.1:25001")?;
+                let sender = UdpSocket::bind("127.0.0.1:25002")?;
+                let config = config::Flow {
+                    name: "throughput-test".into(),
+                    enabled: true,
+                    interface: "lo".into(),
+                    collector: "127.0.0.1:2055".into(),
+                    export_version: version,
+                    sampling_rate,
+                    max_flows: 100,
+                    snaplen: 128,
+                    promiscuous: false,
+                    capture_filter: String::new(),
+                    timeouts: std::collections::BTreeMap::from([("general".into(), 1)]),
+                };
+                let mut worker = worker::Worker::start(
+                    "flow-throughput-test".into(),
+                    None,
+                    json!({"name":"throughput-test"}),
+                    move || flow::prepare(config.clone(), true),
+                )?;
+                let started = Instant::now();
+                const DATAGRAMS: u32 = 32_768;
+                for _ in 0..DATAGRAMS / 64 {
                     for _ in 0..64 {
-                        sender.send_to(&[0; 16], destination)?;
+                        sender.send_to(&[0; 16], target.local_addr()?)?;
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                Ok(())
-            });
-            let ready = ready_rx.recv_timeout(Duration::from_secs(1));
-            let start = Instant::now();
-            let shutdown = worker.shutdown();
-            stop.store(true, std::sync::atomic::Ordering::Release);
-            traffic.join().expect("traffic thread panic")?;
-            ready?;
-            shutdown?;
-            ensure!(
-                start.elapsed() < Duration::from_secs(1),
-                "capture shutdown exceeded 1s"
-            );
-            let status = worker.snapshot();
-            ensure!(
-                status["state"] == "stopped"
-                    && status["dropped_packets"] == "0"
-                    && status["statistics_complete"] == true
-                    && status.get("error").is_none(),
-                "sustained capture lost packets or failed: {status}"
-            );
+                let elapsed = started.elapsed();
+                // Loopback delivers both outgoing and incoming copies to AF_PACKET.
+                let captured = DATAGRAMS * 2;
+                ensure!(
+                    f64::from(captured) / elapsed.as_secs_f64() > 25_600.0,
+                    "fixture did not exceed the old 256 packets/10ms ceiling: {elapsed:?}"
+                );
+                let mut buffer = [0; 2048];
+                let n = collector.recv(&mut buffer)?;
+                let (packets, bytes) = if [1, 5].contains(&version) {
+                    ensure!(
+                        n == (if version == 1 { 64 } else { 72 })
+                            && buffer[..2] == version.to_be_bytes(),
+                        "expected one fixed-format flow, received {n} bytes"
+                    );
+                    let record = if version == 1 { 16 } else { 24 };
+                    (
+                        u64::from(u32::from_be_bytes(
+                            buffer[record + 16..record + 20].try_into()?,
+                        )),
+                        u64::from(u32::from_be_bytes(
+                            buffer[record + 20..record + 24].try_into()?,
+                        )),
+                    )
+                } else {
+                    let record = (if version == 9 { 20 } else { 16 }) + 116 + 4;
+                    ensure!(
+                        n == record + (if version == 9 { 44 } else { 52 })
+                            && buffer[..2] == version.to_be_bytes(),
+                        "expected one template-based flow, received {n} bytes"
+                    );
+                    (
+                        u64::from_be_bytes(buffer[record + 15..record + 23].try_into()?),
+                        u64::from_be_bytes(buffer[record + 23..record + 31].try_into()?),
+                    )
+                };
+                ensure!(
+                    packets == u64::from(captured / sampling_rate) && bytes == packets * 44,
+                    "capture/sampling lost or duplicated packets: {packets}, {bytes} bytes, version {version}, sampling {sampling_rate}"
+                );
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let sending = stop.clone();
+                let destination = target.local_addr()?;
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+                sender.set_write_timeout(Some(Duration::from_millis(250)))?;
+                let traffic = std::thread::spawn(move || -> Result<()> {
+                    sender.send_to(&[0; 16], destination)?;
+                    ready_tx.send(())?;
+                    while !sending.load(std::sync::atomic::Ordering::Acquire) {
+                        for _ in 0..64 {
+                            sender.send_to(&[0; 16], destination)?;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(())
+                });
+                let ready = ready_rx.recv_timeout(Duration::from_secs(1));
+                let start = Instant::now();
+                let shutdown = worker.shutdown();
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                traffic.join().expect("traffic thread panic")?;
+                ready?;
+                shutdown?;
+                ensure!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "capture shutdown exceeded 1s"
+                );
+                let status = worker.snapshot();
+                ensure!(
+                    status["state"] == "stopped"
+                        && status["dropped_packets"] == "0"
+                        && status["statistics_complete"] == true
+                        && status.get("error").is_none(),
+                    "sustained capture lost packets or failed: {status}"
+                );
+            }
         }
         Ok(())
     });
@@ -723,6 +746,19 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                     && status["export_errors"] == "0",
                 "incorrect final export totals: {status}"
             );
+            let flow_bytes = if [1, 5].contains(&version) {
+                "88"
+            } else {
+                "128"
+            };
+            ensure!(
+                status["exported_flow_packets"] == "2"
+                    && status["exported_flow_bytes"] == flow_bytes,
+                "unsampled exporter did not account both loopback copies exactly: {status}"
+            );
+            if version == 5 {
+                ensure!(buffer[22..24] == [0, 0], "v5 advertised sampling");
+            }
             if ![1, 5].contains(&version) {
                 let header = if version == 9 { 20 } else { 16 };
                 let templates =
@@ -730,6 +766,13 @@ fn native_af_packet_capture_exports_v1_v5_v9_ipfix_and_ipv6() {
                 ensure!(
                     buffer[header + templates..header + templates + 2] == 257u16.to_be_bytes(),
                     "IPv6 export did not use template257"
+                );
+                let record = header + templates + 4;
+                let interval = record + if version == 9 { 63 } else { 71 };
+                ensure!(
+                    buffer[interval..interval + 4] == 1u32.to_be_bytes()
+                        && buffer[interval + 4] == 1,
+                    "v9/IPFIX advertised sampled records"
                 );
             }
         }

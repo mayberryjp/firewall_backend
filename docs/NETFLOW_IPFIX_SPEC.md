@@ -11,6 +11,62 @@ is **no softflowd program**. Capture and export run in-process in Rust
 (`netcontrol-services`, `flow.rs`). Nothing external is started, controlled or
 parsed.
 
+Collector developers: see the [IPFIX receiver requirements](IPFIX_RECEIVER_SPEC.md)
+for the required decoder schema, session/template handling, aggregation semantics
+and receiver acceptance checklist.
+
+## IPFIX support at a glance
+
+This is an **IPFIX exporter**, not an IPFIX collector. Select
+`export_version: 10`. The following describes implemented behavior, not every
+transport or feature permitted by the IPFIX standards.
+
+| Capability | Implemented behavior |
+| --- | --- |
+| IPv4 traffic records | Yes; template 256 |
+| IPv6 traffic records | Yes; template 257, when `ipv6_enabled: true` |
+| Export over IPv4 | Yes; UDP to a numeric IPv4 collector |
+| Export over IPv6 | Yes; UDP to a numeric IPv6 collector, when IPv6 is enabled |
+| UDP export transport | **Yes; the only export transport** |
+| TCP export transport | **No** |
+| SCTP export transport | **No** |
+| TLS / DTLS, export encryption or collector authentication | **No** |
+| Receiving/storing IPFIX from other exporters | **No** |
+
+**Sampling is configurable for all versions.** Required `sampling_rate` accepts
+1..1,000,000, except v5 is limited to 16,383; disabled entries use the same
+validation. `1` is unsampled; N selects every Nth received frame. IPFIX/v9
+advertise the configured interval and algorithm 1, v5 advertises the interval
+in its header, and v1 has no sampling metadata. Raw counters are never scaled;
+collector full-traffic estimates must account for sampling. Even unsampled
+capture does not guarantee complete capture or delivery.
+
+**Traffic family and export transport family are independent.** For example,
+IPv4 and IPv6 flow records can both travel over UDP/IPv4 to
+`198.51.100.50:4739`, or over UDP/IPv6 to `[2001:db8::50]:4739`.
+The collector address selects the outer IP family; it does not select which
+traffic is captured. Runtime `address_family: "dual"` describes capture/export
+record capability, not the collector socket family.
+
+Port **4739 is an example**, not an implicit default: the configuration must
+provide a nonzero destination port. The exporter binds a wildcard local address
+and an ephemeral UDP source port (`0.0.0.0:0` or `[::]:0`), then connects that
+UDP socket to the collector. UDP `connect` performs no collector handshake.
+The kernel chooses the export route and source IP; `interface` selects the
+capture interface, not a forced export egress interface. There is no
+configurable export source IP/port, transport selector or collector DNS lookup.
+
+**Captured transport protocols are a separate question.** TCP and UDP traffic
+have source/destination ports decoded. ICMP/ICMPv6 use the type/code encoding
+described below. Other IP protocols, including SCTP (protocol 132), can contribute
+flow records with their protocol number, but both ports remain zero: there is
+no SCTP header, association or stream decoding. `capture_filter: "udp"` filters
+the observed traffic; it does not configure the export transport.
+
+Export is best-effort and unencrypted. Successful local UDP sends do not prove
+collector receipt. Use a trusted network or an operator-managed secure tunnel
+when confidentiality is required; neither is provided by this exporter.
+
 ## 1. What it does
 
 One **exporter instance** captures packets on one interface, groups them into
@@ -20,7 +76,7 @@ ones). Each enabled instance is one worker thread with its own packet socket.
 
 ```mermaid
 flowchart LR
-  A[Interface frames<br/>AF_PACKET, both directions] --> B[Sample 1-in-N]
+  A[Interface frames<br/>AF_PACKET, both directions] --> B[Select every Nth frame<br/>1 = unsampled]
   B --> C[Parse Ethernet/VLAN/IPv4/IPv6]
   C --> D[Capture filter]
   D --> E[Flow table<br/>max_flows]
@@ -40,7 +96,7 @@ Path: `config.softflowd[]` inside the complete configuration of
 | `interface` | string | yes | Valid interface name; a managed interface or an operator-adopted parent. The server preflight is authoritative |
 | `collector` | string | yes | Canonical numeric `IP:port`, nonzero port, IPv6 bracketed (`[2001:db8::1]:4739`); unicast or loopback; no DNS name, zone or mapped IPv6 |
 | `export_version` | integer | yes | `1`, `5`, `9` or `10`; **10 is IPFIX** |
-| `sampling_rate` | integer | yes | 1..1,000,000. `1` = every packet. Version 5 is limited to 16,383 |
+| `sampling_rate` | integer | yes | 1..1,000,000; v5 maximum 16,383. `1` = unsampled. Limits also apply to disabled entries; invalid integers return `422` |
 | `max_flows` | integer | yes | 1..1,000,000 concurrent flows held in memory |
 | `snaplen` | integer | yes | 64..65,535 bytes captured per packet |
 | `promiscuous` | boolean | yes | Adds packet-socket promiscuous membership on the interface |
@@ -71,14 +127,14 @@ Other rules:
   "interface": "lan0",
   "collector": "198.51.100.50:4739",
   "export_version": 10,
-  "sampling_rate": 100,
+  "sampling_rate": 1,
   "max_flows": 65536,
   "snaplen": 256,
   "promiscuous": false,
   "capture_filter": "",
   "timeouts": {"general": 60, "tcp": 300, "tcp.fin": 10, "tcp.rst": 5,
                "udp": 30, "icmp": 30, "maxlife": 3600, "expint": 10},
-  "metadata": {"display_name": "Office traffic export", "description": "Sampled IPFIX"}
+  "metadata": {"display_name": "Office traffic export", "description": "Unsampled IPFIX"}
 }
 ```
 
@@ -115,15 +171,18 @@ interface SoftflowdConfig {
 - **Excluded packets.** IPv4 fragments, IPv6 fragment headers, IPv6 jumbograms,
   non-IP frames and, for versions 1 and 5, all IPv6. They are counted, not
   guessed (section 5).
-- **Sampling.** Deterministic: every Nth received packet is examined, counted before
-  parsing and filtering. Reported counters describe the sampled packets; the server
-  does **not** multiply them. A collector must scale by the sampling interval.
+- **Sampling.** Deterministic selection of every Nth received frame before
+  parsing and filtering; N=1 is unsampled. The selection phase persists across
+  receive batches and resets on worker execution. Counters describe only
+  selected accepted packets, without multiplication. Preserve raw counts and
+  label any collector-side scaling as estimates. Drops and exclusions remain
+  separate omissions that sampling cannot recover.
 - **Flow key.** Source IP, destination IP, source port, destination port, protocol
   and IP type of service (TOS / traffic class). Flows are **unidirectional**: each
   direction is its own flow. For ICMP and ICMPv6, the destination-port field carries
   `type << 8 | code`.
-- **Bytes.** The IP total length of each sampled packet (layer 3, excluding the
-  Ethernet header). Packets counts each sampled packet once.
+- **Bytes.** The IP total length of each selected accepted packet (layer 3,
+  excluding the Ethernet header). Packet count includes each selected packet once.
 - **TCP flags.** OR of all flags seen in the flow.
 - **Collector traffic is excluded.** UDP packets destined to the configured
   collector IP and port are skipped to avoid export feedback loops.
@@ -165,7 +224,7 @@ high-water hash-bucket allocation; this does not promise immediate OS/RSS
 reclamation by the allocator. Every update/removal synchronizes both indexes.
 Timeout classes are cached at worker preparation; packet updates and expiry
 checks each use one monotonic timestamp.
-Flow limits, timeout precedence, sampling, counters and protocol schemas are
+Flow limits, timeout precedence, counters and protocol schemas are
 unchanged; record ordering is not a collector contract.
 
 ## 4. Wire formats
@@ -181,24 +240,76 @@ unchanged; record ordering is not a collector contract.
 | Sampling information | **none** | header field | per-record fields | per-record fields |
 
 - **v1/v5:** integers are network byte order; TCP flags at record offset 40 (v1) or
-  37 (v5). Interface indexes, next hop and masks are zero. v5 puts mode `01`
-  (packet interval) and the interval in the header's sampling field when the rate is
-  above 1.
+  37 (v5). Interface indexes, next hop and masks are zero. v5's sampling header
+  is zero for rate 1; otherwise its high two bits are `01` (packet interval)
+  and its low 14 bits carry the configured rate.
 - **v9 and IPFIX** use template IDs **256 (IPv4)** and **257 (IPv6)**, **resent in
   every export packet**. Fields per record, in order: source address (IE 8 or 27),
   destination address (12 or 28), source port (7), destination port (11), protocol
   (4), type of service (5), TCP control bits (6, one byte), packets (2, 8 bytes),
   octets (1, 8 bytes), start and end time (v9: first/last switched 22/21,
   4 bytes; IPFIX: flowStartMilliseconds/flowEndMilliseconds 152/153, 8 bytes),
-  sampling interval (34, 4 bytes) and sampling algorithm (35, value `1` =
-  deterministic).
+  sampling interval (34, 4 bytes, configured rate) and sampling algorithm (35,
+  value `1` = deterministic; interval 1 means unsampled).
 - **Observation domain / source ID (v9, IPFIX)** is random and chosen each time the
   worker starts, so it changes after a restart or service reconcile. Do not use it
   as a stable exporter identity.
 - **Version 1 carries no sampling metadata.** Runtime reports
-  `sampling_metadata: false` for it; never present v1 totals as unsampled or scaled.
+  `sampling_metadata: false` for it. Metadata absence does not establish
+  unsampled capture: v1 still uses its configured rate. A v1 collector needs
+  the rate out of band to estimate full traffic.
 - Transport is UDP only, with no acknowledgement, retransmission or delivery
   confirmation.
+
+### IPFIX message and template layout
+
+All multibyte integers use network byte order. Each UDP payload contains one
+IPFIX message, with the following 16-byte header:
+
+| Offset | Width | Field | Value/meaning |
+| --- | --- | --- | --- |
+| 0 | 2 | Version | 10 |
+| 2 | 2 | Length | Entire IPFIX message in bytes, including header and sets |
+| 4 | 4 | Export time | Unix epoch seconds at encoding time |
+| 8 | 4 | Sequence number | Number of data records in preceding successfully sent messages; starts at zero, wraps at 32 bits |
+| 12 | 4 | Observation domain ID | Random 32-bit value per worker execution attempt |
+
+Every message includes Template Set **2**, containing both template 256 and
+template 257, even if its data records use only one address family. Each template
+defines these 13 fields in this exact order; no enterprise-specific fields,
+Options Templates or Options Data Sets are emitted.
+
+| Information element | IE ID (IPv4 / IPv6 where different) | Width in bytes | Meaning |
+| --- | --- | --- | --- |
+| sourceIPv4Address / sourceIPv6Address | 8 / 27 | 4 / 16 | Observed source address |
+| destinationIPv4Address / destinationIPv6Address | 12 / 28 | 4 / 16 | Observed destination address |
+| sourceTransportPort | 7 | 2 | Source port, or zero when not decoded |
+| destinationTransportPort | 11 | 2 | Destination port, or ICMP type/code encoding, or zero |
+| protocolIdentifier | 4 | 1 | IP protocol / terminal IPv6 next-header value |
+| ipClassOfService | 5 | 1 | IPv4 TOS / IPv6 traffic class |
+| tcpControlBits | 6 | 1 | OR of observed TCP flag bytes; zero for other protocols |
+| packetDeltaCount | 2 | 8 | Sampled observed packet count, not scaled |
+| octetDeltaCount | 1 | 8 | Sampled observed layer-3 byte count, not scaled |
+| flowStartMilliseconds | 152 | 8 | Unix epoch milliseconds, reconstructed at export |
+| flowEndMilliseconds | 153 | 8 | Unix epoch milliseconds, reconstructed at export |
+| samplingInterval | 34 | 4 | Configured rate 1..1,000,000; 1 is unsampled |
+| samplingAlgorithm | 35 | 1 | Always 1, deterministic |
+
+IPv4 records are **52 bytes**; IPv6 records are **76 bytes**. Data Set IDs
+256/257 refer to the corresponding templates. Only nonempty Data Sets are
+included, IPv4 before IPv6. Set lengths include their four-byte header and
+zero padding to a four-byte boundary. A message carries at most **30 data
+records total**, possibly mixing address families.
+
+There is no periodic template-only message or template withdrawal. Templates
+are resent with every data export. Export timestamps use the current system
+clock and elapsed worker milliseconds; they are not hardware packet timestamps
+or a guarantee of a synchronized wall clock.
+
+Batching is not path-MTU-aware. A message with 30 IPv6 records has a 2416-byte
+UDP payload, so it exceeds a typical 1500-byte link MTU. Operators must account
+for path MTU, IP fragmentation and firewall/collector handling; the exporter
+does not negotiate a smaller message size or guarantee fragment delivery.
 
 ## 5. Runtime and status API
 
@@ -237,12 +348,12 @@ interface SoftflowdStatus {
   exported_flows?: number;            // cumulative since worker start
   exported_packets?: string;          // successful UDP datagrams
   exported_bytes?: string;            // successful UDP payload bytes
-  exported_flow_packets?: string;     // sampled packets in successfully sent records
-  exported_flow_bytes?: string;       // sampled layer-3 bytes in successfully sent records
+  exported_flow_packets?: string;     // sampled observed packets in successfully sent records
+  exported_flow_bytes?: string;       // sampled observed layer-3 bytes in successfully sent records
   export_errors?: string;             // failed export batches (encode/send/deadline)
-  excluded_packets?: number;          // sampled packets excluded (see section 3)
-  filtered_packets?: number;          // sampled packets rejected by the filter
-  malformed_packets?: number;         // sampled packets that failed parsing
+  excluded_packets?: number;          // selected packets excluded (see section 3)
+  filtered_packets?: number;          // selected packets rejected by the filter
+  malformed_packets?: number;         // selected packets that failed parsing
 }
 ```
 
@@ -262,8 +373,8 @@ shutdown flushing. Count only complete successful local UDP sends.
 `exported_packets` counts export UDP datagrams, not captured traffic.
 `exported_bytes` includes NetFlow/IPFIX headers, templates and padding but excludes
 UDP/IP/link headers. `exported_flow_packets` and `exported_flow_bytes` sum the
-sampled packet/layer-3 byte values in successfully sent records without scaling
-by the sampling rate; active unexported flows are not included. `export_errors`
+sampled observed packet/layer-3 byte values in successfully sent records without scaling;
+active unexported flows are not included. `export_errors`
 increments once for a failed export batch (not once per unsent record); the error
 still propagates to the worker supervisor. Totals saturate at u64 maximum.
 Each instance has independent counters. A successful send is local socket
@@ -300,11 +411,12 @@ On hosts with a lower limit, operators can review that sysctl and raise it to at
 least 4,194,304 bytes before restarting exporters if the memory budget permits.
 The daemon does not modify host sysctls. Buffering absorbs bursts, not sustained
 overload: capture and export still share a thread, so CPU contention and export
-work can still produce drops despite bounded expiry/nonblocking writes. Increasing application sampling
-does not reduce the packets initially queued by the kernel.
+work can still produce drops despite bounded expiry/nonblocking writes.
+Application sampling reduces parsing/accounting work but does not reduce
+frames initially queued by the kernel; it cannot guarantee loss-free capture.
 
 `dropped_packets` is the cumulative number of packets the kernel dropped from the
-capture socket before the application saw them (before sampling and filtering). It
+capture socket before the application saw them (before sampling, parsing and filtering). It
 starts at `"0"` with `statistics_complete: true`. Any observed drop makes
 `statistics_complete` **false until the worker restarts**, even if later polls are
 loss-free. Drops do not stop export. This is not a count of lost flow records.
@@ -314,6 +426,8 @@ when `statistics_complete === false`, explaining that flow totals may undercount
 traffic. Never convert it through JavaScript `Number`. Absent fields mean unknown,
 not zero or complete. Never label a running worker loss-free or delivery-verified.
 Do not retry or reconcile automatically because of a warning.
+`statistics_complete: true` does not mean unsampled capture; check the
+configured/runtime `sampling_rate` separately.
 
 ### Home Assistant MQTT stream
 
@@ -337,10 +451,13 @@ without a running worker are unknown (not zero). See
 - **Collector reachability is the operator's job.** The collector needs a route from
   the appliance, and any firewall in front of it must allow the UDP port. The
   appliance does not check that anything is listening.
-- **Startup failure** (interface missing, bind or socket error) makes the
-  transaction fail and roll back. A later capture or export error moves the worker to
-  `error`, can fail verification and block confirmation, and does not retry on its
-  own; use the reconcile action after fixing the cause.
+- **Worker failures** (interface missing, bind/socket, capture or export error)
+  are explicitly reported by the service supervisor, which retries worker
+  preparation/execution with bounded backoff. A failed worker can fail
+  verification and block confirmation; a running/recovered worker still does not
+  prove collector delivery. Retrying recreates sockets and starts a fresh flow
+  cache, counters and observation domain; it does **not** replay failed exports.
+  Reconcile is an explicit repair action, not required to trigger automatic retry.
 - A transaction whose configuration, **as the services layer sees it**, is unchanged
   leaves workers running. That view is the IPv6 policy, NTP, syslog, vnStat, each
   interface's name, kind, up state, addresses and DHCP relay, all flow exporters, all
@@ -370,14 +487,16 @@ without a running worker are unknown (not zero). See
 - Table: name, desired vs observed enabled, interface, collector, version label
   (`10` shown as IPFIX), runtime state, started time, error, staged state, and the
   drop warning when present.
-- Editor: all fields in section 2, a version selector that disables sampling above
-  16,383 for v5, an interface list of managed draft interfaces plus available adopted
+- Editor: all fields in section 2, configurable sampling rate (1 labelled
+  Unsampled; v5 maximum 16,383), an interface list of managed draft interfaces plus available adopted
   parents (mark adopted parents protected), and optional named timeout rows (absence
   means worker default, not zero).
 - Validate locally as section 2 states, but let the server be authoritative; show
   its `error` text verbatim and never parse it for meaning.
-- Explain that `sampling_rate` thins the data and that totals must be scaled by the
-  collector; explain that v1 cannot convey sampling.
+- Explain that counts are sampled observations when the rate exceeds 1; preserve
+  raw totals and label scaled values as estimates. Capture drops and UDP loss
+  can still make totals incomplete. Version 1 requires out-of-band sampling
+  configuration at its collector.
 - Show the `ignored_fields` list after every submit.
 
 ## 9. Acceptance checks
@@ -386,7 +505,8 @@ without a running worker are unknown (not zero). See
    and `active_flows` rising under traffic on that interface.
 2. A collector on the configured port receives packets of the chosen version; for
    v9/IPFIX it receives templates 256/257 in every packet.
-3. Set `sampling_rate` above 16,383 with version 5: rejected with `422`.
+3. Rates 1, 4 and 100 succeed for every version, enabled or disabled. Rates
+   0 or 1,000,001 fail with `422`; v5 also rejects 16,384 and accepts 16,383.
 4. Point at an interface that does not exist: the transaction fails and rolls back.
 5. Disable the instance: its row shows `disabled` and the worker stops (remaining
    flows are exported).
@@ -395,7 +515,7 @@ without a running worker are unknown (not zero). See
 7. Simulator: `simulated`, no counters, no fabricated totals.
 8. On a disposable Linux namespace, sustain more than 25,600 capture frames/s
    (the old receive-loop ceiling), verify exact exported packet/byte counts with
-   sampling intervals 1 and 4, no capture drops, and shutdown within one second
+   every export version at rates 1 and 4, no capture drops, and shutdown within one second
    while traffic is still arriving. This is a regression fixture, not an
    appliance throughput guarantee.
 9. Queue a bounded burst of 128 distinct UDP flows into an exporter with

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- Add collector-facing IPFIX receiver requirements covering UDP/IP families,
+  exact templates/record offsets, session and sequence handling, configurable sampled
+  counters, directional 5-tuple-plus-TOS aggregation, missing context and
+  interoperability acceptance checks. Documentation only; no receiver or
+  backend behavior added, no frontend action.
+
 ### Fixed
 
 - Fix hourly Network Experience summary timeouts for dense 256-host pages:
@@ -76,6 +84,20 @@
   or frontend schema change; next automatic calendar version.
 
 ### Changed
+
+- Support configurable deterministic sampling for all NetFlow v1/v5/v9 and
+  IPFIX exporters: 1..1,000,000, with v5 limited to 16,383; 1 is unsampled.
+  Validate disabled entries, preserve sampling phase across capture batches,
+  emit configured wire metadata and retain raw counts without scaling.
+  Supersedes the unreleased unsampled-only restriction. Accepted-rate expansion;
+  next automatic calendar version.
+  [Required frontend handoff 2026-11-22-02](docs/frontend-handoffs/2026-11-22.md#2026-11-22-02-configurable-flow-sampling).
+
+- Clarify the existing IPFIX implementation specification: IPv4/IPv6 traffic
+  records and collector transports are independent, export is UDP-only without
+  TCP/SCTP or TLS/DTLS, and SCTP traffic lacks port decoding. Document exact
+  message/template fields, batching/path-MTU limitations and supervised retry.
+  Documentation only; no runtime or API change, no frontend action.
 
 - Replace combined interface error/drop totals and deltas in link diagnostics
   and new performance evidence with separate RX/TX errors/drops and RX

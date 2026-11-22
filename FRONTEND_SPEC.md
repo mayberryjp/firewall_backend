@@ -3929,7 +3929,7 @@ Publisher and deployment contract:
   packet until the worker restarts), `dropped_packets` (kernel capture-socket drops,
   exact decimal string, cumulative since worker start), `active_flows` (gauge),
   `exported_flows`, `exported_packets` (UDP datagrams), `exported_bytes` (UDP
-  payload bytes), `exported_flow_packets` and `exported_flow_bytes` (sampled
+  payload bytes), `exported_flow_packets` and `exported_flow_bytes` (sampled observed
   traffic represented by successfully sent records), `export_errors` (failed
   export batches), `excluded_packets`, `filtered_packets` and `malformed_packets`
   (cumulative). The five new export counters are exact decimal strings.
@@ -7623,12 +7623,29 @@ with the same fields. No backend change: enable/disable already uses the existin
 `softflowd.write` permission and complete configuration transaction.
 
 Editor: name, enabled, capture interface, numeric collector address/port, export
-version, sampling rate, maximum flows, snap length, promiscuous capture, optional
+version, configurable sampling rate, maximum flows, snap length, promiscuous capture, optional
 capture filter chosen from empty, `ip`, `ip6`, `tcp`, `udp`, `icmp`, `icmp6`,
 and optional timeout overrides. Arbitrary BPF expressions are not supported.
 Fragments and IPv6 jumbograms are excluded. Versions 1/5 export IPv4;
-9/IPFIX support IPv4 and IPv6. Version 1 cannot convey sampling metadata:
-show `sampling_metadata: false` without inventing unsampled traffic totals.
+9/IPFIX support IPv4 and IPv6. Required `sampling_rate` is configurable for
+all versions: 1..1,000,000, with v5 limited to 16,383, including disabled
+entries. Label 1 **Unsampled** and N>1 **1 in N**. Invalid integers return
+`422`; missing/wrong-type values retain `400`. Preserve the chosen rate in
+full submits; do not silently normalize it. IPFIX/v9 emit the configured
+interval and algorithm 1. v5's sampling header is zero for rate 1 and
+packet-interval mode with the rate otherwise. Version 1 cannot convey sampling
+metadata: `sampling_metadata: false` means metadata absent, not unsampled
+capture; a v1 collector needs the rate out of band. Preserve raw sampled counts,
+label any scaled full-traffic totals as estimates, and do not double-scale.
+Sampling and capture/UDP loss are separate concerns.
+
+All export versions use **UDP only**, over the numeric collector's IPv4 or IPv6
+address family; TCP/SCTP export and TLS/DTLS are not implemented. IPFIX traffic
+record families are independent of the collector family: IPv4 and IPv6 records
+can share one UDP/IPv4 or UDP/IPv6 collector when IPv6 is enabled. Runtime
+`address_family` describes record capability, not the outer transport family.
+`capture_filter: "udp"` selects observed traffic, not export transport. The
+collector port is explicitly configured, with no implicit 4739 default.
 
 Capture interface options include managed draft interfaces and available adopted
 parents. Mark adopted parents protected. Timeout overrides are optional named
@@ -7652,7 +7669,7 @@ Show read-only per-instance export statistics on the table/detail: existing
 `exported_flows` (successfully sent unidirectional records), `exported_packets`
 (successful UDP datagrams), `exported_bytes` (UDP payload bytes, including
 templates/padding but excluding UDP/IP/link headers), `exported_flow_packets`
-and `exported_flow_bytes` (sampled packet and layer-3 byte totals in those records),
+and `exported_flow_bytes` (sampled observed packet and layer-3 byte totals in those records),
 and `export_errors` (failed export batches, including encode/send/deadline errors).
 The five new fields are optional unsigned decimal strings, initialized to `"0"`
 at worker entry and saturated at u64 maximum. Keep strings exact; do not pass
@@ -7662,7 +7679,7 @@ failure and the shutdown flush. Error/stopped rows retain their last observation
 disabled/simulated/unavailable fields remain unknown. All totals reset on each
 worker execution attempt, including supervised retry, reconcile and daemon restart;
 they are not persisted. Use `started_at` to identify a new observation period.
-Flow packet/byte totals are not multiplied by `sampling_rate`, and active
+Flow packet/byte totals are raw sampled observations, not scaled estimates; active
 unexported flows do not contribute. UDP success is local socket acceptance, not
 collector receipt; never display these as acknowledged delivery. Poll the existing
 status endpoint with `state.read`; no new write/reset endpoint is introduced.
@@ -7673,7 +7690,7 @@ delay under backlog. UDP sends are nonblocking; normal encode/send/deadline
 errors still fail the worker. Shutdown flushing is best-effort in batches of
 at most 64 records with a two-second total deadline; incomplete flush/send
 failure is explicitly logged. Stopped totals reflect successful local sends,
-not guaranteed export of every formerly active flow. No field/type, sampling,
+not guaranteed export of every formerly active flow. No field/type,
 protocol-filter, permission or endpoint changes accompany these timing changes.
 
 Native AF_PACKET packet drops no longer stop export or fail service verification
@@ -7681,7 +7698,7 @@ by themselves. Runtime/status rows expose `dropped_packets` (exact unsigned deci
 string) and `statistics_complete` (boolean). Enabled native workers initialize
 these to `"0"` and `true`; each export-scan poll accumulates socket drops and any
 observed loss makes statistics incomplete until worker restart. Shutdown retains
-the values. These are socket drops before application filtering/sampling, not a
+the values. These are socket drops before application sampling/parsing/filtering, not a
 count of lost flow records. Capture/statistics socket errors and export failures
 still produce `state: "error"` and can fail confirmation.
 
@@ -7692,6 +7709,8 @@ while export can continue. Do not convert the decimal counter through JavaScript
 not zero/complete. Do not label a running worker as loss-free or delivery-verified.
 No automatic retry, reconciliation or transaction replay is warranted by this
 warning; the existing unknown-write recovery rules still apply.
+Sampling alone does not set `statistics_complete` false; true does not imply
+unsampled capture. Display the configured/runtime sampling rate separately.
 
 **Reconcile services** is a separate explicitly confirmed runtime action. It sends
 a bodyless POST using stored committed/pending configuration, not the draft.
@@ -7951,7 +7970,7 @@ unsupported route-table/port-uniqueness restrictions.
 | Capture interface | Valid interface name; managed or operator-adopted interface; server preflight remains authoritative |
 | Collector | Canonical numeric unicast or loopback IP:port; nonzero port; bracketed IPv6; no zone/mapped IPv6/DNS |
 | Export version | 1, 5, 9, or 10; label 10 as IPFIX |
-| Sampling rate | 1..1000000; 1 means unsampled; native v5 is limited to 16383 |
+| Sampling rate | Required integer 1..1000000; v5 maximum 16383; 1 means unsampled; validate disabled entries too; invalid integers return 422 |
 | Max flows | 1..1000000 |
 | Snap length | 64..65535 bytes |
 | Capture filter | Optional; exactly empty, `ip`, `ip6`, `tcp`, `udp`, `icmp`, or `icmp6` |

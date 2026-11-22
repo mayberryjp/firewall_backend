@@ -58,6 +58,17 @@ pub(crate) struct Flow {
     #[serde(default)]
     pub timeouts: BTreeMap<String, u64>,
 }
+pub(crate) fn validate_sampling(export_version: u16, sampling_rate: u32) -> Result<()> {
+    ensure!(
+        (1..=1_000_000).contains(&sampling_rate),
+        "sampling_rate must be between 1 and 1000000"
+    );
+    ensure!(
+        export_version != 5 || sampling_rate <= 16383,
+        "NetFlow v5 sampling interval is limited to 16383"
+    );
+    Ok(())
+}
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CaptureFilter {
     All,
@@ -353,11 +364,10 @@ impl Config {
                 [1, 5, 9, 10].contains(&f.export_version),
                 "invalid NetFlow version"
             );
+            validate_sampling(f.export_version, f.sampling_rate)?;
             ensure!(
-                (1..=1_000_000).contains(&f.sampling_rate)
-                    && (1..=1_000_000).contains(&f.max_flows)
-                    && (64..=65535).contains(&f.snaplen),
-                "invalid flow sampling/capacity/snaplen"
+                (1..=1_000_000).contains(&f.max_flows) && (64..=65535).contains(&f.snaplen),
+                "invalid flow capacity/snaplen"
             );
             ensure!(
                 f.capture_filter.len() <= 4096
@@ -376,10 +386,6 @@ impl Config {
                 );
             }
             f.filter()?;
-            ensure!(
-                f.export_version != 5 || f.sampling_rate <= 16383,
-                "NetFlow v5 sampling interval is limited to 16383"
-            );
         }
         ensure!(
             c.gateway_monitors.len() <= 64,
@@ -555,7 +561,7 @@ mod tests {
     }
     #[test]
     fn supported_flow_versions_and_typed_filters() {
-        let mut flow = json!({"name":"flows","enabled":false,"interface":"wan.100","collector":"192.0.2.100:2055","export_version":9,"sampling_rate":1000000,"max_flows":100,"snaplen":128,"promiscuous":false,"capture_filter":"udp","timeouts":{}});
+        let mut flow = json!({"name":"flows","enabled":false,"interface":"wan.100","collector":"192.0.2.100:2055","export_version":9,"sampling_rate":1,"max_flows":100,"snaplen":128,"promiscuous":false,"capture_filter":"udp","timeouts":{}});
         assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_ok());
         let parsed: Flow = serde_json::from_value(flow.clone()).unwrap();
         assert!(parsed.filter().unwrap().matches(true, 17));
@@ -563,11 +569,26 @@ mod tests {
         flow["capture_filter"] = json!("udp port 53");
         assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_err());
         flow["capture_filter"] = json!("");
-        flow["export_version"] = json!(1);
-        assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_ok());
-        flow["export_version"] = json!(5);
-        assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_err());
-        flow["sampling_rate"] = json!(1);
-        assert!(Config::parse(&json!({"softflowd":[flow]})).is_ok());
+        for version in [1, 5, 9, 10] {
+            flow["export_version"] = json!(version);
+            for enabled in [false, true] {
+                flow["enabled"] = json!(enabled);
+                let limit = if version == 5 { 16383 } else { 1_000_000 };
+                for rate in [1, 2, 4, 100, limit] {
+                    flow["sampling_rate"] = json!(rate);
+                    assert!(Config::parse(&json!({"softflowd":[flow.clone()]})).is_ok());
+                }
+                for rate in [0, limit + 1] {
+                    flow["sampling_rate"] = json!(rate);
+                    let error = Config::parse(&json!({"softflowd":[flow.clone()]}))
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        error.contains("sampling_rate") || error.contains("sampling interval"),
+                        "{error}"
+                    );
+                }
+            }
+        }
     }
 }
