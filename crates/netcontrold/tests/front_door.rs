@@ -1033,7 +1033,7 @@ async fn sando_settings_and_import_reports_use_authenticated_confirmed_config_tr
     assert_eq!(latest.0, 200);
     assert_eq!(
         latest.2["config"]["sando"],
-        json!({"api_url":"","sync_enabled":false,"hosts_import":null,"rules_import":null})
+        json!({"api_url":"","sync_enabled":false,"policy_sync_enabled":false,"hosts_import":null,"rules_import":null})
     );
     let mut config = latest.2["config"].clone();
     config["sando"] = json!({

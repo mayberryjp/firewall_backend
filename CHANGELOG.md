@@ -4,6 +4,16 @@
 
 ### Added
 
+- Add independent opt-in Sando policy synchronization every five minutes using
+  conditional `GET /api/ignorelist` and ETags. Automatically replace only
+  Sando-owned existing-host outbound permits, count skipped unsupported entries,
+  preserve other rules/settings, and durably apply/confirm effective changes with
+  one configuration revision increment. Unchanged checks do not create revisions;
+  failed/busy applies retain the validator for retry and normal rollback/recovery.
+  Add `sando.policy_sync_enabled`, require firewall authority for its delegation,
+  and expose separate policy status. Additive opt-in contract; next automatic
+  calendar version. [Required frontend handoff 2026-11-23-01](docs/frontend-handoffs/2026-11-23.md#2026-11-23-01-independent-automatic-sando-policies).
+
 - Add collector-facing IPFIX receiver requirements covering UDP/IP families,
   exact templates/record offsets, session and sequence handling, configurable sampled
   counters, directional 5-tuple-plus-TOS aggregation, missing context and

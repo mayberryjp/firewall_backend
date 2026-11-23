@@ -4004,6 +4004,173 @@ fn sando_import_state_and_firewall_changes_confirm_rollback_and_reopen_together(
 }
 
 #[test]
+fn automatic_sando_policies_commit_only_real_changes_and_recover_apply_failures() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let mut candidate = config();
+    candidate.sando.api_url = "http://sando.example.test".into();
+    candidate.sando.policy_sync_enabled = true;
+    candidate.firewall.policies = Some(serde_json::from_value(json!({
+        "hosts":[{
+            "id":"camera","name":"Camera","addresses":["192.0.2.10"],"policy":"drop","rules":[
+                {"destination":"198.51.100.1/32","action":"drop"},
+                {"destination":"198.51.100.2/32","action":"accept","origin":"import","import_source":"other"},
+                {"destination":"198.51.100.3/32","action":"accept","origin":"import","import_source":"sando"}
+            ]
+        }],
+        "interfaces":[{"interface":"lan0","rules":[{"action":"drop","origin":"import","import_source":"sando"}]}]
+    })).unwrap());
+    let submitted = submit(&mut engine, candidate.clone());
+    assert_eq!(submitted.status, 202, "{}", submitted.body);
+    assert_eq!(
+        confirm(&mut engine, submitted.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let before = engine.committed_revision();
+    let entries =
+        [json!({"src_ip":"192.0.2.10","dst_ip":"198.51.100.4","protocol":6,"dst_port":443})];
+    let outcome = engine
+        .sync_sando_policies(&candidate.sando.api_url, &entries)
+        .unwrap();
+    assert!(outcome.changed);
+    assert_eq!(
+        engine.committed_revision(),
+        before.next(engine.now().date_naive()).unwrap()
+    );
+    assert!(!engine.configuration_busy());
+    let saved = engine.saved_configuration().clone();
+    let policies = saved.firewall.policies.as_ref().unwrap();
+    assert_eq!(
+        &policies.hosts[0].rules[..2],
+        &candidate.firewall.policies.as_ref().unwrap().hosts[0].rules[..2]
+    );
+    assert_eq!(policies.hosts[0].rules[2].destination, "198.51.100.4/32");
+    let mut expected = candidate.clone();
+    expected.firewall.policies.as_mut().unwrap().hosts[0].rules = policies.hosts[0].rules.clone();
+    assert_eq!(saved, expected);
+    let committed = engine.committed_revision();
+    assert!(
+        !engine
+            .sync_sando_policies(&candidate.sando.api_url, &entries)
+            .unwrap()
+            .changed
+    );
+    assert_eq!(engine.committed_revision(), committed);
+    faults.lock().unwrap().fail_applies = 1;
+    assert!(
+        engine
+            .sync_sando_policies(&candidate.sando.api_url, &[])
+            .is_err()
+    );
+    assert_eq!(engine.saved_configuration(), &saved);
+    assert_eq!(engine.committed_revision(), committed);
+    assert!(!engine.configuration_busy());
+    let mut provisional = saved.clone();
+    provisional.interfaces[0].mtu = 1400;
+    let pending = submit(&mut engine, provisional);
+    assert_eq!(pending.status, 202);
+    assert!(
+        engine
+            .sync_sando_policies(&candidate.sando.api_url, &[])
+            .is_err()
+    );
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/rollback",
+                pending.body["id"].as_str().unwrap()
+            ),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    assert!(
+        engine
+            .sync_sando_policies(&candidate.sando.api_url, &[])
+            .unwrap()
+            .changed
+    );
+    assert_eq!(
+        engine
+            .saved_configuration()
+            .firewall
+            .policies
+            .as_ref()
+            .unwrap()
+            .hosts[0]
+            .rules
+            .len(),
+        2
+    );
+    let final_config = engine.saved_configuration().clone();
+    drop(engine);
+    let reopened = Engine::open(&fixture.path(), Box::new(FaultBackend(faults))).unwrap();
+    assert_eq!(reopened.saved_configuration(), &final_config);
+}
+
+#[test]
+fn automatic_sando_enablement_and_source_changes_require_firewall_permission() {
+    let fixture = Fixture::new();
+    let mut engine = fixture.engine();
+    let mut candidate = config();
+    candidate.sando.api_url = "http://sando.example.test".into();
+    let initial = submit(&mut engine, candidate.clone());
+    assert_eq!(initial.status, 202);
+    assert_eq!(
+        confirm(&mut engine, initial.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let permissions: Vec<_> = all()
+        .into_iter()
+        .filter(|permission| permission != "firewall.write")
+        .collect();
+    candidate.sando.policy_sync_enabled = true;
+    let body = |engine: &Engine, config: &Config| {
+        serde_json::to_vec(&json!({
+            "base_revision":engine.committed_revision(),"confirm_timeout_seconds":30,"config":config
+        }))
+        .unwrap()
+    };
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "operator",
+                &permissions,
+                &body(&engine, &candidate)
+            )
+            .status,
+        403
+    );
+    let enabled = submit(&mut engine, candidate.clone());
+    assert_eq!(enabled.status, 202);
+    assert_eq!(
+        confirm(&mut engine, enabled.body["id"].as_str().unwrap()).status,
+        200
+    );
+    candidate.sando.api_url = "http://other.example.test".into();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "operator",
+                &permissions,
+                &body(&engine, &candidate)
+            )
+            .status,
+        403
+    );
+}
+
+#[test]
 fn sando_api_validates_known_fields_instead_of_dropping_invalid_import_state() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

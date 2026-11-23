@@ -48,7 +48,7 @@ pub use mdns::{
     valid_mdns_name,
 };
 pub use model::*;
-pub use sando::{SandoConfig, SandoImportState, SandoImportStatus};
+pub use sando::{SandoConfig, SandoImportState, SandoImportStatus, SandoPolicyOutcome};
 pub use simulator::Simulator;
 
 use anyhow::Result;

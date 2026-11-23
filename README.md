@@ -573,8 +573,9 @@ Saved firewall/NAT rules expose `origin` (`manual`, `import`, `system`, `inherit
 and nullable `import_source`; Sando uses `origin:"import", import_source:"sando"`.
 The frontend must replace only Sando-owned rules, preserve manual rules/other
 imports, and review manual-first ordering within each affected list. The backend
-stores/validates labels and tags generated counter rows as system; it does not
-fetch, merge, delete or reorder imported rules. Labels do not affect matching or
+stores/validates labels and tags generated counter rows as system. The optional
+automatic policy worker below replaces only Sando-owned host rules; ordinary
+configuration writes have no special merge guard. Labels do not affect matching or
 counter generations. See [rule origins and replacement](FRONTEND_SPEC.md#rule-source-labels-and-sando-replacement).
 
 Optional `sando.sync_enabled` (default `false`, requires `api_url`) enables
@@ -588,7 +589,28 @@ snapshot; disabling cancels polling while retaining cached metadata. Sync does
 not modify firewall hosts, rules, configuration revisions or confirmed import
 reports. Server-to-Sando reachability is required; no credentials, arbitrary
 proxy or full device-object storage is added.
-The required **Settings > Sando** toggle, status panel and import workflow are specified
+
+Independent `sando.policy_sync_enabled` (default `false`, requires `api_url`)
+polls `GET /api/ignorelist` immediately and every five minutes after completion.
+It uses `ETag`/`If-None-Match`; `304` does not load or apply a list. A changed
+list automatically replaces Sando-owned outbound accept rules on existing
+hosts, preserving manual/other-provider rules, inventory and default policies.
+Only literal unicast, same-family destinations and supported protocols/ports
+are mapped; unsupported/unmatched/duplicate entries are skipped and counted.
+A valid empty list, or a list with no supported entries, removes old Sando-owned
+host rules. Review this consequence before enabling. No universal permits or
+new hosts are inferred. Enabling/disabling, or changing the URL while enabled,
+requires `firewall.write` as well as `sando.write` and `transactions.write`.
+
+Effective rule changes use durable apply/verification and automatic confirmation,
+advancing the configuration revision once without browser intervention. Failures
+retain the validator for retry and use normal rollback/recovery; busy transactions
+are not overwritten. Unchanged rules/`304` do not create revisions. Read independent
+`policies` status/counts/errors through `GET /api/v1/sando`. Applied configuration
+survives restart; policy status/ETag are in memory and startup fetches unconditionally.
+One-time import reports remain untouched. Host/score sync need not be enabled.
+See the [automatic policy contract](FRONTEND_SPEC.md#automatic-policy-synchronization).
+The required **Settings > Sando** toggles, status panels and import workflow are specified
 in the [frontend contract](FRONTEND_SPEC.md#sando-one-time-imports).
 
 ## Build and validate

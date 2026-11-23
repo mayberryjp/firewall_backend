@@ -573,7 +573,7 @@ routes, not backend endpoints.
 | `/transactions/:id` | Transaction details and lifecycle actions |
 | `/history` | Committed revision history |
 | `/history/:revision` | Historical configuration, comparison, restore |
-| `/settings/sando` | Sando base URL, hourly metadata sync and one-time host/rule imports |
+| `/settings/sando` | Sando base URL, independent hourly metadata/five-minute automatic policy sync and one-time imports |
 
 Deep links must work after browser refresh. Unknown browser routes show an
 application 404, not an empty page. Encode resource names/IDs in URLs.
@@ -1049,6 +1049,7 @@ Configuration changes additionally require permissions for every changed area:
 | Discord alert configuration and private webhook upload | `discord.write` |
 | Host name and time zone (`system`) | `system.write` |
 | Sando URL and frontend-reported import state (`sando`) | `sando.write` |
+| Sando automatic-policy flag, or URL changes while it is enabled | `sando.write` and `firewall.write` |
 | Azure Dynamic DNS configuration and secret upload | `dynamic_dns.write` |
 
 Creating/removing a WireGuard interface typically needs both interface and
@@ -5053,23 +5054,27 @@ isolated native tests.
 ### Sando One-Time Imports
 
 Provide **Settings > Sando** at browser route `/settings/sando` with an API
-base-URL form, **Sync enabled** toggle, hourly metadata status, **Import hosts**
+base-URL form, **Sync hosts and scores** (`sync_enabled`) and separate
+**Automatically sync policies** (`policy_sync_enabled`) toggles, independent
+metadata/policy status, **Import hosts**
 and **Import rules** buttons, and separate latest confirmed host/rule import
 statistics. One-time imports remain frontend-driven and explicitly reviewed.
 Optional hourly synchronization runs in the daemon, fetching only host metadata
-into a separate cache. It never automatically edits firewall hosts/rules or copies
-complete Sando device objects into the firewall schema.
+into a separate cache without editing firewall hosts/rules. Independently enabled
+policy sync automatically applies supported outbound host rules as specified below.
+Neither worker copies complete Sando device objects into the firewall schema.
 
 The always-serialized top-level `config.sando` defaults to:
 
 ```json
-{"api_url":"","sync_enabled":false,"hosts_import":null,"rules_import":null}
+{"api_url":"","sync_enabled":false,"policy_sync_enabled":false,"hosts_import":null,"rules_import":null}
 ```
 
 ```ts
 interface SandoConfig {
   api_url: string;
   sync_enabled: boolean;
+  policy_sync_enabled: boolean;
   hosts_import: SandoImportState | null;
   rules_import: SandoImportState | null;
 }
@@ -5091,7 +5096,7 @@ discard a configured proxy prefix. Empty means unconfigured. Nonempty URLs and
 every record's required `source_url` must be absolute lowercase `http://` or
 `https://` URLs of at most 2048 UTF-8 bytes, with a host, no credentials,
 query/fragment, whitespace, control characters, backslashes or port zero.
-No DNS/HTTP/HTTPS connectivity test occurs on save. `sync_enabled` defaults to
+No DNS/HTTP/HTTPS connectivity test occurs on save. Both sync flags default to
 `false`; `null`, strings and numbers are invalid. Enabling without a configured
 URL returns `422`. No Sando token/credential field is provided.
 
@@ -5126,6 +5131,10 @@ Sando change, including records, clearing, confirmation, rollback and restores.
 Imported hosts/rules additionally require `firewall.write`, and any other
 changed area retains its existing permission. Sando permission cannot authorize
 firewall changes.
+Changing `policy_sync_enabled`, or changing `api_url` when automatic policy sync
+is enabled before or after the change, additionally requires `firewall.write`.
+This includes submit, confirm, rollback and historical restore authorization.
+Enabling is explicit authorization for future unattended Sando rule replacements.
 
 `GET /api/v1/sando` supplies daemon sync status/cache as specified below; there
 is no one-time import or sync-write endpoint. Existing transaction success
@@ -5154,9 +5163,11 @@ configuration is not a successful import and must not advance the saved report.
 
 #### Rule-source labels and Sando replacement
 
-Rule acquisition, mapping, review, replacement and ordering remain **frontend
-responsibilities**. There is no backend rule-import/merge endpoint, automatic
-rule fetch, special preservation guard or background firewall synchronization.
+One-time rule acquisition, mapping, review, replacement and ordering remain
+**frontend responsibilities**. There is no backend one-time rule-import/merge
+endpoint or special preservation guard on ordinary full-package writes.
+The separately enabled daemon policy sync below is an exception to browser-only
+acquisition and reviewed activation, not an implicit change to one-time imports.
 Submit the complete reviewed candidate through ordinary confirmed transactions.
 See [rule origins](#firewall-rule-origins) for persisted labels.
 
@@ -5193,6 +5204,135 @@ These are frontend requirements, not backend enforcement: an authorized full
 configuration write can still edit/delete any rule. Changing a rule's ownership
 label is an explicit reviewed edit, not an automatic consequence of opening an
 editor. Hourly Sando metadata refresh still never changes labels or rules.
+
+#### Automatic policy synchronization
+
+`sando.policy_sync_enabled` is a boolean, default `false`, independent of
+`sync_enabled` (host names/icons/classification/scores). Either can run alone.
+Save it using a normal full confirmed configuration transaction with
+`transactions.write`, `sando.write` and `firewall.write`. A nonempty valid
+`api_url` is required (`422` otherwise); invalid flag types return `400`.
+Do not add a separate endpoint, browser timer, manual confirmation per refresh,
+source credentials, or Sando `POST` requests.
+
+The daemon makes an unauthenticated `GET <api_url>/api/ignorelist`, preserving
+proxy prefixes, immediately on enabled startup, enablement, source change or
+committed host/rule/IPv6-mode change. It then polls **300 seconds after each
+completed attempt**, including failures, independently of hourly metadata sync.
+Requests are single-flight. Only committed settings drive acquisition.
+Disable/source/host changes cancel in-flight acquisition; obsolete results are
+discarded under the engine lock before application. Shutdown cancels acquisition;
+an already-running durable apply/rollback finishes rather than being interrupted.
+An active transaction, recovery, upgrade, restart, path test or managed-state
+drift prevents automatic application, with an explicit error and retry next poll.
+
+The upstream contract is `200` with the complete existing JSON array and a
+valid opaque `ETag`; subsequent polls send that exact value in `If-None-Match`.
+`304` has no list body and causes no mapping, transaction or revision increment.
+`200 []` is an authoritative empty replacement, not a fetch failure. ETags must
+identify the same database snapshot as the list and change for all mutations,
+including automated/bulk deletions; use unique tokens/restore-safe epochs upstream.
+Sando's active-list snapshot route was inspected at
+[8d0febf1](https://github.com/mayberryjp/sando/tree/8d0febf14d3921a6b92a0aa16f6032cd24adb39d);
+live interoperability is still a deployment acceptance check.
+
+Supported mapping is intentionally narrower than alert suppression:
+
+- Require `src_ip` and `dst_ip` to be literal unicast IPv4/IPv6 addresses, of
+  the same family. Reject unspecified, loopback, multicast, link-local,
+  broadcast and IPv4-mapped IPv6 addresses. No hostnames, prefixes or wildcards.
+- Match source to an **existing configured firewall host** by exact normalized
+  IP, never reverse destination matches into outbound rules or create hosts.
+  A host with multiple addresses in the source family is skipped: current host
+  rules cannot constrain one source address without broadening to the others.
+  A dual-stack host with one address per family is supported.
+- `protocol` must be numeric `6`/`17`/`1`/`58` (TCP/UDP/ICMP/ICMPv6), either
+  an integer or nonempty ASCII decimal integer string, as returned by Sando.
+  ICMP family must match, and IPv6 requires `ipv6_enabled`.
+- TCP/UDP `dst_port` must be 1..65535, as an integer or ASCII decimal integer
+  string. Port zero and wildcard ports are skipped, never widened to any port.
+  ICMP/ICMPv6 require recorded `dst_port` zero and map to no transport ports;
+  this does not add ICMP type/code filtering or promise ping-only access.
+- Map to `action:"accept"`, `origin:"import"`, `import_source:"sando"`,
+  literal destination `/32` or `/128`, supported protocol and destination port.
+  Leave destination-host/out-interface/metadata unset. Ignore upstream
+  identifiers/timestamps for matching; exact duplicate generated rules count
+  as skipped rather than being appended twice.
+- Unsupported, malformed-row, unmatched or ambiguous entries are **skipped and
+  counted** while the supported remainder is automatically applied. No partial
+  review is required. A nonempty list with zero supported entries therefore
+  removes old Sando-owned host rules, just like `[]`; explain this before enabling.
+  Invalid JSON/non-array responses, HTTP errors, missing/invalid ETags,
+  unsolicited or mismatched `304`, transport errors, and response/configuration
+  limit violations fail the complete attempt and retain previous configuration.
+
+Replace only host-policy rules labeled exactly `origin:"import"` and
+`import_source:"sando"`, across existing configured hosts including hosts with no
+replacement rules. Preserve all retained rules' relative order and append the
+new unique rules in upstream source order. Manual rules, other providers,
+system/inherited labels, host inventory/defaults, interface policies, input,
+NAT and unrelated configuration remain unchanged. Current per-host/expanded
+ruleset limits apply; a candidate exceeding them fails without partial activation.
+Disable browser **Import rules** while automatic policy sync is enabled, since
+local host-rule edits trigger reconciliation and may be replaced immediately.
+Do not hold a stale full-package draft across an automatic revision; rebase/review
+through normal conflict handling.
+
+Effective rule changes use normal durable transaction intent, backend apply,
+verification and **immediate daemon confirmation** as `system-sando-policy-sync`.
+Each changed ruleset advances the canonical configuration revision once; unchanged
+mapped rules do not create revisions even if the ETag changed. This does not bump
+the compiled software version. Apply/confirmation failures use normal rollback;
+incomplete recovery blocks further writes. An interrupted unconfirmed automatic
+transaction follows normal startup rollback/recovery and is retried by startup
+acquisition. Existing frontend-reported `hosts_import`/`rules_import` records
+are untouched, not misrepresented as automatic-sync counters.
+
+HTTP/TLS, no redirects/proxies, five-second connect and thirty-second request
+timeouts match the metadata worker. Policy responses are bounded to 4 MiB,
+including chunked bodies, at most 4096 rows, and ETags to 512 ASCII bytes.
+Advance the in-memory validator only after successful complete processing,
+including an unchanged mapped result, never after failed apply/persistence.
+ETag and policy status are runtime-only; startup always fetches unconditionally
+against the durable committed configuration. Host/source/enablement/IPv6-mode
+changes invalidate the validator so upstream `304` cannot hide local edits.
+The existing private host metadata cache is unchanged.
+
+`GET /api/v1/sando` keeps its existing API-key/`state.read`, no query/body,
+`200`/`no-store` and error behavior. Top-level fields still describe **metadata
+sync only**. New always-present `policies` describes automatic policy sync:
+
+```json
+{
+  "enabled": true,
+  "state": "succeeded",
+  "sync_interval_seconds": 300,
+  "source_url": "https://inventory.example.test/sando",
+  "etag": "\"ignorelist-synthetic-token\"",
+  "last_attempt_at": "2026-11-23T08:00:00Z",
+  "last_success_at": "2026-11-23T08:00:00Z",
+  "next_sync_at": "2026-11-23T08:05:00Z",
+  "error": null,
+  "imported_count": 8,
+  "skipped_count": 2,
+  "last_changed_revision": "2026.11.23.4"
+}
+```
+
+`state` is `disabled|pending|syncing|succeeded|error`, with disabled taking
+precedence. `imported_count`/`skipped_count` are integer counts for the last
+successfully processed full list, initially zero; `304` preserves them.
+`last_changed_revision` is the nullable string revision of the latest effective
+automatic change in this daemon session, not the current global revision.
+Times are nullable RFC3339 UTC; last attempt/success record completed processing,
+including `304`. Error is nullable display-safe text; failures retain prior
+success/counts/validator. Next poll is null while disabled/fetching/before
+scheduling. Source changes hide prior results; disabled state can retain them.
+Render skipped counts prominently, including zero-supported replacements,
+and distinguish **checked/unchanged**, **applied revision**, **failed** and
+**metadata disabled/policy enabled**. Existing MQTT sensors remain metadata-only.
+Required frontend work is tracked in
+[handoff 2026-11-23-01](docs/frontend-handoffs/2026-11-23.md#2026-11-23-01-independent-automatic-sando-policies).
 
 #### Hourly host-metadata synchronization
 

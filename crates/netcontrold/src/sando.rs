@@ -14,6 +14,7 @@ use std::{
 use tokio::{sync::watch, time::Instant};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(3600);
+const POLICY_INTERVAL: Duration = Duration::from_secs(300);
 const RESPONSE_LIMIT: usize = 4 << 20;
 const CACHE_LIMIT: usize = 1 << 20;
 const HOST_LIMIT: usize = 4096;
@@ -160,7 +161,7 @@ fn project(bytes: &[u8]) -> Result<(Vec<Host>, usize)> {
 }
 
 async fn fetch(client: &reqwest::Client, source: &str) -> Result<(Vec<Host>, usize)> {
-    let mut response = client
+    let response = client
         .get(format!("{}/api/localhosts", source.trim_end_matches('/')))
         .send()
         .await
@@ -170,6 +171,10 @@ async fn fetch(client: &reqwest::Client, source: &str) -> Result<(Vec<Host>, usi
         "Sando returned HTTP {}",
         response.status()
     );
+    project(&response_bytes(response).await?)
+}
+
+async fn response_bytes(mut response: reqwest::Response) -> Result<Vec<u8>> {
     ensure!(
         response
             .content_length()
@@ -184,7 +189,98 @@ async fn fetch(client: &reqwest::Client, source: &str) -> Result<(Vec<Host>, usi
         );
         bytes.extend_from_slice(&chunk);
     }
-    project(&bytes)
+    Ok(bytes)
+}
+
+#[derive(Debug)]
+enum PolicyFetch {
+    Unchanged,
+    List { etag: String, entries: Vec<Value> },
+}
+
+async fn fetch_policies(
+    client: &reqwest::Client,
+    source: &str,
+    etag: Option<&str>,
+) -> Result<PolicyFetch> {
+    let mut request = client.get(format!("{}/api/ignorelist", source.trim_end_matches('/')));
+    if let Some(etag) = etag {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let response = request
+        .send()
+        .await
+        .context("Sando policy request failed")?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        ensure!(
+            etag.is_some(),
+            "Sando returned 304 without a conditional request"
+        );
+        if let Some(returned) = response.headers().get(reqwest::header::ETAG) {
+            ensure!(
+                Some(returned.to_str()?) == etag,
+                "Sando returned a mismatched 304 ETag"
+            );
+        }
+        return Ok(PolicyFetch::Unchanged);
+    }
+    ensure!(
+        response.status() == reqwest::StatusCode::OK,
+        "Sando policies returned HTTP {}",
+        response.status()
+    );
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .context("Sando policies require an ETag")?
+        .to_str()?
+        .to_owned();
+    let tag = etag.strip_prefix("W/").unwrap_or(&etag);
+    ensure!(
+        etag.len() <= 512
+            && tag.starts_with('"')
+            && tag.ends_with('"')
+            && tag.len() >= 2
+            && tag.as_bytes()[1..tag.len() - 1]
+                .iter()
+                .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte)),
+        "invalid Sando policy ETag"
+    );
+    let entries: Vec<Value> = serde_json::from_slice(&response_bytes(response).await?)
+        .context("invalid Sando policy list")?;
+    ensure!(entries.len() <= 4096, "Sando exceeds 4096 policy entries");
+    Ok(PolicyFetch::List { etag, entries })
+}
+
+#[derive(Default, Serialize)]
+struct PolicyState {
+    source_url: String,
+    etag: Option<String>,
+    last_attempt_at: Option<DateTime<Utc>>,
+    last_success_at: Option<DateTime<Utc>>,
+    next_sync_at: Option<DateTime<Utc>>,
+    error: Option<String>,
+    imported_count: u32,
+    skipped_count: u32,
+    last_changed_revision: Option<netcontrol_core::Version>,
+    #[serde(skip)]
+    syncing: bool,
+}
+
+type PolicySource = (String, bool, Vec<netcontrol_core::FirewallHost>, bool);
+
+fn policy_source(config: &netcontrol_core::Config) -> PolicySource {
+    (
+        config.sando.api_url.clone(),
+        config.sando.policy_sync_enabled,
+        config
+            .firewall
+            .policies
+            .as_ref()
+            .map(|policies| policies.hosts.clone())
+            .unwrap_or_default(),
+        config.ipv6_enabled,
+    )
 }
 
 #[derive(Default)]
@@ -198,6 +294,7 @@ pub struct Manager {
     path: PathBuf,
     engine: Arc<Mutex<Engine>>,
     state: Mutex<State>,
+    policies: Mutex<PolicyState>,
 }
 
 impl Manager {
@@ -225,6 +322,7 @@ impl Manager {
                 snapshot,
                 ..Default::default()
             }),
+            policies: Mutex::new(PolicyState::default()),
         }))
     }
 
@@ -341,6 +439,40 @@ impl Manager {
         } else {
             None
         });
+        if !include_hosts {
+            return Ok(result);
+        }
+        let policies = self
+            .policies
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sando policy status unavailable"))?;
+        let empty = PolicyState {
+            source_url: config.api_url.clone(),
+            ..Default::default()
+        };
+        let policies = if policies.source_url == config.api_url {
+            &*policies
+        } else {
+            &empty
+        };
+        let mut policy_status = serde_json::to_value(policies)?;
+        policy_status["enabled"] = json!(config.policy_sync_enabled);
+        policy_status["state"] = json!(if !config.policy_sync_enabled {
+            "disabled"
+        } else if policies.syncing {
+            "syncing"
+        } else if policies.error.is_some() {
+            "error"
+        } else if policies.last_success_at.is_some() {
+            "succeeded"
+        } else {
+            "pending"
+        });
+        policy_status["sync_interval_seconds"] = json!(POLICY_INTERVAL.as_secs());
+        if !config.policy_sync_enabled {
+            policy_status["next_sync_at"] = Value::Null;
+        }
+        result["policies"] = policy_status;
         Ok(result)
     }
 
@@ -416,16 +548,156 @@ impl Manager {
             .no_proxy()
             .user_agent("netcontrol-sando-sync")
             .build()?;
-        let result = self
-            .worker(stop, move |source| {
+        let hosts = self.worker(stop.clone(), {
+            let client = client.clone();
+            move |source| {
                 let client = client.clone();
                 async move { fetch(&client, &source).await }
-            })
-            .await;
+            }
+        });
+        let result = tokio::try_join!(hosts, self.policy_worker(stop, client)).map(|_| ());
         if let Err(error) = &result {
             tracing::error!(%error, "Sando sync worker stopped");
         }
         result
+    }
+
+    fn policy_source(&self) -> Result<PolicySource> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+        let config = engine.saved_configuration();
+        Ok(policy_source(config))
+    }
+
+    fn finish_policies(
+        &self,
+        source: &PolicySource,
+        result: Result<PolicyFetch>,
+    ) -> Result<PolicySource> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+        let config = engine.saved_configuration();
+        let current = policy_source(config);
+        if !current.1 || &current != source {
+            return Ok(source.clone());
+        }
+        let mut policies = self
+            .policies
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sando policy status unavailable"))?;
+        policies.syncing = false;
+        let applied = match result {
+            Ok(PolicyFetch::Unchanged) => Ok(()),
+            Ok(PolicyFetch::List { etag, entries }) => {
+                engine.sync_sando_policies(&source.0, &entries).map(|outcome| {
+                    if outcome.skipped_count > 0 {
+                        tracing::warn!(skipped_count = outcome.skipped_count, "Sando policy entries skipped");
+                    }
+                    policies.imported_count = outcome.imported_count;
+                    policies.skipped_count = outcome.skipped_count;
+                    policies.etag = Some(etag);
+                    if outcome.changed {
+                        policies.last_changed_revision = Some(engine.committed_revision());
+                        tracing::info!(revision = %engine.committed_revision(), "Sando policies automatically committed");
+                    }
+                })
+            }
+            Err(error) => Err(error),
+        };
+        let now = Utc::now();
+        policies.last_attempt_at = Some(now);
+        policies.next_sync_at =
+            Some(now + chrono::TimeDelta::seconds(POLICY_INTERVAL.as_secs() as i64));
+        match applied {
+            Ok(()) => {
+                policies.last_success_at = Some(now);
+                policies.error = None;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Sando automatic policy sync failed");
+                policies.error = Some(format!("Sando automatic policy sync failed: {error:#}"));
+            }
+        }
+        let config = engine.saved_configuration();
+        Ok(policy_source(config))
+    }
+
+    async fn policy_worker(
+        self: &Arc<Self>,
+        mut stop: watch::Receiver<bool>,
+        client: reqwest::Client,
+    ) -> Result<()> {
+        let mut changes = self
+            .engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine unavailable"))?
+            .subscribe_configuration();
+        let mut previous = None;
+        let mut due = Instant::now();
+        let mut request = None;
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            let source = self.policy_source()?;
+            if previous.as_ref() != Some(&source) {
+                request = None;
+                due = Instant::now();
+                let mut policies = self
+                    .policies
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Sando policy status unavailable"))?;
+                if policies.source_url != source.0 {
+                    *policies = PolicyState {
+                        source_url: source.0.clone(),
+                        ..Default::default()
+                    };
+                }
+                policies.etag = None;
+                policies.syncing = false;
+                policies.next_sync_at = None;
+                previous = Some(source.clone());
+            }
+            if source.1 && request.is_none() && Instant::now() >= due {
+                let mut policies = self
+                    .policies
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Sando policy status unavailable"))?;
+                policies.syncing = true;
+                policies.next_sync_at = None;
+                let client = client.clone();
+                let etag = policies.etag.clone();
+                let url = source.0.clone();
+                request = Some(Box::pin(async move {
+                    fetch_policies(&client, &url, etag.as_deref()).await
+                }));
+            }
+            let deadline = (source.1 && request.is_none()).then_some(due);
+            tokio::select! {
+                biased;
+                _ = stop.changed() => break,
+                changed = changes.changed() => { changed.context("configuration notifications closed")?; }
+                _ = crate::wait_until(deadline) => {}
+                result = async { request.as_mut().expect("guarded Sando policy request").await }, if request.is_some() => {
+                    request = None;
+                    let manager = self.clone();
+                    let source = source.clone();
+                    previous = Some(tokio::task::spawn_blocking(move || manager.finish_policies(&source, result)).await??);
+                    due = Instant::now() + POLICY_INTERVAL;
+                }
+            }
+        }
+        let mut policies = self
+            .policies
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sando policy status unavailable"))?;
+        policies.syncing = false;
+        policies.next_sync_at = None;
+        Ok(())
     }
 
     async fn worker<F, Fut>(&self, mut stop: watch::Receiver<bool>, mut acquire: F) -> Result<()>
@@ -497,6 +769,350 @@ impl Manager {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn configure_policies(manager: &Manager, url: &str, enabled: bool) {
+        configure(manager, url, false);
+        let mut engine = manager.engine.lock().unwrap();
+        let mut config = engine.saved_configuration().clone();
+        config.sando.policy_sync_enabled = enabled;
+        if config.firewall.policies.is_none() {
+            config.firewall.policies = Some(serde_json::from_value(json!({"hosts":[{
+                "id":"camera","name":"Camera","addresses":["192.0.2.10"],"policy":"drop","rules":[]
+            }]})).unwrap());
+        }
+        let revision = engine.committed_revision();
+        let reply = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "test",
+            &netcontrol_core::PERMISSIONS
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            &serde_json::to_vec(
+                &json!({"base_revision":revision,"confirm_timeout_seconds":30,"config":config}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(reply.status, 202, "{}", reply.body);
+        let id = reply.body["id"].as_str().unwrap().to_owned();
+        drop(engine);
+        complete(manager, &id, "confirm");
+    }
+
+    fn policy_entries(port: u16) -> Vec<Value> {
+        vec![
+            json!({"ignorelist_id":"synthetic","src_ip":"192.0.2.10","dst_ip":"198.51.100.20","protocol":6,"dst_port":port}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn policy_http_etags_cover_initial_unchanged_edit_empty_and_errors() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+        };
+        let upstream = Arc::new(Mutex::new((
+            "\"one\"".to_string(),
+            json!(policy_entries(443)),
+        )));
+        let server_state = upstream.clone();
+        let app = Router::new()
+            .route(
+                "/prefix/api/ignorelist",
+                get(move |headers: HeaderMap| {
+                    let state = server_state.clone();
+                    async move {
+                        let state = state.lock().unwrap();
+                        let status = if headers
+                            .get("if-none-match")
+                            .is_some_and(|value| value == state.0.as_str())
+                        {
+                            StatusCode::NOT_MODIFIED
+                        } else {
+                            StatusCode::OK
+                        };
+                        (
+                            status,
+                            [("etag", state.0.clone())],
+                            if status == StatusCode::OK {
+                                state.1.to_string()
+                            } else {
+                                String::new()
+                            },
+                        )
+                    }
+                }),
+            )
+            .route("/missing/api/ignorelist", get(|| async { "[]" }))
+            .route(
+                "/bad/api/ignorelist",
+                get(|| async { ([("etag", "\"bad\"")], "{}") }),
+            )
+            .route(
+                "/large/api/ignorelist",
+                get(|| async { ([("etag", "\"large\"")], vec![b' '; RESPONSE_LIMIT + 1]) }),
+            )
+            .route(
+                "/error/api/ignorelist",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/redirect/api/ignorelist",
+                get(|| async { axum::response::Redirect::temporary("/prefix/api/ignorelist") }),
+            )
+            .route(
+                "/unsolicited/api/ignorelist",
+                get(|| async { StatusCode::NOT_MODIFIED }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let (_directory, manager) = fixture();
+        let url = format!("http://{address}/prefix/");
+        configure_policies(&manager, &url, true);
+        manager.policies.lock().unwrap().source_url = url.clone();
+        let mut previous_revision = manager.engine.lock().unwrap().committed_revision();
+        for (etag, entries, changed) in [
+            ("\"one\"", policy_entries(443), true),
+            ("\"two\"", policy_entries(80), true),
+            ("\"three\"", vec![], true),
+            ("\"four\"", vec![], false),
+        ] {
+            *upstream.lock().unwrap() = (etag.into(), json!(entries));
+            let source = manager.policy_source().unwrap();
+            let prior_tag = manager.policies.lock().unwrap().etag.clone();
+            let fetched = fetch_policies(&client, &url, prior_tag.as_deref())
+                .await
+                .unwrap();
+            manager.finish_policies(&source, Ok(fetched)).unwrap();
+            let revision = manager.engine.lock().unwrap().committed_revision();
+            assert_eq!(revision != previous_revision, changed);
+            assert_eq!(manager.status().unwrap()["policies"]["etag"], etag);
+            let unchanged = fetch_policies(&client, &url, Some(etag)).await.unwrap();
+            assert!(matches!(unchanged, PolicyFetch::Unchanged));
+            manager
+                .finish_policies(&manager.policy_source().unwrap(), Ok(unchanged))
+                .unwrap();
+            assert_eq!(
+                manager.engine.lock().unwrap().committed_revision(),
+                revision
+            );
+            previous_revision = revision;
+        }
+        for path in [
+            "missing",
+            "bad",
+            "large",
+            "error",
+            "redirect",
+            "unsolicited",
+        ] {
+            assert!(
+                fetch_policies(&client, &format!("http://{address}/{path}"), None)
+                    .await
+                    .is_err(),
+                "{path}"
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn policy_conflicts_and_obsolete_results_never_advance_the_validator() {
+        let (directory, manager) = fixture();
+        let source = "http://sando.example.test";
+        configure_policies(&manager, source, true);
+        manager.policies.lock().unwrap().source_url = source.into();
+        let key = manager.policy_source().unwrap();
+        let pending = stage(&manager, source, false);
+        manager
+            .finish_policies(
+                &key,
+                Ok(PolicyFetch::List {
+                    etag: "\"one\"".into(),
+                    entries: policy_entries(443),
+                }),
+            )
+            .unwrap();
+        assert!(manager.policies.lock().unwrap().etag.is_none());
+        assert_eq!(manager.status().unwrap()["policies"]["state"], "error");
+        complete(&manager, &pending, "rollback");
+        manager
+            .finish_policies(
+                &key,
+                Ok(PolicyFetch::List {
+                    etag: "\"one\"".into(),
+                    entries: policy_entries(443),
+                }),
+            )
+            .unwrap();
+        assert_eq!(manager.status().unwrap()["policies"]["state"], "succeeded");
+        let revision = manager.engine.lock().unwrap().committed_revision();
+        configure_policies(&manager, source, false);
+        manager
+            .finish_policies(
+                &key,
+                Ok(PolicyFetch::List {
+                    etag: "\"two\"".into(),
+                    entries: vec![],
+                }),
+            )
+            .unwrap();
+        let config = manager.engine.lock().unwrap().saved_configuration().clone();
+        assert_eq!(config.firewall.policies.unwrap().hosts[0].rules.len(), 1);
+        assert_eq!(
+            manager.policies.lock().unwrap().etag.as_deref(),
+            Some("\"one\"")
+        );
+        let reopened =
+            Manager::open(&directory.path().join("sando.json"), manager.engine.clone()).unwrap();
+        assert!(reopened.policies.lock().unwrap().etag.is_none());
+        assert_ne!(
+            manager.engine.lock().unwrap().committed_revision(),
+            revision
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_worker_runs_independently_every_five_minutes_and_stops() {
+        use axum::{Router, http::HeaderMap, routing::get};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = calls.clone();
+        let app = Router::new().route(
+            "/api/ignorelist",
+            get(move |headers: HeaderMap| {
+                let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        assert!(headers.get("if-none-match").is_none());
+                    } else {
+                        assert_eq!(headers["if-none-match"], "\"one\"");
+                    }
+                    (
+                        [("etag", "\"one\"")],
+                        serde_json::to_string(&policy_entries(443)).unwrap(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_directory, manager) = fixture();
+        let url = format!("http://{address}");
+        configure_policies(&manager, &url, true);
+        let (stop, receiver) = watch::channel(false);
+        let worker = tokio::spawn(manager.clone().run(receiver));
+        async fn wait_success(manager: &Manager) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while manager.status().unwrap()["policies"]["state"] != "succeeded" {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        wait_success(&manager).await;
+        settle().await;
+        assert_eq!(manager.status().unwrap()["state"], "disabled");
+        let revision = manager.engine.lock().unwrap().committed_revision();
+        tokio::time::pause();
+        tokio::time::advance(POLICY_INTERVAL - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        wait_success(&manager).await;
+        assert_eq!(
+            manager.engine.lock().unwrap().committed_revision(),
+            revision
+        );
+        configure_policies(&manager, &url, false);
+        tokio::time::pause();
+        settle().await;
+        tokio::time::advance(POLICY_INTERVAL * 2).await;
+        settle().await;
+        tokio::time::resume();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        stop.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+        assert!(!manager.policies.lock().unwrap().syncing);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn policy_source_changes_disable_and_shutdown_cancel_inflight_acquisition() {
+        use axum::{Router, routing::get};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = calls.clone();
+        let app = Router::new()
+            .route(
+                "/slow/api/ignorelist",
+                get(move || {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<String>()
+                }),
+            )
+            .route(
+                "/current/api/ignorelist",
+                get(|| async { ([("etag", "\"current\"")], "[]") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_directory, manager) = fixture();
+        let slow = format!("http://{address}/slow");
+        configure_policies(&manager, &slow, true);
+        let (stop, receiver) = watch::channel(false);
+        let worker = tokio::spawn(manager.clone().run(receiver));
+        async fn wait_for(mut condition: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !condition() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        wait_for(|| calls.load(Ordering::SeqCst) == 1).await;
+        configure_policies(&manager, &slow, false);
+        wait_for(|| !manager.policies.lock().unwrap().syncing).await;
+        assert!(manager.policies.lock().unwrap().last_success_at.is_none());
+        configure_policies(&manager, &slow, true);
+        wait_for(|| calls.load(Ordering::SeqCst) == 2).await;
+        configure_policies(&manager, &format!("http://{address}/current"), true);
+        wait_for(|| manager.status().unwrap()["policies"]["state"] == "succeeded").await;
+        assert_eq!(manager.status().unwrap()["policies"]["etag"], "\"current\"");
+        configure_policies(&manager, &slow, true);
+        wait_for(|| calls.load(Ordering::SeqCst) == 3).await;
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!manager.policies.lock().unwrap().syncing);
+        assert!(manager.policies.lock().unwrap().next_sync_at.is_none());
+        server.abort();
+        let _ = server.await;
+    }
 
     fn inventory() -> Vec<u8> {
         serde_json::to_vec(&json!([{

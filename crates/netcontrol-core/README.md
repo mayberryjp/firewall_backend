@@ -55,8 +55,8 @@ decimal-string counters and no claimed packets/membership.
 ## Persistent state and recovery
 
 `sando` is always-serialized integration configuration, defaulting to
-an empty `api_url`, `sync_enabled: false` and null `hosts_import`/`rules_import`.
-Enabling sync requires a nonempty valid URL. Typed confirmed-import
+an empty `api_url`, `sync_enabled: false`, `policy_sync_enabled: false` and null
+`hosts_import`/`rules_import`. Enabling either sync requires a nonempty valid URL. Typed confirmed-import
 records retain browser-reported source URL, operation/item counts, RFC3339 time
 and succeeded/partial outcome. They are saved atomically with full reviewed
 configuration transactions under `sando.write`; firewall edits still need
@@ -65,6 +65,15 @@ restore semantics, but are excluded from `operational_value`. The daemon's
 optional hourly worker fetches host metadata into a separate private `.sando`
 cache next to the state file; `GET /api/v1/sando` reads it under `state.read`.
 It does not edit firewall configuration, revisions or confirmed import reports.
+The independent five-minute policy worker conditionally fetches `/api/ignorelist`
+and calls the core's restricted Sando replacement/apply workflow. It maps only
+supported existing-host outbound rules, counts skipped entries and preserves all
+non-Sando rules and other settings. Effective changes are durably applied,
+verified and immediately confirmed with one new configuration revision; normal
+busy/drift checks, rollback and restart recovery remain in force. Enabling or
+disabling it, and changing its enabled source, also require `firewall.write`.
+The runtime policy validator advances only after successful processing, resets
+on restart/relevant host changes, and is separate from browser import reports.
 See the
 [complete contract](../../FRONTEND_SPEC.md#sando-one-time-imports).
 
