@@ -36,7 +36,7 @@ strip = true
 opt-level = 1
 
 [profile.test.package.netcontrol-native]
-opt-level = 1
+opt-level = 2
 
 [patch.crates-io]
 mozim = { path = "third_party/mozim" }

@@ -42,7 +42,10 @@ jobs:
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libclang-dev linux-libc-dev
       - run: cargo +stable fmt --all -- --check
-      - run: cargo +stable test --workspace --locked
+      - name: Workspace tests
+        run: cargo +stable test --workspace --locked -- --skip experience_store::tests::dense_hourly_page_obeys_read_and_response_bounds
+      - name: Isolated dense hourly summary deadline
+        run: cargo +stable test -p netcontrol-native --lib --locked experience_store::tests::dense_hourly_page_obeys_read_and_response_bounds -- --exact --nocapture --test-threads=1
       - run: cargo +stable clippy --workspace --all-targets --locked -- -D warnings
 
   gnu:

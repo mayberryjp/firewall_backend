@@ -636,12 +636,26 @@ A supported native C toolchain is needed for TLS
 cryptography; Linux builds also require libclang and Linux UAPI headers for the
 direct nftables bindings. See the [build prerequisites](docs/BUILD_AND_INSTALL.md#build).
 
-The test profile minimally optimizes core/native code (`opt-level=1`) so bounded
-read regressions exercise compiled code rather than wholly unoptimized debug
-execution. Test debug assertions and bounded read deadlines remain enabled:
+The test profile optimizes core code at `opt-level=1` and native code at
+`opt-level=2` so bounded read regressions exercise an optimized native decoder
+rather than debug-build overhead. Test debug assertions and bounded read deadlines remain enabled:
 900 ms normally, with hourly-summary aggregation allowing 900 ms per started
 64-host batch (at most 3.6 seconds for 256 hosts). Development and release
 build profiles are unchanged.
+
+CI runs the dense 256-host/hourly deadline regression in its own required step
+so unrelated parallel tests do not consume its wall-clock read budget. It is
+excluded only from the parallel invocation, not from validation; its 3.6-second
+deadline, 360-slot/256-host correctness and 4 MiB response assertions remain.
+To reproduce CI scheduling locally:
+
+```sh
+cargo +stable test --workspace --locked -- --skip experience_store::tests::dense_hourly_page_obeys_read_and_response_bounds
+```
+
+```sh
+cargo +stable test -p netcontrol-native --lib --locked experience_store::tests::dense_hourly_page_obeys_read_and_response_bounds -- --exact --nocapture --test-threads=1
+```
 
 ```sh
 cargo test --workspace --locked

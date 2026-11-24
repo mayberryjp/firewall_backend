@@ -31,6 +31,12 @@
 
 ### Fixed
 
+- Run the dense hourly Network Experience deadline regression in a separate
+  required CI step and optimize the native test build at level 2, rather than
+  measuring a partially optimized decoder alongside parallel workspace tests.
+  Preserve the 3.6-second read deadline and full data/response-size assertions;
+  no runtime or frontend contract changes. CI-only fix; no release impact.
+
 - Fix hourly Network Experience summary timeouts for dense 256-host pages:
   stream samples/reasons in bucket order, reuse bounded validated decoding,
   and allow 900 ms per started 64-host batch, capped at 3.6 seconds. Preserve
