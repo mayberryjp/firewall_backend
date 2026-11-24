@@ -1180,6 +1180,310 @@ async fn sando_sync_status_requires_read_permission_and_rejects_input() {
 }
 
 #[tokio::test]
+async fn sando_policy_preview_stages_without_writes_and_rejects_stale_or_failed_fetches() {
+    use axum::{Router, http::HeaderMap, routing::get};
+    use netcontrold::http::Credential;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    let upstream = Arc::new(Mutex::new((
+        StatusCode::OK,
+        Some("\"preview\"".to_string()),
+        json!([
+            {"src_ip":"192.0.2.10","dst_ip":"198.51.100.4","protocol":6,"dst_port":443},
+            {"src_ip":"*","dst_ip":"198.51.100.4","protocol":6,"dst_port":443}
+        ]),
+    )));
+    let gated = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let upstream_app = Router::new().route(
+        "/prefix/api/ignorelist",
+        get({
+            let upstream = upstream.clone();
+            let gated = gated.clone();
+            let started = started.clone();
+            let release = release.clone();
+            move |headers: HeaderMap| {
+                let upstream = upstream.clone();
+                let gated = gated.clone();
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    assert!(!headers.contains_key("if-none-match"));
+                    if gated.load(Ordering::SeqCst) {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    let state = upstream.lock().unwrap();
+                    let mut headers = HeaderMap::new();
+                    if let Some(etag) = &state.1 {
+                        headers.insert("etag", etag.parse().unwrap());
+                    }
+                    (state.0, headers, state.2.to_string())
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source = format!("http://{}/prefix", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".test-data")
+        .join(secret("").unwrap());
+    fs::create_dir_all(&path).unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(&path.join("state.json"), Box::new(Simulator::new())).unwrap(),
+    ));
+    let mut app = App::new(
+        engine.clone(),
+        Authentication::Scoped(vec![
+            Credential {
+                name: "previewer".into(),
+                token_sha256: netcontrold::identity::digest("previewer"),
+                permissions: vec![
+                    "state.read".into(),
+                    "sando.write".into(),
+                    "firewall.write".into(),
+                ],
+            },
+            Credential {
+                name: "sando-reader".into(),
+                token_sha256: netcontrold::identity::digest("sando-reader"),
+                permissions: vec!["state.read".into(), "sando.write".into()],
+            },
+            Credential {
+                name: "reader".into(),
+                token_sha256: netcontrold::identity::digest("reader"),
+                permissions: vec!["state.read".into()],
+            },
+        ]),
+        false,
+    );
+    let manager =
+        netcontrold::sando::Manager::open(&path.join("sando.json"), engine.clone()).unwrap();
+    App::attach_sando(&mut app, manager.clone()).unwrap();
+    let fixture = Arc::new(Fixture {
+        path,
+        router: router(app),
+    });
+    let endpoint = "/api/v1/sando/policies/preview";
+    for (method, route, body, token, expected) in [
+        ("POST", endpoint, "", "invalid", 401),
+        ("POST", endpoint, "", "reader", 403),
+        ("POST", endpoint, "", "sando-reader", 403),
+        ("GET", endpoint, "", "previewer", 405),
+        (
+            "POST",
+            "/api/v1/sando/policies/preview?extra=1",
+            "",
+            "previewer",
+            400,
+        ),
+        ("POST", endpoint, "{}", "previewer", 400),
+        ("POST", endpoint, "", "previewer", 422),
+    ] {
+        assert_eq!(
+            fixture.request(method, route, body, "", token, "").await.0,
+            expected
+        );
+    }
+    let permissions = netcontrol_core::PERMISSIONS
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>();
+    let commit = |config: netcontrol_core::Config| {
+        let mut engine = engine.lock().unwrap();
+        let revision = engine.committed_revision();
+        let submitted = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "test",
+            &permissions,
+            &serde_json::to_vec(
+                &json!({"base_revision":revision,"confirm_timeout_seconds":30,"config":config}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(submitted.status, 202, "{}", submitted.body);
+        let confirmed = engine.request(
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/confirm",
+                submitted.body["id"].as_str().unwrap()
+            ),
+            "",
+            "test",
+            &permissions,
+            &[],
+        );
+        assert_eq!(confirmed.status, 200, "{}", confirmed.body);
+    };
+    let mut config = engine.lock().unwrap().saved_configuration().clone();
+    config.sando.api_url = source.clone();
+    config.firewall.policies = Some(serde_json::from_value(json!({
+                    "hosts":[{"id":"camera","name":"Camera","addresses":["192.0.2.10"],"policy":"drop","rules":[
+                        {"destination":"198.51.100.1/32","action":"drop"},
+                        {"destination":"198.51.100.2/32","action":"accept","origin":"import","import_source":"other"},
+                        {"destination":"198.51.100.3/32","action":"accept","origin":"import","import_source":"sando"}
+                    ]}],
+                    "interfaces":[]
+                })).unwrap());
+    commit(config.clone());
+    let revision = engine.lock().unwrap().committed_revision();
+    let transactions = engine
+        .lock()
+        .unwrap()
+        .request("GET", "/api/v1/transactions", "", "test", &permissions, &[])
+        .body;
+    let status = manager.status().unwrap();
+    let initial_entries = upstream.lock().unwrap().2.clone();
+    for (entries, imported, skipped) in [
+        (initial_entries.clone(), 1, 1),
+        (json!([]), 0, 0),
+        (json!([{"src_ip":"*"}]), 0, 1),
+    ] {
+        upstream.lock().unwrap().2 = entries;
+        let reply = fixture
+            .request("POST", endpoint, "", "", "previewer", "")
+            .await;
+        assert_eq!(reply.0, 200, "{}", reply.2);
+        assert_eq!(reply.1["cache-control"], "no-store");
+        assert!(reply.1.get("location").is_none());
+        assert_eq!(reply.2["base_revision"], json!(revision));
+        assert_eq!(reply.2["source_url"], source);
+        assert_eq!(reply.2["etag"], "\"preview\"");
+        assert_eq!(reply.2["imported_count"], imported);
+        assert_eq!(reply.2["skipped_count"], skipped);
+        assert_eq!(reply.2["changed"], true);
+        let preview: netcontrol_core::Config =
+            serde_json::from_value(reply.2["config"].clone()).unwrap();
+        let rules = &preview.firewall.policies.as_ref().unwrap().hosts[0].rules;
+        assert_eq!(rules.len(), 2 + imported as usize);
+        assert_eq!(
+            &rules[..2],
+            &config.firewall.policies.as_ref().unwrap().hosts[0].rules[..2]
+        );
+        let mut expected = config.clone();
+        expected.firewall.policies.as_mut().unwrap().hosts[0].rules = rules.clone();
+        assert_eq!(preview, expected);
+        assert_eq!(engine.lock().unwrap().saved_configuration(), &config);
+        assert_eq!(engine.lock().unwrap().committed_revision(), revision);
+        assert_eq!(manager.status().unwrap(), status);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .request("GET", "/api/v1/transactions", "", "test", &permissions, &[])
+                .body,
+            transactions
+        );
+        assert!(!fixture.path.join("sando.json").exists());
+    }
+    for (http_status, etag, body) in [
+        (StatusCode::OK, None, json!([])),
+        (StatusCode::OK, Some("\"preview\"".into()), json!({})),
+        (
+            StatusCode::NOT_MODIFIED,
+            Some("\"preview\"".into()),
+            json!([]),
+        ),
+        (StatusCode::INTERNAL_SERVER_ERROR, None, json!([])),
+    ] {
+        *upstream.lock().unwrap() = (http_status, etag, body);
+        assert_eq!(
+            fixture
+                .request("POST", endpoint, "", "", "previewer", "")
+                .await
+                .0,
+            503
+        );
+        assert_eq!(engine.lock().unwrap().saved_configuration(), &config);
+        assert_eq!(manager.status().unwrap(), status);
+    }
+    *upstream.lock().unwrap() = (StatusCode::OK, Some("\"preview\"".into()), initial_entries);
+    let staged = fixture
+        .request("POST", endpoint, "", "", "previewer", "")
+        .await;
+    assert_eq!(staged.0, 200);
+    config = serde_json::from_value(staged.2["config"].clone()).unwrap();
+    commit(config.clone());
+    let committed = engine.lock().unwrap().committed_revision();
+    let unchanged = fixture
+        .request("POST", endpoint, "", "", "previewer", "")
+        .await;
+    assert_eq!(unchanged.0, 200);
+    assert_eq!(unchanged.2["changed"], false);
+    assert_eq!(unchanged.2["config"], json!(config));
+    assert_eq!(engine.lock().unwrap().committed_revision(), committed);
+    assert!(!config.sando.sync_enabled);
+    assert!(!config.sando.policy_sync_enabled);
+    assert_eq!(manager.status().unwrap(), status);
+
+    let pending_id = {
+        let mut locked = engine.lock().unwrap();
+        let pending = locked.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "test",
+            &permissions,
+            &serde_json::to_vec(
+                &json!({"base_revision":committed,"confirm_timeout_seconds":30,"config":config}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(pending.status, 202);
+        pending.body["id"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(
+        fixture
+            .request("POST", endpoint, "", "", "previewer", "")
+            .await
+            .0,
+        409
+    );
+    let rolled_back = engine.lock().unwrap().request(
+        "POST",
+        &format!("/api/v1/transactions/{pending_id}/rollback"),
+        "",
+        "test",
+        &permissions,
+        &[],
+    );
+    assert_eq!(rolled_back.status, 200);
+    *upstream.lock().unwrap() = (StatusCode::OK, Some("\"preview\"".into()), json!([]));
+    gated.store(true, Ordering::SeqCst);
+    let pending = tokio::spawn({
+        let fixture = fixture.clone();
+        async move {
+            fixture
+                .request("POST", endpoint, "", "", "previewer", "")
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .request("POST", endpoint, "", "", "previewer", "")
+            .await
+            .0,
+        429
+    );
+    config.firewall.policies.as_mut().unwrap().hosts[0].name = "Updated camera".into();
+    commit(config.clone());
+    release.notify_one();
+    assert_eq!(pending.await.unwrap().0, 409);
+    assert_eq!(engine.lock().unwrap().saved_configuration(), &config);
+    assert_eq!(manager.status().unwrap(), status);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn software_upgrade_requires_permission_and_validates_versions_when_disabled() {
     use netcontrold::http::Credential;
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

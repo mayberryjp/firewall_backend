@@ -4,6 +4,15 @@
 
 ### Added
 
+- Add server-side Sando **Test sync** via bodyless
+  `POST /api/v1/sando/policies/preview`: fetch once using the committed URL and
+  automatic policy mapper, return a validated full candidate/base revision and
+  imported/skipped counts for explicit frontend Save / Commit review. No apply,
+  revision, sync enablement, import-report or worker-cache/status changes.
+  Reject busy/stale previews and bound concurrent retrieval. Additive contract;
+  next automatic calendar version.
+  [Required frontend handoff 2026-11-24-01](docs/frontend-handoffs/2026-11-24.md#2026-11-24-01-test-sync-staged-policy-preview).
+
 - Add independent opt-in Sando policy synchronization every five minutes using
   conditional `GET /api/ignorelist` and ETags. Automatically replace only
   Sando-owned existing-host outbound permits, count skipped unsupported entries,

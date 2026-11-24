@@ -573,7 +573,7 @@ routes, not backend endpoints.
 | `/transactions/:id` | Transaction details and lifecycle actions |
 | `/history` | Committed revision history |
 | `/history/:revision` | Historical configuration, comparison, restore |
-| `/settings/sando` | Sando base URL, independent hourly metadata/five-minute automatic policy sync and one-time imports |
+| `/settings/sando` | Sando base URL, independent hourly metadata/five-minute automatic policy sync, Test sync staged preview and one-time imports |
 
 Deep links must work after browser refresh. Unknown browser routes show an
 application 404, not an empty page. Encode resource names/IDs in URLs.
@@ -5163,9 +5163,11 @@ configuration is not a successful import and must not advance the saved report.
 
 #### Rule-source labels and Sando replacement
 
-One-time rule acquisition, mapping, review, replacement and ordering remain
-**frontend responsibilities**. There is no backend one-time rule-import/merge
-endpoint or special preservation guard on ordinary full-package writes.
+Browser one-time rule acquisition, mapping, review, replacement and ordering remain
+**frontend responsibilities**. The server-side **Test sync** preview below is an
+alternative acquisition/mapping path using the automatic policy mapper; there
+is no backend one-time rule-apply/merge endpoint or special preservation guard
+on ordinary full-package writes.
 The separately enabled daemon policy sync below is an exception to browser-only
 acquisition and reviewed activation, not an implicit change to one-time imports.
 Submit the complete reviewed candidate through ordinary confirmed transactions.
@@ -5205,6 +5207,85 @@ configuration write can still edit/delete any rule. Changing a rule's ownership
 label is an explicit reviewed edit, not an automatic consequence of opening an
 editor. Hourly Sando metadata refresh still never changes labels or rules.
 
+#### Server-side Test sync preview
+
+Add **Test sync** to **Settings > Sando**. It retrieves policies once on the
+daemon and stages a reviewable candidate in the existing **Save / Commit**
+section. It does not enable automatic synchronization or activate the candidate.
+Both sync flags may remain false. Browser-driven imports remain available as
+separate actions; this button uses the automatic policy mapper, not browser mapping.
+
+`POST /api/v1/sando/policies/preview` requires API-key authentication and all of
+`state.read`, `sando.write`, `firewall.write`; `transactions.write` is not needed
+to preview. No body or query parameters are accepted. Only the saved `api_url`
+is used, including its proxy prefix; save URL changes before testing. No arbitrary
+source URL, credentials or candidate configuration can be supplied.
+
+```ts
+interface SandoPolicyPreview {
+  base_revision: string; // canonical yyyy.mm.dd.iteration
+  source_url: string;
+  etag: string; // opaque upstream ETag, not a version
+  imported_count: number; // unique mapped rules, not additions
+  skipped_count: number; // unsupported/unmatched/duplicate rows
+  changed: boolean; // proposed firewall differs from committed firewall
+  config: Config; // complete validated candidate, including read-only software
+}
+```
+
+Success returns `200`/`Cache-Control: no-store`, with no transaction or Location
+header. The daemon makes one unconditional `GET <saved api_url>/api/ignorelist`
+using automatic sync's HTTP/TLS/timeouts/body/ETag/row limits and mapping below.
+Even a previously cached ETag does not cause a conditional request; unsolicited
+`304` is a failure. Existing host rules labeled exactly `import`/`sando` are
+replaced in the proposed configuration only; retained rules, defaults, host
+inventory, interface policies, input, NAT and unrelated configuration are preserved.
+`[]` and all-skipped arrays can propose removal of all prior Sando host rules.
+Display those removals and skipped counts prominently before saving.
+
+The endpoint creates no transaction/revision, applies nothing, writes no
+configuration/import reports/cache, and does not update either worker's status,
+validator or polling schedule. The engine lock is released during retrieval.
+One preview request may run at a time; configuration changes or an active
+configuration workflow invalidate the result rather than returning a stale draft.
+It can also preview with automatic sync enabled, but background changes may
+produce conflicts; recommend disabling automatic policies when testing before
+permanent enablement.
+
+Errors use the normal `{error,transaction:null}` envelope:
+
+- `401` invalid/missing API key; `403` missing any required permission.
+- `405` non-POST; `400` any body (including `{}`) or query parameter.
+- `422` saved URL absent or mapped candidate fails configuration validation.
+- `409` configuration busy before retrieval, or busy/revision/source changed
+  during retrieval. Retry with a fresh preview after the workflow finishes.
+- `429` another preview is running; wait and retry.
+- `503` manager/engine/upgrade state unavailable, or upstream transport,
+  HTTP, JSON, ETag, body/row-limit failure. Show the returned error.
+
+Frontend workflow:
+
+1. Require saved URL and preview permissions. Disable duplicate clicks. Require
+   the existing draft to be clean; if dirty, preserve it and tell the user to save
+   or discard it before testing. Do not silently merge or overwrite unsaved edits.
+2. Call the endpoint without a body. On success verify the current committed
+   revision and draft are still unchanged, then stage `config` with the returned
+   `base_revision`. On conflict or any failure leave the existing draft untouched.
+3. Navigate to **Save / Commit**, showing the normal semantic diff plus source,
+   imported/skipped counts, removed/new rules and **Fetched/staged; not applied**.
+   An unchanged result should say **No policy changes** and not trigger a save.
+4. Do not enable either sync flag, submit automatically, or increment
+   `hosts_import`/`rules_import` from a preview. Submit only after explicit Save
+   using the ordinary full-package request (omit read-only `software` as usual),
+   required changed-component/transaction permissions and explicit confirmation.
+   Discard requires no backend write. Handle stale saves with normal revision
+   conflict/review; never blind-resubmit a stale candidate.
+5. A preview or successful manual save does not start recurring sync. Keep
+   **Automatically sync policies** as a separate explicit decision.
+
+Frontend implementation/acceptance is tracked in
+[handoff 2026-11-24-01](docs/frontend-handoffs/2026-11-24.md#2026-11-24-01-test-sync-staged-policy-preview).
+
 #### Automatic policy synchronization
 
 `sando.policy_sync_enabled` is a boolean, default `false`, independent of
@@ -5212,7 +5293,7 @@ editor. Hourly Sando metadata refresh still never changes labels or rules.
 Save it using a normal full confirmed configuration transaction with
 `transactions.write`, `sando.write` and `firewall.write`. A nonempty valid
 `api_url` is required (`422` otherwise); invalid flag types return `400`.
-Do not add a separate endpoint, browser timer, manual confirmation per refresh,
+Do not add a separate automatic-apply endpoint, browser timer, manual confirmation per refresh,
 source credentials, or Sando `POST` requests.
 
 The daemon makes an unauthenticated `GET <api_url>/api/ignorelist`, preserving
@@ -8219,6 +8300,7 @@ Paths below are relative to `/api/v1`.
 | POST | `/services/discord/webhooks` | Private `{webhook_url}` upload -> `201 {webhook_ref}`; `discord.write` |
 | GET | `/services/discord/status` | First-seen alert delivery state/counts, no secret; `state.read` |
 | POST | `/services/discord/test` | No query/body; send committed version test and clear Discord delivery failures on success; `discord.write` |
+| POST | `/sando/policies/preview` | No query/body -> `SandoPolicyPreview`; `state.read`, `sando.write`, `firewall.write`; stages only, no apply |
 | GET | `/gateway-monitors` | Observed `GatewayMonitor[]` metadata |
 | GET | `/statistics/gateways` | `{sample, monitors: GatewayMonitorStatistics[]}` |
 | GET | `/statistics/gateways/{name}` | `{sample, monitor: GatewayMonitorStatistics}` |

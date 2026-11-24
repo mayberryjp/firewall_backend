@@ -1623,6 +1623,16 @@ impl Engine {
             .map_err(|error| anyhow::anyhow!(error.error))
     }
 
+    pub fn preview_sando_policies(
+        &self,
+        entries: &[Value],
+    ) -> Result<(Config, crate::SandoPolicyOutcome)> {
+        ensure!(!self.closed, "engine is shut down");
+        let (config, mut outcome) = crate::sando::policy_candidate(&self.state.desired, entries)?;
+        outcome.changed = config.firewall != self.state.desired.firewall;
+        Ok((config, outcome))
+    }
+
     pub fn sync_sando_policies(
         &mut self,
         source: &str,
@@ -1638,8 +1648,8 @@ impl Engine {
             !self.configuration_busy(),
             "configuration is busy; Sando policies were not applied"
         );
-        let (config, mut outcome) = crate::sando::policy_candidate(&self.state.desired, entries)?;
-        if config.firewall == self.state.desired.firewall {
+        let (config, outcome) = self.preview_sando_policies(entries)?;
+        if !outcome.changed {
             return Ok(outcome);
         }
         let transaction = self
@@ -1667,7 +1677,6 @@ impl Engine {
                 Err(recovery) => anyhow::anyhow!("{}; rollback: {recovery:#}", error.error),
             });
         }
-        outcome.changed = true;
         Ok(outcome)
     }
 

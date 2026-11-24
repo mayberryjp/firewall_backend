@@ -74,6 +74,10 @@ busy/drift checks, rollback and restart recovery remain in force. Enabling or
 disabling it, and changing its enabled source, also require `firewall.write`.
 The runtime policy validator advances only after successful processing, resets
 on restart/relevant host changes, and is separate from browser import reports.
+`Engine::preview_sando_policies` shares the automatic worker's mapper but only
+returns a validated candidate and counts/change indication, with no apply,
+revision, persistence or flag changes. The daemon's Test sync endpoint stages
+that candidate for the frontend's normal reviewed save/confirmation workflow.
 See the
 [complete contract](../../FRONTEND_SPEC.md#sando-one-time-imports).
 

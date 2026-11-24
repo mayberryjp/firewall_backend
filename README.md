@@ -563,7 +563,8 @@ See the [complete contract](FRONTEND_SPEC.md#discord-first-seen-drop-alerts) and
 
 ## Sando imports
 
-One-time Sando imports are frontend-driven. The backend saves `config.sando`
+Browser one-time Sando imports are frontend-driven; **Test sync** can instead
+retrieve and map policies server-side without applying them. The backend saves `config.sando`
 with an API base URL and separate latest confirmed host/rule import
 records, including source, operation/item counts, time and status. Save them
 with reviewed firewall changes through normal confirmed transactions
@@ -610,6 +611,19 @@ are not overwritten. Unchanged rules/`304` do not create revisions. Read indepen
 survives restart; policy status/ETag are in memory and startup fetches unconditionally.
 One-time import reports remain untouched. Host/score sync need not be enabled.
 See the [automatic policy contract](FRONTEND_SPEC.md#automatic-policy-synchronization).
+
+Bodyless `POST /api/v1/sando/policies/preview` uses the committed Sando URL and
+the same retrieval/host-rule mapping as automatic policy sync. It requires
+`state.read`, `sando.write` and `firewall.write`, but not `transactions.write`.
+It returns the full proposed `config`, `base_revision`, source URL/ETag,
+imported/skipped counts and `changed`; it never submits a transaction, applies
+rules, enables polling, writes import reports or updates worker status/cache.
+Either sync flag may remain disabled. The frontend stages the candidate in
+**Save / Commit** for explicit review, normal save/confirmation or discard.
+Existing unsaved drafts must not be overwritten; a revision change during
+retrieval returns `409` and later stale saves use normal conflict handling.
+Empty/all-skipped previews show the same Sando-owned-rule removals as automatic
+sync, but do not activate them. See [Test sync](FRONTEND_SPEC.md#server-side-test-sync-preview).
 The required **Settings > Sando** toggles, status panels and import workflow are specified
 in the [frontend contract](FRONTEND_SPEC.md#sando-one-time-imports).
 

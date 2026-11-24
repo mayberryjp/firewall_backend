@@ -4030,6 +4030,15 @@ fn automatic_sando_policies_commit_only_real_changes_and_recover_apply_failures(
     let before = engine.committed_revision();
     let entries =
         [json!({"src_ip":"192.0.2.10","dst_ip":"198.51.100.4","protocol":6,"dst_port":443})];
+    let transactions = request(&mut engine, "GET", "/api/v1/transactions", Value::Null).body;
+    let (preview, preview_outcome) = engine.preview_sando_policies(&entries).unwrap();
+    assert!(preview_outcome.changed);
+    assert_eq!(engine.saved_configuration(), &candidate);
+    assert_eq!(engine.committed_revision(), before);
+    assert_eq!(
+        request(&mut engine, "GET", "/api/v1/transactions", Value::Null).body,
+        transactions
+    );
     let outcome = engine
         .sync_sando_policies(&candidate.sando.api_url, &entries)
         .unwrap();
@@ -4040,6 +4049,8 @@ fn automatic_sando_policies_commit_only_real_changes_and_recover_apply_failures(
     );
     assert!(!engine.configuration_busy());
     let saved = engine.saved_configuration().clone();
+    assert_eq!(saved, preview);
+    assert_eq!(outcome, preview_outcome);
     let policies = saved.firewall.policies.as_ref().unwrap();
     assert_eq!(
         &policies.hosts[0].rules[..2],

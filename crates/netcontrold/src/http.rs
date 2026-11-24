@@ -102,6 +102,7 @@ pub struct App {
     processes: std::collections::BTreeMap<String, Arc<crate::processes::Control>>,
     daemon_restart: Option<tokio::sync::watch::Sender<bool>>,
     dns_slots: tokio::sync::Semaphore,
+    sando_preview_slots: tokio::sync::Semaphore,
     host_experience_slots: tokio::sync::Semaphore,
 }
 impl App {
@@ -122,6 +123,7 @@ impl App {
             processes: Default::default(),
             daemon_restart: None,
             dns_slots: tokio::sync::Semaphore::new(2),
+            sando_preview_slots: tokio::sync::Semaphore::new(1),
             host_experience_slots: tokio::sync::Semaphore::new(4),
         })
     }
@@ -694,6 +696,94 @@ fn api(
             return fail(400, "platform status accepts no query or body", true);
         }
         return response(200, app.health.snapshot());
+    }
+    if path == "/api/v1/sando/policies/preview" {
+        for permission in ["state.read", "sando.write", "firewall.write"] {
+            if !credential.permissions.iter().any(|p| p == permission) {
+                return fail(403, &format!("missing permission: {permission}"), true);
+            }
+        }
+        if method != "POST" {
+            return fail(405, "Sando policy preview requires POST", true);
+        }
+        if !query.is_empty() || !body.is_empty() {
+            return fail(400, "Sando policy preview accepts no query or body", true);
+        }
+        let Some(manager) = &app.sando else {
+            return fail(503, "Sando sync is not configured", true);
+        };
+        let Ok(_slot) = app.sando_preview_slots.try_acquire() else {
+            return fail(429, "Sando policy preview already running", true);
+        };
+        if let Err(error) = app.refresh_upgrade_gate() {
+            tracing::error!(%error, "Sando preview could not refresh upgrade state");
+            return fail(503, "upgrade state unavailable", true);
+        }
+        let (base_revision, source_url) = {
+            let Ok(engine) = app.engine.lock() else {
+                return fail(503, "engine unavailable", true);
+            };
+            if engine.configuration_busy() {
+                return fail(409, "configuration is busy; retry Sando preview", true);
+            }
+            let source = &engine.saved_configuration().sando.api_url;
+            if source.is_empty() {
+                return fail(422, "save a Sando api_url before testing sync", true);
+            }
+            (engine.committed_revision(), source.clone())
+        };
+        let (etag, entries) = match tokio::runtime::Handle::current()
+            .block_on(manager.fetch_policy_preview(&source_url))
+        {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(%error, "Sando policy preview fetch failed");
+                return fail(
+                    503,
+                    &format!("Sando policy preview failed: {error:#}"),
+                    true,
+                );
+            }
+        };
+        if let Err(error) = app.refresh_upgrade_gate() {
+            tracing::error!(%error, "Sando preview could not refresh upgrade state");
+            return fail(503, "upgrade state unavailable", true);
+        }
+        let Ok(engine) = app.engine.lock() else {
+            return fail(503, "engine unavailable", true);
+        };
+        if engine.configuration_busy()
+            || engine.committed_revision() != base_revision
+            || engine.saved_configuration().sando.api_url != source_url
+        {
+            return fail(
+                409,
+                "configuration changed during Sando preview; retry",
+                true,
+            );
+        }
+        return match engine.preview_sando_policies(&entries) {
+            Ok((config, outcome)) => response(
+                200,
+                json!({
+                    "base_revision":base_revision,
+                    "source_url":source_url,
+                    "etag":etag,
+                    "imported_count":outcome.imported_count,
+                    "skipped_count":outcome.skipped_count,
+                    "changed":outcome.changed,
+                    "config":config
+                }),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "Sando policy preview validation failed");
+                fail(
+                    422,
+                    &format!("Sando policy preview invalid: {error:#}"),
+                    true,
+                )
+            }
+        };
     }
     if path == "/api/v1/sando" {
         if !credential.permissions.iter().any(|p| p == "state.read") {

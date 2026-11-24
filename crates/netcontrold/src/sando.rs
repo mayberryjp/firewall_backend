@@ -198,6 +198,16 @@ enum PolicyFetch {
     List { etag: String, entries: Vec<Value> },
 }
 
+fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .user_agent("netcontrol-sando-sync")
+        .build()?)
+}
+
 async fn fetch_policies(
     client: &reqwest::Client,
     source: &str,
@@ -298,6 +308,15 @@ pub struct Manager {
 }
 
 impl Manager {
+    pub(crate) async fn fetch_policy_preview(&self, source: &str) -> Result<(String, Vec<Value>)> {
+        match fetch_policies(&http_client()?, source, None).await? {
+            PolicyFetch::List { etag, entries } => Ok((etag, entries)),
+            PolicyFetch::Unchanged => {
+                anyhow::bail!("Sando preview requires a complete policy list")
+            }
+        }
+    }
+
     pub fn open(path: &Path, engine: Arc<Mutex<Engine>>) -> Result<Arc<Self>> {
         crate::identity::secure_parent(path)?;
         let snapshot: Snapshot = if path.try_exists()? {
@@ -541,13 +560,7 @@ impl Manager {
     }
 
     pub async fn run(self: Arc<Self>, stop: watch::Receiver<bool>) -> Result<()> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .user_agent("netcontrol-sando-sync")
-            .build()?;
+        let client = http_client()?;
         let hosts = self.worker(stop.clone(), {
             let client = client.clone();
             move |source| {
