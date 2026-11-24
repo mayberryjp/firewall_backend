@@ -26,16 +26,25 @@ fn policy_rule(entry: &Value) -> Option<(std::net::IpAddr, HostPolicyRule)> {
         .as_str()?
         .parse::<std::net::IpAddr>()
         .ok()?;
-    let destination = entry
-        .get("dst_ip")?
-        .as_str()?
-        .parse::<std::net::IpAddr>()
-        .ok()?;
+    let destination_text = entry.get("dst_ip")?.as_str()?;
+    let destination = if destination_text == "*" {
+        if source.is_ipv4() {
+            "0.0.0.0/0".into()
+        } else {
+            "::/0".into()
+        }
+    } else {
+        let destination = crate::canonical_ip(destination_text).ok()?;
+        if !crate::global_unicast(destination) || source.is_ipv4() != destination.is_ipv4() {
+            return None;
+        }
+        format!(
+            "{destination}/{}",
+            if destination.is_ipv4() { 32 } else { 128 }
+        )
+    };
     if !crate::global_unicast(source)
-        || !crate::global_unicast(destination)
-        || source.is_ipv4() != destination.is_ipv4()
-        || crate::canonical_ip(&source.to_string()).is_err()
-        || crate::canonical_ip(&destination.to_string()).is_err()
+        || crate::canonical_ip(entry.get("src_ip")?.as_str()?).is_err()
     {
         return None;
     }
@@ -49,10 +58,17 @@ fn policy_rule(entry: &Value) -> Option<(std::net::IpAddr, HostPolicyRule)> {
     if !protocol.matches_family(source) {
         return None;
     }
-    let port = integer(entry.get("dst_port")?)?;
+    let port_value = entry.get("dst_port")?;
     let destination_ports = match protocol {
-        FilterProtocol::Tcp | FilterProtocol::Udp if (1..=65535).contains(&port) => vec![port],
-        FilterProtocol::Icmp | FilterProtocol::Icmpv6 if port == 0 => vec![],
+        _ if port_value.as_str() == Some("*") => vec![],
+        FilterProtocol::Tcp | FilterProtocol::Udp => {
+            let port = integer(port_value)?;
+            if !(1..=65535).contains(&port) {
+                return None;
+            }
+            vec![port]
+        }
+        FilterProtocol::Icmp | FilterProtocol::Icmpv6 if integer(port_value) == Some(0) => vec![],
         _ => return None,
     };
     Some((
@@ -63,10 +79,7 @@ fn policy_rule(entry: &Value) -> Option<(std::net::IpAddr, HostPolicyRule)> {
             metadata: Default::default(),
             out_interface: String::new(),
             destination_host: String::new(),
-            destination: format!(
-                "{destination}/{}",
-                if destination.is_ipv4() { 32 } else { 128 }
-            ),
+            destination,
             protocol: match protocol {
                 FilterProtocol::Tcp => "tcp",
                 FilterProtocol::Udp => "udp",
@@ -81,6 +94,19 @@ fn policy_rule(entry: &Value) -> Option<(std::net::IpAddr, HostPolicyRule)> {
     ))
 }
 
+fn sando_owned(rule: &HostPolicyRule) -> bool {
+    rule.origin == RuleOrigin::Import && rule.import_source.as_deref() == Some("sando")
+}
+
+fn same_match(left: &HostPolicyRule, right: &HostPolicyRule) -> bool {
+    left.out_interface == right.out_interface
+        && left.destination_host == right.destination_host
+        && left.destination == right.destination
+        && left.protocol == right.protocol
+        && left.destination_ports == right.destination_ports
+        && left.action == right.action
+}
+
 pub(crate) fn policy_candidate(
     config: &Config,
     entries: &[Value],
@@ -89,10 +115,14 @@ pub(crate) fn policy_candidate(
     let mut next = config.clone();
     let mut outcome = SandoPolicyOutcome::default();
     let Some(policies) = next.firewall.policies.as_mut() else {
-        outcome.skipped_count = entries.len() as u32;
+        ensure!(
+            entries.is_empty(),
+            "No replacement rules could be imported; existing rules were retained"
+        );
         return Ok((next, outcome));
     };
     let mut replacements = vec![Vec::new(); policies.hosts.len()];
+    let mut supported = false;
     for entry in entries {
         let mapped = policy_rule(entry).and_then(|(source, rule)| {
             if source.is_ipv6() && !config.ipv6_enabled {
@@ -102,33 +132,52 @@ pub(crate) fn policy_candidate(
                 host.addresses
                     .iter()
                     .any(|address| address.parse() == Ok(source))
-                    && host
-                        .addresses
-                        .iter()
-                        .filter(|address| {
-                            address
-                                .parse::<std::net::IpAddr>()
-                                .is_ok_and(|ip| ip.is_ipv4() == source.is_ipv4())
-                        })
-                        .count()
-                        == 1
             })?;
             Some((index, rule))
         });
-        if let Some((index, rule)) = mapped
-            && !replacements[index].contains(&rule)
-        {
-            replacements[index].push(rule);
-            outcome.imported_count += 1;
+        if let Some((index, rule)) = mapped {
+            supported = true;
+            if replacements[index]
+                .iter()
+                .any(|existing| same_match(existing, &rule))
+                || policies.hosts[index]
+                    .rules
+                    .iter()
+                    .any(|existing| !sando_owned(existing) && same_match(existing, &rule))
+            {
+                outcome.skipped_count += 1;
+            } else {
+                replacements[index].push(rule);
+                outcome.imported_count += 1;
+            }
         } else {
             outcome.skipped_count += 1;
         }
     }
-    for (host, rules) in policies.hosts.iter_mut().zip(replacements) {
-        host.rules.retain(|rule| {
-            !(rule.origin == RuleOrigin::Import && rule.import_source.as_deref() == Some("sando"))
-        });
-        host.rules.extend(rules);
+    ensure!(
+        entries.is_empty() || supported,
+        "No replacement rules could be imported; existing rules were retained"
+    );
+    for (host, mut rules) in policies.hosts.iter_mut().zip(replacements) {
+        if !host.rules.iter().any(sando_owned) && rules.is_empty() {
+            continue;
+        }
+        let mut retained: Vec<_> = host
+            .rules
+            .iter()
+            .filter(|rule| !sando_owned(rule))
+            .cloned()
+            .collect();
+        retained.sort_by_key(|rule| rule.origin != RuleOrigin::Manual);
+        // Keep unchanged permits in their saved order, independent of upstream query ordering.
+        for old in host.rules.iter().filter(|rule| sando_owned(rule)) {
+            if let Some(index) = rules.iter().position(|rule| same_match(old, rule)) {
+                rules.remove(index);
+                retained.push(old.clone());
+            }
+        }
+        retained.extend(rules);
+        host.rules = retained;
     }
     next.validate()?;
     Ok((next, outcome))
@@ -242,7 +291,7 @@ mod tests {
             "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
             "firewall":{"policies":{"hosts":[
                 {"id":"camera","name":"Camera","addresses":["192.0.2.10","2001:db8::10"],"policy":"drop","rules":[]},
-                {"id":"ambiguous","name":"Multiple addresses","addresses":["192.0.2.20","192.0.2.21"],"policy":"drop","rules":[]}
+                {"id":"multiple","name":"Multiple addresses","addresses":["192.0.2.20","192.0.2.21"],"policy":"drop","rules":[]}
             ]}}
         })).unwrap();
         let good =
@@ -255,8 +304,6 @@ mod tests {
         for (field, invalid) in [
             ("src_ip", json!("*")),
             ("src_ip", json!("192.0.2.99")),
-            ("src_ip", json!("192.0.2.20")),
-            ("dst_ip", json!("*")),
             ("dst_ip", json!("198.51.100.0/24")),
             ("dst_ip", json!("2001:db8::20")),
             ("dst_ip", json!("224.0.0.1")),
@@ -264,7 +311,6 @@ mod tests {
             ("protocol", json!(47)),
             ("protocol", json!(58)),
             ("dst_port", json!(0)),
-            ("dst_port", json!("*")),
             ("dst_port", json!(65536)),
             ("dst_port", json!(true)),
             ("dst_port", Value::Null),
@@ -288,6 +334,80 @@ mod tests {
         assert!(policies.hosts[0].rules[1].destination_ports.is_empty());
         assert_eq!(policies.hosts[0].rules[2].protocol, "icmp");
         assert!(policies.hosts[1].rules.is_empty());
+    }
+
+    #[test]
+    fn browser_wildcards_and_portless_icmp_map_without_inventing_wildcards() {
+        for (source, destination, expected) in [
+            ("192.0.2.10", "*", "0.0.0.0/0"),
+            ("2001:db8::10", "*", "::/0"),
+            ("192.0.2.10", "198.51.100.20", "198.51.100.20/32"),
+        ] {
+            for protocol in [6, 17, if source.contains(':') { 58 } else { 1 }] {
+                let (_, rule) = policy_rule(&json!({
+                    "src_ip":source,"dst_ip":destination,"protocol":protocol,"dst_port":"*"
+                }))
+                .unwrap();
+                assert_eq!(rule.destination, expected);
+                assert!(rule.destination_ports.is_empty());
+                let zero = json!({"src_ip":source,"dst_ip":destination,"protocol":protocol,"dst_port":"0"});
+                assert_eq!(policy_rule(&zero).is_some(), matches!(protocol, 1 | 58));
+                for invalid in [Value::Null, json!(""), json!("any"), json!(false)] {
+                    let mut entry = zero.clone();
+                    entry["dst_port"] = invalid;
+                    assert!(policy_rule(&entry).is_none());
+                }
+            }
+        }
+        assert!(
+            policy_rule(&json!({"src_ip":"*","dst_ip":"*","protocol":6,"dst_port":"*"})).is_none()
+        );
+    }
+
+    #[test]
+    fn browser_replacement_deduplicates_retained_rules_and_preserves_saved_permit_order() {
+        let config: Config = serde_json::from_value(json!({
+            "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
+            "firewall":{"policies":{"hosts":[
+                {"id":"camera","name":"Camera","addresses":["192.0.2.10","192.0.2.11"],"policy":"drop","rules":[
+                    {"origin":"import","import_source":"other","destination":"198.51.100.20/32","protocol":"tcp","destination_ports":[443],"action":"accept"},
+                    {"destination":"198.51.100.30/32","protocol":"udp","destination_ports":[53],"action":"accept"},
+                    {"origin":"import","import_source":"sando","destination":"0.0.0.0/0","protocol":"icmp","action":"accept"},
+                    {"origin":"import","import_source":"sando","destination":"198.51.100.40/32","protocol":"tcp","destination_ports":[443],"action":"accept"}
+                ]}
+            ]}}
+        })).unwrap();
+        let entries = [
+            json!({"src_ip":"192.0.2.11","dst_ip":"198.51.100.40","protocol":6,"dst_port":443}),
+            json!({"src_ip":"192.0.2.10","dst_ip":"*","protocol":1,"dst_port":0}),
+            json!({"src_ip":"192.0.2.10","dst_ip":"198.51.100.20","protocol":6,"dst_port":443}),
+            json!({"src_ip":"192.0.2.10","dst_ip":"198.51.100.30","protocol":17,"dst_port":53}),
+        ];
+        let (next, outcome) = policy_candidate(&config, &entries).unwrap();
+        assert_eq!((outcome.imported_count, outcome.skipped_count), (2, 2));
+        let mut expected = config.clone();
+        expected.firewall.policies.as_mut().unwrap().hosts[0]
+            .rules
+            .swap(0, 1);
+        assert_eq!(next, expected);
+        let reversed: Vec<_> = entries.into_iter().rev().collect();
+        assert_eq!(policy_candidate(&next, &reversed).unwrap().0, next);
+        assert_eq!(
+            policy_candidate(&next, &reversed[0..1])
+                .unwrap()
+                .1
+                .imported_count,
+            0
+        );
+        assert!(
+            policy_candidate(
+                &next,
+                &[json!({"src_ip":"*","dst_ip":"*","protocol":6,"dst_port":"*"})]
+            )
+            .is_err()
+        );
+        let (empty, _) = policy_candidate(&next, &[]).unwrap();
+        assert_eq!(empty.firewall.policies.unwrap().hosts[0].rules.len(), 2);
     }
 
     fn config() -> SandoConfig {

@@ -4028,8 +4028,10 @@ fn automatic_sando_policies_commit_only_real_changes_and_recover_apply_failures(
         200
     );
     let before = engine.committed_revision();
-    let entries =
-        [json!({"src_ip":"192.0.2.10","dst_ip":"198.51.100.4","protocol":6,"dst_port":443})];
+    let entries = [
+        json!({"src_ip":"192.0.2.10","dst_ip":"198.51.100.4","protocol":6,"dst_port":443}),
+        json!({"src_ip":"192.0.2.10","dst_ip":"*","protocol":1,"dst_port":"*"}),
+    ];
     let transactions = request(&mut engine, "GET", "/api/v1/transactions", Value::Null).body;
     let (preview, preview_outcome) = engine.preview_sando_policies(&entries).unwrap();
     assert!(preview_outcome.changed);
@@ -4067,6 +4069,21 @@ fn automatic_sando_policies_commit_only_real_changes_and_recover_apply_failures(
             .unwrap()
             .changed
     );
+    assert_eq!(engine.committed_revision(), committed);
+    let reversed: Vec<_> = entries.iter().cloned().rev().collect();
+    assert!(
+        !engine
+            .sync_sando_policies(&candidate.sando.api_url, &reversed)
+            .unwrap()
+            .changed
+    );
+    assert_eq!(engine.committed_revision(), committed);
+    assert!(
+        engine
+            .sync_sando_policies(&candidate.sando.api_url, &[json!({"src_ip":"*"})])
+            .is_err()
+    );
+    assert_eq!(engine.saved_configuration(), &saved);
     assert_eq!(engine.committed_revision(), committed);
     faults.lock().unwrap().fail_applies = 1;
     assert!(

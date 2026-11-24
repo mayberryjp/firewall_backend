@@ -31,6 +31,14 @@
 
 ### Fixed
 
+- Align server-side Sando rule mapping with browser explicit wildcard
+  destinations/ports and portless ICMP handling. Deduplicate against retained
+  rules, keep manual rules first and preserve unchanged permit order to avoid
+  query-order-only diffs/revisions. Reject nonempty all-invalid replacements
+  instead of deleting saved permits. Existing-host scope remains; no inventory
+  creation. Mapping/error contract fix; next automatic calendar version.
+  [Required frontend review 2026-11-25-01](docs/frontend-handoffs/2026-11-25.md#2026-11-25-01-browser-compatible-sando-policy-mapping).
+
 - Synchronize the Sando policy scheduler test with completion of next-poll
   scheduling before advancing its virtual clock. Remove a CI-only race with
   blocking transaction completion; no production timing or contract changes.

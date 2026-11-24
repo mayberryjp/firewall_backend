@@ -5240,8 +5240,9 @@ Even a previously cached ETag does not cause a conditional request; unsolicited
 `304` is a failure. Existing host rules labeled exactly `import`/`sando` are
 replaced in the proposed configuration only; retained rules, defaults, host
 inventory, interface policies, input, NAT and unrelated configuration are preserved.
-`[]` and all-skipped arrays can propose removal of all prior Sando host rules.
-Display those removals and skipped counts prominently before saving.
+`[]` can propose removal of all prior Sando host rules. A nonempty array with
+no supported existing-host rows fails without staging removals. Display removals,
+explicit wildcard permits and skipped counts prominently before saving.
 
 The endpoint creates no transaction/revision, applies nothing, writes no
 configuration/import reports/cache, and does not update either worker's status,
@@ -5256,7 +5257,8 @@ Errors use the normal `{error,transaction:null}` envelope:
 
 - `401` invalid/missing API key; `403` missing any required permission.
 - `405` non-POST; `400` any body (including `{}`) or query parameter.
-- `422` saved URL absent or mapped candidate fails configuration validation.
+- `422` saved URL absent, no supported existing-host rows in a nonempty source,
+  or mapped candidate fails configuration validation.
 - `409` configuration busy before retrieval, or busy/revision/source changed
   during retrieval. Retry with a fresh preview after the workflow finishes.
 - `429` another preview is running; wait and retry.
@@ -5272,7 +5274,8 @@ Frontend workflow:
    revision and draft are still unchanged, then stage `config` with the returned
    `base_revision`. On conflict or any failure leave the existing draft untouched.
 3. Navigate to **Save / Commit**, showing the normal semantic diff plus source,
-   imported/skipped counts, removed/new rules and **Fetched/staged; not applied**.
+   imported/skipped counts, removed/new rules, explicit wildcard permits and
+   **Fetched/staged; not applied**.
    An unchanged result should say **No policy changes** and not trigger a save.
 4. Do not enable either sync flag, submit automatically, or increment
    `hosts_import`/`rules_import` from a preview. Submit only after explicit Save
@@ -5319,38 +5322,48 @@ live interoperability is still a deployment acceptance check.
 
 Supported mapping is intentionally narrower than alert suppression:
 
-- Require `src_ip` and `dst_ip` to be literal unicast IPv4/IPv6 addresses, of
-  the same family. Reject unspecified, loopback, multicast, link-local,
-  broadcast and IPv4-mapped IPv6 addresses. No hostnames, prefixes or wildcards.
+- Require `src_ip` to be a canonical literal unicast IPv4/IPv6 address.
+  `dst_ip` must be a canonical unicast address of the same family or the explicit
+  string `"*"`, which maps to `0.0.0.0/0` or `::/0` in the source family.
+  Reject unspecified, loopback, multicast, link-local, broadcast and IPv4-mapped
+  IPv6 addresses. No hostnames, prefixes or wildcard sources.
 - Match source to an **existing configured firewall host** by exact normalized
   IP, never reverse destination matches into outbound rules or create hosts.
-  A host with multiple addresses in the source family is skipped: current host
-  rules cannot constrain one source address without broadening to the others.
-  A dual-stack host with one address per family is supported.
+  As in browser imports, the permit applies to the matching host's configured
+  addresses in that family, including multiple addresses; it is not a
+  single-source-address constraint. Host inventory/defaults remain unchanged.
 - `protocol` must be numeric `6`/`17`/`1`/`58` (TCP/UDP/ICMP/ICMPv6), either
   an integer or nonempty ASCII decimal integer string, as returned by Sando.
   ICMP family must match, and IPv6 requires `ipv6_enabled`.
 - TCP/UDP `dst_port` must be 1..65535, as an integer or ASCII decimal integer
-  string. Port zero and wildcard ports are skipped, never widened to any port.
-  ICMP/ICMPv6 require recorded `dst_port` zero and map to no transport ports;
+  string, or explicit `"*"` for any destination port. Port zero, missing/null
+  and invalid values are skipped, never inferred as wildcards.
+  ICMP/ICMPv6 accept recorded `dst_port` zero (integer/string) or `"*"` and map to no transport ports;
   this does not add ICMP type/code filtering or promise ping-only access.
 - Map to `action:"accept"`, `origin:"import"`, `import_source:"sando"`,
-  literal destination `/32` or `/128`, supported protocol and destination port.
+  literal destination `/32` or `/128` (or explicit wildcard `/0`), supported
+  protocol and destination port (omitted for wildcard/ICMP).
   Leave destination-host/out-interface/metadata unset. Ignore upstream
-  identifiers/timestamps for matching; exact duplicate generated rules count
-  as skipped rather than being appended twice.
-- Unsupported, malformed-row, unmatched or ambiguous entries are **skipped and
+  identifiers/timestamps for matching. Matching/action fields determine duplicates,
+  ignoring ownership and display metadata; retained manual/other-provider rules
+  prevent duplicate generated permits. Duplicate rows count as skipped.
+- Unsupported, malformed-row or unmatched entries are **skipped and
   counted** while the supported remainder is automatically applied. No partial
-  review is required. A nonempty list with zero supported entries therefore
-  removes old Sando-owned host rules, just like `[]`; explain this before enabling.
+  review is required. A nonempty list with zero supported existing-host rows
+  fails the complete attempt and retains the prior configuration. Supported
+  rows already covered by retained rules are valid, not an all-invalid failure.
+  Only a successful genuinely empty list `[]` authorizes empty replacement.
   Invalid JSON/non-array responses, HTTP errors, missing/invalid ETags,
   unsolicited or mismatched `304`, transport errors, and response/configuration
   limit violations fail the complete attempt and retain previous configuration.
 
 Replace only host-policy rules labeled exactly `origin:"import"` and
 `import_source:"sando"`, across existing configured hosts including hosts with no
-replacement rules. Preserve all retained rules' relative order and append the
-new unique rules in upstream source order. Manual rules, other providers,
+replacement rules. In affected lists put retained manual rules first, preserving
+relative order within manual and other retained rules. Keep still-present
+Sando permits in their saved relative order (and retain their display metadata),
+then append genuinely new unique rules in upstream source order. Upstream query
+ordering alone must not generate rule changes or revisions. Manual rules, other providers,
 system/inherited labels, host inventory/defaults, interface policies, input,
 NAT and unrelated configuration remain unchanged. Current per-host/expanded
 ruleset limits apply; a candidate exceeding them fails without partial activation.

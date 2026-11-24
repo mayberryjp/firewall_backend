@@ -68,7 +68,12 @@ It does not edit firewall configuration, revisions or confirmed import reports.
 The independent five-minute policy worker conditionally fetches `/api/ignorelist`
 and calls the core's restricted Sando replacement/apply workflow. It maps only
 supported existing-host outbound rules, counts skipped entries and preserves all
-non-Sando rules and other settings. Effective changes are durably applied,
+non-Sando rules and other settings. Explicit wildcard destinations/ports and
+ICMP zero/wildcard ports match browser mapping; invalid/missing values never
+become wildcards. A nonempty all-invalid replacement fails without removing
+saved rules; empty lists remain authoritative. Retained matching rules suppress
+duplicates, manual rules stay first, and unchanged Sando permits retain saved
+order rather than following upstream query-order changes. Effective changes are durably applied,
 verified and immediately confirmed with one new configuration revision; normal
 busy/drift checks, rollback and restart recovery remain in force. Enabling or
 disabling it, and changing its enabled source, also require `firewall.write`.

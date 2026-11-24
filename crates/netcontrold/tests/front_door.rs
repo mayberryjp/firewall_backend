@@ -1342,7 +1342,11 @@ async fn sando_policy_preview_stages_without_writes_and_rejects_stale_or_failed_
     for (entries, imported, skipped) in [
         (initial_entries.clone(), 1, 1),
         (json!([]), 0, 0),
-        (json!([{"src_ip":"*"}]), 0, 1),
+        (
+            json!([{"src_ip":"192.0.2.10","dst_ip":"*","protocol":1,"dst_port":"*"}]),
+            1,
+            0,
+        ),
     ] {
         upstream.lock().unwrap().2 = entries;
         let reply = fixture
@@ -1402,6 +1406,18 @@ async fn sando_policy_preview_stages_without_writes_and_rejects_stale_or_failed_
         assert_eq!(engine.lock().unwrap().saved_configuration(), &config);
         assert_eq!(manager.status().unwrap(), status);
     }
+    *upstream.lock().unwrap() = (
+        StatusCode::OK,
+        Some("\"preview\"".into()),
+        json!([{"src_ip":"*"}]),
+    );
+    let invalid = fixture
+        .request("POST", endpoint, "", "", "previewer", "")
+        .await;
+    assert_eq!(invalid.0, 422);
+    assert_eq!(engine.lock().unwrap().saved_configuration(), &config);
+    assert_eq!(engine.lock().unwrap().committed_revision(), revision);
+    assert_eq!(manager.status().unwrap(), status);
     *upstream.lock().unwrap() = (StatusCode::OK, Some("\"preview\"".into()), initial_entries);
     let staged = fixture
         .request("POST", endpoint, "", "", "previewer", "")

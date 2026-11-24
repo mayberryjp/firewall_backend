@@ -596,11 +596,14 @@ polls `GET /api/ignorelist` immediately and every five minutes after completion.
 It uses `ETag`/`If-None-Match`; `304` does not load or apply a list. A changed
 list automatically replaces Sando-owned outbound accept rules on existing
 hosts, preserving manual/other-provider rules, inventory and default policies.
-Only literal unicast, same-family destinations and supported protocols/ports
-are mapped; unsupported/unmatched/duplicate entries are skipped and counted.
-A valid empty list, or a list with no supported entries, removes old Sando-owned
-host rules. Review this consequence before enabling. No universal permits or
-new hosts are inferred. Enabling/disabling, or changing the URL while enabled,
+Canonical unicast, same-family addresses and supported protocols/ports are
+mapped, including browser-compatible explicit `*` destinations/ports and
+ICMP zero/wildcard ports. Host permits cover that host's addresses in the
+matching family. Unsupported/unmatched/duplicate entries are skipped and counted.
+A valid empty list removes old Sando-owned host rules; a nonempty all-invalid
+list fails and retains them. Retained rules prevent duplicate permits, manual
+rules stay first, and unchanged Sando permits retain saved order despite upstream
+query ordering. No wildcard sources or new hosts are inferred. Enabling/disabling, or changing the URL while enabled,
 requires `firewall.write` as well as `sando.write` and `transactions.write`.
 
 Effective rule changes use durable apply/verification and automatic confirmation,
@@ -622,7 +625,7 @@ Either sync flag may remain disabled. The frontend stages the candidate in
 **Save / Commit** for explicit review, normal save/confirmation or discard.
 Existing unsaved drafts must not be overwritten; a revision change during
 retrieval returns `409` and later stale saves use normal conflict handling.
-Empty/all-skipped previews show the same Sando-owned-rule removals as automatic
+Empty previews show the same Sando-owned-rule removals as automatic
 sync, but do not activate them. See [Test sync](FRONTEND_SPEC.md#server-side-test-sync-preview).
 The required **Settings > Sando** toggles, status panels and import workflow are specified
 in the [frontend contract](FRONTEND_SPEC.md#sando-one-time-imports).
