@@ -305,6 +305,8 @@ pub struct Manager {
     engine: Arc<Mutex<Engine>>,
     state: Mutex<State>,
     policies: Mutex<PolicyState>,
+    #[cfg(test)]
+    policy_poll_scheduled: tokio::sync::Notify,
 }
 
 impl Manager {
@@ -342,6 +344,8 @@ impl Manager {
                 ..Default::default()
             }),
             policies: Mutex::new(PolicyState::default()),
+            #[cfg(test)]
+            policy_poll_scheduled: tokio::sync::Notify::new(),
         }))
     }
 
@@ -701,6 +705,8 @@ impl Manager {
                     let source = source.clone();
                     previous = Some(tokio::task::spawn_blocking(move || manager.finish_policies(&source, result)).await??);
                     due = Instant::now() + POLICY_INTERVAL;
+                    #[cfg(test)]
+                    self.policy_poll_scheduled.notify_one();
                 }
             }
         }
@@ -1025,20 +1031,20 @@ mod tests {
         configure_policies(&manager, &url, true);
         let (stop, receiver) = watch::channel(false);
         let worker = tokio::spawn(manager.clone().run(receiver));
-        async fn wait_success(manager: &Manager) {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while manager.status().unwrap()["policies"]["state"] != "succeeded" {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
+        async fn wait_scheduled(manager: &Manager) {
+            // Success is visible before the blocking apply rejoins and sets the next deadline.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.policy_poll_scheduled.notified(),
+            )
             .await
             .unwrap();
+            assert_eq!(manager.status().unwrap()["policies"]["state"], "succeeded");
         }
-        wait_success(&manager).await;
-        settle().await;
+        wait_scheduled(&manager).await;
+        tokio::time::pause();
         assert_eq!(manager.status().unwrap()["state"], "disabled");
         let revision = manager.engine.lock().unwrap().committed_revision();
-        tokio::time::pause();
         tokio::time::advance(POLICY_INTERVAL - Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1051,7 +1057,7 @@ mod tests {
         })
         .await
         .unwrap();
-        wait_success(&manager).await;
+        wait_scheduled(&manager).await;
         assert_eq!(
             manager.engine.lock().unwrap().committed_revision(),
             revision

@@ -31,6 +31,10 @@
 
 ### Fixed
 
+- Synchronize the Sando policy scheduler test with completion of next-poll
+  scheduling before advancing its virtual clock. Remove a CI-only race with
+  blocking transaction completion; no production timing or contract changes.
+
 - Run the dense hourly Network Experience deadline regression in a separate
   required CI step and optimize the native test build at level 2, rather than
   measuring a partially optimized decoder alongside parallel workspace tests.
