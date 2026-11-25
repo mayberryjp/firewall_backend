@@ -1016,6 +1016,16 @@ async fn sando_settings_and_import_reports_use_authenticated_confirmed_config_tr
                         "state.read".into(),
                         "transactions.write".into(),
                         "sando.write".into(),
+                        "firewall.write".into(),
+                    ],
+                },
+                Credential {
+                    name: "sando-only".into(),
+                    token_sha256: netcontrold::identity::digest("sando-only"),
+                    permissions: vec![
+                        "state.read".into(),
+                        "transactions.write".into(),
+                        "sando.write".into(),
                     ],
                 },
                 Credential {
@@ -1058,6 +1068,13 @@ async fn sando_settings_and_import_reports_use_authenticated_confirmed_config_tr
     assert_eq!(
         fixture
             .request("POST", "/api/v1/transactions", &body, "", "reader", "")
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        fixture
+            .request("POST", "/api/v1/transactions", &body, "", "sando-only", "")
             .await
             .0,
         403

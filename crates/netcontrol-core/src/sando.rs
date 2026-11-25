@@ -1,4 +1,4 @@
-use crate::{Config, FilterProtocol, HostPolicyRule, RuleOrigin};
+use crate::{Config, FilterProtocol, FirewallHost, HostPolicyRule, RuleOrigin};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,108 @@ pub struct SandoPolicyOutcome {
     pub imported_count: u32,
     pub skipped_count: u32,
     pub changed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SandoHost {
+    pub addresses: Vec<std::net::IpAddr>,
+    pub host_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SandoHostOutcome {
+    pub added_count: u32,
+    pub skipped_count: u32,
+    pub changed: bool,
+}
+
+pub(crate) fn host_candidate(
+    config: &Config,
+    hosts: &[SandoHost],
+) -> Result<(Config, SandoHostOutcome)> {
+    ensure!(hosts.len() <= 4096, "Sando exceeds 4096 hosts");
+    let mut next = config.clone();
+    let mut outcome = SandoHostOutcome::default();
+    let mut policies = config.firewall.policies.clone().unwrap_or_default();
+    for host in hosts {
+        let addresses: Vec<_> = host
+            .addresses
+            .iter()
+            .filter(|ip| {
+                crate::global_unicast(**ip)
+                    && crate::canonical_ip(&ip.to_string()).is_ok()
+                    && (ip.is_ipv4() || config.ipv6_enabled)
+            })
+            .map(ToString::to_string)
+            .collect();
+        let Some(primary) = addresses.first() else {
+            outcome.skipped_count += 1;
+            continue;
+        };
+        let owners: Vec<_> = policies
+            .hosts
+            .iter()
+            .filter(|existing| {
+                existing
+                    .addresses
+                    .iter()
+                    .any(|address| addresses.contains(address))
+            })
+            .collect();
+        if !owners.is_empty() {
+            if owners.len() != 1
+                || !addresses
+                    .iter()
+                    .all(|address| owners[0].addresses.contains(address))
+            {
+                outcome.skipped_count += 1;
+            }
+            continue;
+        }
+        let id = format!("sando_{}", primary.replace([':', '.'], "_"));
+        let mut name = host
+            .host_name
+            .as_deref()
+            .unwrap_or(primary)
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>();
+        while name.len() > 80 {
+            name.pop();
+        }
+        name = name.trim_end().to_owned();
+        if name.is_empty() || policies.hosts.iter().any(|existing| existing.name == name) {
+            name = primary.clone();
+        }
+        if policies
+            .hosts
+            .iter()
+            .any(|existing| existing.id == id || existing.name == name)
+        {
+            outcome.skipped_count += 1;
+            continue;
+        }
+        policies.hosts.push(FirewallHost {
+            metadata: Default::default(),
+            id,
+            name,
+            addresses,
+            policy: "drop".into(),
+            rules: Vec::new(),
+        });
+        outcome.added_count += 1;
+    }
+    if outcome.added_count > 0 {
+        ensure!(
+            config.firewall.rules.is_empty(),
+            "Sando host sync requires host policies; remove legacy forwarding rules through a reviewed transaction"
+        );
+        next.firewall.policies = Some(policies);
+        next.validate()?;
+        outcome.changed = true;
+    }
+    Ok((next, outcome))
 }
 
 fn integer(value: &Value) -> Option<i64> {
@@ -283,6 +385,93 @@ impl SandoConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn automatic_hosts_use_browser_identity_defaults_and_preserve_existing_hosts() {
+        let config: Config = serde_json::from_value(json!({
+            "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
+            "firewall":{"policies":{"hosts":[
+                {"id":"manual","name":"Camera","addresses":["192.0.2.10"],"policy":"accept","rules":[{"action":"drop"}]}
+            ]}}
+        })).unwrap();
+        let hosts = [
+            SandoHost {
+                addresses: vec!["192.0.2.10".parse().unwrap()],
+                host_name: Some("Changed name".into()),
+            },
+            SandoHost {
+                addresses: vec!["192.0.2.10".parse().unwrap(), "192.0.2.11".parse().unwrap()],
+                host_name: None,
+            },
+            SandoHost {
+                addresses: vec![
+                    "192.0.2.20".parse().unwrap(),
+                    "2001:db8::20".parse().unwrap(),
+                ],
+                host_name: Some("Camera".into()),
+            },
+            SandoHost {
+                addresses: vec!["fe80::20".parse().unwrap()],
+                host_name: None,
+            },
+        ];
+        let (next, outcome) = host_candidate(&config, &hosts).unwrap();
+        assert_eq!((outcome.added_count, outcome.skipped_count), (1, 2));
+        assert!(outcome.changed);
+        let policies = next.firewall.policies.as_ref().unwrap();
+        assert_eq!(
+            policies.hosts[0],
+            config.firewall.policies.as_ref().unwrap().hosts[0]
+        );
+        assert_eq!(policies.hosts[1].id, "sando_192_0_2_20");
+        assert_eq!(policies.hosts[1].name, "192.0.2.20");
+        assert_eq!(policies.hosts[1].addresses, ["192.0.2.20"]);
+        assert_eq!(policies.hosts[1].policy, "drop");
+        assert!(policies.hosts[1].rules.is_empty());
+        assert_eq!(host_candidate(&next, &hosts).unwrap().0, next);
+        assert!(!host_candidate(&next, &[]).unwrap().1.changed);
+        assert_eq!(host_candidate(&next, &[]).unwrap().0, next);
+    }
+
+    #[test]
+    fn automatic_hosts_support_dual_stack_names_and_fail_atomic_configuration_limits() {
+        let config = Config {
+            ipv6_enabled: true,
+            ..Default::default()
+        };
+        let host = SandoHost {
+            addresses: vec![
+                "192.0.2.20".parse().unwrap(),
+                "2001:db8::20".parse().unwrap(),
+            ],
+            host_name: Some(format!(" {} ", "\u{754c}".repeat(40))),
+        };
+        let (mut next, _) = host_candidate(&config, &[host]).unwrap();
+        let added = &next.firewall.policies.as_ref().unwrap().hosts[0];
+        assert_eq!(added.addresses.len(), 2);
+        assert!(added.name.len() <= 80);
+        let hosts = (1..=129)
+            .map(|index| SandoHost {
+                addresses: vec![format!("198.51.100.{index}").parse().unwrap()],
+                host_name: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            host_candidate(&next, &hosts)
+                .unwrap_err()
+                .to_string()
+                .contains("128 hosts")
+        );
+        next.firewall.policies = None;
+        next.firewall.rules =
+            serde_json::from_value(json!([{"source":"192.0.2.0/24","action":"accept"}])).unwrap();
+        assert!(
+            host_candidate(&next, &hosts[..1])
+                .unwrap_err()
+                .to_string()
+                .contains("legacy forwarding")
+        );
+    }
 
     #[test]
     fn automatic_policies_skip_unsupported_entries_without_broadening_sources() {

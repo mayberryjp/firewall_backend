@@ -298,6 +298,9 @@ struct State {
     snapshot: Snapshot,
     syncing: bool,
     next_sync_at: Option<DateTime<Utc>>,
+    added_hosts: u32,
+    skipped_firewall_hosts: u32,
+    last_changed_revision: Option<netcontrol_core::Version>,
 }
 
 pub struct Manager {
@@ -307,6 +310,8 @@ pub struct Manager {
     policies: Mutex<PolicyState>,
     #[cfg(test)]
     policy_poll_scheduled: tokio::sync::Notify,
+    #[cfg(test)]
+    host_poll_scheduled: tokio::sync::Notify,
 }
 
 impl Manager {
@@ -346,6 +351,8 @@ impl Manager {
             policies: Mutex::new(PolicyState::default()),
             #[cfg(test)]
             policy_poll_scheduled: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            host_poll_scheduled: tokio::sync::Notify::new(),
         }))
     }
 
@@ -465,6 +472,18 @@ impl Manager {
         if !include_hosts {
             return Ok(result);
         }
+        let current_source = state.snapshot.source_url == config.api_url;
+        result["added_hosts"] = json!(if current_source { state.added_hosts } else { 0 });
+        result["skipped_firewall_hosts"] = json!(if current_source {
+            state.skipped_firewall_hosts
+        } else {
+            0
+        });
+        result["last_changed_revision"] = json!(if current_source {
+            state.last_changed_revision
+        } else {
+            None
+        });
         let policies = self
             .policies
             .lock()
@@ -509,7 +528,7 @@ impl Manager {
     }
 
     fn finish(&self, source: &str, result: Result<(Vec<Host>, usize)>) -> Result<()> {
-        let engine = self
+        let mut engine = self
             .engine
             .lock()
             .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
@@ -522,7 +541,6 @@ impl Manager {
         if !config.sync_enabled || config.api_url != source {
             return Ok(());
         }
-        let now: DateTime<Utc> = std::time::SystemTime::now().into();
         if state.snapshot.source_url != source {
             state.snapshot = Snapshot {
                 source_url: source.into(),
@@ -530,9 +548,33 @@ impl Manager {
             };
         }
         let mut next = state.snapshot.clone();
+        let applied = result.and_then(|(hosts, skipped)| {
+            let imports: Vec<_> = hosts
+                .iter()
+                .map(|host| netcontrol_core::SandoHost {
+                    addresses: host.addresses.clone(),
+                    host_name: host.host_name.clone(),
+                })
+                .collect();
+            let outcome = engine.sync_sando_hosts(source, &imports)?;
+            Ok((hosts, skipped, outcome))
+        });
+        let now = Utc::now();
         next.last_attempt_at = Some(now);
-        match result {
-            Ok((hosts, skipped)) => {
+        match applied {
+            Ok((hosts, skipped, outcome)) => {
+                state.added_hosts = outcome.added_count;
+                state.skipped_firewall_hosts = outcome.skipped_count;
+                if outcome.skipped_count > 0 {
+                    tracing::warn!(
+                        skipped_hosts = outcome.skipped_count,
+                        "Sando firewall hosts skipped"
+                    );
+                }
+                if outcome.changed {
+                    state.last_changed_revision = Some(engine.committed_revision());
+                    tracing::info!(revision = %engine.committed_revision(), added_hosts = outcome.added_count, "Sando hosts automatically committed");
+                }
                 next.hosts = hosts;
                 next.skipped_hosts = skipped;
                 next.last_success_at = Some(now);
@@ -719,7 +761,11 @@ impl Manager {
         Ok(())
     }
 
-    async fn worker<F, Fut>(&self, mut stop: watch::Receiver<bool>, mut acquire: F) -> Result<()>
+    async fn worker<F, Fut>(
+        self: &Arc<Self>,
+        mut stop: watch::Receiver<bool>,
+        mut acquire: F,
+    ) -> Result<()>
     where
         F: FnMut(String) -> Fut,
         Fut: std::future::Future<Output = Result<(Vec<Host>, usize)>>,
@@ -751,6 +797,9 @@ impl Manager {
                         source_url: source.0.clone(),
                         ..Default::default()
                     };
+                    state.added_hosts = 0;
+                    state.skipped_firewall_hosts = 0;
+                    state.last_changed_revision = None;
                 }
                 previous = Some(source.clone());
             }
@@ -771,15 +820,21 @@ impl Manager {
                 _ = crate::wait_until(deadline) => {}
                 result = async { request.as_mut().expect("guarded Sando request").await }, if request.is_some() => {
                     request = None;
-                    self.finish(&previous.as_ref().context("Sando source missing")?.0, result)?;
+                    let manager = self.clone();
+                    let source = previous.as_ref().context("Sando source missing")?.0.clone();
+                    tokio::task::spawn_blocking(move || manager.finish(&source, result)).await??;
                     due = Instant::now() + SYNC_INTERVAL;
+                    #[cfg(test)]
+                    self.host_poll_scheduled.notify_one();
                 }
             }
         }
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?
-            .syncing = false;
+            .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
+        state.syncing = false;
+        state.next_sync_at = None;
         Ok(())
     }
 }
@@ -1347,7 +1402,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hourly_sync_observes_only_confirmed_settings_and_preserves_firewall_and_revisions() {
+    async fn hourly_sync_observes_confirmed_settings_and_adds_hosts_only_once() {
         let (_directory, manager) = fixture();
         let calls = Arc::new(AtomicUsize::new(0));
         let attempts = calls.clone();
@@ -1372,10 +1427,22 @@ mod tests {
         configure(&manager, "http://sando.example.test/proxy", true);
         let before = manager.engine.lock().unwrap().saved_configuration().clone();
         let revision = manager.engine.lock().unwrap().committed_revision();
-        settle().await;
+        manager.host_poll_scheduled.notified().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.status().unwrap()["state"], "succeeded");
         assert_eq!(manager.status().unwrap()["hosts"][0]["threat_score"], -1);
+        assert_eq!(manager.status().unwrap()["added_hosts"], 1);
+        let saved = manager.engine.lock().unwrap().saved_configuration().clone();
+        let added = &saved.firewall.policies.as_ref().unwrap().hosts[0];
+        assert_eq!(added.id, "sando_192_0_2_10");
+        assert_eq!(added.addresses, ["192.0.2.10"]);
+        assert_eq!(added.policy, "drop");
+        assert!(added.rules.is_empty());
+        let mut expected = before.clone();
+        expected.firewall.policies = saved.firewall.policies.clone();
+        assert_eq!(saved, expected);
+        let committed = manager.engine.lock().unwrap().committed_revision();
+        assert_eq!(committed, revision.next(Utc::now().date_naive()).unwrap());
         let summary = manager.mqtt_status(&before.sando).unwrap();
         assert_eq!(summary["state"], "succeeded");
         assert_eq!(
@@ -1389,16 +1456,13 @@ mod tests {
         settle().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(Duration::from_secs(1)).await;
-        settle().await;
+        manager.host_poll_scheduled.notified().await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             manager.engine.lock().unwrap().committed_revision(),
-            revision
+            committed
         );
-        assert_eq!(
-            *manager.engine.lock().unwrap().saved_configuration(),
-            before
-        );
+        assert_eq!(*manager.engine.lock().unwrap().saved_configuration(), saved);
         configure(&manager, "http://sando.example.test/proxy", false);
         tokio::time::advance(SYNC_INTERVAL * 2).await;
         settle().await;
@@ -1459,6 +1523,149 @@ mod tests {
         );
     }
 
+    #[test]
+    fn busy_host_import_retains_configuration_and_snapshot_until_retry() {
+        let (_directory, manager) = fixture();
+        let source = "http://sando.example.test";
+        configure(&manager, source, true);
+        let before = manager.engine.lock().unwrap().saved_configuration().clone();
+        let revision = manager.engine.lock().unwrap().committed_revision();
+        let pending = stage(&manager, source, true);
+        manager.finish(source, project(&inventory())).unwrap();
+        assert_eq!(manager.status().unwrap()["state"], "error");
+        assert!(
+            manager.status().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("busy")
+        );
+        assert!(
+            manager.status().unwrap()["hosts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            manager.engine.lock().unwrap().saved_configuration(),
+            &before
+        );
+        assert_eq!(
+            manager.engine.lock().unwrap().committed_revision(),
+            revision
+        );
+        complete(&manager, &pending, "rollback");
+        manager.finish(source, project(&inventory())).unwrap();
+        assert_eq!(manager.status().unwrap()["state"], "succeeded");
+        assert_eq!(manager.status().unwrap()["added_hosts"], 1);
+        assert_eq!(
+            manager.status().unwrap()["last_changed_revision"],
+            json!(manager.engine.lock().unwrap().committed_revision())
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_inventory_additions_trigger_policy_sync_without_browser_imports() {
+        use axum::{Router, routing::get};
+        let app = Router::new()
+            .route("/api/localhosts", get(|| async { inventory() }))
+            .route(
+                "/api/ignorelist",
+                get(|| async {
+                    (
+                        [("etag", "\"hosts\"")],
+                        serde_json::to_string(&policy_entries(443)).unwrap(),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_directory, manager) = fixture();
+        configure(&manager, &source, true);
+        {
+            let mut engine = manager.engine.lock().unwrap();
+            let mut config = engine.saved_configuration().clone();
+            config.sando.policy_sync_enabled = true;
+            let base_revision = engine.committed_revision();
+            let permissions: Vec<_> = netcontrol_core::PERMISSIONS
+                .iter()
+                .map(|p| p.to_string())
+                .collect();
+            let transaction = engine.request("POST", "/api/v1/transactions", "", "test", &permissions,
+                &serde_json::to_vec(&json!({"base_revision":base_revision,"confirm_timeout_seconds":30,"config":config})).unwrap());
+            assert_eq!(transaction.status, 202, "{}", transaction.body);
+            let confirmed = engine.request(
+                "POST",
+                &format!(
+                    "/api/v1/transactions/{}/confirm",
+                    transaction.body["id"].as_str().unwrap()
+                ),
+                "",
+                "test",
+                &permissions,
+                &[],
+            );
+            assert_eq!(confirmed.status, 200, "{}", confirmed.body);
+        }
+        let revision = manager.engine.lock().unwrap().committed_revision();
+        let (stop, receiver) = watch::channel(false);
+        let worker = tokio::spawn(manager.clone().run(receiver));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let complete = {
+                    let engine = manager.engine.lock().unwrap();
+                    engine
+                        .saved_configuration()
+                        .firewall
+                        .policies
+                        .as_ref()
+                        .is_some_and(|policies| {
+                            policies.hosts.len() == 1 && policies.hosts[0].rules.len() == 1
+                        })
+                };
+                if complete
+                    && manager.status().unwrap()["state"] == "succeeded"
+                    && manager.status().unwrap()["policies"]["state"] == "succeeded"
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(manager.status().unwrap()["hosts"][0]["threat_score"], -1);
+        assert_eq!(manager.status().unwrap()["added_hosts"], 1);
+        {
+            let engine = manager.engine.lock().unwrap();
+            let config = engine.saved_configuration();
+            assert_eq!(
+                config.firewall.policies.as_ref().unwrap().hosts[0].policy,
+                "drop"
+            );
+            assert!(config.sando.hosts_import.is_none());
+            assert!(config.sando.rules_import.is_none());
+            assert_eq!(
+                engine.committed_revision(),
+                revision
+                    .next(Utc::now().date_naive())
+                    .unwrap()
+                    .next(Utc::now().date_naive())
+                    .unwrap()
+            );
+        }
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!manager.state.lock().unwrap().syncing);
+        assert!(manager.state.lock().unwrap().next_sync_at.is_none());
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn disable_source_changes_and_shutdown_cancel_inflight_syncs() {
         let (_directory, manager) = fixture();
@@ -1495,6 +1702,78 @@ mod tests {
         worker.await.unwrap().unwrap();
         assert!(!manager.state.lock().unwrap().syncing);
         assert!(manager.status().unwrap()["last_success_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_started_automatic_host_commit() {
+        let (_directory, manager) = fixture();
+        configure(&manager, "http://sando.example.test", true);
+        let acquired = Arc::new(tokio::sync::Notify::new());
+        let release_fetch = Arc::new(tokio::sync::Notify::new());
+        let returned = Arc::new(tokio::sync::Notify::new());
+        let (stop, receiver) = watch::channel(false);
+        let task_manager = manager.clone();
+        let started = acquired.clone();
+        let gate = release_fetch.clone();
+        let ready = returned.clone();
+        let mut worker = tokio::spawn(async move {
+            task_manager
+                .worker(receiver, move |_| {
+                    let started = started.clone();
+                    let gate = gate.clone();
+                    let ready = ready.clone();
+                    async move {
+                        started.notify_one();
+                        gate.notified().await;
+                        let result = project(&inventory());
+                        ready.notify_one();
+                        result
+                    }
+                })
+                .await
+        });
+        acquired.notified().await;
+        let (held, held_receiver) = std::sync::mpsc::channel();
+        let (unlock, unlock_receiver) = std::sync::mpsc::channel();
+        let engine = manager.engine.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = engine.lock().unwrap();
+            held.send(()).unwrap();
+            unlock_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        });
+        held_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_fetch.notify_one();
+        returned.notified().await;
+        stop.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut worker)
+                .await
+                .is_err()
+        );
+        unlock.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let engine = manager.engine.lock().unwrap();
+        assert!(!engine.configuration_busy());
+        assert_eq!(
+            engine
+                .saved_configuration()
+                .firewall
+                .policies
+                .as_ref()
+                .unwrap()
+                .hosts
+                .len(),
+            1
+        );
+        assert!(!manager.state.lock().unwrap().syncing);
+        assert!(manager.state.lock().unwrap().next_sync_at.is_none());
     }
 
     #[test]

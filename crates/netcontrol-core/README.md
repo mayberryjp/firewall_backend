@@ -64,7 +64,15 @@ configuration transactions under `sando.write`; firewall edits still need
 restore semantics, but are excluded from `operational_value`. The daemon's
 optional hourly worker fetches host metadata into a separate private `.sando`
 cache next to the state file; `GET /api/v1/sando` reads it under `state.read`.
-It does not edit firewall configuration, revisions or confirmed import reports.
+The host worker also calls `Engine::sync_sando_hosts` to durably add new
+canonical unicast firewall hosts with stable Sando IDs, policy `drop` and no
+initial rules. Preserve existing hosts/addresses/names/rules and never delete
+missing inventory. All additions use one automatically confirmed transaction/
+revision; repeated inventory and metadata-only changes create none. Busy/
+validation/apply failures use normal rollback and explicit errors. Either sync
+flag now delegates firewall changes and requires `firewall.write`, as do URL
+changes while either flag is enabled. Metadata remains separate, and confirmed
+browser import reports are untouched. New hosts trigger policy reconciliation.
 The independent five-minute policy worker conditionally fetches `/api/ignorelist`
 and calls the core's restricted Sando replacement/apply workflow. It maps only
 supported existing-host outbound rules, counts skipped entries and preserves all

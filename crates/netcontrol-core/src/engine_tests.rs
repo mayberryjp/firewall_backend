@@ -4199,6 +4199,139 @@ fn automatic_sando_enablement_and_source_changes_require_firewall_permission() {
 }
 
 #[test]
+fn automatic_sando_hosts_require_authority_commit_once_and_preserve_failed_or_busy_state() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let mut candidate = config();
+    candidate.sando.api_url = "http://sando.example.test".into();
+    candidate.sando.sync_enabled = true;
+    let permissions: Vec<_> = all()
+        .into_iter()
+        .filter(|p| p != "firewall.write")
+        .collect();
+    let body = serde_json::to_vec(&json!({"base_revision":engine.committed_revision(),"confirm_timeout_seconds":30,"config":candidate})).unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "operator",
+                &permissions,
+                &body
+            )
+            .status,
+        403
+    );
+    let initial = submit(&mut engine, candidate.clone());
+    assert_eq!(initial.status, 202);
+    let id = initial.body["id"].as_str().unwrap();
+    for action in ["confirm", "rollback"] {
+        assert_eq!(
+            engine
+                .request(
+                    "POST",
+                    &format!("/api/v1/transactions/{id}/{action}"),
+                    "",
+                    "operator",
+                    &permissions,
+                    &[]
+                )
+                .status,
+            403
+        );
+    }
+    assert_eq!(confirm(&mut engine, id).status, 200);
+    let revision = engine.committed_revision();
+    let host = crate::SandoHost {
+        addresses: vec!["192.0.2.20".parse().unwrap()],
+        host_name: Some("Camera".into()),
+    };
+    let outcome = engine
+        .sync_sando_hosts(&candidate.sando.api_url, std::slice::from_ref(&host))
+        .unwrap();
+    assert_eq!(outcome.added_count, 1);
+    assert!(outcome.changed);
+    assert_eq!(
+        engine.committed_revision(),
+        revision.next(engine.now().date_naive()).unwrap()
+    );
+    assert!(!engine.configuration_busy());
+    let saved = engine.saved_configuration().clone();
+    let committed = engine.committed_revision();
+    assert!(
+        !engine
+            .sync_sando_hosts(&candidate.sando.api_url, &[host])
+            .unwrap()
+            .changed
+    );
+    assert!(
+        !engine
+            .sync_sando_hosts(&candidate.sando.api_url, &[])
+            .unwrap()
+            .changed
+    );
+    assert_eq!(engine.committed_revision(), committed);
+    assert!(
+        engine
+            .sync_sando_hosts("http://other.example.test", &[])
+            .is_err()
+    );
+    let new = crate::SandoHost {
+        addresses: vec!["192.0.2.30".parse().unwrap()],
+        host_name: None,
+    };
+    faults.lock().unwrap().fail_applies = 1;
+    assert!(
+        engine
+            .sync_sando_hosts(&candidate.sando.api_url, std::slice::from_ref(&new))
+            .is_err()
+    );
+    assert_eq!(engine.saved_configuration(), &saved);
+    assert_eq!(engine.committed_revision(), committed);
+    let mut provisional = saved.clone();
+    provisional.interfaces[0].mtu = 1400;
+    let pending = submit(&mut engine, provisional);
+    assert_eq!(pending.status, 202);
+    assert!(
+        engine
+            .sync_sando_hosts(&candidate.sando.api_url, &[new])
+            .is_err()
+    );
+    let pending_id = pending.body["id"].as_str().unwrap().to_owned();
+    drop(engine);
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults))).unwrap();
+    assert_eq!(engine.saved_configuration(), &saved);
+    assert_eq!(
+        request(
+            &mut engine,
+            "POST",
+            &format!("/api/v1/transactions/{pending_id}/rollback"),
+            Value::Null
+        )
+        .status,
+        200
+    );
+    let mut changed = saved.clone();
+    changed.sando.api_url = "http://other.example.test".into();
+    let body = serde_json::to_vec(&json!({"base_revision":engine.committed_revision(),"confirm_timeout_seconds":30,"config":changed})).unwrap();
+    assert_eq!(
+        engine
+            .request(
+                "POST",
+                "/api/v1/transactions",
+                "",
+                "operator",
+                &permissions,
+                &body
+            )
+            .status,
+        403
+    );
+}
+
+#[test]
 fn sando_api_validates_known_fields_instead_of_dropping_invalid_import_state() {
     let fixture = Fixture::new();
     let mut engine = fixture.engine();

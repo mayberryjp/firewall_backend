@@ -4,6 +4,16 @@
 
 ### Added
 
+- Extend backend Sando hosts/scores sync to add new firewall hosts automatically
+  with stable browser-pattern IDs, bounded names and default `drop` policy.
+  Preserve existing inventory/settings; apply additions through durable
+  verification/immediate confirmation and one revision, then trigger independent
+  policy reconciliation. Add host-add/skip/revision status; both sync flags now
+  require firewall delegation. Remove browser acquisition requirements from the
+  frontend contract. Breaking delegation/activation behavior, additive status;
+  next automatic calendar version.
+  [Required frontend coordination 2026-11-25-02](docs/frontend-handoffs/2026-11-25.md#2026-11-25-02-automatic-firewall-hosts-and-server-only-sando).
+
 - Add server-side Sando **Test sync** via bodyless
   `POST /api/v1/sando/policies/preview`: fetch once using the committed URL and
   automatic policy mapper, return a validated full candidate/base revision and

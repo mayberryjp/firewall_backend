@@ -305,7 +305,11 @@ fn authorize(permissions: &[String], before: &Config, after: &Config) -> ApiResu
     let mut a = before.normalized();
     let mut b = after.normalized();
     if a.sando.policy_sync_enabled != b.sando.policy_sync_enabled
-        || ((a.sando.policy_sync_enabled || b.sando.policy_sync_enabled)
+        || a.sando.sync_enabled != b.sando.sync_enabled
+        || ((a.sando.policy_sync_enabled
+            || b.sando.policy_sync_enabled
+            || a.sando.sync_enabled
+            || b.sando.sync_enabled)
             && a.sando.api_url != b.sando.api_url)
     {
         require(permissions, "firewall.write")?;
@@ -1652,32 +1656,74 @@ impl Engine {
         if !outcome.changed {
             return Ok(outcome);
         }
+        self.apply_sando_configuration(
+            config,
+            "system-sando-policy-sync",
+            format!(
+                "Automatic Sando policy sync: {} rules, {} skipped entries",
+                outcome.imported_count, outcome.skipped_count
+            ),
+        )?;
+        Ok(outcome)
+    }
+
+    pub fn sync_sando_hosts(
+        &mut self,
+        source: &str,
+        hosts: &[crate::SandoHost],
+    ) -> Result<crate::SandoHostOutcome> {
+        ensure!(!self.closed, "engine is shut down");
+        ensure!(
+            self.state.desired.sando.sync_enabled && self.state.desired.sando.api_url == source,
+            "Sando host synchronization is disabled or its source changed"
+        );
+        ensure!(
+            !self.configuration_busy(),
+            "configuration is busy; Sando hosts were not added"
+        );
+        let (config, outcome) = crate::sando::host_candidate(&self.state.desired, hosts)?;
+        if outcome.changed {
+            self.apply_sando_configuration(
+                config,
+                "system-sando-host-sync",
+                format!(
+                    "Automatic Sando host sync: {} hosts added, {} skipped",
+                    outcome.added_count, outcome.skipped_count
+                ),
+            )?;
+        }
+        Ok(outcome)
+    }
+
+    fn apply_sando_configuration(
+        &mut self,
+        config: Config,
+        actor: &str,
+        description: String,
+    ) -> Result<()> {
         let transaction = self
             .submit(
-                "system-sando-policy-sync",
+                actor,
                 SubmitRequest {
                     base_revision: self.state.revision,
                     confirm_timeout_seconds: 300,
                     config,
-                    description: format!(
-                        "Automatic Sando policy sync: {} rules, {} skipped entries",
-                        outcome.imported_count, outcome.skipped_count
-                    ),
+                    description,
                 },
                 None,
             )
             .map_err(|error| anyhow::anyhow!(error.error))?;
-        if let Err(error) = self.confirm(&transaction.id, "system-sando-policy-sync") {
+        if let Err(error) = self.confirm(&transaction.id, actor) {
             let recovery = self.rollback(
                 &transaction.id,
-                "automatic Sando policy confirmation failed",
+                "automatic Sando synchronization confirmation failed",
             );
             return Err(match recovery {
                 Ok(()) => anyhow::anyhow!(error.error),
                 Err(recovery) => anyhow::anyhow!("{}; rollback: {recovery:#}", error.error),
             });
         }
-        Ok(outcome)
+        Ok(())
     }
 
     pub fn commit_initial_configuration(&mut self, config: Config) -> Result<Transaction> {

@@ -563,8 +563,9 @@ See the [complete contract](FRONTEND_SPEC.md#discord-first-seen-drop-alerts) and
 
 ## Sando imports
 
-Browser one-time Sando imports are frontend-driven; **Test sync** can instead
-retrieve and map policies server-side without applying them. The backend saves `config.sando`
+Sando acquisition runs entirely in the daemon; **Test sync** retrieves and maps
+policies server-side without applying them. Remove browser host/rule imports.
+The backend saves `config.sando`
 with an API base URL and separate latest confirmed host/rule import
 records, including source, operation/item counts, time and status. Save them
 with reviewed firewall changes through normal confirmed transactions
@@ -572,8 +573,8 @@ with reviewed firewall changes through normal confirmed transactions
 
 Saved firewall/NAT rules expose `origin` (`manual`, `import`, `system`, `inherited`)
 and nullable `import_source`; Sando uses `origin:"import", import_source:"sando"`.
-The frontend must replace only Sando-owned rules, preserve manual rules/other
-imports, and review manual-first ordering within each affected list. The backend
+The daemon replaces only Sando-owned host rules, preserves manual rules/other
+imports and keeps manual-first ordering within each affected list. The backend
 stores/validates labels and tags generated counter rows as system. The optional
 automatic policy worker below replaces only Sando-owned host rules; ordinary
 configuration writes have no special merge guard. Labels do not affect matching or
@@ -586,9 +587,19 @@ host names, icons, classification descriptions and threat scores from Sando's
 `GET /api/localhosts`; it never recalculates scores or imports ignore lists.
 Read the durable, bounded metadata snapshot and last attempt/success/error using
 `GET /api/v1/sando` (`state.read`). Failed refreshes preserve the last successful
-snapshot; disabling cancels polling while retaining cached metadata. Sync does
-not modify firewall hosts, rules, configuration revisions or confirmed import
-reports. Server-to-Sando reachability is required; no credentials, arbitrary
+snapshot; disabling cancels polling while retaining cached metadata. Host sync automatically adds new canonical unicast firewall hosts with stable
+browser-pattern IDs, bounded unique names, policy `drop` and no initial rules.
+Existing hosts, addresses, manual names/policies/rules and unrelated settings
+remain unchanged; missing inventory never deletes hosts. IPv6 additions require
+`ipv6_enabled`; conflicting/ineligible rows are skipped and counted. All valid
+additions use one durable apply/verify/immediate confirmation and configuration
+revision; unchanged/score-only refreshes create none. Busy/apply failures retain
+the prior configuration/cache and retry hourly. Existing host limits apply
+atomically, and legacy forwarding rules must first be removed explicitly.
+New hosts trigger the independently enabled policy worker immediately.
+Metadata remains a separate cache; confirmed browser import reports are untouched.
+Both sync toggles and URL changes while either is enabled require `firewall.write`
+with normal Sando/transaction authority. Server-to-Sando reachability is required; no credentials, arbitrary
 proxy or full device-object storage is added.
 
 Independent `sando.policy_sync_enabled` (default `false`, requires `api_url`)
@@ -621,7 +632,9 @@ the same retrieval/host-rule mapping as automatic policy sync. It requires
 It returns the full proposed `config`, `base_revision`, source URL/ETag,
 imported/skipped counts and `changed`; it never submits a transaction, applies
 rules, enables polling, writes import reports or updates worker status/cache.
-Either sync flag may remain disabled. The frontend stages the candidate in
+Either sync flag may remain disabled for already configured hosts. Test sync
+does not create hosts: enable host sync and await discovery for new hosts.
+The frontend stages the candidate in
 **Save / Commit** for explicit review, normal save/confirmation or discard.
 Existing unsaved drafts must not be overwritten; a revision change during
 retrieval returns `409` and later stale saves use normal conflict handling.
