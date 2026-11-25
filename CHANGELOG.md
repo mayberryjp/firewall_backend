@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+
+- Make nonempty automatic Sando inventory authoritative for missing hosts tagged
+  as backend imports from that source: delete those hosts and all their policies/
+  rules in the same durable confirmed transaction as additions. Persist protected
+  manual/import host provenance; never infer/adopt ownership from old IDs/history.
+  Reject empty/addressless inventories and preserve prior configuration/cache.
+  Retain manual/other-source hosts and fail dangling surviving-host references.
+  Add `removed_hosts` status. Breaking ownership/deletion contract; next automatic
+  calendar version.
+  [Required frontend coordination 2026-11-26-01](docs/frontend-handoffs/2026-11-26.md#2026-11-26-01-authoritative-sando-host-deletion).
+
 ### Added
 
 - Extend backend Sando hosts/scores sync to add new firewall hosts automatically

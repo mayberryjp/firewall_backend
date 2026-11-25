@@ -66,13 +66,20 @@ optional hourly worker fetches host metadata into a separate private `.sando`
 cache next to the state file; `GET /api/v1/sando` reads it under `state.read`.
 The host worker also calls `Engine::sync_sando_hosts` to durably add new
 canonical unicast firewall hosts with stable Sando IDs, policy `drop` and no
-initial rules. Preserve existing hosts/addresses/names/rules and never delete
-missing inventory. All additions use one automatically confirmed transaction/
+initial rules and daemon-owned `origin:"import"` / `sando_source` tags.
+Human-defined hosts are `origin:"manual"` without a source. Nonempty authoritative
+inventory deletes missing same-source imported hosts and all their rules;
+manual hosts and other-source hosts remain untouched. Empty/addressless
+inventory fails explicitly without deletion/cache clearing. Surviving references
+to removed hosts fail candidate validation atomically. Ownership follows saved
+configuration/recovery; clients cannot forge or clear tags on existing hosts.
+No history-based inference, compatibility paths or migrations.
+All additions/removals use one automatically confirmed transaction/
 revision; repeated inventory and metadata-only changes create none. Busy/
 validation/apply failures use normal rollback and explicit errors. Either sync
 flag now delegates firewall changes and requires `firewall.write`, as do URL
 changes while either flag is enabled. Metadata remains separate, and confirmed
-browser import reports are untouched. New hosts trigger policy reconciliation.
+browser import reports are untouched. Host changes trigger policy reconciliation.
 The independent five-minute policy worker conditionally fetches `/api/ignorelist`
 and calls the core's restricted Sando replacement/apply workflow. It maps only
 supported existing-host outbound rules, counts skipped entries and preserves all

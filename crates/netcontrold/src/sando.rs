@@ -299,6 +299,7 @@ struct State {
     syncing: bool,
     next_sync_at: Option<DateTime<Utc>>,
     added_hosts: u32,
+    removed_hosts: u32,
     skipped_firewall_hosts: u32,
     last_changed_revision: Option<netcontrol_core::Version>,
 }
@@ -474,6 +475,11 @@ impl Manager {
         }
         let current_source = state.snapshot.source_url == config.api_url;
         result["added_hosts"] = json!(if current_source { state.added_hosts } else { 0 });
+        result["removed_hosts"] = json!(if current_source {
+            state.removed_hosts
+        } else {
+            0
+        });
         result["skipped_firewall_hosts"] = json!(if current_source {
             state.skipped_firewall_hosts
         } else {
@@ -564,6 +570,7 @@ impl Manager {
         match applied {
             Ok((hosts, skipped, outcome)) => {
                 state.added_hosts = outcome.added_count;
+                state.removed_hosts = outcome.removed_count;
                 state.skipped_firewall_hosts = outcome.skipped_count;
                 if outcome.skipped_count > 0 {
                     tracing::warn!(
@@ -573,7 +580,7 @@ impl Manager {
                 }
                 if outcome.changed {
                     state.last_changed_revision = Some(engine.committed_revision());
-                    tracing::info!(revision = %engine.committed_revision(), added_hosts = outcome.added_count, "Sando hosts automatically committed");
+                    tracing::info!(revision = %engine.committed_revision(), added_hosts = outcome.added_count, removed_hosts = outcome.removed_count, "Sando hosts automatically committed");
                 }
                 next.hosts = hosts;
                 next.skipped_hosts = skipped;
@@ -798,6 +805,7 @@ impl Manager {
                         ..Default::default()
                     };
                     state.added_hosts = 0;
+                    state.removed_hosts = 0;
                     state.skipped_firewall_hosts = 0;
                     state.last_changed_revision = None;
                 }
@@ -1521,6 +1529,57 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn automatic_host_removals_are_reported_and_empty_inventory_retains_state() {
+        let (_directory, manager) = fixture();
+        let source = "http://sando.example.test";
+        configure(&manager, source, true);
+        let inventory = br#"[{"ip_address":"192.0.2.10"},{"ip_address":"192.0.2.20"}]"#;
+        manager.finish(source, project(inventory)).unwrap();
+        let before = manager.engine.lock().unwrap().saved_configuration().clone();
+        let status = manager.status().unwrap();
+        manager.finish(source, project(b"[]")).unwrap();
+        let error = manager.status().unwrap();
+        assert_eq!(error["state"], "error");
+        assert!(error["error"].as_str().unwrap().contains("empty"));
+        assert_eq!(error["last_success_at"], status["last_success_at"]);
+        assert_eq!(error["hosts"], status["hosts"]);
+        assert_eq!(
+            manager.engine.lock().unwrap().saved_configuration(),
+            &before
+        );
+        let revision = manager.engine.lock().unwrap().committed_revision();
+        manager
+            .finish(source, project(br#"[{"ip_address":"192.0.2.20"}]"#))
+            .unwrap();
+        let status = manager.status().unwrap();
+        assert_eq!(status["state"], "succeeded");
+        assert_eq!(status["removed_hosts"], 1);
+        assert_eq!(status["added_hosts"], 0);
+        assert_eq!(status["hosts"].as_array().unwrap().len(), 1);
+        let engine = manager.engine.lock().unwrap();
+        assert_eq!(
+            engine.committed_revision(),
+            revision.next(Utc::now().date_naive()).unwrap()
+        );
+        assert_eq!(
+            status["last_changed_revision"],
+            json!(engine.committed_revision())
+        );
+        assert_eq!(
+            engine
+                .saved_configuration()
+                .firewall
+                .policies
+                .as_ref()
+                .unwrap()
+                .hosts
+                .len(),
+            1
+        );
+        assert!(!engine.configuration_busy());
     }
 
     #[test]

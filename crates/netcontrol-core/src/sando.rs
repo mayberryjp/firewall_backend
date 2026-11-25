@@ -20,6 +20,7 @@ pub struct SandoHost {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SandoHostOutcome {
     pub added_count: u32,
+    pub removed_count: u32,
     pub skipped_count: u32,
     pub changed: bool,
 }
@@ -28,10 +29,34 @@ pub(crate) fn host_candidate(
     config: &Config,
     hosts: &[SandoHost],
 ) -> Result<(Config, SandoHostOutcome)> {
+    validate_url(&config.sando.api_url)?;
+    ensure!(
+        !hosts.is_empty(),
+        "Sando inventory is empty; firewall hosts were retained"
+    );
     ensure!(hosts.len() <= 4096, "Sando exceeds 4096 hosts");
     let mut next = config.clone();
     let mut outcome = SandoHostOutcome::default();
     let mut policies = config.firewall.policies.clone().unwrap_or_default();
+    let mut seen = std::collections::BTreeSet::new();
+    for host in hosts {
+        ensure!(
+            !host.addresses.is_empty(),
+            "Sando inventory host requires an IP address"
+        );
+        for address in &host.addresses {
+            seen.insert(address.to_string());
+        }
+    }
+    policies.hosts.retain(|host| {
+        let remove = host.origin == RuleOrigin::Import
+            && host.sando_source.as_deref() == Some(config.sando.api_url.as_str())
+            && !host.addresses.iter().any(|address| seen.contains(address));
+        if remove {
+            outcome.removed_count += 1;
+        }
+        !remove
+    });
     for host in hosts {
         let addresses: Vec<_> = host
             .addresses
@@ -93,6 +118,8 @@ pub(crate) fn host_candidate(
         }
         policies.hosts.push(FirewallHost {
             metadata: Default::default(),
+            sando_source: Some(config.sando.api_url.clone()),
+            origin: RuleOrigin::Import,
             id,
             name,
             addresses,
@@ -101,13 +128,13 @@ pub(crate) fn host_candidate(
         });
         outcome.added_count += 1;
     }
-    if outcome.added_count > 0 {
+    if outcome.added_count > 0 || outcome.removed_count > 0 {
         ensure!(
             config.firewall.rules.is_empty(),
             "Sando host sync requires host policies; remove legacy forwarding rules through a reviewed transaction"
         );
         next.firewall.policies = Some(policies);
-        next.validate()?;
+        next.validate().map_err(|error| anyhow::anyhow!("Sando host reconciliation candidate is invalid; resolve invalid configuration or references to removed hosts before retrying: {error:#}"))?;
         outcome.changed = true;
     }
     Ok((next, outcome))
@@ -313,7 +340,7 @@ pub enum SandoImportStatus {
     Partial,
 }
 
-fn validate_url(value: &str) -> Result<()> {
+pub(crate) fn validate_url(value: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
             && value.len() <= 2048
@@ -389,6 +416,7 @@ mod tests {
     #[test]
     fn automatic_hosts_use_browser_identity_defaults_and_preserve_existing_hosts() {
         let config: Config = serde_json::from_value(json!({
+            "sando":{"api_url":"http://sando.example.test"},
             "interfaces":[{"name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]}],
             "firewall":{"policies":{"hosts":[
                 {"id":"manual","name":"Camera","addresses":["192.0.2.10"],"policy":"accept","rules":[{"action":"drop"}]}
@@ -428,15 +456,34 @@ mod tests {
         assert_eq!(policies.hosts[1].addresses, ["192.0.2.20"]);
         assert_eq!(policies.hosts[1].policy, "drop");
         assert!(policies.hosts[1].rules.is_empty());
+        assert_eq!(
+            policies.hosts[1].sando_source.as_deref(),
+            Some("http://sando.example.test")
+        );
+        let mut without_source = next.clone();
+        without_source.firewall.policies.as_mut().unwrap().hosts[1].sando_source = None;
+        without_source.firewall.policies.as_mut().unwrap().hosts[1].origin = RuleOrigin::Manual;
+        assert_eq!(
+            next.operational_value().unwrap(),
+            without_source.operational_value().unwrap()
+        );
         assert_eq!(host_candidate(&next, &hosts).unwrap().0, next);
-        assert!(!host_candidate(&next, &[]).unwrap().1.changed);
-        assert_eq!(host_candidate(&next, &[]).unwrap().0, next);
+        assert!(
+            host_candidate(&next, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
     }
 
     #[test]
     fn automatic_hosts_support_dual_stack_names_and_fail_atomic_configuration_limits() {
         let config = Config {
             ipv6_enabled: true,
+            sando: SandoConfig {
+                api_url: "http://sando.example.test".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let host = SandoHost {
@@ -470,6 +517,65 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("legacy forwarding")
+        );
+    }
+
+    #[test]
+    fn automatic_hosts_remove_only_missing_same_source_hosts_and_their_rules() {
+        let config: Config = serde_json::from_value(json!({
+            "sando":{"api_url":"http://sando.example.test"},
+            "ipv6_enabled":true,
+            "firewall":{"policies":{"hosts":[
+                {"id":"gone","origin":"import","sando_source":"http://sando.example.test","name":"Gone","addresses":["192.0.2.10"],"policy":"accept","rules":[{"action":"accept"},{"origin":"import","import_source":"sando","action":"drop"}]},
+                {"id":"present","origin":"import","sando_source":"http://sando.example.test","name":"Present","addresses":["192.0.2.20","2001:db8::20"],"policy":"drop"},
+                {"id":"sando_192_0_2_30","name":"Browser imported","addresses":["192.0.2.30"],"policy":"accept"},
+                {"id":"other","origin":"import","sando_source":"http://other.example.test","name":"Other source","addresses":["192.0.2.40"],"policy":"drop"}
+            ]}}
+        })).unwrap();
+        let hosts = [SandoHost {
+            addresses: vec!["2001:db8::20".parse().unwrap()],
+            host_name: None,
+        }];
+        let (next, outcome) = host_candidate(&config, &hosts).unwrap();
+        assert_eq!((outcome.added_count, outcome.removed_count), (0, 1));
+        assert!(outcome.changed);
+        assert_eq!(
+            next.firewall.policies.as_ref().unwrap().hosts,
+            config.firewall.policies.as_ref().unwrap().hosts[1..]
+        );
+        assert!(!host_candidate(&next, &hosts).unwrap().1.changed);
+        let mut ipv4_only = config.clone();
+        ipv4_only.ipv6_enabled = false;
+        ipv4_only.firewall.policies.as_mut().unwrap().hosts[1].addresses =
+            vec!["192.0.2.20".into()];
+        let dual_snapshot = [SandoHost {
+            addresses: vec![
+                "192.0.2.20".parse().unwrap(),
+                "2001:db8::20".parse().unwrap(),
+            ],
+            host_name: None,
+        }];
+        assert_eq!(
+            host_candidate(&ipv4_only, &dual_snapshot)
+                .unwrap()
+                .1
+                .removed_count,
+            1
+        );
+        assert!(host_candidate(&config, &[]).is_err());
+
+        let mut referenced = config.clone();
+        referenced.firewall.policies.as_mut().unwrap().hosts[2].rules =
+            serde_json::from_value(json!([{"destination_host":"gone","action":"accept"}])).unwrap();
+        assert!(
+            host_candidate(&referenced, &hosts)
+                .unwrap_err()
+                .to_string()
+                .contains("destination_host")
+        );
+        assert_eq!(
+            referenced.firewall.policies.as_ref().unwrap().hosts.len(),
+            4
         );
     }
 

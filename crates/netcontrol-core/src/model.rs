@@ -570,6 +570,10 @@ pub struct FirewallPolicies {
 pub struct FirewallHost {
     #[serde(default, skip_serializing_if = "ObjectMetadata::is_empty")]
     pub metadata: ObjectMetadata,
+    #[serde(default)]
+    pub origin: RuleOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sando_source: Option<String>,
     pub id: String,
     pub name: String,
     pub addresses: Vec<String>,
@@ -1029,6 +1033,19 @@ impl Config {
         value.as_object_mut().unwrap().remove("system");
         value.as_object_mut().unwrap().remove("dynamic_dns");
         value.as_object_mut().unwrap().remove("sando");
+        if let Some(hosts) = value
+            .get_mut("firewall")
+            .and_then(|firewall| firewall.get_mut("policies"))
+            .and_then(|policies| policies.get_mut("hosts"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for host in hosts {
+                if let Some(object) = host.as_object_mut() {
+                    object.remove("sando_source");
+                    object.remove("origin");
+                }
+            }
+        }
         strip(&mut value);
         if let Some(routes) = value["routes"].as_array_mut() {
             routes.retain(|route| route["enabled"] == true);
@@ -2100,6 +2117,13 @@ impl FirewallPolicies {
         let mut addresses = BTreeSet::new();
         let mut names = BTreeSet::new();
         for h in &self.hosts {
+            ensure!(
+                (h.origin == RuleOrigin::Import) == h.sando_source.is_some(),
+                "imported firewall hosts require sando_source; manually defined hosts must not have it"
+            );
+            if let Some(source) = &h.sando_source {
+                crate::sando::validate_url(source)?;
+            }
             ensure!(
                 valid_name(&h.id, 64, false) && hosts.insert(&h.id, h).is_none(),
                 "invalid or duplicate firewall host ID"

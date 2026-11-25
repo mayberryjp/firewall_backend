@@ -1751,6 +1751,8 @@ fn policy_references_ports_expansion_and_family() {
         hosts: vec![
             FirewallHost {
                 metadata: Default::default(),
+                sando_source: None,
+                origin: RuleOrigin::Manual,
                 id: "client".into(),
                 name: "Client".into(),
                 addresses: vec!["192.0.2.10".into()],
@@ -1769,6 +1771,8 @@ fn policy_references_ports_expansion_and_family() {
             },
             FirewallHost {
                 metadata: Default::default(),
+                sando_source: None,
+                origin: RuleOrigin::Manual,
                 id: "server".into(),
                 name: "Server".into(),
                 addresses: vec!["198.51.100.10".into()],
@@ -1902,6 +1906,8 @@ fn policy_expansion_accepts_exact_limit_and_rejects_one_extra() {
     for i in 0..2 {
         let mut h = FirewallHost {
             metadata: Default::default(),
+            sando_source: None,
+            origin: RuleOrigin::Manual,
             id: format!("host{i}"),
             name: format!("Host {i}"),
             addresses: vec![format!("192.0.2.{}", i + 1)],

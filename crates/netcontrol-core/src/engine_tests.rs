@@ -4267,10 +4267,9 @@ fn automatic_sando_hosts_require_authority_commit_once_and_preserve_failed_or_bu
             .changed
     );
     assert!(
-        !engine
+        engine
             .sync_sando_hosts(&candidate.sando.api_url, &[])
-            .unwrap()
-            .changed
+            .is_err()
     );
     assert_eq!(engine.committed_revision(), committed);
     assert!(
@@ -4329,6 +4328,104 @@ fn automatic_sando_hosts_require_authority_commit_once_and_preserve_failed_or_bu
             .status,
         403
     );
+}
+
+#[test]
+fn automatic_sando_host_deletion_is_owned_atomic_and_durable() {
+    let fixture = Fixture::new();
+    let faults = Arc::new(Mutex::new(Faults::default()));
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    let source = "http://sando.example.test";
+    let mut candidate = config();
+    candidate.sando.api_url = source.into();
+    candidate.sando.sync_enabled = true;
+    let reply = submit(&mut engine, candidate);
+    assert_eq!(reply.status, 202);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let hosts: Vec<_> = ["192.0.2.20", "192.0.2.30"]
+        .iter()
+        .map(|address| crate::SandoHost {
+            addresses: vec![address.parse().unwrap()],
+            host_name: None,
+        })
+        .collect();
+    engine.sync_sando_hosts(source, &hosts).unwrap();
+    let mut candidate = engine.saved_configuration().clone();
+    candidate.firewall.policies.as_mut().unwrap().hosts[0].rules = serde_json::from_value(
+        json!([{"action":"accept"},{"origin":"import","import_source":"sando","action":"drop"}]),
+    )
+    .unwrap();
+    let reply = submit(&mut engine, candidate.clone());
+    assert_eq!(reply.status, 202);
+    assert_eq!(
+        confirm(&mut engine, reply.body["id"].as_str().unwrap()).status,
+        200
+    );
+    let saved = engine.saved_configuration().clone();
+    let revision = engine.committed_revision();
+    for forged in [None, Some("http://other.example.test".into())] {
+        let mut candidate = saved.clone();
+        candidate.firewall.policies.as_mut().unwrap().hosts[0].sando_source = forged;
+        let reply = submit(&mut engine, candidate);
+        assert_eq!(reply.status, 422, "{}", reply.body);
+        assert!(
+            reply.body["error"]
+                .as_str()
+                .unwrap()
+                .contains("daemon-managed")
+        );
+    }
+    faults.lock().unwrap().fail_applies = 1;
+    assert!(engine.sync_sando_hosts(source, &hosts[1..]).is_err());
+    assert_eq!(engine.saved_configuration(), &saved);
+    assert_eq!(engine.committed_revision(), revision);
+    assert!(engine.sync_sando_hosts(source, &[]).is_err());
+    drop(engine);
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults.clone()))).unwrap();
+    assert_eq!(engine.saved_configuration(), &saved);
+    let outcome = engine.sync_sando_hosts(source, &hosts[1..]).unwrap();
+    assert_eq!((outcome.added_count, outcome.removed_count), (0, 1));
+    assert!(!engine.configuration_busy());
+    assert_eq!(
+        engine.committed_revision(),
+        revision.next(engine.now().date_naive()).unwrap()
+    );
+    assert_eq!(
+        engine
+            .saved_configuration()
+            .firewall
+            .policies
+            .as_ref()
+            .unwrap()
+            .hosts
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .saved_configuration()
+            .firewall
+            .policies
+            .as_ref()
+            .unwrap()
+            .hosts[0]
+            .id,
+        "sando_192_0_2_30"
+    );
+    let committed = engine.committed_revision();
+    drop(engine);
+    let mut engine = Engine::open(&fixture.path(), Box::new(FaultBackend(faults))).unwrap();
+    assert_eq!(engine.committed_revision(), committed);
+    assert!(
+        !engine
+            .sync_sando_hosts(source, &hosts[1..])
+            .unwrap()
+            .changed
+    );
+    assert_eq!(engine.committed_revision(), committed);
 }
 
 #[test]

@@ -1287,6 +1287,28 @@ impl Engine {
                     "software metadata is daemon-managed; omit it or submit the current value",
                 ));
             }
+            let saved_hosts = self
+                .state
+                .desired
+                .firewall
+                .policies
+                .as_ref()
+                .map(|policies| &policies.hosts);
+            if r.config.firewall.policies.as_ref().is_some_and(|policies| {
+                policies.hosts.iter().any(|host| {
+                    let existing = saved_hosts
+                        .and_then(|hosts| hosts.iter().find(|saved| saved.id == host.id));
+                    host.sando_source.as_ref()
+                        != existing.and_then(|saved| saved.sando_source.as_ref())
+                        || host.origin
+                            != existing.map_or(crate::RuleOrigin::Manual, |saved| saved.origin)
+                })
+            }) {
+                return Err(ApiError::new(
+                    422,
+                    "firewall host origin and sando_source are daemon-managed; preserve current values for existing hosts and use manual origin without sando_source for new hosts",
+                ));
+            }
             authorize(permissions, &self.state.desired, &r.config)?;
             let t = self.submit(actor, r, None)?;
             let mut reply_body = value(&t)?;
@@ -1687,8 +1709,8 @@ impl Engine {
                 config,
                 "system-sando-host-sync",
                 format!(
-                    "Automatic Sando host sync: {} hosts added, {} skipped",
-                    outcome.added_count, outcome.skipped_count
+                    "Automatic Sando host sync: {} hosts added, {} removed, {} skipped",
+                    outcome.added_count, outcome.removed_count, outcome.skipped_count
                 ),
             )?;
         }

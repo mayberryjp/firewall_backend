@@ -595,13 +595,21 @@ Read the durable, bounded metadata snapshot and last attempt/success/error using
 snapshot; disabling cancels polling while retaining cached metadata. Host sync automatically adds new canonical unicast firewall hosts with stable
 browser-pattern IDs, bounded unique names, policy `drop` and no initial rules.
 Existing hosts, addresses, manual names/policies/rules and unrelated settings
-remain unchanged; missing inventory never deletes hosts. IPv6 additions require
+remain unchanged while present. New automatic hosts carry `origin:"import"`
+and a daemon-managed `sando_source` URL; human-defined hosts carry `origin:"manual"`.
+Successful nonempty inventory removes missing same-source imported hosts and
+all their rules, including manual rules on those hosts. Empty/addressless inventory
+is an explicit error and never deletes hosts or clears the last successful cache.
+Manual/unmarked hosts and hosts from another source are never inferred or adopted.
+References from surviving hosts/interface policies block reconciliation explicitly
+until resolved. No commit-history reconstruction or ownership migration is performed.
+IPv6 additions require
 `ipv6_enabled`; conflicting/ineligible rows are skipped and counted. All valid
-additions use one durable apply/verify/immediate confirmation and configuration
+additions/removals use one durable apply/verify/immediate confirmation and configuration
 revision; unchanged/score-only refreshes create none. Busy/apply failures retain
 the prior configuration/cache and retry hourly. Existing host limits apply
 atomically, and legacy forwarding rules must first be removed explicitly.
-New hosts trigger the independently enabled policy worker immediately.
+Host changes trigger the independently enabled policy worker immediately.
 Metadata remains a separate cache; confirmed browser import reports are untouched.
 Both sync toggles and URL changes while either is enabled require `firewall.write`
 with normal Sando/transaction authority. Server-to-Sando reachability is required; no credentials, arbitrary

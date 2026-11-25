@@ -5370,8 +5370,8 @@ changes invalidate the validator so upstream `304` cannot hide local edits.
 The existing private host metadata cache is unchanged.
 
 `GET /api/v1/sando` keeps its existing API-key/`state.read`, no query/body,
-`200`/`no-store` and error behavior. Top-level fields still describe **metadata
-sync only**. New always-present `policies` describes automatic policy sync:
+`200`/`no-store` and error behavior. Top-level fields describe **host reconciliation
+and metadata sync**. Always-present `policies` describes automatic policy sync:
 
 ```json
 {
@@ -5435,17 +5435,44 @@ and the serialized private cache to 1 MiB. Cache writes are atomic, owner-only
 and durable at `<--state path>.sando`; corrupt/unsafe existing caches fail startup
 explicitly. Metadata remains outside configuration; host additions are revisioned
 firewall configuration. Existing confirmed import counters do not change.
-Empty inventory only clears this cache, never firewall configuration;
-upstream may return empty arrays on database errors, so do not infer deletions.
+Empty inventory (including inventory with no usable IP-bearing metadata rows)
+is an explicit sync error: retain the previous successful metadata/cache and
+firewall configuration. Upstream may return empty arrays on database errors;
+never treat those as authorization to delete every host.
 
 Automatic host mapping and application:
 
 - Match canonical unicast addresses to existing configured hosts. Never rename,
-  delete, change policy/rules, or add addresses to an existing host. Inventory
-  disappears/source changes do not remove configured hosts. Cross-host overlaps
+  change policy/rules, or add addresses to a surviving host. Cross-host overlaps
   or rows proposing additional addresses on an existing host are skipped/countable.
   A manually removed host still present upstream can be added again next sync;
   disable host sync to prevent rediscovery.
+- New automatically created firewall hosts have `origin:"import"` and
+  `sando_source` equal to the committed `sando.api_url` at creation. Human-defined
+  hosts have `origin:"manual"` (default for new manual input), with absent/null
+  `sando_source`. Serialized host configurations always include `origin`;
+  `sando_source` is omitted when null. Source is an absolute HTTP(S) base URL with
+  the same 1..2048-byte restrictions as `sando.api_url`. Import requires a source;
+  manual excludes it. These fields are persisted configuration provenance, not
+  native operational settings or editable ownership controls.
+- On each successful **nonempty** inventory, remove a host only when its
+  `origin` is `import`, its `sando_source` exactly matches the current committed
+  URL, and none of its saved addresses appear anywhere in the validated snapshot.
+  Presence checks include both IP families even when IPv6 additions are disabled.
+  Remove the host, its default policy and **all its rules**, including manually
+  added rules on that imported host. Manual/unmarked and other-source hosts are
+  retained. Do not infer ownership from IDs, names or transaction history; no
+  tagging migration/adoption or compatibility path is provided.
+- Existing full-config clients must preserve `origin` and `sando_source` for
+  every retained host. `POST /api/v1/transactions` rejects forged/changed/cleared
+  ownership with `422`; new manually submitted hosts must use manual origin
+  without a source. Explicit manual deletion remains authorized normally.
+  Revision restore uses the saved provenance; normal confirmation/rollback apply.
+- Rules on surviving hosts or interface/input policies that reference a removed
+  host are not silently deleted or rewritten. Candidate validation fails the
+  entire reconciliation with an explicit sync error until an operator resolves
+  those references. Fetch/JSON/duplicate-address/empty/busy/validation/apply
+  errors never turn into deletion or a success-shaped empty inventory.
 - New hosts use all supported addresses from their row: canonical unicast IPv4
   and, only when `ipv6_enabled`, IPv6. Ignore unusable/disabled-family addresses;
   skip rows with none usable. Do not interpret MAC-only records as hosts.
@@ -5456,14 +5483,15 @@ Automatic host mapping and application:
 - New host default policy is `drop`, with no initial host rules or raw Sando
   device fields. Ordinary configured global ICMP exceptions and ingress-before-
   host precedence still apply; discovery is not a new isolation guarantee.
-- Apply all additions in one durable transaction as `system-sando-host-sync`,
+- Apply all additions and removals in one durable transaction as `system-sando-host-sync`,
   verify and immediately confirm, advancing configuration revision once.
-  Repeated inventory, score/name-only changes and empty inventory create no revision.
+  Repeated inventory and score/name-only changes create no revision; empty inventory
+  errors create none.
   Normal busy/drift/recovery/upgrade guards and rollback apply. A valid mapped
   candidate exceeding 128 hosts or other configuration limits fails atomically;
   no arbitrary truncation or partial activation. Legacy forwarding rules must
   be explicitly removed through a reviewed transaction before host creation.
-- Successful host additions notify the independent policy worker, invalidating
+- Successful host additions/removals notify the independent policy worker, invalidating
   its validator and triggering immediate reconciliation for new hosts. Enable
   both flags for complete unattended hosts/scores/policies. Host-only sync does
   not import policies, and policy-only sync still requires configured hosts.
@@ -5491,6 +5519,7 @@ trigger HTTP acquisition. Synthetic successful response:
   "error": null,
   "skipped_hosts": 0,
   "added_hosts": 1,
+  "removed_hosts": 0,
   "skipped_firewall_hosts": 0,
   "last_changed_revision": "2026.11.25.2",
   "hosts": [{
@@ -5518,12 +5547,13 @@ trigger HTTP acquisition. Synthetic successful response:
   are omitted and counted in integer `skipped_hosts`. Invalid non-MAC IP strings
   reject the snapshot. Match metadata by exact address, never by display name;
   metadata includes rows that may be ineligible for firewall creation; see mapping above.
-- `added_hosts` and `skipped_firewall_hosts`: non-null integer counts for the
+- `added_hosts`, `removed_hosts` and `skipped_firewall_hosts`: non-null integer counts for the
   latest successful host reconciliation in this daemon session, zero initially.
-  Existing unchanged hosts are not additions/skips. Cache-only `skipped_hosts`
+  Removed hosts include their policies/rules; counts are hosts, not rule counts.
+  Existing unchanged hosts are not additions/removals/skips. Cache-only `skipped_hosts`
   remains the omitted upstream-row count; do not combine these as a host census.
 - `last_changed_revision`: nullable canonical configuration revision of the
-  latest automatic host addition in this daemon session, null before additions/
+  latest automatic host addition/removal in this daemon session, null before changes/
   after restart. Counts/revision are runtime-only, source-scoped and can remain
   visible while disabled or after an error. Read configured hosts/revisions from
   normal configuration APIs, not from the metadata cache.
@@ -8765,6 +8795,8 @@ interface InputFirewall {
 }
 
 interface FirewallHost {
+  origin: "manual" | "import";
+  sando_source?: string | null;
   id: string;
   name: string;
   addresses: string[];
