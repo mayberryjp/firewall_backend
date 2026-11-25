@@ -41,6 +41,12 @@
 
 ### Fixed
 
+- Remove the startup integration tests' bind/drop/rebind port race: use
+  daemon-owned ephemeral HTTP/SSH ports and bounded listener-readiness events,
+  while preserving HTTP, SSH identity, watchdog and failed-startup assertions.
+  Report the actual bound HTTP address in startup diagnostics. No HTTP,
+  authentication or configuration contract changes.
+
 - Align server-side Sando rule mapping with browser explicit wildcard
   destinations/ports and portless ICMP handling. Deduplicate against retained
   rules, keep manual rules first and preserve unchanged permit order to avoid

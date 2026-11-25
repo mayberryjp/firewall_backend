@@ -615,7 +615,8 @@ async fn run(options: Options) -> Result<()> {
     let readiness_watchdog = watchdog.clone();
     let readiness_handle = handle.clone();
     let readiness = tokio::spawn(async move {
-        if readiness_handle.listening().await.is_some() {
+        if let Some(address) = readiness_handle.listening().await {
+            tracing::info!(%address, "HTTP listener enabled");
             if let Err(error) = readiness_watchdog.ready() {
                 tracing::warn!(%error, "systemd readiness notification failed");
             }

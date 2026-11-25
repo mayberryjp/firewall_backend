@@ -68,6 +68,11 @@ view and host journal. Existing history is not rewritten. Routine HTTP completio
 events are not emitted. Named process/worker lifecycle, retry and destination
 recovery events provide troubleshooting context without request/packet logging.
 
+Startup diagnostics report the actual bound HTTP address in the
+`HTTP listener enabled` event's `address` field, after listener readiness.
+Enabled SSH reports its bound address in `configuration SSH listener enabled`.
+These include OS-assigned ports when a listener is configured with port zero.
+
 The performance stream is always available in native mode, without the
 host-services opt-in. Existing collectors record newly observed qdisc drops,
 separate interface RX/TX errors and drops, RX frame/length errors,

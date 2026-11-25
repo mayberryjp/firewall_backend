@@ -1,40 +1,94 @@
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
+    sync::mpsc::{self, Receiver},
     thread,
     time::{Duration, Instant},
 };
 
-struct Daemon(Child);
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        if self.0.try_wait().unwrap().is_none() {
-            self.0.kill().unwrap();
+struct Daemon {
+    child: Child,
+    output: Receiver<String>,
+    reader: Option<thread::JoinHandle<()>>,
+    diagnostics: Vec<String>,
+}
+
+impl Daemon {
+    fn new(mut child: Child) -> Self {
+        let stderr = child.stderr.take().unwrap();
+        let (sender, output) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                sender.send(line.unwrap()).unwrap();
+            }
+        });
+        Self {
+            child,
+            output,
+            reader: Some(reader),
+            diagnostics: Vec::new(),
         }
-        self.0.wait().unwrap();
+    }
+
+    fn listeners(&mut self, messages: &[&str]) -> Vec<SocketAddr> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut addresses = vec![None; messages.len()];
+        while addresses.iter().any(Option::is_none) {
+            let line = match self
+                .output
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) => line,
+                Err(error) => panic!(
+                    "daemon did not report bound listeners: {error}: {}",
+                    self.diagnostics.join("\n")
+                ),
+            };
+            self.diagnostics.push(line.clone());
+            if !line.starts_with('{') {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            for (index, message) in messages.iter().enumerate() {
+                if event["fields"]["message"] == *message {
+                    let address: SocketAddr = event["fields"]["address"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    assert!(address.ip().is_loopback() && address.port() != 0, "{event}");
+                    addresses[index] = Some(address);
+                }
+            }
+        }
+        addresses.into_iter().map(Option::unwrap).collect()
+    }
+
+    fn error_output(&mut self) -> String {
+        self.reader.take().unwrap().join().unwrap();
+        self.diagnostics.extend(self.output.try_iter());
+        self.diagnostics.join("\n")
     }
 }
 
-fn available() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().unwrap().is_none() {
+            self.child.kill().unwrap();
+        }
+        self.child.wait().unwrap();
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
+    }
 }
 
 fn connect(child: &mut Daemon, address: SocketAddr) -> TcpStream {
     let start = Instant::now();
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            let mut error = String::new();
-            child
-                .0
-                .stderr
-                .as_mut()
-                .unwrap()
-                .read_to_string(&mut error)
-                .unwrap();
+        if let Some(status) = child.child.try_wait().unwrap() {
+            let error = child.error_output();
             panic!("daemon exited before readiness: {status}: {error}");
         }
         if let Ok(stream) = TcpStream::connect(address) {
@@ -60,8 +114,7 @@ fn actual_daemon_notifies_readiness_progress_and_stopping() {
     receiver
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    let http = available();
-    let mut child = Daemon(
+    let mut child = Daemon::new(
         Command::new(env!("CARGO_BIN_EXE_netcontrold"))
             .arg("--disable-release-checks")
             .env_remove("NETCONTROL_UPGRADE_CONFIG")
@@ -69,7 +122,7 @@ fn actual_daemon_notifies_readiness_progress_and_stopping() {
             .env("WATCHDOG_USEC", "1000000")
             .env_remove("WATCHDOG_PID")
             .env_remove("NETCONTROL_SSH_LISTEN")
-            .args(["--listen", &http.to_string()])
+            .args(["--listen", "127.0.0.1:0"])
             .arg("--state")
             .arg(directory.path().join("state.json"))
             .arg("--credential-db")
@@ -82,10 +135,14 @@ fn actual_daemon_notifies_readiness_progress_and_stopping() {
     let mut buffer = [0; 256];
     let count = receiver.recv(&mut buffer).unwrap();
     assert!(buffer[..count].starts_with(b"READY=1\n"));
+    let http = child.listeners(&["HTTP listener enabled"])[0];
     let _stream = connect(&mut child, http);
     let count = receiver.recv(&mut buffer).unwrap();
     assert_eq!(&buffer[..count], b"WATCHDOG=1");
-    assert_eq!(unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(
+        unsafe { libc::kill(child.child.id() as i32, libc::SIGTERM) },
+        0
+    );
     loop {
         let count = receiver.recv(&mut buffer).unwrap();
         if &buffer[..count] == b"STOPPING=1" {
@@ -94,7 +151,7 @@ fn actual_daemon_notifies_readiness_progress_and_stopping() {
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
+        if let Some(status) = child.child.try_wait().unwrap() {
             assert!(status.success(), "{status}");
             break;
         }
@@ -111,13 +168,6 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
     let key = directory.path().join("host.ssh-key");
     let mut public_identity = None;
     for explicit_listener in [false, true] {
-        let http = available();
-        let ssh = loop {
-            let address = available();
-            if address != http {
-                break address;
-            }
-        };
         let mut command = Command::new(env!("CARGO_BIN_EXE_netcontrold"));
         command
             .arg("--disable-release-checks")
@@ -129,14 +179,14 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
                 if explicit_listener {
                     "invalid-listener".to_string()
                 } else {
-                    ssh.to_string()
+                    "127.0.0.1:0".to_owned()
                 },
             )
-            .args(["--listen", &http.to_string()]);
+            .args(["--listen", "127.0.0.1:0"]);
         if explicit_listener {
-            command.args(["--ssh-listen", &ssh.to_string()]);
+            command.args(["--ssh-listen", "127.0.0.1:0"]);
         }
-        let mut child = Daemon(
+        let mut child = Daemon::new(
             command
                 .arg("--state")
                 .arg(&state)
@@ -149,6 +199,12 @@ fn actual_daemon_exposes_http_and_custom_ssh_and_reuses_host_identity() {
                 .spawn()
                 .unwrap(),
         );
+        let addresses = child.listeners(&[
+            "HTTP listener enabled",
+            "configuration SSH listener enabled",
+        ]);
+        let (http, ssh) = (addresses[0], addresses[1]);
+        assert_ne!(http, ssh);
         let mut stream = connect(&mut child, http);
         stream
             .write_all(b"GET /auth/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -297,15 +353,14 @@ fn http_bind_failure_stops_custom_ssh_and_exits_without_hanging() {
     let directory = tempfile::tempdir().unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let http = occupied.local_addr().unwrap();
-    let ssh = available();
-    let mut child = Daemon(
+    let mut child = Daemon::new(
         Command::new(env!("CARGO_BIN_EXE_netcontrold"))
             .args([
                 "--disable-release-checks",
                 "--listen",
                 &http.to_string(),
                 "--ssh-listen",
-                &ssh.to_string(),
+                "127.0.0.1:0",
             ])
             .arg("--state")
             .arg(directory.path().join("state.json"))
@@ -316,17 +371,11 @@ fn http_bind_failure_stops_custom_ssh_and_exits_without_hanging() {
             .spawn()
             .unwrap(),
     );
+    let ssh = child.listeners(&["configuration SSH listener enabled"])[0];
     let start = Instant::now();
     loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            let mut error = String::new();
-            child
-                .0
-                .stderr
-                .as_mut()
-                .unwrap()
-                .read_to_string(&mut error)
-                .unwrap();
+        if let Some(status) = child.child.try_wait().unwrap() {
+            let error = child.error_output();
             assert!(!status.success());
             assert!(error.contains("HTTP listener failed"), "{error}");
             assert!(
@@ -368,8 +417,7 @@ fn default_release_discovery_and_manual_check_work_without_installation_configur
     let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
     proxy.set_nonblocking(true).unwrap();
     let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
-    let http = available();
-    let mut child = Daemon(
+    let mut child = Daemon::new(
         Command::new(env!("CARGO_BIN_EXE_netcontrold"))
             .env_remove("NETCONTROL_UPGRADE_CONFIG")
             .env_remove("NETCONTROL_SSH_LISTEN")
@@ -379,7 +427,7 @@ fn default_release_discovery_and_manual_check_work_without_installation_configur
             .env("https_proxy", &proxy_url)
             .env("NO_PROXY", "")
             .env("no_proxy", "")
-            .args(["--listen", &http.to_string()])
+            .args(["--listen", "127.0.0.1:0"])
             .arg("--state")
             .arg(directory.path().join("state.json"))
             .arg("--auth-file")
@@ -389,6 +437,7 @@ fn default_release_discovery_and_manual_check_work_without_installation_configur
             .spawn()
             .unwrap(),
     );
+    let http = child.listeners(&["HTTP listener enabled"])[0];
     let request = |child: &mut Daemon, method: &str, path: &str| {
         let mut stream = connect(child, http);
         write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
