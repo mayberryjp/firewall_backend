@@ -785,6 +785,63 @@ fn api(
             }
         };
     }
+    if matches!(
+        path,
+        "/api/v1/sando/hosts/sync" | "/api/v1/sando/policies/sync"
+    ) {
+        for permission in [
+            "state.read",
+            "sando.write",
+            "firewall.write",
+            "transactions.write",
+        ] {
+            if !credential.permissions.iter().any(|p| p == permission) {
+                return fail(403, &format!("missing permission: {permission}"), true);
+            }
+        }
+        if method != "POST" {
+            return fail(405, "Sando force sync requires POST", true);
+        }
+        if !query.is_empty() || !body.is_empty() {
+            return fail(400, "Sando force sync accepts no query or body", true);
+        }
+        let Some(manager) = &app.sando else {
+            return fail(503, "Sando sync is not configured", true);
+        };
+        if let Err(error) = app.refresh_upgrade_gate() {
+            tracing::error!(%error, "Sando force sync could not refresh upgrade state");
+            return fail(503, "upgrade state unavailable", true);
+        }
+        {
+            let Ok(engine) = app.engine.lock() else {
+                return fail(503, "engine unavailable", true);
+            };
+            if engine.configuration_busy() {
+                return fail(409, "configuration is busy; retry Sando sync", true);
+            }
+            if engine.saved_configuration().sando.api_url.is_empty() {
+                return fail(422, "save a Sando api_url before forcing sync", true);
+            }
+        }
+        let Ok(slot) = manager.try_sync_slot() else {
+            return fail(
+                409,
+                "Sando sync already running; retry after it finishes",
+                true,
+            );
+        };
+        return match tokio::runtime::Handle::current().block_on(manager.force_sync(
+            path == "/api/v1/sando/policies/sync",
+            &credential.name,
+            slot,
+        )) {
+            Ok(status) => response(200, status),
+            Err(error) => {
+                tracing::warn!(%error, "Sando force sync failed");
+                fail(503, &format!("Sando force sync failed: {error:#}"), true)
+            }
+        };
+    }
     if path == "/api/v1/sando" {
         if !credential.permissions.iter().any(|p| p == "state.read") {
             return fail(403, "insufficient Sando read permission", true);

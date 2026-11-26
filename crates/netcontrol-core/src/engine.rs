@@ -1664,9 +1664,28 @@ impl Engine {
         source: &str,
         entries: &[Value],
     ) -> Result<crate::SandoPolicyOutcome> {
+        self.apply_sando_policies(source, entries, None)
+    }
+
+    pub fn force_sando_policies(
+        &mut self,
+        source: &str,
+        entries: &[Value],
+        actor: &str,
+    ) -> Result<crate::SandoPolicyOutcome> {
+        self.apply_sando_policies(source, entries, Some(actor))
+    }
+
+    fn apply_sando_policies(
+        &mut self,
+        source: &str,
+        entries: &[Value],
+        actor: Option<&str>,
+    ) -> Result<crate::SandoPolicyOutcome> {
         ensure!(!self.closed, "engine is shut down");
         ensure!(
-            self.state.desired.sando.policy_sync_enabled
+            (actor.is_some() || self.state.desired.sando.policy_sync_enabled)
+                && !source.is_empty()
                 && self.state.desired.sando.api_url == source,
             "Sando policy synchronization is disabled or its source changed"
         );
@@ -1680,10 +1699,16 @@ impl Engine {
         }
         self.apply_sando_configuration(
             config,
-            "system-sando-policy-sync",
+            actor.unwrap_or("system-sando-policy-sync"),
             format!(
-                "Automatic Sando policy sync: {} rules, {} skipped entries",
-                outcome.imported_count, outcome.skipped_count
+                "{} Sando policy sync: {} rules, {} skipped entries",
+                if actor.is_some() {
+                    "Forced"
+                } else {
+                    "Automatic"
+                },
+                outcome.imported_count,
+                outcome.skipped_count
             ),
         )?;
         Ok(outcome)
@@ -1694,9 +1719,29 @@ impl Engine {
         source: &str,
         hosts: &[crate::SandoHost],
     ) -> Result<crate::SandoHostOutcome> {
+        self.apply_sando_hosts(source, hosts, None)
+    }
+
+    pub fn force_sando_hosts(
+        &mut self,
+        source: &str,
+        hosts: &[crate::SandoHost],
+        actor: &str,
+    ) -> Result<crate::SandoHostOutcome> {
+        self.apply_sando_hosts(source, hosts, Some(actor))
+    }
+
+    fn apply_sando_hosts(
+        &mut self,
+        source: &str,
+        hosts: &[crate::SandoHost],
+        actor: Option<&str>,
+    ) -> Result<crate::SandoHostOutcome> {
         ensure!(!self.closed, "engine is shut down");
         ensure!(
-            self.state.desired.sando.sync_enabled && self.state.desired.sando.api_url == source,
+            (actor.is_some() || self.state.desired.sando.sync_enabled)
+                && !source.is_empty()
+                && self.state.desired.sando.api_url == source,
             "Sando host synchronization is disabled or its source changed"
         );
         ensure!(
@@ -1707,10 +1752,17 @@ impl Engine {
         if outcome.changed {
             self.apply_sando_configuration(
                 config,
-                "system-sando-host-sync",
+                actor.unwrap_or("system-sando-host-sync"),
                 format!(
-                    "Automatic Sando host sync: {} hosts added, {} removed, {} skipped",
-                    outcome.added_count, outcome.removed_count, outcome.skipped_count
+                    "{} Sando host sync: {} hosts added, {} removed, {} skipped",
+                    if actor.is_some() {
+                        "Forced"
+                    } else {
+                        "Automatic"
+                    },
+                    outcome.added_count,
+                    outcome.removed_count,
+                    outcome.skipped_count
                 ),
             )?;
         }

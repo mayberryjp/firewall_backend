@@ -568,8 +568,9 @@ See the [complete contract](FRONTEND_SPEC.md#discord-first-seen-drop-alerts) and
 
 ## Sando imports
 
-Sando acquisition runs entirely in the daemon; **Test sync** retrieves and maps
-policies server-side without applying them. Remove browser host/rule imports.
+Sando acquisition runs entirely in the daemon. Keep separate server-side
+**Force host sync** and **Force policy sync** actions; remove Test sync and
+browser host/rule imports. The policy preview API remains available to API clients.
 The backend saves `config.sando`
 with an API base URL and separate latest confirmed host/rule import
 records, including source, operation/item counts, time and status. Save them
@@ -639,6 +640,18 @@ survives restart; policy status/ETag are in memory and startup fetches unconditi
 One-time import reports remain untouched. Host/score sync need not be enabled.
 See the [automatic policy contract](FRONTEND_SPEC.md#automatic-policy-synchronization).
 
+**Force host sync** and **Force policy sync** call bodyless
+`POST /api/v1/sando/hosts/sync` and `POST /api/v1/sando/policies/sync`.
+Both use the saved endpoint and require `state.read`, `sando.write`,
+`firewall.write` and `transactions.write`. They perform one-time server-side
+acquisition and durable immediate confirmation, even with automation disabled,
+without changing either sync flag or browser import reports. Policies fetch
+unconditionally, ignoring the cached ETag. Success returns `200` with the full
+Sando status and updated success timestamps. Failures preserve prior successes
+and report an error; concurrent syncs and busy configuration are rejected.
+The frontend retains both force buttons, but not browser imports or Test sync.
+See [manual force sync](FRONTEND_SPEC.md#manual-server-side-force-sync).
+
 Bodyless `POST /api/v1/sando/policies/preview` uses the committed Sando URL and
 the same retrieval/host-rule mapping as automatic policy sync. It requires
 `state.read`, `sando.write` and `firewall.write`, but not `transactions.write`.
@@ -647,7 +660,7 @@ imported/skipped counts and `changed`; it never submits a transaction, applies
 rules, enables polling, writes import reports or updates worker status/cache.
 Either sync flag may remain disabled for already configured hosts. Test sync
 does not create hosts: enable host sync and await discovery for new hosts.
-The frontend stages the candidate in
+An API client can stage the candidate in
 **Save / Commit** for explicit review, normal save/confirmation or discard.
 Existing unsaved drafts must not be overwritten; a revision change during
 retrieval returns `409` and later stale saves use normal conflict handling.

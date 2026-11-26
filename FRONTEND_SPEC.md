@@ -573,7 +573,7 @@ routes, not backend endpoints.
 | `/transactions/:id` | Transaction details and lifecycle actions |
 | `/history` | Committed revision history |
 | `/history/:revision` | Historical configuration, comparison, restore |
-| `/settings/sando` | Sando base URL, independent hourly metadata/five-minute automatic policy sync, Test sync staged preview and one-time imports |
+| `/settings/sando` | Sando base URL, independent automatic host/policy sync, separate server-side force-sync actions and success timestamps |
 
 Deep links must work after browser refresh. Unknown browser routes show an
 application 404, not an empty page. Encode resource names/IDs in URLs.
@@ -5057,7 +5057,8 @@ isolated native tests.
 Provide **Settings > Sando** at browser route `/settings/sando` with an API
 base-URL form, **Sync hosts and scores** (`sync_enabled`) and separate
 **Automatically sync policies** (`policy_sync_enabled`) toggles, independent
-host/metadata and policy status, and server-side **Test sync**. Remove browser
+host/metadata and policy status, and separate **Force host sync** and
+**Force policy sync** buttons. Remove **Test sync** and browser
 **Import hosts** / **Import rules** acquisition and mapping: the daemon owns
 host discovery, metadata/threat scores and policy acquisition. Hourly host sync
 adds new firewall hosts with default policy `drop` through durable automatically
@@ -5141,8 +5142,9 @@ Enabling delegates unattended host additions or policy replacements. Deploying
 this contract also changes existing enabled host-sync settings: disable them
 before deployment if automatic `drop`-default host additions are not intended.
 
-`GET /api/v1/sando` supplies daemon sync status/cache as specified below; there
-is no one-time import or sync-write endpoint. Existing transaction success
+`GET /api/v1/sando` supplies daemon sync status/cache as specified below.
+The manual force-sync endpoints below apply one-time server-side synchronization;
+there is no browser acquisition. Existing transaction success
 statuses remain submit `202`, confirm/rollback `200`; ordinary error envelope
 `{error,transaction}` applies: `401` API authentication, `403` permission,
 `400` invalid known JSON types/out-of-range unsigned integers/missing record fields/status enum/timestamp
@@ -5184,9 +5186,53 @@ Test sync exposes the same proposed replacement for explicit review/save/discard
 An authorized full configuration write can still edit/delete any rule; changing
 ownership remains an explicit reviewed edit, not an editor-opening side effect.
 
+#### Manual server-side force sync
+
+Keep **Force host sync** and **Force policy sync** on `/settings/sando`.
+Use bodyless, queryless `POST /api/v1/sando/hosts/sync` or
+`POST /api/v1/sando/policies/sync` with API-key authentication and all of
+`state.read`, `sando.write`, `firewall.write`, `transactions.write`.
+Only the committed endpoint is used; arbitrary URLs/configuration are rejected.
+Both actions work when their automatic sync flag is false and leave both flags
+and saved browser import reports unchanged.
+
+Each request retrieves once on the daemon with the existing limits/timeouts,
+then uses the same host reconciliation or policy mapping and durable
+submit/verify/immediate-confirm/rollback as its automatic worker. Host sync can
+add and delete same-source imported hosts and their rules under the existing
+authoritative inventory rules. Policy sync fetches an unconditional complete
+list, never `If-None-Match`, so unchanged ETags cannot suppress reapplication.
+Effective changes create one revision; unchanged checks create none.
+Configuration changes during retrieval invalidate the request without applying
+its fetched result. Manual and automatic acquisition share an exclusion slot;
+another sync request is rejected rather than queued or repeated.
+
+Success returns `200`/`Cache-Control: no-store` with the full `GET /sando`
+response shape. Separate `last_success_at` / `policies.last_success_at` advance
+on successful unchanged checks too. `enabled` still describes automation;
+`state` is `syncing` during a manual request, then `disabled` if automation
+remains disabled. Manual checks do not postpone already scheduled automatic
+acquisition. Worker/cache failures retain prior success timestamps and
+configuration according to the existing rollback/recovery contract.
+Errors use `{error,transaction:null}`: `401` authentication, `403` missing any
+permission, `405` non-POST, `400` any body/query, `422` missing saved endpoint,
+`409` a sync already running or configuration busy before acquisition, and
+`503` manager/engine/upgrade/unavailable, upstream/validation/apply/cache failure
+or configuration changed during retrieval. Do not claim success on an error.
+
+Disable duplicate clicks and actions during pending/stale status reads, active
+configuration/recovery/upgrade operations, or unsaved edits. Preserve drafts;
+tell the user inline to save/discard them first. Do not add confirmation popups
+or bring back browser import/Test sync. On success refresh committed state and
+the separate server timestamps in the saved timezone. Errors remain inline,
+and requests are never automatically retried. After a lost response, inspect
+server state/status before deciding whether to retry.
+
 #### Server-side Test sync preview
 
-Add **Test sync** to **Settings > Sando**. It retrieves policies once on the
+The preview API is retained for API clients; it is not a required frontend
+button or a prerequisite for automatic sync. The frontend removes **Test sync**
+and uses the separate force-sync actions below. Preview retrieves policies once on the
 daemon and stages a reviewable candidate in the existing **Save / Commit**
 section. It does not enable automatic synchronization or activate the candidate.
 Both sync flags may remain false when configured hosts already exist. This
@@ -5243,7 +5289,7 @@ Errors use the normal `{error,transaction:null}` envelope:
 - `503` manager/engine/upgrade state unavailable, or upstream transport,
   HTTP, JSON, ETag, body/row-limit failure. Show the returned error.
 
-Frontend workflow:
+Optional API-client preview workflow (not the Settings page):
 
 1. Require saved URL and preview permissions. Disable duplicate clicks. Require
    the existing draft to be clean; if dirty, preserve it and tell the user to save

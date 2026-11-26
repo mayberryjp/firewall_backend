@@ -16,6 +16,13 @@
 
 ### Added
 
+- Add separate server-side host/policy force sync endpoints and frontend actions.
+  One-time sync works with automatic sync disabled, preserving both flags and
+  browser import reports. Require full read/Sando/firewall/transaction authority,
+  reject overlapping or stale acquisitions, and share the durable automatic
+  reconciliation path. Additive API contract; next automatic calendar version.
+  [Frontend coordination 2026-11-26-02](docs/frontend-handoffs/2026-11-26.md#2026-11-26-02-manual-server-side-force-sync).
+
 - Extend backend Sando hosts/scores sync to add new firewall hosts automatically
   with stable browser-pattern IDs, bounded names and default `drop` policy.
   Preserve existing inventory/settings; apply additions through durable

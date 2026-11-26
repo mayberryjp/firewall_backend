@@ -309,6 +309,7 @@ pub struct Manager {
     engine: Arc<Mutex<Engine>>,
     state: Mutex<State>,
     policies: Mutex<PolicyState>,
+    sync_slot: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     policy_poll_scheduled: tokio::sync::Notify,
     #[cfg(test)]
@@ -350,6 +351,7 @@ impl Manager {
                 ..Default::default()
             }),
             policies: Mutex::new(PolicyState::default()),
+            sync_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             policy_poll_scheduled: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -439,10 +441,10 @@ impl Manager {
         } else {
             &empty
         };
-        let status = if !config.sync_enabled {
-            "disabled"
-        } else if state.syncing && state.snapshot.source_url == config.api_url {
+        let status = if state.syncing && state.snapshot.source_url == config.api_url {
             "syncing"
+        } else if !config.sync_enabled {
+            "disabled"
         } else if snapshot.error.is_some() {
             "error"
         } else if snapshot.last_success_at.is_some() {
@@ -505,10 +507,10 @@ impl Manager {
         };
         let mut policy_status = serde_json::to_value(policies)?;
         policy_status["enabled"] = json!(config.policy_sync_enabled);
-        policy_status["state"] = json!(if !config.policy_sync_enabled {
-            "disabled"
-        } else if policies.syncing {
+        policy_status["state"] = json!(if policies.syncing {
             "syncing"
+        } else if !config.policy_sync_enabled {
+            "disabled"
         } else if policies.error.is_some() {
             "error"
         } else if policies.last_success_at.is_some() {
@@ -534,6 +536,15 @@ impl Manager {
     }
 
     fn finish(&self, source: &str, result: Result<(Vec<Host>, usize)>) -> Result<()> {
+        self.finish_hosts(source, result, None)
+    }
+
+    fn finish_hosts(
+        &self,
+        source: &str,
+        result: Result<(Vec<Host>, usize)>,
+        forced: Option<(&str, netcontrol_core::Version)>,
+    ) -> Result<()> {
         let mut engine = self
             .engine
             .lock()
@@ -544,7 +555,12 @@ impl Manager {
             .lock()
             .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
         state.syncing = false;
-        if !config.sync_enabled || config.api_url != source {
+        if let Some((_, revision)) = forced {
+            ensure!(
+                engine.committed_revision() == revision && config.api_url == source,
+                "configuration changed during forced Sando sync; retry"
+            );
+        } else if !config.sync_enabled || config.api_url != source {
             return Ok(());
         }
         if state.snapshot.source_url != source {
@@ -562,7 +578,11 @@ impl Manager {
                     host_name: host.host_name.clone(),
                 })
                 .collect();
-            let outcome = engine.sync_sando_hosts(source, &imports)?;
+            let outcome = if let Some((actor, _)) = forced {
+                engine.force_sando_hosts(source, &imports, actor)?
+            } else {
+                engine.sync_sando_hosts(source, &imports)?
+            };
             Ok((hosts, skipped, outcome))
         });
         let now = Utc::now();
@@ -580,7 +600,7 @@ impl Manager {
                 }
                 if outcome.changed {
                     state.last_changed_revision = Some(engine.committed_revision());
-                    tracing::info!(revision = %engine.committed_revision(), added_hosts = outcome.added_count, removed_hosts = outcome.removed_count, "Sando hosts automatically committed");
+                    tracing::info!(revision = %engine.committed_revision(), added_hosts = outcome.added_count, removed_hosts = outcome.removed_count, "Sando hosts committed");
                 }
                 next.hosts = hosts;
                 next.skipped_hosts = skipped;
@@ -608,7 +628,10 @@ impl Manager {
                 state.snapshot.error = Some(format!("Could not persist Sando sync: {error:#}"));
             }
         }
-        state.next_sync_at = Some(now + chrono::TimeDelta::seconds(SYNC_INTERVAL.as_secs() as i64));
+        if forced.is_none() {
+            state.next_sync_at =
+                Some(now + chrono::TimeDelta::seconds(SYNC_INTERVAL.as_secs() as i64));
+        }
         Ok(())
     }
 
@@ -642,13 +665,22 @@ impl Manager {
         source: &PolicySource,
         result: Result<PolicyFetch>,
     ) -> Result<PolicySource> {
+        self.finish_policy_sync(source, result, None)
+    }
+
+    fn finish_policy_sync(
+        &self,
+        source: &PolicySource,
+        result: Result<PolicyFetch>,
+        forced: Option<(&str, netcontrol_core::Version)>,
+    ) -> Result<PolicySource> {
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
         let config = engine.saved_configuration();
         let current = policy_source(config);
-        if !current.1 || &current != source {
+        if forced.is_none() && (!current.1 || &current != source) {
             return Ok(source.clone());
         }
         let mut policies = self
@@ -656,10 +688,21 @@ impl Manager {
             .lock()
             .map_err(|_| anyhow::anyhow!("Sando policy status unavailable"))?;
         policies.syncing = false;
+        if let Some((_, revision)) = forced {
+            ensure!(
+                engine.committed_revision() == revision && &current == source,
+                "configuration changed during forced Sando sync; retry"
+            );
+        }
         let applied = match result {
             Ok(PolicyFetch::Unchanged) => Ok(()),
             Ok(PolicyFetch::List { etag, entries }) => {
-                engine.sync_sando_policies(&source.0, &entries).map(|outcome| {
+                let outcome = if let Some((actor, _)) = forced {
+                    engine.force_sando_policies(&source.0, &entries, actor)
+                } else {
+                    engine.sync_sando_policies(&source.0, &entries)
+                };
+                outcome.map(|outcome| {
                     if outcome.skipped_count > 0 {
                         tracing::warn!(skipped_count = outcome.skipped_count, "Sando policy entries skipped");
                     }
@@ -668,7 +711,7 @@ impl Manager {
                     policies.etag = Some(etag);
                     if outcome.changed {
                         policies.last_changed_revision = Some(engine.committed_revision());
-                        tracing::info!(revision = %engine.committed_revision(), "Sando policies automatically committed");
+                        tracing::info!(revision = %engine.committed_revision(), "Sando policies committed");
                     }
                 })
             }
@@ -676,20 +719,100 @@ impl Manager {
         };
         let now = Utc::now();
         policies.last_attempt_at = Some(now);
-        policies.next_sync_at =
-            Some(now + chrono::TimeDelta::seconds(POLICY_INTERVAL.as_secs() as i64));
+        if forced.is_none() {
+            policies.next_sync_at =
+                Some(now + chrono::TimeDelta::seconds(POLICY_INTERVAL.as_secs() as i64));
+        }
         match applied {
             Ok(()) => {
                 policies.last_success_at = Some(now);
                 policies.error = None;
             }
             Err(error) => {
-                tracing::warn!(%error, "Sando automatic policy sync failed");
-                policies.error = Some(format!("Sando automatic policy sync failed: {error:#}"));
+                tracing::warn!(%error, "Sando policy sync failed");
+                policies.error = Some(format!("Sando policy sync failed: {error:#}"));
             }
         }
         let config = engine.saved_configuration();
         Ok(policy_source(config))
+    }
+
+    pub(crate) fn try_sync_slot(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        self.sync_slot.clone().try_acquire_owned()
+    }
+
+    pub(crate) async fn force_sync(
+        &self,
+        policies: bool,
+        actor: &str,
+        _slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Value> {
+        let (source, revision) = {
+            let engine = self
+                .engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine unavailable"))?;
+            ensure!(
+                !engine.configuration_busy(),
+                "configuration is busy; retry Sando sync"
+            );
+            let source = policy_source(engine.saved_configuration());
+            ensure!(
+                !source.0.is_empty(),
+                "save a Sando api_url before forcing sync"
+            );
+            (source, engine.committed_revision())
+        };
+        let client = http_client()?;
+        if policies {
+            {
+                let mut state = self
+                    .policies
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Sando policy status unavailable"))?;
+                if state.source_url != source.0 {
+                    *state = PolicyState {
+                        source_url: source.0.clone(),
+                        ..Default::default()
+                    };
+                }
+                state.syncing = true;
+            }
+            // A force sync must fetch a complete list, even when the ETag is unchanged.
+            let result = fetch_policies(&client, &source.0, None).await;
+            self.finish_policy_sync(&source, result, Some((actor, revision)))?;
+        } else {
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
+                if state.snapshot.source_url != source.0 {
+                    *state = State {
+                        snapshot: Snapshot {
+                            source_url: source.0.clone(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                }
+                state.syncing = true;
+            }
+            let result = fetch(&client, &source.0).await;
+            self.finish_hosts(&source.0, result, Some((actor, revision)))?;
+        }
+        let status = self.status()?;
+        let error = if policies {
+            &status["policies"]["error"]
+        } else {
+            &status["error"]
+        };
+        if let Some(error) = error.as_str() {
+            anyhow::bail!("{error}");
+        }
+        Ok(status)
     }
 
     async fn policy_worker(
@@ -729,6 +852,10 @@ impl Manager {
                 previous = Some(source.clone());
             }
             if source.1 && request.is_none() && Instant::now() >= due {
+                let Ok(slot) = self.sync_slot.clone().try_acquire_owned() else {
+                    due = Instant::now() + Duration::from_secs(1);
+                    continue;
+                };
                 let mut policies = self
                     .policies
                     .lock()
@@ -739,7 +866,8 @@ impl Manager {
                 let etag = policies.etag.clone();
                 let url = source.0.clone();
                 request = Some(Box::pin(async move {
-                    fetch_policies(&client, &url, etag.as_deref()).await
+                    let result = fetch_policies(&client, &url, etag.as_deref()).await;
+                    (slot, result)
                 }));
             }
             let deadline = (source.1 && request.is_none()).then_some(due);
@@ -748,7 +876,7 @@ impl Manager {
                 _ = stop.changed() => break,
                 changed = changes.changed() => { changed.context("configuration notifications closed")?; }
                 _ = crate::wait_until(deadline) => {}
-                result = async { request.as_mut().expect("guarded Sando policy request").await }, if request.is_some() => {
+                (_slot, result) = async { request.as_mut().expect("guarded Sando policy request").await }, if request.is_some() => {
                     request = None;
                     let manager = self.clone();
                     let source = source.clone();
@@ -812,13 +940,18 @@ impl Manager {
                 previous = Some(source.clone());
             }
             if source.1 && request.is_none() && Instant::now() >= due {
+                let Ok(slot) = self.sync_slot.clone().try_acquire_owned() else {
+                    due = Instant::now() + Duration::from_secs(1);
+                    continue;
+                };
                 let mut state = self
                     .state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Sando status unavailable"))?;
                 state.syncing = true;
                 state.next_sync_at = None;
-                request = Some(Box::pin(acquire(source.0)));
+                let acquisition = acquire(source.0);
+                request = Some(Box::pin(async move { (slot, acquisition.await) }));
             }
             let deadline = (source.1 && request.is_none()).then_some(due);
             tokio::select! {
@@ -826,7 +959,7 @@ impl Manager {
                 _ = stop.changed() => break,
                 changed = changes.changed() => { changed.context("configuration notifications closed")?; }
                 _ = crate::wait_until(deadline) => {}
-                result = async { request.as_mut().expect("guarded Sando request").await }, if request.is_some() => {
+                (_slot, result) = async { request.as_mut().expect("guarded Sando request").await }, if request.is_some() => {
                     request = None;
                     let manager = self.clone();
                     let source = previous.as_ref().context("Sando source missing")?.0.clone();
@@ -1218,6 +1351,113 @@ mod tests {
         ));
         let manager = Manager::open(&directory.path().join("sando.json"), engine).unwrap();
         (directory, manager)
+    }
+
+    #[tokio::test]
+    async fn force_sync_preserves_enabled_automatic_schedule() {
+        use axum::{Router, routing::get};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let upstream = Router::new().route(
+            "/api/localhosts",
+            get({
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { String::from_utf8(inventory()).unwrap() }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let (_directory, manager) = fixture();
+        configure(&manager, &source, true);
+        let (stop, receiver) = watch::channel(false);
+        let worker = tokio::spawn(manager.clone().run(receiver));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.host_poll_scheduled.notified(),
+        )
+        .await
+        .unwrap();
+        let scheduled = manager.status().unwrap()["next_sync_at"].clone();
+        let result = manager
+            .force_sync(false, "operator", manager.try_sync_slot().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result["enabled"], true);
+        assert_eq!(result["next_sync_at"], scheduled);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        tokio::time::pause();
+        tokio::time::advance(SYNC_INTERVAL - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.host_poll_scheduled.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        stop.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn force_sync_rejects_overlap_and_changed_configuration_without_applying() {
+        use axum::{Router, routing::get};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let upstream = Router::new().route(
+            "/api/localhosts",
+            get({
+                let started = started.clone();
+                let release = release.clone();
+                move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        String::from_utf8(inventory()).unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let (_directory, manager) = fixture();
+        configure(&manager, &source, false);
+        let request = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                let slot = manager.try_sync_slot().unwrap();
+                manager.force_sync(false, "operator", slot).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        assert!(manager.try_sync_slot().is_err());
+        assert_eq!(manager.status().unwrap()["state"], "syncing");
+        configure(&manager, "http://other.example.test", false);
+        let revision = manager.engine.lock().unwrap().committed_revision();
+        release.notify_one();
+        let error = request.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("configuration changed"));
+        assert_eq!(
+            manager.engine.lock().unwrap().committed_revision(),
+            revision
+        );
+        assert!(manager.status().unwrap()["last_success_at"].is_null());
+        assert!(manager.try_sync_slot().is_ok());
+        server.abort();
+        let _ = server.await;
     }
 
     fn stage(manager: &Manager, url: &str, enabled: bool) -> String {

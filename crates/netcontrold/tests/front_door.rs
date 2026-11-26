@@ -1197,6 +1197,213 @@ async fn sando_sync_status_requires_read_permission_and_rejects_input() {
 }
 
 #[tokio::test]
+async fn sando_force_sync_applies_disabled_workers_and_enforces_authority() {
+    use axum::{Router, http::HeaderMap, routing::get};
+    use netcontrold::http::Credential;
+
+    let fail_hosts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let upstream = Router::new()
+        .route("/api/localhosts", get({
+            let fail = fail_hosts.clone();
+            move || {
+                let fail = fail.clone();
+                async move {
+                    if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                        (StatusCode::SERVICE_UNAVAILABLE, "[]")
+                    } else {
+                        (StatusCode::OK, r#"[{"ip_address":"192.0.2.10","dhcp_hostname":"Camera"}]"#)
+                    }
+                }
+            }
+        }))
+        .route("/api/ignorelist", get(|headers: HeaderMap| async move {
+            assert!(!headers.contains_key("if-none-match"));
+            ([("etag", "\"same\"")], r#"[{"src_ip":"192.0.2.10","dst_ip":"198.51.100.4","protocol":6,"dst_port":443}]"#)
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".test-data")
+        .join(secret("").unwrap());
+    fs::create_dir_all(&path).unwrap();
+    let engine = Arc::new(Mutex::new(
+        Engine::open(&path.join("state.json"), Box::new(Simulator::new())).unwrap(),
+    ));
+    let permissions: Vec<String> = netcontrol_core::PERMISSIONS
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    let mut credentials = vec![Credential {
+        name: "operator".into(),
+        token_sha256: netcontrold::identity::digest("operator"),
+        permissions: permissions.clone(),
+    }];
+    for missing in [
+        "state.read",
+        "sando.write",
+        "firewall.write",
+        "transactions.write",
+    ] {
+        credentials.push(Credential {
+            name: missing.into(),
+            token_sha256: netcontrold::identity::digest(missing),
+            permissions: permissions
+                .iter()
+                .filter(|p| p.as_str() != missing)
+                .cloned()
+                .collect(),
+        });
+    }
+    let mut app = App::new(engine.clone(), Authentication::Scoped(credentials), false);
+    let manager =
+        netcontrold::sando::Manager::open(&path.join("sando.json"), engine.clone()).unwrap();
+    App::attach_sando(&mut app, manager.clone()).unwrap();
+    let fixture = Fixture {
+        path,
+        router: router(app),
+    };
+    for endpoint in ["/api/v1/sando/hosts/sync", "/api/v1/sando/policies/sync"] {
+        assert_eq!(
+            fixture
+                .request("POST", endpoint, "", "", "invalid", "")
+                .await
+                .0,
+            401
+        );
+        for missing in [
+            "state.read",
+            "sando.write",
+            "firewall.write",
+            "transactions.write",
+        ] {
+            assert_eq!(
+                fixture
+                    .request("POST", endpoint, "", "", missing, "")
+                    .await
+                    .0,
+                403
+            );
+        }
+        for (method, route, body, expected) in [
+            ("GET", endpoint.to_owned(), "", 405),
+            ("POST", format!("{endpoint}?extra=1"), "", 400),
+            ("POST", endpoint.to_owned(), "{}", 400),
+            ("POST", endpoint.to_owned(), "", 422),
+        ] {
+            assert_eq!(
+                fixture
+                    .request(method, &route, body, "", "operator", "")
+                    .await
+                    .0,
+                expected
+            );
+        }
+    }
+    let commit = |config: netcontrol_core::Config| {
+        let mut engine = engine.lock().unwrap();
+        let revision = engine.committed_revision();
+        let submitted = engine.request(
+            "POST",
+            "/api/v1/transactions",
+            "",
+            "test",
+            &permissions,
+            &serde_json::to_vec(
+                &json!({"base_revision":revision,"confirm_timeout_seconds":30,"config":config}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(submitted.status, 202, "{}", submitted.body);
+        let confirmed = engine.request(
+            "POST",
+            &format!(
+                "/api/v1/transactions/{}/confirm",
+                submitted.body["id"].as_str().unwrap()
+            ),
+            "",
+            "test",
+            &permissions,
+            &[],
+        );
+        assert_eq!(confirmed.status, 200, "{}", confirmed.body);
+    };
+    let mut config = engine.lock().unwrap().saved_configuration().clone();
+    config.sando.api_url = source;
+    config.interfaces = serde_json::from_value(json!([{
+        "name":"lan0","kind":"dummy","role":"lan","mtu":1500,"up":true,"addresses":["192.0.2.1/24"]
+    }]))
+    .unwrap();
+    commit(config);
+    let revision = engine.lock().unwrap().committed_revision();
+    let host_result = fixture
+        .request("POST", "/api/v1/sando/hosts/sync", "", "", "operator", "")
+        .await;
+    assert_eq!(host_result.0, 200, "{}", host_result.2);
+    assert_eq!(host_result.1["cache-control"], "no-store");
+    assert_eq!(host_result.2["enabled"], false);
+    assert_eq!(host_result.2["policies"]["enabled"], false);
+    assert_eq!(host_result.2["added_hosts"], 1);
+    assert!(host_result.2["last_success_at"].is_string());
+    assert_ne!(engine.lock().unwrap().committed_revision(), revision);
+    let policy_result = fixture
+        .request(
+            "POST",
+            "/api/v1/sando/policies/sync",
+            "",
+            "",
+            "operator",
+            "",
+        )
+        .await;
+    assert_eq!(policy_result.0, 200, "{}", policy_result.2);
+    assert!(policy_result.2["policies"]["last_success_at"].is_string());
+    assert_eq!(policy_result.2["policies"]["imported_count"], 1);
+    let mut config = engine.lock().unwrap().saved_configuration().clone();
+    assert!(!config.sando.sync_enabled && !config.sando.policy_sync_enabled);
+    assert!(config.sando.hosts_import.is_none() && config.sando.rules_import.is_none());
+    let host = &mut config.firewall.policies.as_mut().unwrap().hosts[0];
+    assert_eq!(host.rules.len(), 1);
+    host.rules.clear();
+    commit(config);
+    // The same ETag must not prevent reapplication after a local rule edit.
+    assert_eq!(
+        fixture
+            .request(
+                "POST",
+                "/api/v1/sando/policies/sync",
+                "",
+                "",
+                "operator",
+                ""
+            )
+            .await
+            .0,
+        200
+    );
+    let saved = engine.lock().unwrap().saved_configuration().clone();
+    assert_eq!(
+        saved.firewall.policies.as_ref().unwrap().hosts[0]
+            .rules
+            .len(),
+        1
+    );
+    let revision = engine.lock().unwrap().committed_revision();
+    fail_hosts.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failure = fixture
+        .request("POST", "/api/v1/sando/hosts/sync", "", "", "operator", "")
+        .await;
+    assert_eq!(failure.0, 503);
+    assert!(failure.2["error"].as_str().unwrap().contains("503"));
+    assert_eq!(engine.lock().unwrap().committed_revision(), revision);
+    let status = manager.status().unwrap();
+    assert_eq!(status["last_success_at"], host_result.2["last_success_at"]);
+    assert!(status["error"].is_string());
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn sando_policy_preview_stages_without_writes_and_rejects_stale_or_failed_fetches() {
     use axum::{Router, http::HeaderMap, routing::get};
     use netcontrold::http::Credential;
